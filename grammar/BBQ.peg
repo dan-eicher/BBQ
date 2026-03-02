@@ -1,0 +1,699 @@
+// =============================================================
+// BBQ (Binary Block Query) — PEG Grammar
+//
+// Port of BBQ.atg (Coco/R) to pegc format.
+// Builds the same BBQ AST as the original grammar.
+//
+// Generate with:
+//   ./build/pegc/pegc grammar/BBQ.peg -frames grammar/frames/ -o frontend/ -prefix ""
+// =============================================================
+
+COMPILER BBQ
+
+(. #include <string>
+   #include <vector>
+   #include <optional>
+   #include <cstdlib>
+.)
+
+COMMENTS FROM "#" TO "\n"
+COMMENTS FROM "//" TO "\n"
+
+IGNORE '\r' + '\n' + '\t' + ' '
+
+PRODUCTIONS
+
+// ═══════════════════════════════════════════════════════════════
+// Top-Level
+// ═══════════════════════════════════════════════════════════════
+
+BBQ
+    (. std::vector<EndianDirective*> dirs;
+       std::vector<Rule*> rules; .)
+    = { Directive<&dirs> }
+      Rule_<&rules>
+      { Rule_<&rules> }
+    (. skip(); if (!at_end()) return false; .)
+    (. ast = new Grammar(std::move(dirs), std::move(rules));
+       ast->loc = SourceLoc{nullptr, 1, 1}; .)
+.
+
+Directive <. std::vector<EndianDirective*> *dirs .>
+    (. Endianness e; .)
+    = "@endian"
+      ( "big"    (. e = Endianness::Big; .)
+      | "little" (. e = Endianness::Little; .)
+      )
+    (. auto* d = new EndianDirective(e);
+       d->loc = Loc();
+       dirs->push_back(d); .)
+.
+
+Rule_ <. std::vector<Rule*> *rules .>
+    (. std::string name; TypeExpr* body; .)
+    = ident<name>       (. SourceLoc loc = Loc(); .)
+      "="
+      TypeBody<&body>
+    (. auto* r = new Rule(std::move(name), body);
+       r->loc = loc;
+       rules->push_back(r); .)
+.
+
+// ═══════════════════════════════════════════════════════════════
+// Type Expressions
+// ═══════════════════════════════════════════════════════════════
+
+TypeBody <. TypeExpr* *result .>
+    (. TypeExpr* first;
+       std::vector<TypeExpr*> alts; .)
+    = TypeTerm<&first>       (. alts.push_back(first); .)
+      { "|"
+        TypeTerm<&first>     (. alts.push_back(first); .)
+      }
+    (. if (alts.size() == 1)
+           *result = alts[0];
+       else {
+           auto loc = alts[0]->loc;
+           *result = new Alternatives(std::move(alts));
+           (*result)->loc = loc;
+       } .)
+.
+
+TypeTerm <. TypeExpr* *result .>
+    (. Expr* constr = nullptr;
+       Interval* iv = nullptr; .)
+    = TypePrimary<result>
+      [ ConstraintBlock<&constr> ]
+      [ IntervalSpec<&iv> ]
+.
+
+TypePrimary <. TypeExpr* *result .>
+    = "struct"    StructBody<result>
+    | "union"     UnionBody<result>
+    | "array"     ArrayBody<result>
+    | "optional"  OptionalBody<result>
+    | "switch"    SwitchBody<result>
+    | "compute"   ComputeBody<result>
+    | "extern"    ExternBody<result>
+    | "bitfield"  BitfieldBody<result>
+    | PrimitiveType<result>
+    | "(" TypeBody<result> ")"
+    | RuleRefType<result>
+.
+
+// ── Struct ──────────────────────────────────────────────────
+
+StructBody <. TypeExpr* *result .>
+    (. std::vector<Field*> fields;
+       SourceLoc loc = Loc(); .)
+    = "{"
+      [ StructElement<&fields>
+        { "," StructElement<&fields> }
+        [ "," ]
+      ]
+      "}"
+    (. *result = new Struct(std::move(fields));
+       (*result)->loc = loc; .)
+.
+
+StructElement <. std::vector<Field*> *fields .>
+    = EndianDirectiveField<fields>
+    | FieldDecl<fields>
+.
+
+EndianDirectiveField <. std::vector<Field*> *fields .>
+    (. Expr* expr; .)
+    = "@endian" ":"
+      Expr_<&expr>
+    (. auto* es = new EndianSwitch(expr);
+       es->loc = Loc();
+       auto* f = new Field("", es, std::nullopt, std::nullopt);
+       f->loc = es->loc;
+       fields->push_back(f); .)
+.
+
+FieldDecl <. std::vector<Field*> *fields .>
+    (. std::string name;
+       TypeExpr* body;
+       Expr* constr = nullptr;
+       Interval* iv = nullptr; .)
+    = ident<name>            (. SourceLoc loc = Loc(); .)
+      ":"
+      TypeBody<&body>
+      [ ConstraintBlock<&constr> ]
+      [ IntervalSpec<&iv> ]
+    (. auto* f = new Field(std::move(name), body,
+           constr ? std::optional<Expr*>(constr) : std::nullopt,
+           iv     ? std::optional<Interval*>(iv) : std::nullopt);
+       f->loc = loc;
+       fields->push_back(f); .)
+.
+
+// ── Union ───────────────────────────────────────────────────
+
+UnionBody <. TypeExpr* *result .>
+    (. std::vector<Variant*> variants;
+       SourceLoc loc = Loc(); .)
+    = "{"
+      [ VariantDecl<&variants>
+        { "," VariantDecl<&variants> }
+        [ "," ]
+      ]
+      "}"
+    (. *result = new Union(std::move(variants));
+       (*result)->loc = loc; .)
+.
+
+VariantDecl <. std::vector<Variant*> *variants .>
+    (. std::string name;
+       TypeExpr* body;
+       Expr* constr = nullptr;
+       Interval* iv = nullptr; .)
+    = ident<name>            (. SourceLoc loc = Loc(); .)
+      ":"
+      TypeBody<&body>
+      [ ConstraintBlock<&constr> ]
+      [ IntervalSpec<&iv> ]
+    (. auto* v = new Variant(std::move(name), body,
+           constr ? std::optional<Expr*>(constr) : std::nullopt,
+           iv     ? std::optional<Interval*>(iv) : std::nullopt);
+       v->loc = loc;
+       variants->push_back(v); .)
+.
+
+// ── Array ───────────────────────────────────────────────────
+
+ArrayBody <. TypeExpr* *result .>
+    (. TypeExpr* elem;
+       ArraySpec* spec;
+       Expr* constr = nullptr;
+       Interval* iv = nullptr;
+       Interval* elem_iv = nullptr;
+       SourceLoc loc = Loc(); .)
+    = "<" TypeBody<&elem> ">"
+      ArraySpecRule<&spec>
+      [ ConstraintBlock<&constr> ]
+      [ IntervalSpec<&iv> ]
+      [ "@" ElementIntervalSpec<&elem_iv> ]
+    (. *result = new Array(elem, spec,
+           constr ? std::optional<Expr*>(constr) : std::nullopt,
+           iv     ? std::optional<Interval*>(iv) : std::nullopt,
+           elem_iv ? std::optional<Interval*>(elem_iv) : std::nullopt);
+       (*result)->loc = loc; .)
+.
+
+ArraySpecRule <. ArraySpec* *result .>
+    (. Expr* count;
+       Separator* sep;
+       Terminator* term; .)
+    = "["
+      Expr_<&count>
+      "]"
+      (. *result = new FixedCount(count); (*result)->loc = count->loc; .)
+    | "("
+      SepSpec<&sep> ","
+      TermSpec<&term>
+      ")"
+      (. *result = new SepTerm(sep, term); (*result)->loc = sep->loc; .)
+.
+
+SepSpec <. Separator* *result .>
+    (. TypeExpr* ty; .)
+    = "none"
+      (. *result = new NoneSep(); (*result)->loc = Loc(); .)
+    | TypeBody<&ty>
+      (. auto* s = new TypeSep(ty); s->loc = ty->loc; *result = s; .)
+.
+
+TermSpec <. Terminator* *result .>
+    (. Expr* e; TypeExpr* ty; .)
+    = "eof"
+      (. *result = new EofTerm(); (*result)->loc = Loc(); .)
+    | "count" "(" Expr_<&e> ")"
+      (. *result = new CountTerm(e); (*result)->loc = Loc(); .)
+    | "until" "(" Expr_<&e> ")"
+      (. *result = new UntilTerm(e); (*result)->loc = Loc(); .)
+    | TypeBody<&ty>
+      (. auto* tt = new BBQ::TypeTerm(ty); tt->loc = ty->loc; *result = tt; .)
+.
+
+// ── Optional ────────────────────────────────────────────────
+
+OptionalBody <. TypeExpr* *result .>
+    (. TypeExpr* elem;
+       Expr* constr = nullptr;
+       Interval* iv = nullptr;
+       SourceLoc loc = Loc(); .)
+    = "<" TypeBody<&elem> ">"
+      [ ConstraintBlock<&constr> ]
+      [ IntervalSpec<&iv> ]
+    (. *result = new Optional(elem,
+           constr ? std::optional<Expr*>(constr) : std::nullopt,
+           iv     ? std::optional<Interval*>(iv) : std::nullopt);
+       (*result)->loc = loc; .)
+.
+
+// ── Switch ──────────────────────────────────────────────────
+
+SwitchBody <. TypeExpr* *result .>
+    (. Expr* disc;
+       std::vector<SwitchCase*> cases;
+       SwitchDefault* def = nullptr;
+       SourceLoc loc = Loc(); .)
+    = "(" Expr_<&disc> ")"
+      "{"
+      { SwitchCaseRule<&cases> }
+      [ DefaultCaseRule<&def> ]
+      "}"
+    (. *result = new Switch(disc, std::move(cases),
+           def ? std::optional<SwitchDefault*>(def) : std::nullopt);
+       (*result)->loc = loc; .)
+.
+
+SwitchCaseRule <. std::vector<SwitchCase*> *cases .>
+    (. CaseValue* cv;
+       TypeExpr* target;
+       Interval* iv = nullptr; .)
+    = CaseValueRule<&cv>
+      ":"
+      TypeBody<&target>
+      [ IntervalSpec<&iv> ]
+      ";"
+    (. auto* sc = new SwitchCase(cv, target,
+           iv ? std::optional<Interval*>(iv) : std::nullopt);
+       sc->loc = cv->loc;
+       cases->push_back(sc); .)
+.
+
+DefaultCaseRule <. SwitchDefault* *result .>
+    (. TypeExpr* target;
+       Interval* iv = nullptr; .)
+    = "default"    (. SourceLoc loc = Loc(); .)
+      ":"
+      TypeBody<&target>
+      [ IntervalSpec<&iv> ]
+      ";"
+    (. *result = new SwitchDefault(target,
+           iv ? std::optional<Interval*>(iv) : std::nullopt);
+       (*result)->loc = loc; .)
+.
+
+CaseValueRule <. CaseValue* *result .>
+    (. std::vector<std::string> path;
+       std::string s;
+       int64_t ival; .)
+    = DottedRef<result>
+    | integer<ival>           (. *result = new IntValue(ival); (*result)->loc = Loc(); .)
+    | string_lit<s>           (. *result = new StrValue(std::move(s)); (*result)->loc = Loc(); .)
+    | !"default" ident<s>     (. *result = new IdentValue(std::move(s)); (*result)->loc = Loc(); .)
+.
+
+DottedRef <. CaseValue* *result .>
+    (. std::vector<std::string> path;
+       std::string s; .)
+    = ident<s>               (. path.push_back(std::move(s)); .)
+      "."
+      ident<s>               (. path.push_back(std::move(s)); .)
+      { "."
+        ident<s>             (. path.push_back(std::move(s)); .)
+      }
+    (. *result = new RefValue(std::move(path)); (*result)->loc = Loc(); .)
+.
+
+// ── Compute ─────────────────────────────────────────────────
+
+ComputeBody <. TypeExpr* *result .>
+    (. Expr* e;
+       PrimitiveKind* pk;
+       SourceLoc loc = Loc(); .)
+    = "("
+      Expr_<&e>
+      ":"
+      PrimKeyword<&pk>
+      ")"
+    (. *result = new Compute(e, pk);
+       (*result)->loc = loc; .)
+.
+
+// ── Extern ──────────────────────────────────────────────
+
+ExternBody <. TypeExpr* *result .>
+    (. std::string func; std::string ctype;
+       Expr* constr = nullptr; Interval* iv = nullptr;
+       SourceLoc loc = Loc(); .)
+    = "("
+      string_lit<func>
+      ","
+      string_lit<ctype>
+      ")"
+      [ ConstraintBlock<&constr> ]
+      [ IntervalSpec<&iv> ]
+    (. *result = new Extern(std::move(func), std::move(ctype),
+           constr ? std::optional<Expr*>(constr) : std::nullopt,
+           iv     ? std::optional<Interval*>(iv) : std::nullopt);
+       (*result)->loc = loc; .)
+.
+
+// ── Bitfield ───────────────────────────────────────────────
+
+BitfieldBody <. TypeExpr* *result .>
+    (. PrimitiveKind* container;
+       std::vector<BitfieldEntry*> entries;
+       SourceLoc loc = Loc(); .)
+    = "<" PrimKeyword<&container> ">"
+      "{"
+      [ BitfieldEntryRule<&entries>
+        { "," BitfieldEntryRule<&entries> }
+        [ "," ]
+      ]
+      "}"
+    (. *result = new Bitfield(container, std::move(entries));
+       (*result)->loc = loc; .)
+.
+
+BitfieldEntryRule <. std::vector<BitfieldEntry*> *entries .>
+    (. std::string name; int64_t width; .)
+    = ident<name>       (. SourceLoc loc = Loc(); .)
+      ":"
+      integer<width>
+    (. auto* e = new BitfieldEntry(std::move(name), width);
+       e->loc = loc;
+       entries->push_back(e); .)
+.
+
+// ── Primitive Type ──────────────────────────────────────────
+
+PrimitiveType <. TypeExpr* *result .>
+    (. PrimitiveKind* pk;
+       Expr* constr = nullptr;
+       Interval* iv = nullptr; .)
+    = PrimKeyword<&pk>
+      (. SourceLoc loc = pk->loc; .)
+      [ ConstraintBlock<&constr> ]
+      [ IntervalSpec<&iv> ]
+    (. *result = new Primitive(pk,
+           constr ? std::optional<Expr*>(constr) : std::nullopt,
+           iv     ? std::optional<Interval*>(iv) : std::nullopt);
+       (*result)->loc = loc; .)
+.
+
+PrimKeyword <. PrimitiveKind* *result .>
+    (. std::string s; .)
+    = ident<s>
+      (. *result = DecodePrimitive(s, Loc());
+         if (!*result) return false; .)
+.
+
+// ── Rule Reference ──────────────────────────────────────────
+
+RuleRefType <. TypeExpr* *result .>
+    (. std::string name;
+       Expr* constr = nullptr;
+       Interval* iv = nullptr; .)
+    = ident<name>        (. SourceLoc loc = Loc(); .)
+      [ ConstraintBlock<&constr> ]
+      [ IntervalSpec<&iv> ]
+    (. *result = new RuleRef(std::move(name),
+           constr ? std::optional<Expr*>(constr) : std::nullopt,
+           iv     ? std::optional<Interval*>(iv) : std::nullopt);
+       (*result)->loc = loc; .)
+.
+
+// ── Constraint (where clause) ───────────────────────────────
+
+ConstraintBlock <. Expr* *result .>
+    = "where" Expr_<result>
+.
+
+// ── Interval ────────────────────────────────────────────────
+
+IntervalSpec <. Interval* *result .>
+    (. Expr* a; Expr* b; .)
+    = "["
+      Expr_<&a>
+      ( ","
+        Expr_<&b>
+        (. *result = new StartEnd(a, b); (*result)->loc = a->loc; .)
+      |   (. *result = new Length(a); (*result)->loc = a->loc; .)
+      )
+      "]"
+.
+
+ElementIntervalSpec <. Interval* *result .>
+    (. Expr* a; Expr* b; .)
+    = "["
+      Expr_<&a> "," Expr_<&b>
+      "]"
+    (. *result = new StartEnd(a, b); (*result)->loc = a->loc; .)
+.
+
+// ═══════════════════════════════════════════════════════════════
+// Expression Language
+// ═══════════════════════════════════════════════════════════════
+
+Expr_ <. Expr* *result .>
+    = TernaryExpr<result>
+.
+
+TernaryExpr <. Expr* *result .>
+    (. Expr* then_; Expr* else_; .)
+    = LogicalOr<result>
+      [ "?"
+        Expr_<&then_>
+        ":"
+        TernaryExpr<&else_>
+        (. *result = new Ternary(*result, then_, else_);
+           (*result)->loc = then_->loc; .)
+      ]
+.
+
+LogicalOr <. Expr* *result .>
+    (. Expr* rhs; .)
+    = LogicalAnd<result>
+      { "||"
+        LogicalAnd<&rhs>
+        (. *result = new BinOp(*result, Binop::Or, rhs);
+           (*result)->loc = rhs->loc; .)
+      }
+.
+
+LogicalAnd <. Expr* *result .>
+    (. Expr* rhs; .)
+    = BitwiseOr<result>
+      { "&&"
+        BitwiseOr<&rhs>
+        (. *result = new BinOp(*result, Binop::And, rhs);
+           (*result)->loc = rhs->loc; .)
+      }
+.
+
+BitwiseOr <. Expr* *result .>
+    (. Expr* rhs; .)
+    = BitwiseXor<result>
+      { "|"
+        BitwiseXor<&rhs>
+        (. *result = new BinOp(*result, Binop::BitOr, rhs);
+           (*result)->loc = rhs->loc; .)
+      }
+.
+
+BitwiseXor <. Expr* *result .>
+    (. Expr* rhs; .)
+    = BitwiseAnd<result>
+      { "^"
+        BitwiseAnd<&rhs>
+        (. *result = new BinOp(*result, Binop::BitXor, rhs);
+           (*result)->loc = rhs->loc; .)
+      }
+.
+
+BitwiseAnd <. Expr* *result .>
+    (. Expr* rhs; .)
+    = Equality<result>
+      { "&"
+        Equality<&rhs>
+        (. *result = new BinOp(*result, Binop::BitAnd, rhs);
+           (*result)->loc = rhs->loc; .)
+      }
+.
+
+Equality <. Expr* *result .>
+    (. Expr* rhs; .)
+    = Relational<result>
+      { "=="
+        Relational<&rhs>
+        (. *result = new BinOp(*result, Binop::Eq, rhs);
+           (*result)->loc = rhs->loc; .)
+      | "!="
+        Relational<&rhs>
+        (. *result = new BinOp(*result, Binop::Ne, rhs);
+           (*result)->loc = rhs->loc; .)
+      }
+.
+
+Relational <. Expr* *result .>
+    (. Expr* rhs; .)
+    = Shift<result>
+      { "<="
+        Shift<&rhs>
+        (. *result = new BinOp(*result, Binop::Le, rhs);
+           (*result)->loc = rhs->loc; .)
+      | ">="
+        Shift<&rhs>
+        (. *result = new BinOp(*result, Binop::Ge, rhs);
+           (*result)->loc = rhs->loc; .)
+      | "<" !"<"
+        Shift<&rhs>
+        (. *result = new BinOp(*result, Binop::Lt, rhs);
+           (*result)->loc = rhs->loc; .)
+      | ">" !">"
+        Shift<&rhs>
+        (. *result = new BinOp(*result, Binop::Gt, rhs);
+           (*result)->loc = rhs->loc; .)
+      }
+.
+
+Shift <. Expr* *result .>
+    (. Expr* rhs; .)
+    = Additive<result>
+      { "<<"
+        Additive<&rhs>
+        (. *result = new BinOp(*result, Binop::Shl, rhs);
+           (*result)->loc = rhs->loc; .)
+      | ">>"
+        Additive<&rhs>
+        (. *result = new BinOp(*result, Binop::Shr, rhs);
+           (*result)->loc = rhs->loc; .)
+      }
+.
+
+Additive <. Expr* *result .>
+    (. Expr* rhs; .)
+    = Multiplicative<result>
+      { "+"
+        Multiplicative<&rhs>
+        (. *result = new BinOp(*result, Binop::Add, rhs);
+           (*result)->loc = rhs->loc; .)
+      | "-"
+        Multiplicative<&rhs>
+        (. *result = new BinOp(*result, Binop::Sub, rhs);
+           (*result)->loc = rhs->loc; .)
+      }
+.
+
+Multiplicative <. Expr* *result .>
+    (. Expr* rhs; .)
+    = Unary<result>
+      { "*"
+        Unary<&rhs>
+        (. *result = new BinOp(*result, Binop::Mul, rhs);
+           (*result)->loc = rhs->loc; .)
+      | "/"
+        Unary<&rhs>
+        (. *result = new BinOp(*result, Binop::Div, rhs);
+           (*result)->loc = rhs->loc; .)
+      | "%"
+        Unary<&rhs>
+        (. *result = new BinOp(*result, Binop::Mod, rhs);
+           (*result)->loc = rhs->loc; .)
+      }
+.
+
+Unary <. Expr* *result .>
+    (. Expr* operand; Unaryop op; .)
+    = ( "-"   (. op = Unaryop::Neg; .)
+      | "~"   (. op = Unaryop::BitNot; .)
+      | "!"   (. op = Unaryop::Not; .)
+      | "abs" (. op = Unaryop::Abs; .)
+      )
+      Postfix<&operand>
+      (. *result = new UnaryOp(op, operand);
+         (*result)->loc = operand->loc; .)
+    | Postfix<result>
+.
+
+Postfix <. Expr* *result .>
+    (. Expr* idx; std::string fname; .)
+    = PrimaryExpr<result>
+      { "["
+        Expr_<&idx>
+        "]"
+        (. auto* ref = dynamic_cast<Ref*>(*result);
+           if (ref) {
+               auto* ia = new IndexAcc(ref->path, idx);
+               ia->loc = ref->loc;
+               ref->path = ia;
+           } .)
+      | "."
+        ident<fname>
+        (. auto* ref = dynamic_cast<Ref*>(*result);
+           if (ref) {
+               auto* fa = new FieldAcc(ref->path, std::move(fname));
+               fa->loc = ref->loc;
+               ref->path = fa;
+           } .)
+      }
+.
+
+PrimaryExpr <. Expr* *result .>
+    (. std::string name;
+       std::vector<Expr*> args;
+       Expr* arg;
+       int64_t ival;
+       double fval;
+       std::string sval; .)
+    = FloatLitExpr<result>
+    | integer<ival>
+      (. *result = new IntLit(ival);
+         (*result)->loc = Loc(); .)
+    | string_lit<sval>
+      (. *result = new StrLit(std::move(sval));
+         (*result)->loc = Loc(); .)
+    | "true"
+      (. *result = new BoolLit(true);
+         (*result)->loc = Loc(); .)
+    | "false"
+      (. *result = new BoolLit(false);
+         (*result)->loc = Loc(); .)
+    | "little"
+      (. *result = new EndianLit(Endianness::Little);
+         (*result)->loc = Loc(); .)
+    | "big"
+      (. *result = new EndianLit(Endianness::Big);
+         (*result)->loc = Loc(); .)
+    | "EOI"
+      (. *result = new EOI();
+         (*result)->loc = Loc(); .)
+    | CallExpr<result>
+    | ident<name>
+      (. auto* s = new Simple(std::move(name));
+         s->loc = Loc();
+         *result = new Ref(s);
+         (*result)->loc = Loc(); .)
+    | "(" Expr_<result> ")"
+.
+
+FloatLitExpr <. Expr* *result .>
+    (. double fval; .)
+    = floating<fval>
+      (. *result = new FloatLit(static_cast<float>(fval));
+         (*result)->loc = Loc(); .)
+.
+
+CallExpr <. Expr* *result .>
+    (. std::string name;
+       std::vector<Expr*> args;
+       Expr* arg; .)
+    = ident<name>        (. SourceLoc loc = Loc(); .)
+      "("
+      [ Expr_<&arg>      (. args.push_back(arg); .)
+        { ","
+          Expr_<&arg>    (. args.push_back(arg); .)
+        }
+      ]
+      ")"
+      (. *result = new Call(std::move(name), std::move(args));
+         (*result)->loc = loc; .)
+.
+
+END BBQ.

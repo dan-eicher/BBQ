@@ -1,0 +1,18 @@
+@endian big
+
+IPv4Header = struct {
+    ver_ihl:        uint8,
+    version:        compute((ver_ihl >> 4) & 0x0F : uint8),
+    ihl:            compute(ver_ihl & 0x0F : uint8),
+    dscp_ecn:       uint8,
+    total_length:   uint16,
+    identification: uint16,
+    flags_offset:   uint16,
+    flags:          compute((flags_offset >> 13) & 0x07 : uint8),
+    frag_offset:    compute(flags_offset & 0x1FFF : uint16),
+    ttl:            uint8,
+    protocol:       uint8,
+    checksum:       uint16,
+    src_addr:       uint32,
+    dst_addr:       uint32
+}

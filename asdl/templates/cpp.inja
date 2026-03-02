@@ -1,0 +1,190 @@
+#ifndef {{upper(name)}}_H
+#define {{upper(name)}}_H
+
+#include <vector>
+#include <string>
+#include <optional>
+#include <memory>
+#include <stdexcept>
+
+namespace {{name}}
+{
+
+{% for base in bases %}
+struct {{base}};
+{% endfor %}
+{% for def in definitions %}
+  {% if def.type == "sum" %}
+    {% for type in def.types %}
+struct {{type.name}};
+    {% endfor %}
+  {% else %}
+struct {{def.name}};
+  {% endif %}
+{% endfor %}
+
+struct Arena {
+public:
+    explicit Arena(size_t block_size = 4096)
+        : default_block_size(align_up(block_size, default_alignment)) {}
+
+    void* allocate(size_t size, size_t alignment = default_alignment) {
+        validate_alignment(alignment);
+
+        if (size == 0) return nullptr;
+
+        const size_t aligned_offset = align_up(current_offset, alignment);
+        const size_t required_space = aligned_offset + size;
+
+        if (!current_block || required_space > current_block_size) {
+            // Only allocate larger blocks when truly needed
+            grow(std::max(size, default_block_size), alignment);
+            return allocate(size, alignment);
+        }
+
+        void* ptr = current_block + aligned_offset;
+        current_offset = aligned_offset + size;
+        return ptr;
+    }
+
+    void reset() noexcept {
+        blocks.clear();
+        current_block = nullptr;
+        current_offset = 0;
+        current_block_size = 0;
+    }
+
+private:
+    static constexpr size_t default_alignment = alignof(std::max_align_t);
+    const size_t default_block_size;
+
+    struct AlignedDeleter {
+        void operator()(char* p) const noexcept { std::free(p); }
+    };
+
+    static size_t align_up(size_t value, size_t alignment) noexcept {
+        return (value + alignment - 1) & ~(alignment - 1);
+    }
+
+    void validate_alignment(size_t alignment) const {
+        if (alignment > default_alignment || (alignment & (alignment - 1)) != 0) {
+            throw std::invalid_argument("Unsupported alignment");
+        }
+    }
+
+    void grow(size_t min_size, size_t alignment) {
+        // Calculate size needed, preserving at least 4KB for small allocations
+        const size_t new_block_size = align_up(
+            std::max(min_size, default_block_size),
+            alignment
+        );
+        
+        char* new_block = static_cast<char*>(std::aligned_alloc(alignment, new_block_size));
+        if (!new_block) throw std::bad_alloc();
+
+        blocks.emplace_back(new_block);
+        current_block = new_block;
+        current_block_size = new_block_size;
+        current_offset = 0;
+    }
+
+    std::vector<std::unique_ptr<char, AlignedDeleter>> blocks;
+    char* current_block = nullptr;
+    size_t current_offset = 0;
+    size_t current_block_size = 0;
+};
+
+struct ASTVisitor
+{
+	virtual ~ASTVisitor() = default;
+{% for def in definitions %}
+  {% if def.type == "sum" %}
+    {% for type in def.types %}
+	virtual void visit({{name}}::{{type.name}}* node) {}
+    {% endfor %}
+  {% else %}
+	virtual void visit({{name}}::{{def.name}}* node) {}
+  {% endif %}
+{% endfor %}
+};
+
+struct ASTNode {
+    int line;
+    int column;
+
+    virtual ~ASTNode() = default;
+    virtual void accept(ASTVisitor& visitor) = 0;
+
+    void* operator new(size_t size) {
+        return get_arena().allocate(size);
+    }
+
+    void operator delete(void*) noexcept {}
+
+    // Static member function to access the arena
+    static Arena& get_arena() {
+        static Arena arena; // Initialized once per program
+        return arena;
+    }
+};
+
+{% for def in definitions %}
+  {% if def.type == "sum" %}
+    {# Base type (e.g., Type) - no constructor #}
+    {% if length(def.types) > 1 %}
+struct {{camelcase(def.name)}} : public ASTNode {
+    virtual ~{{camelcase(def.name)}}() = default;
+};
+
+    {% endif %}
+    {# Concrete subtypes (e.g., Product, Sum) #}
+    {% for type in def.types %}
+struct {{type.name}} : public {{type.base}} {
+    {% if length(type.fields) > 0 %}
+    {{type.name}}({% for field in type.fields %}
+        {% if field.flag == "optional" %}std::optional<{{get_type(field.type)}}>{% else if field.flag == "sequence" %}std::vector<{{get_type(field.type)}}>{% else %}{{get_type(field.type)}}{% endif %} {{safe_name(field.name)}}{% if not loop.is_last %}, {% endif %}{% endfor %}) 
+        : {% for field in type.fields %}{{safe_name(field.name)}}{% if field.flag == "none" %}({{safe_name(field.name)}}){% else %}(std::move({{safe_name(field.name)}})){% endif %}{% if not loop.is_last %}, {% endif %}{% endfor %} {}
+    {% endif %}
+
+    void accept(ASTVisitor& visitor) override { visitor.visit(this); }
+
+    {% for field in type.fields %}
+    {% if field.flag == "sequence" %}
+    std::vector<{{get_type(field.type)}}> {{safe_name(field.name)}};
+    {% else if field.flag == "optional" %}
+    std::optional<{{get_type(field.type)}}> {{safe_name(field.name)}};
+    {% else %}
+    {{get_type(field.type)}} {{safe_name(field.name)}};
+    {% endif %}
+    {% endfor %}
+};
+
+    {% endfor %}
+  {% else %}
+    {# Product types #}
+struct {{def.name}} : public ASTNode {
+    {% if length(def.fields) > 0 %}
+    {{def.name}}({% for field in def.fields %}
+        {% if field.flag == "optional" %}std::optional<{{get_type(field.type)}}>{% else if field.flag == "sequence" %}std::vector<{{get_type(field.type)}}>{% else %}{{get_type(field.type)}}{% endif %} {{safe_name(field.name)}}{% if not loop.is_last %}, {% endif %}{% endfor %}) 
+        : {% for field in def.fields %}{{safe_name(field.name)}}{% if field.flag == "none" %}({{safe_name(field.name)}}){% else %}(std::move({{safe_name(field.name)}})){% endif %}{% if not loop.is_last %}, {% endif %}{% endfor %} {}
+    {% endif %}
+
+    void accept(ASTVisitor& visitor) override { visitor.visit(this); }
+
+    {% for field in def.fields %}
+    {% if field.flag == "sequence" %}
+    std::vector<{{get_type(field.type)}}> {{safe_name(field.name)}};
+    {% else if field.flag == "optional" %}
+    std::optional<{{get_type(field.type)}}> {{safe_name(field.name)}};
+    {% else %}
+    {{get_type(field.type)}} {{safe_name(field.name)}};
+    {% endif %}
+    {% endfor %}
+};
+
+  {% endif %}
+{% endfor %}
+
+} // namespace {{name}}
+
+#endif // {{upper(name)}}_H

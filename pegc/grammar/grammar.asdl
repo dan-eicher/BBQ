@@ -1,0 +1,67 @@
+// =============================================================
+// PEG Parser Generator — Grammar AST Definition
+//
+// Defines the AST produced by parsing .peg grammar files.
+// Compatible with the ASDL generator at ../../../asdl
+//
+// Run: ../../../asdl/build/asdl -i grammar.asdl -t templates/grammar_ast.inja -o ../frontend/GrammarAST.h
+// =============================================================
+
+module PegGrammar {
+
+    // Root
+    grammar = Grammar(identifier name, header* headers, charset_def* charsets,
+                      token_def* tokens, comment_def* comments, bool has_ignore,
+                      charset_expr? ignore, production* productions)
+
+    // Preamble (code blocks between COMPILER and first section)
+    header = Header(string code)
+
+    // Character class definitions (CHARACTERS section)
+    charset_def  = CharsetDef(identifier name, charset_expr body)
+    charset_expr = Range(int from, int to)
+                 | Single(int ch)
+                 | Union(charset_expr left, charset_expr right)
+                 | Diff(charset_expr base, charset_expr minus)
+                 | NameRef(identifier name)
+                 | Any
+
+    // Token definitions (TOKENS section)
+    token_def = TokenDef(identifier name, token_expr pattern)
+    token_expr = TLiteral(string value)
+               | TCharset(identifier name)
+               | TSequence(token_expr* elements)
+               | TAlternation(token_expr* alternatives)
+               | TStar(token_expr body)
+               | TPlus(token_expr body)
+               | TOptional(token_expr body)
+               | TRange(int from, int to)
+
+    // Comment definitions (COMMENTS section)
+    comment_def = CommentDef(string open, string close, bool nested)
+
+    // Productions (PRODUCTIONS section)
+    production = Production(identifier name, param* params, string? locals_code,
+                            peg_expr body)
+    param      = Param(string type_code, string name, bool is_ref)
+
+    // PEG expressions
+    peg_expr = Literal(string value)
+             | CharsetRef(identifier name)
+             | TokenRef(identifier name)
+             | RuleCall(identifier name, arg* args)
+             | Sequence(peg_expr* elements)
+             | Choice(peg_expr* alternatives)
+             | Star(peg_expr body)
+             | Plus(peg_expr body)
+             | Optional(peg_expr body)
+             | And(peg_expr body)
+             | Not(peg_expr body)
+             | Group(peg_expr body)
+             | Action(string code)
+             | Resolver(string code, peg_expr body)
+             | AnyExpr
+
+    // Arguments to rule calls
+    arg = Arg(string expr)
+}

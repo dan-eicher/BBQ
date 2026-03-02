@@ -1,0 +1,132 @@
+// =============================================================
+// BBQ (Binary Block Query) — Abstract Syntax Definition
+//
+// Defines the AST produced by parsing .bbq format specs.
+// Used by the static C++ code generator.
+//
+// Compatible with the ASDL generator at ../../asdl
+// Run: ../../asdl/build/asdl -i BBQ.asdl -t templates/bbq_ast.inja -o ../frontend/BBQ_AST.h
+// =============================================================
+
+module BBQ {
+
+    // Top level
+    grammar       = Grammar(directive* directives, rule* rules)
+
+    directive     = EndianDirective(endianness endian)
+
+    rule          = Rule(identifier name, type_expr body)
+
+    // Type expressions
+    //
+    // Alternatives: rule-level | (unnamed biased choice)
+    //Struct:       sequential named fields
+    //Union:        named alternatives (PEG biased choice)
+    //Array:        repeated elements (fixed count or sep/term)
+    //Optional:     conditional presence (try parse / succeed empty)
+    // Switch:       discriminated dispatch on expression value
+    //Compute:      derived value, no input consumed
+    //Primitive:    binary read (uint8, uint32be, float64, bytes, etc.)
+    //RuleRef:      reference to another rule
+
+    type_expr     = Alternatives(type_expr* alts)
+                  | Struct(field* fields)
+                  | Union(variant* variants)
+                  | Array(type_expr element, array_spec spec,
+                          expr? constraint, interval? interval,
+                          interval? element_interval)
+                  | Optional(type_expr element,
+                             expr? constraint, interval? interval)
+                  | Switch(expr discriminator, switch_case* cases,
+                           switch_default? default)
+                  | Compute(expr expression, primitive_kind result_type)
+                  | Primitive(primitive_kind kind,
+                              expr? constraint, interval? interval)
+                  | RuleRef(identifier name,
+                            expr? constraint, interval? interval)
+                  | Extern(string func_name, string cpp_type,
+                           expr? constraint, interval? interval)
+                  | Bitfield(primitive_kind container, bitfield_entry* entries)
+                  | EndianSwitch(expr endian_expr)
+
+    bitfield_entry = BitfieldEntry(identifier name, int64 width)
+
+    field         = Field(identifier name, type_expr body,
+                          expr? constraint, interval? interval)
+
+    variant       = Variant(identifier name, type_expr body,
+                            expr? constraint, interval? interval)
+
+    // Array specifications
+    array_spec    = FixedCount(expr count)
+                  | SepTerm(separator sep, terminator term)
+
+    separator     = TypeSep(type_expr sep_type)
+                  | NoneSep
+
+    terminator    = EofTerm
+                  | CountTerm(expr count)
+                  | UntilTerm(expr condition)
+                  | TypeTerm(type_expr term_type)
+
+    // Switch
+    switch_case    = SwitchCase(case_value value, type_expr target,
+                                interval? interval)
+    switch_default = SwitchDefault(type_expr target, interval? interval)
+
+    case_value    = IntValue(int64 value)
+                  | StrValue(string value)
+                  | IdentValue(identifier name)
+                  | RefValue(identifier* path)
+
+    // Interval
+    //
+    // StartEnd: explicit byte range [start, end]
+    //Length:   relative to current position [length]
+    interval      = StartEnd(expr start, expr end)
+                  | Length(expr length)
+
+    // Primitive kinds
+    //
+    // Covers all binary read types: integers (signed/unsigned, 8-64 bit),
+    //floats (32/64 bit), raw bytes, strings, booleans.
+    //Endianness is per-field: Little, Big, or Default (resolved by @endian).
+    primitive_kind = IntegerKind(width width, signedness sign, endianness endian)
+                   | FloatKind(width width, endianness endian)
+                   | BytesKind
+                   | StringKind
+                   | BoolKind
+
+    width         = W8 | W16 | W32 | W64
+
+    signedness    = Unsigned | Signed
+
+    endianness    = Little | Big | Default
+
+    // Expression language (unified arithmetic + boolean + bitwise)
+    expr          = BinOp(expr left, binop op, expr right)
+                  | UnaryOp(unaryop op, expr operand)
+                  | Ternary(expr cond, expr then_branch, expr else_branch)
+                  | IntLit(int64 value)
+                  | FloatLit(float value)
+                  | StrLit(string value)
+                  | BoolLit(bool value)
+                  | Ref(ref_path path)
+                  | Call(identifier func, expr* args)
+                  | EndianLit(endianness value)
+                  | EOI
+
+    // Reference paths (field access chains)
+    ref_path      = Simple(identifier name)
+                  | FieldAcc(ref_path base, identifier field)
+                  | IndexAcc(ref_path base, expr index)
+
+    // Binary operators
+    binop         = Add | Sub | Mul | Div | Mod
+                  | BitAnd | BitOr | BitXor | Shl | Shr
+                  | And | Or
+                  | Eq | Ne | Lt | Le | Gt | Ge
+
+    // Unary operators
+    unaryop       = Neg | BitNot | Not | Abs
+}

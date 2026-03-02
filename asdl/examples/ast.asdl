@@ -1,0 +1,13 @@
+module ast
+{
+    mod         = Module(identifier id, definition *dfns)
+
+    definition  = Definition(identifier name, type value)
+
+    type        = Product(field *fields)
+                | Sum(constructor *types, field *attrs)
+
+    constructor = Constructor(identifier name, field *fields)
+
+    field       = Field(identifier type, int ?flag, identifier name)
+}

@@ -1,0 +1,6 @@
+Header = struct {
+    magic:   uint32be where magic == 0x89504E47,
+    version: uint16le,
+    flags:   uint8,
+    length:  uint32le where length > 0
+}

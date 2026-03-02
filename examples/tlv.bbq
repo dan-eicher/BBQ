@@ -1,0 +1,11 @@
+@endian little
+
+TLVEntry = struct {
+    type:   uint8,
+    length: uint16,
+    value:  bytes[length]
+}
+
+TLVStream = struct {
+    entries: array<TLVEntry>(none, eof)
+}

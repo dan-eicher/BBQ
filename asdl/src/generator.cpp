@@ -1,0 +1,230 @@
+#include "generator.h"
+#include "exceptions.h"
+#include "validator.h"
+#include "string_utils.h"
+#include "Parser.h"
+#include <fstream>
+#include <sstream>
+#include <unordered_set>
+
+Generator::Generator() {
+    env_.set_trim_blocks(true);
+    env_.set_lstrip_blocks(true);
+    setup_callbacks();
+}
+
+void Generator::setup_callbacks() {
+    env_.add_callback("get_type", 1, [this](inja::Arguments& args) {
+        std::string type = args.at(0)->get<std::string>();
+        return types_.get_type(type);
+    });
+
+    env_.add_callback("camelcase", 1, [](inja::Arguments& args) {
+        try {
+            return CamelCase(args.at(0)->get<std::string>());
+        } catch (const std::exception& e) {
+            throw TemplateException("Error in camelcase conversion: " + std::string(e.what()));
+        }
+    });
+
+    env_.add_callback("snakecase", 1, [](inja::Arguments& args) {
+        try {
+            return SnakeCase(args.at(0)->get<std::string>());
+        } catch (const std::exception& e) {
+            throw TemplateException("Error in snakecase conversion: " + std::string(e.what()));
+        }
+    });
+
+    env_.add_callback("not_base_type", 1, [this](inja::Arguments& args) {
+        std::string type_name = args.at(0)->get<std::string>();
+        return !types_.is_base_type(type_name);
+    });
+
+    env_.add_callback("safe_name", 1, [](inja::Arguments& args) {
+        std::string name = args.at(0)->get<std::string>();
+        return get_safe_name(name);
+    });
+
+    env_.add_callback("concat", 2, [](inja::Arguments& args) {
+        std::string a = args.at(0)->get<std::string>();
+        std::string b = args.at(1)->get<std::string>();
+        return a + b;
+    });
+}
+
+asdl_ast::Module* Generator::parse(const std::string& input_file) {
+    std::ifstream file(input_file);
+    if (!file.good()) {
+        throw ParseException("Failed to open file: " + input_file);
+    }
+
+    std::string content((std::istreambuf_iterator<char>(file)),
+                         std::istreambuf_iterator<char>());
+
+    Parser parser;
+    parser.init(content.data(), static_cast<int>(content.size()));
+
+    if (!parser.parse()) {
+        std::stringstream msg;
+        if (parser.has_errors()) {
+            auto& errs = parser.errors();
+            msg << "Parser error at line " << errs[0].line
+                << ", col " << errs[0].col << ": " << errs[0].message;
+        } else {
+            auto fur = parser.furthest();
+            msg << "Parse failed near line " << fur.line << ", col " << fur.col;
+        }
+        throw ParseException(msg.str());
+    }
+
+    if (!parser.ast) {
+        throw ParseException("Parser returned null AST");
+    }
+
+    return parser.ast;
+}
+
+static std::string flag_to_string(asdl_ast::Flag f) {
+    switch (f) {
+        case asdl_ast::Flag::Optional: return "optional";
+        case asdl_ast::Flag::Sequence: return "sequence";
+        default: return "none";
+    }
+}
+
+static json fields_to_json(const std::vector<asdl_ast::Field*>& fields) {
+    json arr = json::array();
+    for (auto* f : fields) {
+        arr.push_back({
+            {"type", f->type_name},
+            {"flag", flag_to_string(f->flag)},
+            {"name", f->name}
+        });
+    }
+    return arr;
+}
+
+json Generator::to_json(const asdl_ast::Module* module) {
+    json result;
+    result["name"] = module->name;
+    result["definitions"] = json::array();
+    result["aliases"] = json::object();
+
+    for (auto* alias : module->aliases) {
+        result["aliases"][alias->name] = alias->ctype;
+    }
+
+    for (auto* def : module->definitions) {
+        json jdef;
+        jdef["name"] = def->name;
+
+        if (auto* prod = dynamic_cast<asdl_ast::Product*>(def->body)) {
+            jdef["type"] = "product";
+            jdef["fields"] = fields_to_json(prod->fields);
+        } else if (auto* sum = dynamic_cast<asdl_ast::Sum*>(def->body)) {
+            jdef["type"] = "sum";
+            jdef["types"] = json::array();
+            for (auto* ctor : sum->types) {
+                jdef["types"].push_back({
+                    {"name", ctor->name},
+                    {"fields", fields_to_json(ctor->fields)}
+                });
+            }
+            jdef["attributes"] = fields_to_json(sum->attributes);
+        }
+
+        result["definitions"].push_back(jdef);
+    }
+
+    return result;
+}
+
+void Generator::process(json& module) {
+    module["bases"] = json::array();
+
+    // Register type aliases first (these are treated as base types)
+    if (module.contains("aliases") && module["aliases"].is_object()) {
+        for (auto& [name, ctype] : module["aliases"].items()) {
+            types_.register_alias(name, ctype.get<std::string>());
+        }
+    }
+
+    std::unordered_set<std::string> defined_types;
+    for (const json& def : module["definitions"]) {
+        defined_types.insert(def["name"].get<std::string>());
+    }
+
+    for (json& def : module["definitions"]) {
+        std::string name, base;
+
+        if (def["type"] == "sum") {
+            // Detect enum-like sum types: all constructors have zero fields
+            bool is_enum = true;
+            for (const auto& ctor : def["types"]) {
+                if (!ctor["fields"].empty()) {
+                    is_enum = false;
+                    break;
+                }
+            }
+            def["is_enum"] = is_enum;
+
+            if (is_enum) {
+                // Enum type: register as value type, no base class needed
+                name = CamelCase(def["name"]);
+                types_.register_type(def["name"], name);
+            } else if (def["types"].size() == 1) {
+                name = def["types"][0]["name"];
+                base = "ASTNode";
+                types_.register_type(def["name"], name + "*");
+                module["bases"].push_back(name);
+                for (json& value : def["types"]) {
+                    value["base"] = base;
+                }
+            } else {
+                name = CamelCase(def["name"]);
+                base = name;
+                types_.register_type(def["name"], name + "*");
+                module["bases"].push_back(name);
+                for (json& value : def["types"]) {
+                    value["base"] = base;
+                }
+            }
+        } else {
+            def["is_enum"] = false;
+            name = def["name"];
+            types_.register_type(name, name);
+        }
+    }
+
+    validate_type_references(module, types_);
+}
+
+void Generator::generate(const json& module, const std::string& template_file, std::ostream& output) {
+    inja::Template temp;
+    try {
+        temp = env_.parse_template(template_file);
+    } catch (const std::exception& e) {
+        throw TemplateException("Failed to parse template file '" + template_file + "': " + e.what());
+    }
+
+    try {
+        output << env_.render(temp, module);
+    } catch (const std::exception& e) {
+        throw TemplateException(std::string("Failed to render template: ") + e.what());
+    }
+}
+
+void Generator::generate(const json& module, const std::string& template_file, const std::string& output_file) {
+    inja::Template temp;
+    try {
+        temp = env_.parse_template(template_file);
+    } catch (const std::exception& e) {
+        throw TemplateException("Failed to parse template file '" + template_file + "': " + e.what());
+    }
+
+    try {
+        env_.write(temp, module, output_file);
+    } catch (const std::exception& e) {
+        throw TemplateException(std::string("Failed to render template: ") + e.what());
+    }
+}

@@ -1,0 +1,21 @@
+# Build directories
+build/
+build-*/
+pegc/build/
+
+# IDE / editor
+.cache/
+.vscode/
+.idea/
+compile_commands.json
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Claude Code
+.claude/
+
+# OS
+.DS_Store

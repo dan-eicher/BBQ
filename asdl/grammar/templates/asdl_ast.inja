@@ -1,0 +1,102 @@
+#pragma once
+// Generated from asdl.asdl — do not edit
+
+#include <string>
+#include <vector>
+
+namespace {{name}}
+{
+
+struct SourceLoc {
+    const char* file = nullptr;
+    int line = 0;
+    int col = 0;
+};
+
+// ── Forward declarations ──────────────────────────────────────
+{% for def in definitions %}
+  {% if def.type == "sum" and not def.is_enum %}
+    {% if length(def.types) > 1 %}
+struct {{camelcase(def.name)}};
+    {% endif %}
+    {% for type in def.types %}
+struct {{type.name}};
+    {% endfor %}
+  {% else if def.type == "product" %}
+struct {{def.name}};
+  {% endif %}
+{% endfor %}
+
+// ── Enum types ────────────────────────────────────────────────
+{% for def in definitions %}
+  {% if def.is_enum %}
+enum class {{camelcase(def.name)}} {
+    {% for type in def.types %}
+    {{type.name}}{% if not loop.is_last %},{% endif %}
+
+    {% endfor %}
+};
+  {% endif %}
+{% endfor %}
+
+// ── Base node ─────────────────────────────────────────────────
+struct ASTNode {
+    SourceLoc loc;
+    virtual ~ASTNode() = default;
+};
+
+// ── Sum type bases ────────────────────────────────────────────
+{% for def in definitions %}
+  {% if def.type == "sum" and not def.is_enum and length(def.types) > 1 %}
+struct {{camelcase(def.name)}} : public ASTNode {
+    virtual ~{{camelcase(def.name)}}() = default;
+};
+
+  {% endif %}
+{% endfor %}
+
+// ── Concrete types ────────────────────────────────────────────
+{% for def in definitions %}
+  {% if def.type == "sum" and not def.is_enum %}
+    {% for type in def.types %}
+struct {{type.name}} : public {{type.base}} {
+      {% if length(type.fields) > 0 %}
+    {{type.name}}({% for field in type.fields %}{% if field.flag == "optional" %}std::optional<{{get_type(field.type)}}> {% else if field.flag == "sequence" %}std::vector<{{get_type(field.type)}}> {% else %}{{get_type(field.type)}} {%+ endif %}{{safe_name(field.name)}}{% if not loop.is_last %}, {% endif %}{% endfor %})
+        : {% for field in type.fields %}{{safe_name(field.name)}}(std::move({{safe_name(field.name)}})){% if not loop.is_last %}, {% endif %}{% endfor %}{{ " {}" }}
+      {% endif %}
+
+      {% for field in type.fields %}
+        {% if field.flag == "sequence" %}
+    std::vector<{{get_type(field.type)}}> {{safe_name(field.name)}};
+        {% else if field.flag == "optional" %}
+    std::optional<{{get_type(field.type)}}> {{safe_name(field.name)}};
+        {% else %}
+    {{get_type(field.type)}} {{safe_name(field.name)}};
+        {% endif %}
+      {% endfor %}
+};
+
+    {% endfor %}
+  {% else if not def.is_enum %}
+struct {{def.name}} {
+    SourceLoc loc;
+    {% if length(def.fields) > 0 %}
+    {{def.name}}({% for field in def.fields %}{% if field.flag == "optional" %}std::optional<{{get_type(field.type)}}> {% else if field.flag == "sequence" %}std::vector<{{get_type(field.type)}}> {% else %}{{get_type(field.type)}} {%+ endif %}{{safe_name(field.name)}}{% if not loop.is_last %}, {% endif %}{% endfor %})
+        : {% for field in def.fields %}{{safe_name(field.name)}}(std::move({{safe_name(field.name)}})){% if not loop.is_last %}, {% endif %}{% endfor %}{{ " {}" }}
+    {% endif %}
+
+    {% for field in def.fields %}
+      {% if field.flag == "sequence" %}
+    std::vector<{{get_type(field.type)}}> {{safe_name(field.name)}};
+      {% else if field.flag == "optional" %}
+    std::optional<{{get_type(field.type)}}> {{safe_name(field.name)}};
+      {% else %}
+    {{get_type(field.type)}} {{safe_name(field.name)}};
+      {% endif %}
+    {% endfor %}
+};
+
+  {% endif %}
+{% endfor %}
+
+} // namespace {{name}}

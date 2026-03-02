@@ -1,0 +1,12 @@
+module asdl_ast
+{
+    flag         = None | Optional | Sequence
+
+    module       = Module(identifier name, typealias *aliases, definition *definitions)
+    typealias    = TypeAlias(identifier name, string ctype)
+    definition   = Definition(identifier name, type_body body)
+    type_body    = Product(field *fields)
+                 | Sum(constructor *types, field *attributes)
+    constructor  = Constructor(identifier name, field *fields)
+    field        = Field(identifier type_name, flag flag, identifier name)
+}

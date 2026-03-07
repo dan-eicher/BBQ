@@ -80,6 +80,9 @@ add_subdirectory(pegc)
 # --- asdl subproject ---
 add_subdirectory(asdl)
 
+# --- jitterator subproject ---
+add_subdirectory(jitterator)
+
 # --- Auto-regenerate BBQ_AST.h from BBQ.asdl ---
 add_custom_command(
     OUTPUT ${CMAKE_CURRENT_SOURCE_DIR}/frontend/BBQ_AST.h

@@ -1,0 +1,171 @@
+# elf64.bbq — ELF-64 Object File Format
+#
+# System V Application Binary Interface
+# https://refspecs.linuxfoundation.org/elf/gabi4+/
+#
+# ELF64 Data Type Mapping:
+#   Elf64_Addr    = uint64   (unsigned program address)
+#   Elf64_Off     = uint64   (unsigned file offset)
+#   Elf64_Half    = uint16   (unsigned medium integer)
+#   Elf64_Word    = uint32   (unsigned integer)
+#   Elf64_Sword   = int32    (signed integer)
+#   Elf64_Xword   = uint64   (unsigned long integer)
+#   Elf64_Sxword  = int64    (signed long integer)
+
+@endian little
+
+# ── ELF Identification ────────────────────────────────────────
+#
+# The first 16 bytes of every ELF file. Machine-independent;
+# identifies class (32/64), encoding (LSB/MSB), version, OS/ABI.
+#
+# EI_CLASS:  1 = ELFCLASS32, 2 = ELFCLASS64
+# EI_DATA:   1 = ELFDATA2LSB (little-endian), 2 = ELFDATA2MSB (big-endian)
+
+Elf64_Ident = struct {
+    ei_mag:        uint32 where ei_mag == 0x464C457F,   # "\x7fELF" as LE uint32
+    ei_class:      uint8 where ei_class == 2,            # ELFCLASS64
+    ei_data:       uint8,
+    ei_version:    uint8,
+    ei_osabi:      uint8,
+    ei_abiversion: uint8,
+    ei_pad:        bytes[7]
+}
+
+# ── ELF Header (Elf64_Ehdr, 64 bytes) ────────────────────────
+#
+# e_type:    0=ET_NONE  1=ET_REL  2=ET_EXEC  3=ET_DYN  4=ET_CORE
+# e_machine: 0=EM_NONE  3=EM_386  62=EM_X86_64  183=EM_AARCH64
+
+Elf64_Ehdr = struct {
+    e_ident:     Elf64_Ident,
+    e_type:      uint16,
+    e_machine:   uint16,
+    e_version:   uint32,
+    e_entry:     uint64,
+    e_phoff:     uint64,
+    e_shoff:     uint64,
+    e_flags:     uint32,
+    e_ehsize:    uint16,
+    e_phentsize: uint16,
+    e_phnum:     uint16,
+    e_shentsize: uint16,
+    e_shnum:     uint16,
+    e_shstrndx:  uint16
+}
+
+# ── Section Header (Elf64_Shdr, 64 bytes) ─────────────────────
+#
+# sh_type:
+#    0 = SHT_NULL         1 = SHT_PROGBITS    2 = SHT_SYMTAB
+#    3 = SHT_STRTAB       4 = SHT_RELA        5 = SHT_HASH
+#    6 = SHT_DYNAMIC      7 = SHT_NOTE        8 = SHT_NOBITS
+#    9 = SHT_REL         11 = SHT_DYNSYM
+#
+# sh_flags:
+#   0x1 = SHF_WRITE   0x2 = SHF_ALLOC   0x4 = SHF_EXECINSTR
+#   0x10 = SHF_MERGE  0x20 = SHF_STRINGS
+#
+# sh_link / sh_info interpretation:
+#   SHT_SYMTAB: sh_link = string table index, sh_info = last local + 1
+#   SHT_RELA:   sh_link = symbol table index, sh_info = target section index
+
+Elf64_Shdr = struct {
+    sh_name:      uint32,
+    sh_type:      uint32,
+    sh_flags:     uint64,
+    sh_addr:      uint64,
+    sh_offset:    uint64,
+    sh_size:      uint64,
+    sh_link:      uint32,
+    sh_info:      uint32,
+    sh_addralign: uint64,
+    sh_entsize:   uint64
+}
+
+# ── Symbol Table Entry (Elf64_Sym, 24 bytes) ──────────────────
+#
+# NB: Field order differs from ELF32 —
+#   ELF32: name, value, size, info, other, shndx
+#   ELF64: name, info, other, shndx, value, size
+#
+# st_info encoding:
+#   binding = st_info >> 4     (0=STB_LOCAL, 1=STB_GLOBAL, 2=STB_WEAK)
+#   type    = st_info & 0xF    (0=STT_NOTYPE, 1=STT_OBJECT, 2=STT_FUNC,
+#                                3=STT_SECTION, 4=STT_FILE)
+#
+# st_shndx special values:
+#   0 = SHN_UNDEF, 0xFFF1 = SHN_ABS, 0xFFF2 = SHN_COMMON
+
+Elf64_Sym = struct {
+    st_name:  uint32,
+    st_info:  uint8,
+    st_other: uint8,
+    st_shndx: uint16,
+    st_value: uint64,
+    st_size:  uint64,
+    st_bind:  compute((st_info >> 4) & 0x0F : uint8),
+    st_type:  compute(st_info & 0x0F : uint8)
+}
+
+# ── Program Header (Elf64_Phdr, 56 bytes) ─────────────────────
+#
+# p_type:  0=PT_NULL  1=PT_LOAD  2=PT_DYNAMIC  3=PT_INTERP
+#          4=PT_NOTE  6=PT_PHDR  7=PT_TLS
+# p_flags: 1=PF_X (execute)  2=PF_W (write)  4=PF_R (read)
+#
+# NB: p_flags position differs from ELF32 —
+#   ELF32: type, offset, vaddr, paddr, filesz, memsz, flags, align
+#   ELF64: type, flags, offset, vaddr, paddr, filesz, memsz, align
+
+Elf64_Phdr = struct {
+    p_type:   uint32,
+    p_flags:  uint32,
+    p_offset: uint64,
+    p_vaddr:  uint64,
+    p_paddr:  uint64,
+    p_filesz: uint64,
+    p_memsz:  uint64,
+    p_align:  uint64
+}
+
+# ── Relocation Entries ────────────────────────────────────────
+#
+# r_info encoding (ELF64):
+#   symbol_index = r_info >> 32
+#   reloc_type   = r_info & 0xFFFFFFFF
+#
+# Elf64_Rela includes an explicit addend; Elf64_Rel does not.
+
+Elf64_Rela = struct {
+    r_offset: uint64,
+    r_info:   uint64,
+    r_addend: int64,
+    r_sym:    compute((r_info >> 32) & 0xFFFFFFFF : uint32),
+    r_type:   compute(r_info & 0xFFFFFFFF : uint32)
+}
+
+Elf64_Rel = struct {
+    r_offset: uint64,
+    r_info:   uint64,
+    r_sym:    compute((r_info >> 32) & 0xFFFFFFFF : uint32),
+    r_type:   compute(r_info & 0xFFFFFFFF : uint32)
+}
+
+# ── Top-Level: ELF64 Object File ──────────────────────────────
+#
+# Parses the ELF header, then uses its offsets to random-access
+# the section header table and program header table.
+#
+# Section contents (symbol tables, string tables, .text bytes)
+# are accessed by C++ code using offsets from the parsed headers.
+
+Elf64 = struct {
+    ehdr: Elf64_Ehdr,
+    shdrs: array<Elf64_Shdr>[ehdr.e_shnum]
+        @ [ehdr.e_shoff + i * ehdr.e_shentsize,
+           ehdr.e_shoff + (i + 1) * ehdr.e_shentsize],
+    phdrs: array<Elf64_Phdr>[ehdr.e_phnum]
+        @ [ehdr.e_phoff + i * ehdr.e_phentsize,
+           ehdr.e_phoff + (i + 1) * ehdr.e_phentsize]
+}

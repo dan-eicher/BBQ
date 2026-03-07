@@ -1,0 +1,19 @@
+# Jitterator — Copy-and-Patch stencil extractor
+
+add_executable(jitterator
+    src/jitterator.cpp
+    extract/elf64Parser.cpp
+)
+target_include_directories(jitterator PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/extract
+    ${CMAKE_SOURCE_DIR}/backends/cpp/runtime  # BBQContext.h
+)
+
+# --- Calculator proof-of-life example ---
+add_executable(calc_example
+    example/calc.cpp
+)
+target_include_directories(calc_example PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/example
+    ${CMAKE_CURRENT_SOURCE_DIR}/runtime
+)

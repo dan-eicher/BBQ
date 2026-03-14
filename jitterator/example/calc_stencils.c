@@ -2,41 +2,41 @@
 
 #include <stdint.h>
 
+#define STENCIL __attribute__((preserve_none))
+#define TAIL    __attribute__((musttail))
+
 // Hole declarations
-extern void __attribute__((preserve_none)) _HOLE_cont(int64_t *slots);
+extern void STENCIL _HOLE_cont(int64_t *slots);
 extern uint64_t _HOLE_dst;
 extern uint64_t _HOLE_lhs;
 extern uint64_t _HOLE_rhs;
 extern uint64_t _HOLE_value;
 
 // add: slots[dst] = slots[lhs] + slots[rhs]
-void __attribute__((preserve_none))
-add(int64_t *slots) {
+void STENCIL add(int64_t *slots) {
     slots[_HOLE_dst] = slots[_HOLE_lhs] + slots[_HOLE_rhs];
-    return _HOLE_cont(slots);
+    TAIL return _HOLE_cont(slots);
 }
 
 // sub: slots[dst] = slots[lhs] - slots[rhs]
-void __attribute__((preserve_none))
-sub(int64_t *slots) {
+void STENCIL sub(int64_t *slots) {
     slots[_HOLE_dst] = slots[_HOLE_lhs] - slots[_HOLE_rhs];
-    return _HOLE_cont(slots);
+    TAIL return _HOLE_cont(slots);
 }
 
 // load_const: slots[dst] = value
-void __attribute__((preserve_none))
-load_const(int64_t *slots) {
+void STENCIL load_const(int64_t *slots) {
     slots[_HOLE_dst] = (int64_t)_HOLE_value;
-    return _HOLE_cont(slots);
+    TAIL return _HOLE_cont(slots);
 }
 
-// exit: return to caller
-void __attribute__((preserve_none))
-halt(int64_t *slots) {
+// halt: return to caller
+void STENCIL halt(int64_t *slots) {
     return;
 }
 
 // entry: transition from C calling convention to preserve_none
+// No TAIL here — crossing calling conventions requires a call, not a tail call.
 void entry(int64_t *slots) {
-    return ((void __attribute__((preserve_none))(*)(int64_t*))_HOLE_cont)(slots);
+    return ((void STENCIL (*)(int64_t*))_HOLE_cont)(slots);
 }

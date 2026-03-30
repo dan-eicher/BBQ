@@ -1,0 +1,14 @@
+// Simple expression tree grammar for testing burgc
+TERM Const = 1
+TERM Add   = 2
+TERM Mul   = 3
+TERM Load  = 4
+
+START reg
+
+RULES
+
+reg  : Const            = 1;
+reg  : Add(reg, reg)    = 2;
+reg  : Mul(reg, reg)    = 3;
+reg  : Load             = 4;

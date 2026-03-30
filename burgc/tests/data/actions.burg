@@ -1,0 +1,16 @@
+// Grammar with semantic actions for testing reducer generation
+TERM Const = 1
+TERM Add   = 2
+TERM Load  = 3
+
+(. #include "emitter.h" .)
+
+START stmt
+
+RULES
+
+con  : Const           = 1 (1) (. emit_const(node); .);
+reg  : Add(reg, reg)   = 2 (2) (. emit_add(node); .);
+reg  : Load            = 3 (1) (. emit_load(node); .);
+reg  : con             = 4 (0) (. emit_chain(node); .);
+stmt : reg             = 5 (0);

@@ -1,0 +1,104 @@
+COMPILER Burg
+
+(. #include <string>
+   #include <vector>
+   #include <cstdint>
+.)
+
+COMMENTS FROM "//" TO "\n"
+COMMENTS FROM "/*" TO "*/"
+
+IGNORE '\r' + '\n' + '\t' + ' '
+
+PRODUCTIONS
+
+Burg
+    (. std::vector<burg_ast::TermDecl*> terms;
+       std::string start_sym;
+       std::vector<std::string> headers;
+       std::vector<burg_ast::Rule*> rules;
+       burg_ast::Rule* r; .)
+    = { Decl<terms, start_sym, headers> }
+      "RULES"
+      { RuleDecl<&r>  (. rules.push_back(r); .) }
+      (. skip(); if (!at_end()) return false; .)
+    (. ast = new burg_ast::Spec();
+       ast->terminals = std::move(terms);
+       ast->start = std::move(start_sym);
+       ast->headers = std::move(headers);
+       ast->rules = std::move(rules);
+       ast->loc = {1, 1}; .)
+.
+
+Decl <. std::vector<burg_ast::TermDecl*> &terms, std::string &start, std::vector<std::string> &headers .>
+    = TermDecl_<terms>
+    | StartDecl<start>
+    | HeaderAction_<headers>
+.
+
+HeaderAction_ <. std::vector<std::string> &headers .>
+    (. std::string code; .)
+    = "(." (. if (!scan_to("." ")", code)) return false; .)
+    (. headers.push_back(code); .)
+.
+
+TermDecl_ <. std::vector<burg_ast::TermDecl*> &terms .>
+    (. std::string name; int64_t num; .)
+    = "TERM"
+      { ident<name> "=" integer<num>
+        (. auto* t = new burg_ast::TermDecl();
+           t->name = std::move(name);
+           t->number = num;
+           t->loc = {line(), col()};
+           terms.push_back(t); .)
+      }
+.
+
+StartDecl <. std::string &start .>
+    = "START" ident<start>
+.
+
+RuleDecl <. burg_ast::Rule* *result .>
+    (. std::string nt;
+       burg_ast::TreePattern* pat;
+       int64_t rulenum;
+       int64_t cost = 0;
+       std::string guard;
+       std::string action; .)
+    = ident<nt>             (. burg_ast::SourceLoc loc = {line(), col()}; .)
+      ":"
+      TreePat<&pat>
+      [ "where" "(." (. if (!scan_to("." ")", guard)) return false; .) ]
+      "=" integer<rulenum>
+      [ "(" integer<cost> ")" ]
+      [ "(." (. if (!scan_to("." ")", action)) return false; .) ]
+      ";"
+    (. *result = new burg_ast::Rule();
+       (*result)->nonterm = std::move(nt);
+       (*result)->pattern = pat;
+       (*result)->rule_number = rulenum;
+       (*result)->cost = cost;
+       (*result)->guard = std::move(guard);
+       (*result)->action = std::move(action);
+       (*result)->loc = loc; .)
+.
+
+TreePat <. burg_ast::TreePattern* *result .>
+    (. std::string name;
+       std::vector<burg_ast::TreePattern*> children;
+       burg_ast::TreePattern* child; .)
+    = ident<name>           (. burg_ast::SourceLoc loc = {line(), col()}; .)
+      [ "("
+        TreePat<&child>     (. children.push_back(child); .)
+        { ","
+          TreePat<&child>   (. children.push_back(child); .)
+        }
+        ")"
+      ]
+    (. *result = new burg_ast::TreePattern();
+       (*result)->name = std::move(name);
+       (*result)->children = std::move(children);
+       (*result)->loc = loc; .)
+.
+
+END Burg.

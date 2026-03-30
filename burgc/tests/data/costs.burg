@@ -1,0 +1,12 @@
+// Grammar with explicit costs for testing cost minimization
+TERM Const = 1
+TERM Add   = 2
+TERM Mov   = 3
+
+START reg
+
+RULES
+
+reg : Const          = 1 (1);
+reg : Add(reg, reg)  = 2 (2);
+reg : Mov(reg)       = 3 (1);

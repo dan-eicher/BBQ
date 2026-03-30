@@ -80,6 +80,9 @@ add_subdirectory(pegc)
 # --- asdl subproject ---
 add_subdirectory(asdl)
 
+# --- burgc subproject ---
+add_subdirectory(burgc)
+
 # --- jitterator subproject ---
 add_subdirectory(jitterator)
 
@@ -109,5 +112,21 @@ add_custom_command(
             ${CMAKE_CURRENT_SOURCE_DIR}/grammar/frames/Parser.frame
             ${CMAKE_CURRENT_SOURCE_DIR}/grammar/frames/ParserImpl.frame
     COMMENT "Generating Parser.h/.cpp from BBQ.peg"
+    VERBATIM
+)
+
+# --- Auto-regenerate burgc Parser.h/.cpp from burg.peg ---
+add_custom_command(
+    OUTPUT ${CMAKE_CURRENT_SOURCE_DIR}/burgc/frontend/Parser.h
+           ${CMAKE_CURRENT_SOURCE_DIR}/burgc/frontend/Parser.cpp
+    COMMAND pegc ${CMAKE_CURRENT_SOURCE_DIR}/burgc/grammar/burg.peg
+                 -frames ${CMAKE_CURRENT_SOURCE_DIR}/burgc/grammar/frames/
+                 -o ${CMAKE_CURRENT_SOURCE_DIR}/burgc/frontend/
+                 -prefix ""
+    DEPENDS pegc
+            ${CMAKE_CURRENT_SOURCE_DIR}/burgc/grammar/burg.peg
+            ${CMAKE_CURRENT_SOURCE_DIR}/burgc/grammar/frames/Parser.frame
+            ${CMAKE_CURRENT_SOURCE_DIR}/burgc/grammar/frames/ParserImpl.frame
+    COMMENT "Generating burgc Parser.h/.cpp from burg.peg"
     VERBATIM
 )

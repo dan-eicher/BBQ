@@ -1,0 +1,14 @@
+// Grammar with chain rules for testing closure generation
+TERM Const  = 1
+TERM Add    = 2
+TERM Load   = 3
+
+START stmt
+
+RULES
+
+con  : Const          = 1;
+reg  : Add(reg, reg)  = 2;
+reg  : Load           = 3;
+reg  : con            = 4 (0);
+stmt : reg            = 5 (0);

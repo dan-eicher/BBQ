@@ -6,9 +6,11 @@ typedef enum {
     STENCIL_ADD = 0,
     STENCIL_SUB = 1,
     STENCIL_LOAD_CONST = 2,
-    STENCIL_HALT = 3,
-    STENCIL_ENTRY = 4,
-    STENCIL_COUNT = 5
+    STENCIL_MUL = 3,
+    STENCIL_NEG = 4,
+    STENCIL_HALT = 5,
+    STENCIL_ENTRY = 6,
+    STENCIL_COUNT = 7
 } StencilId;
 
 typedef enum {
@@ -78,6 +80,34 @@ static const PatchEntry patches_load_const[] = {
 
 static const char *holes_load_const[] = {"_HOLE_value", "_HOLE_dst", "_HOLE_cont", };
 
+static const uint8_t code_mul[] = {
+    0x48,0x8b,0x05,0x00,0x00,0x00,0x00,0x48,0x8b,0x0d,0x00,0x00,0x00,0x00,0x49,0x8b,
+    0x0c,0xcc,0x49,0x0f,0xaf,0x0c,0xc4,0x48,0x8b,0x05,0x00,0x00,0x00,0x00,0x49,0x89,
+    0x0c,0xc4,0xe9,0x00,0x00,0x00,0x00,
+};
+
+static const PatchEntry patches_mul[] = {
+    {3, PATCH_REL_DATA, 0, "_HOLE_lhs"},
+    {10, PATCH_REL_DATA, 1, "_HOLE_rhs"},
+    {26, PATCH_REL_DATA, 2, "_HOLE_dst"},
+    {35, PATCH_REL_BRANCH, 3, "_HOLE_cont"},
+};
+
+static const char *holes_mul[] = {"_HOLE_lhs", "_HOLE_rhs", "_HOLE_dst", "_HOLE_cont", };
+
+static const uint8_t code_neg[] = {
+    0x48,0x8b,0x05,0x00,0x00,0x00,0x00,0x31,0xc9,0x49,0x2b,0x0c,0xc4,0x48,0x8b,0x05,
+    0x00,0x00,0x00,0x00,0x49,0x89,0x0c,0xc4,0xe9,0x00,0x00,0x00,0x00,
+};
+
+static const PatchEntry patches_neg[] = {
+    {3, PATCH_REL_DATA, 0, "_HOLE_src"},
+    {16, PATCH_REL_DATA, 1, "_HOLE_dst"},
+    {25, PATCH_REL_BRANCH, 2, "_HOLE_cont"},
+};
+
+static const char *holes_neg[] = {"_HOLE_src", "_HOLE_dst", "_HOLE_cont", };
+
 static const uint8_t code_halt[] = {
     0xc3,
 };
@@ -97,6 +127,8 @@ static const StencilDef stencil_table[STENCIL_COUNT] = {
     [STENCIL_ADD] = {code_add, 38, patches_add, 4, 4, 3, holes_add},
     [STENCIL_SUB] = {code_sub, 38, patches_sub, 4, 4, 3, holes_sub},
     [STENCIL_LOAD_CONST] = {code_load_const, 23, patches_load_const, 3, 3, 2, holes_load_const},
+    [STENCIL_MUL] = {code_mul, 39, patches_mul, 4, 4, 3, holes_mul},
+    [STENCIL_NEG] = {code_neg, 29, patches_neg, 3, 3, 2, holes_neg},
     [STENCIL_HALT] = {code_halt, 1, nullptr, 0, 0, 0, nullptr},
     [STENCIL_ENTRY] = {code_entry, 27, patches_entry, 1, 1, 0, holes_entry},
 };

@@ -30,6 +30,19 @@ void STENCIL load_const(int64_t *slots) {
     TAIL return _HOLE_cont(slots);
 }
 
+// mul: slots[dst] = slots[lhs] * slots[rhs]
+void STENCIL mul(int64_t *slots) {
+    slots[_HOLE_dst] = slots[_HOLE_lhs] * slots[_HOLE_rhs];
+    TAIL return _HOLE_cont(slots);
+}
+
+// neg: slots[dst] = -slots[src]
+extern uint64_t _HOLE_src;
+void STENCIL neg(int64_t *slots) {
+    slots[_HOLE_dst] = -slots[_HOLE_src];
+    TAIL return _HOLE_cont(slots);
+}
+
 // halt: return to caller
 void STENCIL halt(int64_t *slots) {
     return;

@@ -68,31 +68,43 @@ the predecessor of `preserve_none`).
 
 Requires Clang 19+. GCC does not support `preserve_none`.
 
+### Macros
+
+Stencil source files use two convenience macros:
+
+```c
+#define STENCIL __attribute__((preserve_none))
+#define TAIL    __attribute__((musttail))
+```
+
+`STENCIL` marks the calling convention. `TAIL` guarantees the compiler
+emits a tail call — if it can't, compilation fails rather than silently
+generating a non-tail call that would break the stencil chain.
+
 ### Stencil Structure
 
 A stencil is a `preserve_none` function that:
 1. Receives the execution context in registers
 2. Does its computation
-3. Tail-calls its continuation (another stencil)
+3. Tail-calls its continuation (another stencil) — must use `TAIL`
 
 ```c
 // stencils.c
 
-// Holes are extern symbols starting with _HOLE_
+#define STENCIL __attribute__((preserve_none))
+#define TAIL    __attribute__((musttail))
 
 // Continuation holes — tail-called, become jmp instructions
-extern void __attribute__((preserve_none))
-    _HOLE_cont(int64_t *slots);
+extern void STENCIL _HOLE_cont(int64_t *slots);
 
 // Data holes — loaded via RIP-relative addressing, need constant pool
 extern uint64_t _HOLE_dst;
 extern uint64_t _HOLE_lhs;
 extern uint64_t _HOLE_rhs;
 
-void __attribute__((preserve_none))
-add(int64_t *slots) {
+void STENCIL add(int64_t *slots) {
     slots[_HOLE_dst] = slots[_HOLE_lhs] + slots[_HOLE_rhs];
-    return _HOLE_cont(slots);     // tail call → jmp
+    TAIL return _HOLE_cont(slots);
 }
 ```
 
@@ -108,8 +120,8 @@ add:
     jmp  0                     ; _HOLE_cont → relocation
 ```
 
-No prologue. No epilogue. No stack frame. The `return _HOLE_cont(slots)`
-becomes a `jmp` because `preserve_none` + tail call = zero overhead.
+No prologue. No epilogue. No stack frame. The `TAIL return _HOLE_cont(slots)`
+becomes a `jmp` because `preserve_none` + `musttail` = guaranteed tail call.
 
 ### Two Kinds of Holes
 
@@ -133,12 +145,11 @@ The first stencil emitted should be an **entry** stencil that transitions
 from the standard C calling convention to `preserve_none`:
 
 ```c
-// Called from regular C code — note: NOT preserve_none
+// Called from regular C code — note: NOT preserve_none, NOT TAIL.
+// Crossing calling conventions requires a call (not a tail call) so the
+// compiler generates a prologue/epilogue that saves callee-saved regs.
 void entry(int64_t *slots) {
-    // The compiler generates a proper prologue (saves callee-saved regs).
-    // The call transitions to preserve_none.
-    return ((void __attribute__((preserve_none)) (*)(int64_t*))
-            _HOLE_cont)(slots);
+    return ((void STENCIL (*)(int64_t*))_HOLE_cont)(slots);
 }
 ```
 
@@ -164,8 +175,7 @@ The last stencil is a **halt** stencil — a `preserve_none` function that
 returns to the caller:
 
 ```c
-void __attribute__((preserve_none))
-halt(int64_t *slots) {
+void STENCIL halt(int64_t *slots) {
     return;  // just ret — returns to entry's epilogue
 }
 ```
@@ -184,13 +194,12 @@ function pointer is passed as a hole:
 extern uint64_t _HOLE_extern_fn;
 extern uint64_t _HOLE_extern_arg;
 
-void __attribute__((preserve_none))
-call_extern(int64_t *slots) {
+void STENCIL call_extern(int64_t *slots) {
     typedef int64_t (*ext_fn_t)(int64_t*);
     ext_fn_t fn = (ext_fn_t)_HOLE_extern_fn;
     int64_t result = fn(slots);
     slots[_HOLE_extern_arg] = result;
-    return _HOLE_cont(slots);
+    TAIL return _HOLE_cont(slots);
 }
 ```
 
@@ -506,26 +515,27 @@ fn(slots);
 
 Stencils (`example/calc_stencils.c`):
 ```c
-extern void __attribute__((preserve_none)) _HOLE_cont(int64_t *slots);
+#define STENCIL __attribute__((preserve_none))
+#define TAIL    __attribute__((musttail))
+
+extern void STENCIL _HOLE_cont(int64_t *slots);
 extern uint64_t _HOLE_dst;
 extern uint64_t _HOLE_lhs;
 extern uint64_t _HOLE_rhs;
 extern uint64_t _HOLE_value;
 
-void __attribute__((preserve_none))
-add(int64_t *slots) {
+void STENCIL add(int64_t *slots) {
     slots[_HOLE_dst] = slots[_HOLE_lhs] + slots[_HOLE_rhs];
-    return _HOLE_cont(slots);
+    TAIL return _HOLE_cont(slots);
 }
 
-void __attribute__((preserve_none))
-halt(int64_t *slots) {
+void STENCIL halt(int64_t *slots) {
     return;
 }
 
+// No TAIL — crossing calling conventions requires call, not tail call
 void entry(int64_t *slots) {
-    return ((void __attribute__((preserve_none))(*)(int64_t*))
-            _HOLE_cont)(slots);
+    return ((void STENCIL (*)(int64_t*))_HOLE_cont)(slots);
 }
 ```
 

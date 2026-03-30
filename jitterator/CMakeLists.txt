@@ -17,3 +17,15 @@ target_include_directories(calc_example PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/example
     ${CMAKE_CURRENT_SOURCE_DIR}/runtime
 )
+
+# --- Calculator JIT (full toolchain demo: pegc + asdl + burgc + jitterator) ---
+add_executable(calc_jit
+    example/calc_jit.cpp
+    example/frontend/Parser.cpp
+)
+target_include_directories(calc_jit PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/example
+    ${CMAKE_CURRENT_SOURCE_DIR}/example/frontend
+    ${CMAKE_CURRENT_SOURCE_DIR}/runtime
+    ${CMAKE_SOURCE_DIR}/pegc/runtime
+)

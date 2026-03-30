@@ -1,0 +1,15 @@
+// calc_ir.asdl — Slot-based continuation graph for the calculator
+//
+// int64 fields are slot indices or constant data.
+// node fields are continuation edges (control flow).
+
+module calc_ir {
+
+    node = SlotRef(int64 slot, node next)
+         | LoadConst(int64 value, int64 dest, node next)
+         | Add(int64 lhs, int64 rhs, int64 dest, node next)
+         | Sub(int64 lhs, int64 rhs, int64 dest, node next)
+         | Mul(int64 lhs, int64 rhs, int64 dest, node next)
+         | Neg(int64 src, int64 dest, node next)
+         | Halt(int64 result_slot)
+}

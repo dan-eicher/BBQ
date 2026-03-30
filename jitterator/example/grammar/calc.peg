@@ -1,0 +1,47 @@
+COMPILER Calc
+
+(. #include <string>
+   #include <cstdint>
+.)
+
+IGNORE '\r' + '\n' + '\t' + ' '
+
+PRODUCTIONS
+
+Calc
+    (. calc::Expr* e; .)
+    = Expr<&e>
+      (. skip(); if (!at_end()) return false; .)
+    (. ast = new calc::Program(e); .)
+.
+
+Expr <. calc::Expr* *result .>  = AddExpr<result> .
+
+AddExpr <. calc::Expr* *result .>
+    (. calc::Expr* right; .)
+    = MulExpr<result>
+      { "+" MulExpr<&right>  (. *result = new calc::BinOp(calc::Op::Add, *result, right); .)
+      | "-" MulExpr<&right>  (. *result = new calc::BinOp(calc::Op::Sub, *result, right); .)
+      }
+.
+
+MulExpr <. calc::Expr* *result .>
+    (. calc::Expr* right; .)
+    = UnaryExpr<result>
+      { "*" UnaryExpr<&right>  (. *result = new calc::BinOp(calc::Op::Mul, *result, right); .)
+      }
+.
+
+UnaryExpr <. calc::Expr* *result .>
+    = "-" UnaryExpr<result>  (. *result = new calc::NegOp(*result); .)
+    | Atom<result>
+.
+
+Atom <. calc::Expr* *result .>
+    (. int64_t n; .)
+    = "$" integer<n>  (. *result = new calc::SlotRef(n); .)
+    | integer<n>      (. *result = new calc::IntLit(n); .)
+    | "(" Expr<result> ")"
+.
+
+END Calc.

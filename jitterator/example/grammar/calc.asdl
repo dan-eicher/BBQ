@@ -1,0 +1,13 @@
+// calc.asdl — AST for the calculator expression language
+
+module calc {
+
+    program = Program(expr body)
+
+    op = Add | Sub | Mul
+
+    expr = IntLit(int64 value)
+         | SlotRef(int64 slot)
+         | BinOp(op op, expr left, expr right)
+         | NegOp(expr operand)
+}

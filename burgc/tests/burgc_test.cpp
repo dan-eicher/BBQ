@@ -629,3 +629,55 @@ TEST(BurgCBackend, NoClassWrapper) {
     EXPECT_NE(code.find("struct BurgState"), std::string::npos);
     EXPECT_NE(code.find("struct BurgContext"), std::string::npos);
 }
+
+// ── NAMESPACE tests ───────────────────────────────────────
+
+TEST(BurgParser, ParsesNamespace) {
+    Parser parser;
+    const char* input = "TERM X=1 NAMESPACE foo RULES r: X = 1;";
+    parser.init(input, (int)strlen(input));
+    EXPECT_TRUE(parser.parse());
+    ASSERT_NE(parser.ast, nullptr);
+    EXPECT_EQ(parser.ast->ns, "foo");
+}
+
+TEST(BurgParser, NamespaceOptional) {
+    Parser parser;
+    const char* input = "TERM X=1 RULES r: X = 1;";
+    parser.init(input, (int)strlen(input));
+    EXPECT_TRUE(parser.parse());
+    ASSERT_NE(parser.ast, nullptr);
+    EXPECT_TRUE(parser.ast->ns.empty());
+}
+
+TEST(BurgCppBackend, EmitsNamespace) {
+    std::string code = gen_cpp(
+        "TERM X=1 NAMESPACE myns RULES r: X = 1;");
+    EXPECT_NE(code.find("namespace myns {"), std::string::npos);
+    EXPECT_NE(code.find("} // namespace myns"), std::string::npos);
+    // Class should be inside the namespace
+    auto ns_pos = code.find("namespace myns {");
+    auto class_pos = code.find("class BurgMatcher {");
+    auto ns_close = code.find("} // namespace myns");
+    EXPECT_LT(ns_pos, class_pos);
+    EXPECT_LT(class_pos, ns_close);
+}
+
+TEST(BurgCppBackend, NoNamespaceWithout) {
+    std::string code = gen_cpp("TERM X=1 RULES r: X = 1;");
+    EXPECT_EQ(code.find("namespace"), std::string::npos);
+}
+
+TEST(BurgCBackend, EmitsNamespace) {
+    auto backend = create_c_backend();
+    std::string code = gen_code(
+        "TERM X=1 NAMESPACE myns RULES r: X = 1;", *backend);
+    EXPECT_NE(code.find("namespace myns {"), std::string::npos);
+    EXPECT_NE(code.find("} // namespace myns"), std::string::npos);
+    // Structs should be inside the namespace
+    auto ns_pos = code.find("namespace myns {");
+    auto struct_pos = code.find("struct BurgState");
+    auto ns_close = code.find("} // namespace myns");
+    EXPECT_LT(ns_pos, struct_pos);
+    EXPECT_LT(struct_pos, ns_close);
+}

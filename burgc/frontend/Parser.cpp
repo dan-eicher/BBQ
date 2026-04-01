@@ -23,6 +23,7 @@ void Parser::setup_skip() {
 bool Parser::parse_Burg() {
     std::vector<burg_ast::TermDecl*> terms;
        std::string start_sym;
+       std::string ns;
        std::string members_block;
        std::vector<std::string> headers;
        std::vector<burg_ast::Rule*> rules;
@@ -31,7 +32,7 @@ bool Parser::parse_Burg() {
         auto _m0 = save();
         if (![&]() -> bool {
             skip();
-            if (!parse_Decl(terms, start_sym, members_block, headers)) return false;
+            if (!parse_Decl(terms, start_sym, ns, members_block, headers)) return false;
             return true;
         }()) { restore(_m0); break; }
     }
@@ -50,6 +51,7 @@ bool Parser::parse_Burg() {
     ast = new burg_ast::Spec();
        ast->terminals = std::move(terms);
        ast->start = std::move(start_sym);
+       ast->ns = std::move(ns);
        ast->members = std::move(members_block);
        ast->headers = std::move(headers);
        ast->rules = std::move(rules);
@@ -57,7 +59,7 @@ bool Parser::parse_Burg() {
     return true;
 }
 
-bool Parser::parse_Decl(std::vector<burg_ast::TermDecl*>& terms, std::string& start, std::string& members, std::vector<std::string>& headers) {
+bool Parser::parse_Decl(std::vector<burg_ast::TermDecl*>& terms, std::string& start, std::string& ns, std::string& members, std::vector<std::string>& headers) {
     {
         auto _m0 = save();
         if ([&]() -> bool {
@@ -74,6 +76,12 @@ bool Parser::parse_Decl(std::vector<burg_ast::TermDecl*>& terms, std::string& st
         restore(_m0);
         if ([&]() -> bool {
             skip();
+            if (!parse_NamespaceDecl(ns)) return false;
+            return true;
+        }()) {} else {
+        restore(_m0);
+        if ([&]() -> bool {
+            skip();
             if (!parse_MembersDecl(members)) return false;
             return true;
         }()) {} else {
@@ -83,7 +91,16 @@ bool Parser::parse_Decl(std::vector<burg_ast::TermDecl*>& terms, std::string& st
         }
         }
         }
+        }
     }
+    return true;
+}
+
+bool Parser::parse_NamespaceDecl(std::string& ns) {
+    skip();
+    if (!keyword("NAMESPACE")) return false;
+    skip();
+    if (!ident(ns)) return false;
     return true;
 }
 

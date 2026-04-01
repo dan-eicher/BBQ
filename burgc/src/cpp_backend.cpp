@@ -11,6 +11,10 @@ public:
         emit_user_headers(out);
         emit_macros_check(out);
 
+        // ── Namespace open ──
+        if (!a.spec->ns.empty())
+            out << "namespace " << a.spec->ns << " {\n\n";
+
         // ── Class open ──
         out << "class BurgMatcher {\n";
         out << "public:\n";
@@ -79,6 +83,10 @@ public:
 
         // ── Class close ──
         out << "}; // class BurgMatcher\n";
+
+        // ── Namespace close ──
+        if (!a.spec->ns.empty())
+            out << "\n} // namespace " << a.spec->ns << "\n";
     }
 };
 

@@ -14,6 +14,10 @@ public:
         emit_user_headers(out);
         emit_macros_check(out);
 
+        // ── Namespace open ──
+        if (!a.spec->ns.empty())
+            out << "namespace " << a.spec->ns << " {\n\n";
+
         // ── BurgState (top-level struct) ──
         out << "// ── State record ──\n\n";
         emit_state_struct(out, 0);
@@ -76,6 +80,10 @@ public:
         out << "static void burg_rewrite(BURG_NODE_TYPE root, BurgContext* ctx) {\n";
         emit_rewrite_body(out, 1);
         out << "}\n";
+
+        // ── Namespace close ──
+        if (!a.spec->ns.empty())
+            out << "\n} // namespace " << a.spec->ns << "\n";
     }
 };
 

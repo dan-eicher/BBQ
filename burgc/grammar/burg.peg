@@ -15,28 +15,35 @@ PRODUCTIONS
 Burg
     (. std::vector<burg_ast::TermDecl*> terms;
        std::string start_sym;
+       std::string ns;
        std::string members_block;
        std::vector<std::string> headers;
        std::vector<burg_ast::Rule*> rules;
        burg_ast::Rule* r; .)
-    = { Decl<terms, start_sym, members_block, headers> }
+    = { Decl<terms, start_sym, ns, members_block, headers> }
       "RULES"
       { RuleDecl<&r>  (. rules.push_back(r); .) }
       (. skip(); if (!at_end()) return false; .)
     (. ast = new burg_ast::Spec();
        ast->terminals = std::move(terms);
        ast->start = std::move(start_sym);
+       ast->ns = std::move(ns);
        ast->members = std::move(members_block);
        ast->headers = std::move(headers);
        ast->rules = std::move(rules);
        ast->loc = {1, 1}; .)
 .
 
-Decl <. std::vector<burg_ast::TermDecl*> &terms, std::string &start, std::string &members, std::vector<std::string> &headers .>
+Decl <. std::vector<burg_ast::TermDecl*> &terms, std::string &start, std::string &ns, std::string &members, std::vector<std::string> &headers .>
     = TermDecl_<terms>
     | StartDecl<start>
+    | NamespaceDecl<ns>
     | MembersDecl<members>
     | HeaderAction_<headers>
+.
+
+NamespaceDecl <. std::string &ns .>
+    = "NAMESPACE" ident<ns>
 .
 
 MembersDecl <. std::string &members .>

@@ -75,6 +75,9 @@ protected:
     // Shared function bodies (emitted between backend-provided signatures)
     void emit_closures(std::ostream& out, int indent,
                        const std::string& prefix, bool fwd_decls);
+    void emit_dp_body(std::ostream& out, int indent);
+    void emit_label_alloc(std::ostream& out, int indent);
+    void emit_label_tree_body(std::ostream& out, int indent);
     void emit_label_body(std::ostream& out, int indent);
     void emit_rule_func_body(std::ostream& out, int indent);
     void emit_nt_name_body(std::ostream& out, int indent);

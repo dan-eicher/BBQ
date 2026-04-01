@@ -410,13 +410,13 @@ TEST(BurgCppBackend, LabelFuncIsMethod) {
     gen.generate(out);
     std::string code = out.str();
     EXPECT_NE(code.find("BurgState* burg_label(BURG_NODE_TYPE node)"), std::string::npos);
-    EXPECT_NE(code.find("BURG_NODE_OP(node)"), std::string::npos);
+    EXPECT_NE(code.find("BurgState* burg_label_tree(BURG_NODE_TYPE node)"), std::string::npos);
+    EXPECT_NE(code.find("void burg_dp(BurgState* p, BURG_NODE_TYPE node)"), std::string::npos);
     EXPECT_NE(code.find("BURG_NODE_ARITY(node)"), std::string::npos);
     EXPECT_NE(code.find("BURG_NODE_CHILD(node, i)"), std::string::npos);
-    EXPECT_NE(code.find("BURG_NODE_ID(node)"), std::string::npos);
 }
 
-TEST(BurgCppBackend, LabelCachesBeforeDP) {
+TEST(BurgCppBackend, GraphLabelCachesBeforeDP) {
     BurgGenerator gen;
     auto* spec = gen.parse(source_path("tests/data/simple.burg"));
     ASSERT_NE(spec, nullptr);
@@ -424,11 +424,14 @@ TEST(BurgCppBackend, LabelCachesBeforeDP) {
     std::ostringstream out;
     gen.generate(out);
     std::string code = out.str();
-    auto cache_pos = code.find("burg_cache_store(id, p)");
-    auto switch_pos = code.find("switch (op)");
+    // In the graph label function, cache_store should appear before burg_dp call
+    auto label_pos = code.find("BurgState* burg_label(BURG_NODE_TYPE node)");
+    auto cache_pos = code.find("burg_cache_store(id, p)", label_pos);
+    auto dp_pos = code.find("burg_dp(p, node)", cache_pos);
+    ASSERT_NE(label_pos, std::string::npos);
     ASSERT_NE(cache_pos, std::string::npos);
-    ASSERT_NE(switch_pos, std::string::npos);
-    EXPECT_LT(cache_pos, switch_pos);
+    ASSERT_NE(dp_pos, std::string::npos);
+    EXPECT_LT(cache_pos, dp_pos);
 }
 
 TEST(BurgCppBackend, IndexedChildrenInDP) {
@@ -453,6 +456,57 @@ TEST(BurgCppBackend, ReducerIsMethod) {
     gen.generate(out);
     EXPECT_NE(out.str().find("void burg_reduce(BURG_NODE_TYPE node, BurgState* state, int goalnt)"),
               std::string::npos);
+}
+
+TEST(BurgCppBackend, EmitsArenaAllocator) {
+    BurgGenerator gen;
+    auto* spec = gen.parse(source_path("tests/data/simple.burg"));
+    ASSERT_NE(spec, nullptr);
+    ASSERT_TRUE(gen.analyze(spec));
+    std::ostringstream out;
+    gen.generate(out);
+    std::string code = out.str();
+    EXPECT_NE(code.find("arena_alloc"), std::string::npos);
+    EXPECT_NE(code.find("arena_reset"), std::string::npos);
+    EXPECT_NE(code.find("arena_"), std::string::npos);
+    // No malloc in generated code
+    EXPECT_EQ(code.find("malloc("), std::string::npos);
+}
+
+TEST(BurgCppBackend, TreeFastPathInRewrite) {
+    BurgGenerator gen;
+    auto* spec = gen.parse(source_path("tests/data/actions.burg"));
+    ASSERT_NE(spec, nullptr);
+    ASSERT_TRUE(gen.analyze(spec));
+    std::ostringstream out;
+    gen.generate(out);
+    std::string code = out.str();
+    // Fast path: check SUCC_COUNT, call burg_label_tree directly
+    EXPECT_NE(code.find("BURG_NODE_SUCC_COUNT(root) == 0"), std::string::npos);
+    EXPECT_NE(code.find("burg_label_tree(root)"), std::string::npos);
+    // Slow path: RPO still present
+    EXPECT_NE(code.find("BURG_NODE_SUCC("), std::string::npos);
+    EXPECT_NE(code.find("burg_label(n)"), std::string::npos);
+}
+
+TEST(BurgCppBackend, TreeLabelHasNoCache) {
+    BurgGenerator gen;
+    auto* spec = gen.parse(source_path("tests/data/simple.burg"));
+    ASSERT_NE(spec, nullptr);
+    ASSERT_TRUE(gen.analyze(spec));
+    std::ostringstream out;
+    gen.generate(out);
+    std::string code = out.str();
+    // Find burg_label_tree body — should NOT have cache calls
+    auto tree_pos = code.find("BurgState* burg_label_tree(BURG_NODE_TYPE node)");
+    auto tree_end = code.find("burg_label(BURG_NODE_TYPE node)", tree_pos + 10);
+    ASSERT_NE(tree_pos, std::string::npos);
+    ASSERT_NE(tree_end, std::string::npos);
+    std::string tree_body = code.substr(tree_pos, tree_end - tree_pos);
+    EXPECT_EQ(tree_body.find("burg_cache"), std::string::npos);
+    // But should have arena_alloc and burg_dp
+    EXPECT_NE(tree_body.find("arena_alloc"), std::string::npos);
+    EXPECT_NE(tree_body.find("burg_dp"), std::string::npos);
 }
 
 // ── Where guard tests ─────────────────────────────────────
@@ -522,7 +576,7 @@ TEST(BurgCppBackend, RewriteFuncReducesWhenActions) {
     EXPECT_NE(out.str().find("burg_reduce(n, s,"), std::string::npos);
 }
 
-TEST(BurgCppBackend, RewriteFuncClearsCache) {
+TEST(BurgCppBackend, RewriteResetsArenaFirst) {
     BurgGenerator gen;
     auto* spec = gen.parse(source_path("tests/data/simple.burg"));
     ASSERT_NE(spec, nullptr);
@@ -530,11 +584,13 @@ TEST(BurgCppBackend, RewriteFuncClearsCache) {
     std::ostringstream out;
     gen.generate(out);
     std::string code = out.str();
-    auto clear_pos = code.find("burg_cache_clear()");
-    auto rpo_pos = code.find("rpo");
-    ASSERT_NE(clear_pos, std::string::npos);
-    ASSERT_NE(rpo_pos, std::string::npos);
-    EXPECT_LT(clear_pos, rpo_pos);
+    // arena_reset should be the first thing in burg_rewrite
+    auto rewrite_pos = code.find("void burg_rewrite(");
+    auto arena_pos = code.find("arena_reset()", rewrite_pos);
+    auto succ_pos = code.find("BURG_NODE_SUCC_COUNT", rewrite_pos);
+    ASSERT_NE(arena_pos, std::string::npos);
+    ASSERT_NE(succ_pos, std::string::npos);
+    EXPECT_LT(arena_pos, succ_pos);
 }
 
 // ── MEMBERS tests ─────────────────────────────────────────
@@ -613,12 +669,17 @@ TEST(BurgCBackend, CtxThreadedInCalls) {
         "RULES\n"
         "r: X = 1 (. action(); .);\n"
         "r: Y(r) = 2 (. action2(); .);", *backend);
-    // Label recursive call should pass ctx
+    // Graph label recursive call should pass ctx
     EXPECT_NE(code.find("burg_label(BURG_NODE_CHILD(node, i), ctx)"), std::string::npos);
+    // Tree label recursive call should pass ctx
+    EXPECT_NE(code.find("burg_label_tree(BURG_NODE_CHILD(node, i), ctx)"), std::string::npos);
     // Cache calls should pass ctx
     EXPECT_NE(code.find("burg_cache_lookup(id, ctx)"), std::string::npos);
     EXPECT_NE(code.find("burg_cache_store(id, p, ctx)"), std::string::npos);
     EXPECT_NE(code.find("burg_cache_clear(ctx)"), std::string::npos);
+    // Arena calls should pass ctx
+    EXPECT_NE(code.find("arena_alloc(sizeof(BurgState), ctx)"), std::string::npos);
+    EXPECT_NE(code.find("arena_reset(ctx)"), std::string::npos);
 }
 
 TEST(BurgCBackend, NoClassWrapper) {

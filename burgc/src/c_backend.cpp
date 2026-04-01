@@ -24,17 +24,37 @@ public:
 
         // ── Context struct from MEMBERS ──
         out << "// ── Context ──\n\n";
+        out << "static constexpr size_t ARENA_PAGE_SIZE = 4096;\n\n";
         out << "struct BurgContext {\n";
+        out << "    std::vector<char*> arena_pages;\n";
+        out << "    int arena_cur = -1;\n";
+        out << "    size_t arena_pos = 0;\n";
         out << "    std::unordered_map<void*, BurgState*> burg_state_cache;\n";
         if (!a.spec->members.empty()) {
             std::string trimmed = trim(a.spec->members);
             if (!trimmed.empty())
                 out << "    " << trimmed << "\n";
         }
+        out << "    ~BurgContext() { for (auto* p : arena_pages) delete[] p; }\n";
         out << "};\n\n";
 
+        // ── Arena functions ──
+        out << "// ── Arena allocator (page-based, stable pointers) ──\n\n";
+        out << "static void* arena_alloc(size_t size, BurgContext* ctx) {\n";
+        out << "    size = (size + 7) & ~7;\n";
+        out << "    if (ctx->arena_cur < 0 || ctx->arena_pos + size > ARENA_PAGE_SIZE) {\n";
+        out << "        if (++ctx->arena_cur >= (int)ctx->arena_pages.size())\n";
+        out << "            ctx->arena_pages.push_back(new char[ARENA_PAGE_SIZE]);\n";
+        out << "        ctx->arena_pos = 0;\n";
+        out << "    }\n";
+        out << "    void* p = ctx->arena_pages[ctx->arena_cur] + ctx->arena_pos;\n";
+        out << "    ctx->arena_pos += size;\n";
+        out << "    return p;\n";
+        out << "}\n\n";
+        out << "static void arena_reset(BurgContext* ctx) { ctx->arena_cur = -1; ctx->arena_pos = 0; }\n\n";
+
         // ── Cache functions ──
-        out << "// ── State cache ──\n\n";
+        out << "// ── State cache (graph path only) ──\n\n";
         out << "static BurgState* burg_cache_lookup(void* id, BurgContext* ctx) {\n";
         out << "    auto it = ctx->burg_state_cache.find(id);\n";
         out << "    return (it != ctx->burg_state_cache.end()) ? it->second : nullptr;\n";
@@ -49,8 +69,20 @@ public:
         // Closures (static, with forward declarations)
         emit_closures(out, 0, "static ", true);
 
-        // Label (static + ctx)
-        out << "// ── Label function (bottom-up, cached) ──\n\n";
+        // DP (static + ctx)
+        out << "// ── Cost DP (shared by tree and graph label) ──\n\n";
+        out << "static void burg_dp(BurgState* p, BURG_NODE_TYPE node, BurgContext* ctx) {\n";
+        emit_dp_body(out, 1);
+        out << "}\n\n";
+
+        // Label tree (static + ctx, no cache)
+        out << "// ── Label (tree path — no cache) ──\n\n";
+        out << "static BurgState* burg_label_tree(BURG_NODE_TYPE node, BurgContext* ctx) {\n";
+        emit_label_tree_body(out, 1);
+        out << "}\n\n";
+
+        // Label graph (static + ctx, with cache)
+        out << "// ── Label (graph path — cached) ──\n\n";
         out << "static BurgState* burg_label(BURG_NODE_TYPE node, BurgContext* ctx) {\n";
         emit_label_body(out, 1);
         out << "}\n\n";
@@ -76,7 +108,7 @@ public:
         }
 
         // Rewriter (static + ctx)
-        out << "\n// ── Graph rewriter (RPO walk over successor edges) ──\n\n";
+        out << "\n// ── Rewriter ──\n\n";
         out << "static void burg_rewrite(BURG_NODE_TYPE root, BurgContext* ctx) {\n";
         emit_rewrite_body(out, 1);
         out << "}\n";

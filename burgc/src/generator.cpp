@@ -364,35 +364,53 @@ void BurgBackend::emit_label_dp_switch(std::ostream& out, int indent) {
     pad(out, indent); out << "}\n";
 }
 
+// DP switch body — shared between tree and graph label functions
+void BurgBackend::emit_dp_body(std::ostream& out, int indent) {
+    pad(out, indent); out << "int op = p->op;\n";
+    emit_label_dp_switch(out, indent);
+}
+
+// Arena alloc + BurgState init — shared between tree and graph label
+void BurgBackend::emit_label_alloc(std::ostream& out, int indent) {
+    pad(out, indent); out << "int arity = BURG_NODE_ARITY(node);\n";
+    pad(out, indent); out << "auto* p = (BurgState*)arena_alloc(sizeof(BurgState)" << ctx_arg() << ");\n";
+    pad(out, indent); out << "p->op = BURG_NODE_OP(node);\n";
+    pad(out, indent); out << "p->child_count = arity;\n";
+    pad(out, indent); out << "p->children = arity > 0\n";
+    pad(out, indent); out << "    ? (BurgState**)arena_alloc(arity * sizeof(BurgState*)" << ctx_arg() << ")\n";
+    pad(out, indent); out << "    : nullptr;\n";
+    pad(out, indent); out << "for (int i = 0; i <= BURG_MAX_NT; i++) {\n";
+    pad(out, indent + 1); out << "p->cost[i] = BURG_MAX_COST;\n";
+    pad(out, indent + 1); out << "p->rule[i] = 0;\n";
+    pad(out, indent); out << "}\n";
+}
+
+// Tree label body — no cache, arena alloc, calls burg_dp
+void BurgBackend::emit_label_tree_body(std::ostream& out, int indent) {
+    emit_label_alloc(out, indent);
+    out << "\n";
+    pad(out, indent); out << "for (int i = 0; i < arity; i++)\n";
+    pad(out, indent + 1); out << "p->children[i] = burg_label_tree(BURG_NODE_CHILD(node, i)" << ctx_arg() << ");\n\n";
+    pad(out, indent); out << "burg_dp(p, node" << ctx_arg() << ");\n";
+    pad(out, indent); out << "return p;\n";
+}
+
+// Graph label body — cache + arena alloc, calls burg_dp
 void BurgBackend::emit_label_body(std::ostream& out, int indent) {
     pad(out, indent); out << "void* id = BURG_NODE_ID(node);\n";
     pad(out, indent); out << "BurgState* cached = burg_cache_lookup(id" << ctx_arg() << ");\n";
     pad(out, indent); out << "if (cached) return cached;\n\n";
 
-    pad(out, indent); out << "int op = BURG_NODE_OP(node);\n";
-    pad(out, indent); out << "int arity = BURG_NODE_ARITY(node);\n\n";
-
-    pad(out, indent); out << "auto* p = (BurgState*)malloc(sizeof(BurgState));\n";
-    pad(out, indent); out << "p->op = op;\n";
-    pad(out, indent); out << "p->child_count = arity;\n";
-    pad(out, indent); out << "p->children = arity > 0\n";
-    pad(out, indent); out << "    ? (BurgState**)malloc(arity * sizeof(BurgState*))\n";
-    pad(out, indent); out << "    : nullptr;\n";
-    pad(out, indent); out << "for (int i = 0; i <= BURG_MAX_NT; i++) {\n";
-    pad(out, indent + 1); out << "p->cost[i] = BURG_MAX_COST;\n";
-    pad(out, indent + 1); out << "p->rule[i] = 0;\n";
-    pad(out, indent); out << "}\n\n";
+    emit_label_alloc(out, indent);
+    out << "\n";
 
     pad(out, indent); out << "// Cache BEFORE DP (back-edge cut-point safety)\n";
     pad(out, indent); out << "burg_cache_store(id, p" << ctx_arg() << ");\n\n";
 
-    pad(out, indent); out << "// Label children recursively (cache handles cycles)\n";
     pad(out, indent); out << "for (int i = 0; i < arity; i++)\n";
     pad(out, indent + 1); out << "p->children[i] = burg_label(BURG_NODE_CHILD(node, i)" << ctx_arg() << ");\n\n";
 
-    pad(out, indent); out << "// ── Cost DP ──\n";
-    emit_label_dp_switch(out, indent);
-
+    pad(out, indent); out << "burg_dp(p, node" << ctx_arg() << ");\n";
     pad(out, indent); out << "return p;\n";
 }
 
@@ -502,6 +520,19 @@ void BurgBackend::emit_rpo_dfs(std::ostream& out, int indent) {
 void BurgBackend::emit_rewrite_body(std::ostream& out, int indent) {
     int64_t start_idx = a_->nonterm_index.at(a_->start_nonterm);
 
+    pad(out, indent); out << "arena_reset(" << ctx_solo() << ");\n\n";
+
+    // Fast path: tree (no successor edges → skip RPO + cache)
+    pad(out, indent); out << "if (BURG_NODE_SUCC_COUNT(root) == 0) {\n";
+    pad(out, indent + 1); out << "BurgState* state = burg_label_tree(root" << ctx_arg() << ");\n";
+    if (a_->has_actions) {
+        pad(out, indent + 1); out << "if (state->rule[" << start_idx << "])\n";
+        pad(out, indent + 2); out << "burg_reduce(root, state, " << start_idx << ctx_arg() << ");\n";
+    }
+    pad(out, indent + 1); out << "return;\n";
+    pad(out, indent); out << "}\n\n";
+
+    // Slow path: graph (RPO + cache)
     pad(out, indent); out << "burg_cache_clear(" << ctx_solo() << ");\n\n";
 
     pad(out, indent); out << "// Compute reverse postorder via iterative DFS\n";

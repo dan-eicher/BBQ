@@ -27,6 +27,17 @@ target_include_directories(bbq_cpp_backend PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/backends/cpp/runtime)
 target_link_libraries(bbq_cpp_backend PUBLIC bbq_frontend)
 
+# --- C backend library ---
+add_library(bbq_c_backend STATIC
+    backends/c/CTypeEmitter.cpp
+    backends/c/CReaderEmitter.cpp
+    backends/c/CWriterEmitter.cpp
+)
+target_include_directories(bbq_c_backend PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/backends/c
+    ${CMAKE_CURRENT_SOURCE_DIR}/backends/c/runtime)
+target_link_libraries(bbq_c_backend PUBLIC bbq_frontend)
+
 # --- CEK backend library ---
 add_library(bbq_cek_backend STATIC
     backends/cek/Machine.cpp
@@ -38,7 +49,7 @@ target_link_libraries(bbq_cek_backend PUBLIC bbq_frontend)
 
 # --- bbqc code generator ---
 add_executable(bbqc tools/bbqc.cpp)
-target_link_libraries(bbqc PRIVATE bbq_cpp_backend)
+target_link_libraries(bbqc PRIVATE bbq_cpp_backend bbq_c_backend)
 
 # --- tests ---
 find_package(GTest REQUIRED)
@@ -53,8 +64,10 @@ add_executable(bbq_tests
     test/integration_test.cpp
     test/codegen_compile_test.cpp
     test/cek_test.cpp
+    test/c_type_emitter_test.cpp
+    test/c_backend_e2e_test.cpp
 )
-target_link_libraries(bbq_tests PRIVATE bbq_cpp_backend bbq_cek_backend GTest::GTest GTest::Main)
+target_link_libraries(bbq_tests PRIVATE bbq_cpp_backend bbq_c_backend bbq_cek_backend GTest::GTest GTest::Main)
 target_compile_definitions(bbq_tests PRIVATE
     SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
 gtest_discover_tests(bbq_tests)
@@ -115,18 +128,5 @@ add_custom_command(
     VERBATIM
 )
 
-# --- Auto-regenerate burgc Parser.h/.cpp from burg.peg ---
-add_custom_command(
-    OUTPUT ${CMAKE_CURRENT_SOURCE_DIR}/burgc/frontend/Parser.h
-           ${CMAKE_CURRENT_SOURCE_DIR}/burgc/frontend/Parser.cpp
-    COMMAND pegc ${CMAKE_CURRENT_SOURCE_DIR}/burgc/grammar/burg.peg
-                 -frames ${CMAKE_CURRENT_SOURCE_DIR}/burgc/grammar/frames/
-                 -o ${CMAKE_CURRENT_SOURCE_DIR}/burgc/frontend/
-                 -prefix ""
-    DEPENDS pegc
-            ${CMAKE_CURRENT_SOURCE_DIR}/burgc/grammar/burg.peg
-            ${CMAKE_CURRENT_SOURCE_DIR}/burgc/grammar/frames/Parser.frame
-            ${CMAKE_CURRENT_SOURCE_DIR}/burgc/grammar/frames/ParserImpl.frame
-    COMMENT "Generating burgc Parser.h/.cpp from burg.peg"
-    VERBATIM
-)
+
+

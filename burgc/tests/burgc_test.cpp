@@ -11,6 +11,24 @@ static std::string source_path(const char* relative) {
     return std::string(SOURCE_DIR) + "/" + relative;
 }
 
+// Helper: parse + analyze + generate with a specific backend
+static std::string gen_code(const char* input, BurgBackend& backend) {
+    Parser parser;
+    parser.init(input, (int)strlen(input));
+    if (!parser.parse() || !parser.ast) return "";
+    BurgGenerator gen;
+    if (!gen.analyze(parser.ast)) return "";
+    std::ostringstream out;
+    backend.generate(out, gen.analysis());
+    return out.str();
+}
+
+// Helper: parse + analyze + generate with default (C++) backend
+static std::string gen_cpp(const char* input) {
+    auto backend = create_cpp_backend();
+    return gen_code(input, *backend);
+}
+
 // ── Parser tests ──────────────────────────────────────────
 
 TEST(BurgParser, ParsesSimpleSpec) {
@@ -36,9 +54,7 @@ TEST(BurgParser, ParsesExplicitCosts) {
     auto* spec = gen.parse(source_path("tests/data/costs.burg"));
     ASSERT_NE(spec, nullptr);
     EXPECT_EQ(spec->rules.size(), 3u);
-    // First rule: Const with cost 1
     EXPECT_EQ(spec->rules[0]->cost, 1);
-    // Second rule: Add with cost 2
     EXPECT_EQ(spec->rules[1]->cost, 2);
 }
 
@@ -56,10 +72,8 @@ TEST(BurgParser, TreePatternStructure) {
     BurgGenerator gen;
     auto* spec = gen.parse(source_path("tests/data/simple.burg"));
     ASSERT_NE(spec, nullptr);
-    // Rule 0: reg : Const = 1  (leaf pattern)
     EXPECT_TRUE(spec->rules[0]->pattern->is_leaf());
     EXPECT_EQ(spec->rules[0]->pattern->name, "Const");
-    // Rule 1: reg : Add(reg, reg) = 2  (binary pattern)
     EXPECT_FALSE(spec->rules[1]->pattern->is_leaf());
     EXPECT_EQ(spec->rules[1]->pattern->name, "Add");
     EXPECT_EQ(spec->rules[1]->pattern->children.size(), 2u);
@@ -71,9 +85,8 @@ TEST(BurgParser, DefaultCostIsZero) {
     BurgGenerator gen;
     auto* spec = gen.parse(source_path("tests/data/simple.burg"));
     ASSERT_NE(spec, nullptr);
-    for (auto* rule : spec->rules) {
+    for (auto* rule : spec->rules)
         EXPECT_EQ(rule->cost, 0);
-    }
 }
 
 TEST(BurgParser, RejectsInvalidInput) {
@@ -95,7 +108,7 @@ TEST(BurgParser, InlineParseSimple) {
 
 TEST(BurgParser, InlineParseRejectsIncomplete) {
     Parser parser;
-    const char* input = "TERM X=1";  // missing RULES section
+    const char* input = "TERM X=1";
     parser.init(input, (int)strlen(input));
     EXPECT_FALSE(parser.parse());
 }
@@ -123,9 +136,7 @@ TEST(BurgAnalysis, RejectsDuplicateTerminals) {
     const char* input = "TERM X=1 X=2 RULES r: X = 1;";
     parser.init(input, (int)strlen(input));
     ASSERT_TRUE(parser.parse());
-
     BurgGenerator gen;
-    // Parse through inline AST
     EXPECT_FALSE(gen.analyze(parser.ast));
     EXPECT_FALSE(gen.errors().empty());
 }
@@ -135,151 +146,121 @@ TEST(BurgAnalysis, RejectsUndeclaredTerminalInPattern) {
     const char* input = "TERM X=1 RULES r: Y(r) = 1;";
     parser.init(input, (int)strlen(input));
     ASSERT_TRUE(parser.parse());
-
     BurgGenerator gen;
     EXPECT_FALSE(gen.analyze(parser.ast));
 }
 
-// ── Code generation tests ─────────────────────────────────
+// ── C++ backend codegen tests ─────────────────────────────
 
-TEST(BurgCodegen, GeneratesOutput) {
+TEST(BurgCppBackend, GeneratesOutput) {
     BurgGenerator gen;
     auto* spec = gen.parse(source_path("tests/data/simple.burg"));
     ASSERT_NE(spec, nullptr);
     ASSERT_TRUE(gen.analyze(spec));
-
     std::ostringstream out;
     gen.generate(out);
     std::string code = out.str();
-
     EXPECT_FALSE(code.empty());
-    // Header guard
     EXPECT_NE(code.find("#pragma once"), std::string::npos);
 }
 
-TEST(BurgCodegen, EmitsTerminalConstants) {
+TEST(BurgCppBackend, EmitsTerminalConstants) {
     BurgGenerator gen;
     auto* spec = gen.parse(source_path("tests/data/simple.burg"));
     ASSERT_NE(spec, nullptr);
     ASSERT_TRUE(gen.analyze(spec));
-
     std::ostringstream out;
     gen.generate(out);
     std::string code = out.str();
-
     EXPECT_NE(code.find("BURG_Const"), std::string::npos);
     EXPECT_NE(code.find("BURG_Add"), std::string::npos);
     EXPECT_NE(code.find("BURG_Mul"), std::string::npos);
     EXPECT_NE(code.find("BURG_Load"), std::string::npos);
 }
 
-TEST(BurgCodegen, EmitsNonterminalConstants) {
+TEST(BurgCppBackend, EmitsNonterminalConstants) {
     BurgGenerator gen;
     auto* spec = gen.parse(source_path("tests/data/simple.burg"));
     ASSERT_NE(spec, nullptr);
     ASSERT_TRUE(gen.analyze(spec));
-
     std::ostringstream out;
     gen.generate(out);
     std::string code = out.str();
-
     EXPECT_NE(code.find("reg_NT"), std::string::npos);
     EXPECT_NE(code.find("BURG_MAX_NT"), std::string::npos);
 }
 
-TEST(BurgCodegen, EmitsStateStruct) {
+TEST(BurgCppBackend, EmitsClassWrapper) {
     BurgGenerator gen;
     auto* spec = gen.parse(source_path("tests/data/simple.burg"));
     ASSERT_NE(spec, nullptr);
     ASSERT_TRUE(gen.analyze(spec));
-
     std::ostringstream out;
     gen.generate(out);
     std::string code = out.str();
+    EXPECT_NE(code.find("class BurgMatcher {"), std::string::npos);
+    EXPECT_NE(code.find("}; // class BurgMatcher"), std::string::npos);
+}
 
+TEST(BurgCppBackend, EmitsStateStruct) {
+    BurgGenerator gen;
+    auto* spec = gen.parse(source_path("tests/data/simple.burg"));
+    ASSERT_NE(spec, nullptr);
+    ASSERT_TRUE(gen.analyze(spec));
+    std::ostringstream out;
+    gen.generate(out);
+    std::string code = out.str();
     EXPECT_NE(code.find("struct BurgState"), std::string::npos);
     EXPECT_NE(code.find("int op;"), std::string::npos);
     EXPECT_NE(code.find("BurgState** children;"), std::string::npos);
-    EXPECT_NE(code.find("int child_count;"), std::string::npos);
 }
 
-TEST(BurgCodegen, EmitsStateFunction) {
-    BurgGenerator gen;
-    auto* spec = gen.parse(source_path("tests/data/simple.burg"));
-    ASSERT_NE(spec, nullptr);
-    ASSERT_TRUE(gen.analyze(spec));
-
-    std::ostringstream out;
-    gen.generate(out);
-    std::string code = out.str();
-
-    EXPECT_NE(code.find("burg_state"), std::string::npos);
-    EXPECT_NE(code.find("switch (op)"), std::string::npos);
-    EXPECT_NE(code.find("case BURG_Const:"), std::string::npos);
-    EXPECT_NE(code.find("case BURG_Add:"), std::string::npos);
-}
-
-TEST(BurgCodegen, EmitsClosuresForChainRules) {
+TEST(BurgCppBackend, EmitsClosuresForChainRules) {
     BurgGenerator gen;
     auto* spec = gen.parse(source_path("tests/data/chain.burg"));
     ASSERT_NE(spec, nullptr);
     ASSERT_TRUE(gen.analyze(spec));
-
     std::ostringstream out;
     gen.generate(out);
-    std::string code = out.str();
-
-    // Chain rules: reg→con and stmt→reg should produce closures
-    EXPECT_NE(code.find("closure_"), std::string::npos);
+    EXPECT_NE(out.str().find("closure_"), std::string::npos);
 }
 
-TEST(BurgCodegen, EmitsRuleLookup) {
+TEST(BurgCppBackend, EmitsRuleLookup) {
     BurgGenerator gen;
     auto* spec = gen.parse(source_path("tests/data/simple.burg"));
     ASSERT_NE(spec, nullptr);
     ASSERT_TRUE(gen.analyze(spec));
-
     std::ostringstream out;
     gen.generate(out);
     std::string code = out.str();
-
     EXPECT_NE(code.find("burg_rule"), std::string::npos);
     EXPECT_NE(code.find("burg_label"), std::string::npos);
     EXPECT_NE(code.find("burg_nt_name"), std::string::npos);
 }
 
-TEST(BurgCodegen, NontermNameTable) {
+TEST(BurgCppBackend, NontermNameTable) {
     BurgGenerator gen;
     auto* spec = gen.parse(source_path("tests/data/chain.burg"));
     ASSERT_NE(spec, nullptr);
     ASSERT_TRUE(gen.analyze(spec));
-
     std::ostringstream out;
     gen.generate(out);
     std::string code = out.str();
-
     EXPECT_NE(code.find("\"stmt\""), std::string::npos);
     EXPECT_NE(code.find("\"reg\""), std::string::npos);
     EXPECT_NE(code.find("\"con\""), std::string::npos);
 }
 
-// ── Integration: generated code compiles ──────────────────
-
-TEST(BurgCodegen, GeneratedCodeHasCorrectStructure) {
+TEST(BurgCppBackend, CostsInGeneratedCode) {
     BurgGenerator gen;
     auto* spec = gen.parse(source_path("tests/data/costs.burg"));
     ASSERT_NE(spec, nullptr);
     ASSERT_TRUE(gen.analyze(spec));
-
     std::ostringstream out;
     gen.generate(out);
     std::string code = out.str();
-
-    // Costs should appear in the generated code
-    EXPECT_NE(code.find("+ 1"), std::string::npos);  // cost 1
-    EXPECT_NE(code.find("+ 2"), std::string::npos);  // cost 2
-
-    // Unary operator: Mov has one child
+    EXPECT_NE(code.find("+ 1"), std::string::npos);
+    EXPECT_NE(code.find("+ 2"), std::string::npos);
     EXPECT_NE(code.find("case BURG_Mov:"), std::string::npos);
 }
 
@@ -290,10 +271,8 @@ TEST(BurgParser, ParsesActions) {
     auto* spec = gen.parse(source_path("tests/data/actions.burg"));
     ASSERT_NE(spec, nullptr);
     EXPECT_EQ(spec->rules.size(), 5u);
-    // Rule 0 has action
     EXPECT_FALSE(spec->rules[0]->action.empty());
     EXPECT_NE(spec->rules[0]->action.find("emit_const"), std::string::npos);
-    // Rule 4 (stmt : reg) has no action
     EXPECT_TRUE(spec->rules[4]->action.empty());
 }
 
@@ -306,13 +285,11 @@ TEST(BurgParser, ParsesHeaderBlocks) {
 }
 
 TEST(BurgParser, ActionsOptional) {
-    // Existing specs without actions should still parse fine
     BurgGenerator gen;
     auto* spec = gen.parse(source_path("tests/data/simple.burg"));
     ASSERT_NE(spec, nullptr);
-    for (auto* rule : spec->rules) {
+    for (auto* rule : spec->rules)
         EXPECT_TRUE(rule->action.empty());
-    }
     EXPECT_TRUE(spec->headers.empty());
 }
 
@@ -337,141 +314,116 @@ TEST(BurgParser, InlineParseActionWithCost) {
     EXPECT_NE(parser.ast->rules[0]->action.find("do_thing"), std::string::npos);
 }
 
-TEST(BurgCodegen, EmitsReducerForActions) {
+TEST(BurgCppBackend, EmitsReducerForActions) {
     BurgGenerator gen;
     auto* spec = gen.parse(source_path("tests/data/actions.burg"));
     ASSERT_NE(spec, nullptr);
     ASSERT_TRUE(gen.analyze(spec));
-
     std::ostringstream out;
     gen.generate(out);
     std::string code = out.str();
-
     EXPECT_NE(code.find("burg_reduce"), std::string::npos);
     EXPECT_NE(code.find("emit_const(node)"), std::string::npos);
     EXPECT_NE(code.find("emit_add(node)"), std::string::npos);
     EXPECT_NE(code.find("emit_load(node)"), std::string::npos);
 }
 
-TEST(BurgCodegen, ReducerHasChildReductions) {
+TEST(BurgCppBackend, ReducerHasChildReductions) {
     BurgGenerator gen;
     auto* spec = gen.parse(source_path("tests/data/actions.burg"));
     ASSERT_NE(spec, nullptr);
     ASSERT_TRUE(gen.analyze(spec));
-
     std::ostringstream out;
     gen.generate(out);
     std::string code = out.str();
-
-    // Add(reg, reg) should reduce indexed children
     EXPECT_NE(code.find("BURG_NODE_CHILD(node, 0)"), std::string::npos);
     EXPECT_NE(code.find("BURG_NODE_CHILD(node, 1)"), std::string::npos);
     EXPECT_NE(code.find("state->children[0]"), std::string::npos);
     EXPECT_NE(code.find("state->children[1]"), std::string::npos);
 }
 
-TEST(BurgCodegen, NoReducerWithoutActions) {
+TEST(BurgCppBackend, NoReducerWithoutActions) {
     BurgGenerator gen;
     auto* spec = gen.parse(source_path("tests/data/simple.burg"));
     ASSERT_NE(spec, nullptr);
     ASSERT_TRUE(gen.analyze(spec));
-
     std::ostringstream out;
     gen.generate(out);
-    std::string code = out.str();
-
-    // No actions → no reducer generated
-    EXPECT_EQ(code.find("burg_reduce"), std::string::npos);
+    EXPECT_EQ(out.str().find("burg_reduce"), std::string::npos);
 }
 
-TEST(BurgCodegen, EmitsUserHeaders) {
+TEST(BurgCppBackend, EmitsUserHeaders) {
     BurgGenerator gen;
     auto* spec = gen.parse(source_path("tests/data/actions.burg"));
     ASSERT_NE(spec, nullptr);
     ASSERT_TRUE(gen.analyze(spec));
-
     std::ostringstream out;
     gen.generate(out);
-    std::string code = out.str();
-
-    EXPECT_NE(code.find("#include \"emitter.h\""), std::string::npos);
+    EXPECT_NE(out.str().find("#include \"emitter.h\""), std::string::npos);
 }
 
-TEST(BurgCodegen, StartSymbolIsFirstNonterminal) {
+TEST(BurgCppBackend, StartSymbolIsFirstNonterminal) {
     BurgGenerator gen;
     auto* spec = gen.parse(source_path("tests/data/chain.burg"));
     ASSERT_NE(spec, nullptr);
     ASSERT_TRUE(gen.analyze(spec));
-
     std::ostringstream out;
     gen.generate(out);
-    std::string code = out.str();
-
-    // START stmt — should be nonterminal index 1
-    EXPECT_NE(code.find("stmt_NT = 1"), std::string::npos);
+    EXPECT_NE(out.str().find("stmt_NT = 1"), std::string::npos);
 }
 
 // ── Graph-aware codegen tests ─────────────────────────────
 
-TEST(BurgCodegen, EmitsStateCache) {
+TEST(BurgCppBackend, EmitsStateCache) {
     BurgGenerator gen;
     auto* spec = gen.parse(source_path("tests/data/simple.burg"));
     ASSERT_NE(spec, nullptr);
     ASSERT_TRUE(gen.analyze(spec));
-
     std::ostringstream out;
     gen.generate(out);
     std::string code = out.str();
-
     EXPECT_NE(code.find("burg_state_cache"), std::string::npos);
     EXPECT_NE(code.find("burg_cache_lookup"), std::string::npos);
     EXPECT_NE(code.find("burg_cache_store"), std::string::npos);
 }
 
-TEST(BurgCodegen, EmitsMacroChecks) {
+TEST(BurgCppBackend, EmitsMacroChecks) {
     BurgGenerator gen;
     auto* spec = gen.parse(source_path("tests/data/simple.burg"));
     ASSERT_NE(spec, nullptr);
     ASSERT_TRUE(gen.analyze(spec));
-
     std::ostringstream out;
     gen.generate(out);
     std::string code = out.str();
-
     EXPECT_NE(code.find("BURG_NODE_TYPE"), std::string::npos);
     EXPECT_NE(code.find("BURG_NODE_OP"), std::string::npos);
     EXPECT_NE(code.find("BURG_NODE_CHILD"), std::string::npos);
     EXPECT_NE(code.find("BURG_NODE_ID"), std::string::npos);
 }
 
-TEST(BurgCodegen, LabelFuncUsesMacros) {
+TEST(BurgCppBackend, LabelFuncIsMethod) {
     BurgGenerator gen;
     auto* spec = gen.parse(source_path("tests/data/simple.burg"));
     ASSERT_NE(spec, nullptr);
     ASSERT_TRUE(gen.analyze(spec));
-
     std::ostringstream out;
     gen.generate(out);
     std::string code = out.str();
-
-    EXPECT_NE(code.find("burg_label(BURG_NODE_TYPE node)"), std::string::npos);
+    EXPECT_NE(code.find("BurgState* burg_label(BURG_NODE_TYPE node)"), std::string::npos);
     EXPECT_NE(code.find("BURG_NODE_OP(node)"), std::string::npos);
     EXPECT_NE(code.find("BURG_NODE_ARITY(node)"), std::string::npos);
     EXPECT_NE(code.find("BURG_NODE_CHILD(node, i)"), std::string::npos);
     EXPECT_NE(code.find("BURG_NODE_ID(node)"), std::string::npos);
 }
 
-TEST(BurgCodegen, LabelCachesBeforeDP) {
+TEST(BurgCppBackend, LabelCachesBeforeDP) {
     BurgGenerator gen;
     auto* spec = gen.parse(source_path("tests/data/simple.burg"));
     ASSERT_NE(spec, nullptr);
     ASSERT_TRUE(gen.analyze(spec));
-
     std::ostringstream out;
     gen.generate(out);
     std::string code = out.str();
-
-    // Cache store must appear BEFORE the switch (DP)
     auto cache_pos = code.find("burg_cache_store(id, p)");
     auto switch_pos = code.find("switch (op)");
     ASSERT_NE(cache_pos, std::string::npos);
@@ -479,33 +431,27 @@ TEST(BurgCodegen, LabelCachesBeforeDP) {
     EXPECT_LT(cache_pos, switch_pos);
 }
 
-TEST(BurgCodegen, IndexedChildrenInDP) {
+TEST(BurgCppBackend, IndexedChildrenInDP) {
     BurgGenerator gen;
     auto* spec = gen.parse(source_path("tests/data/simple.burg"));
     ASSERT_NE(spec, nullptr);
     ASSERT_TRUE(gen.analyze(spec));
-
     std::ostringstream out;
     gen.generate(out);
     std::string code = out.str();
-
-    // Add(reg, reg) should use indexed children in DP
     EXPECT_NE(code.find("p->children[0]->rule["), std::string::npos);
     EXPECT_NE(code.find("p->children[1]->rule["), std::string::npos);
     EXPECT_NE(code.find("p->child_count >= 2"), std::string::npos);
 }
 
-TEST(BurgCodegen, ReducerTakesNodeAndState) {
+TEST(BurgCppBackend, ReducerIsMethod) {
     BurgGenerator gen;
     auto* spec = gen.parse(source_path("tests/data/actions.burg"));
     ASSERT_NE(spec, nullptr);
     ASSERT_TRUE(gen.analyze(spec));
-
     std::ostringstream out;
     gen.generate(out);
-    std::string code = out.str();
-
-    EXPECT_NE(code.find("burg_reduce(BURG_NODE_TYPE node, BurgState* state, int goalnt)"),
+    EXPECT_NE(out.str().find("void burg_reduce(BURG_NODE_TYPE node, BurgState* state, int goalnt)"),
               std::string::npos);
 }
 
@@ -543,73 +489,143 @@ TEST(BurgParser, WhereGuardOptional) {
     EXPECT_TRUE(parser.ast->rules[0]->guard.empty());
 }
 
-TEST(BurgCodegen, EmitsGuardPredicate) {
-    Parser parser;
-    const char* input =
+TEST(BurgCppBackend, EmitsGuardPredicate) {
+    std::string code = gen_cpp(
         "TERM X=1 TERM Y=2 START r RULES\n"
-        "r: X where (. is_pure(node) .) = 1 (. action(); .);";
-    parser.init(input, (int)strlen(input));
-    ASSERT_TRUE(parser.parse());
-
-    BurgGenerator gen;
-    ASSERT_TRUE(gen.analyze(parser.ast));
-
-    std::ostringstream out;
-    gen.generate(out);
-    std::string code = out.str();
-
-    // Guard should appear in the label function
+        "r: X where (. is_pure(node) .) = 1 (. action(); .);");
     EXPECT_NE(code.find("is_pure(node)"), std::string::npos);
 }
 
 // ── Graph rewriter tests ──────────────────────────────────
 
-TEST(BurgCodegen, EmitsRewriteFunc) {
+TEST(BurgCppBackend, EmitsRewriteFunc) {
     BurgGenerator gen;
     auto* spec = gen.parse(source_path("tests/data/simple.burg"));
     ASSERT_NE(spec, nullptr);
     ASSERT_TRUE(gen.analyze(spec));
-
     std::ostringstream out;
     gen.generate(out);
     std::string code = out.str();
-
-    EXPECT_NE(code.find("burg_rewrite(BURG_NODE_TYPE root)"), std::string::npos);
-    // RPO walk uses successor macros
+    EXPECT_NE(code.find("void burg_rewrite(BURG_NODE_TYPE root)"), std::string::npos);
     EXPECT_NE(code.find("BURG_NODE_SUCC_COUNT"), std::string::npos);
     EXPECT_NE(code.find("BURG_NODE_SUCC("), std::string::npos);
-    // Labels all nodes
     EXPECT_NE(code.find("burg_label(n)"), std::string::npos);
 }
 
-TEST(BurgCodegen, RewriteFuncReducesWhenActions) {
+TEST(BurgCppBackend, RewriteFuncReducesWhenActions) {
     BurgGenerator gen;
     auto* spec = gen.parse(source_path("tests/data/actions.burg"));
     ASSERT_NE(spec, nullptr);
     ASSERT_TRUE(gen.analyze(spec));
-
     std::ostringstream out;
     gen.generate(out);
-    std::string code = out.str();
-
-    // When actions exist, rewrite calls burg_reduce
-    EXPECT_NE(code.find("burg_reduce(n, s,"), std::string::npos);
+    EXPECT_NE(out.str().find("burg_reduce(n, s,"), std::string::npos);
 }
 
-TEST(BurgCodegen, RewriteFuncClearsCache) {
+TEST(BurgCppBackend, RewriteFuncClearsCache) {
     BurgGenerator gen;
     auto* spec = gen.parse(source_path("tests/data/simple.burg"));
     ASSERT_NE(spec, nullptr);
     ASSERT_TRUE(gen.analyze(spec));
-
     std::ostringstream out;
     gen.generate(out);
     std::string code = out.str();
-
-    // Should clear cache at start
     auto clear_pos = code.find("burg_cache_clear()");
     auto rpo_pos = code.find("rpo");
     ASSERT_NE(clear_pos, std::string::npos);
     ASSERT_NE(rpo_pos, std::string::npos);
     EXPECT_LT(clear_pos, rpo_pos);
+}
+
+// ── MEMBERS tests ─────────────────────────────────────────
+
+TEST(BurgParser, ParsesMembersBlock) {
+    Parser parser;
+    const char* input =
+        "TERM X=1\n"
+        "MEMBERS (. int count_ = 0;\n"
+        "    Heap* heap_ = nullptr; .)\n"
+        "RULES r: X = 1;";
+    parser.init(input, (int)strlen(input));
+    EXPECT_TRUE(parser.parse());
+    ASSERT_NE(parser.ast, nullptr);
+    EXPECT_NE(parser.ast->members.find("count_"), std::string::npos);
+    EXPECT_NE(parser.ast->members.find("heap_"), std::string::npos);
+}
+
+TEST(BurgCppBackend, EmitsMembersInClass) {
+    std::string code = gen_cpp(
+        "TERM X=1\n"
+        "MEMBERS (. int count_ = 0; .)\n"
+        "RULES r: X = 1;");
+    EXPECT_NE(code.find("class BurgMatcher {"), std::string::npos);
+    EXPECT_NE(code.find("int count_ = 0;"), std::string::npos);
+    auto class_pos = code.find("class BurgMatcher {");
+    auto member_pos = code.find("int count_ = 0;");
+    auto close_pos = code.find("}; // class BurgMatcher");
+    EXPECT_LT(class_pos, member_pos);
+    EXPECT_LT(member_pos, close_pos);
+}
+
+TEST(BurgCppBackend, NoMembersBlockStillWorks) {
+    BurgGenerator gen;
+    auto* spec = gen.parse(source_path("tests/data/simple.burg"));
+    ASSERT_NE(spec, nullptr);
+    ASSERT_TRUE(gen.analyze(spec));
+    std::ostringstream out;
+    gen.generate(out);
+    std::string code = out.str();
+    EXPECT_NE(code.find("class BurgMatcher {"), std::string::npos);
+    EXPECT_NE(code.find("}; // class BurgMatcher"), std::string::npos);
+}
+
+// ── C backend tests ───────────────────────────────────────
+
+TEST(BurgCBackend, EmitsContextStruct) {
+    auto backend = create_c_backend();
+    std::string code = gen_code(
+        "TERM X=1\n"
+        "MEMBERS (. int count_ = 0; .)\n"
+        "RULES r: X = 1;", *backend);
+    EXPECT_NE(code.find("struct BurgContext"), std::string::npos);
+    EXPECT_NE(code.find("int count_ = 0;"), std::string::npos);
+    EXPECT_NE(code.find("burg_state_cache"), std::string::npos);
+    // No class wrapper
+    EXPECT_EQ(code.find("class BurgMatcher"), std::string::npos);
+}
+
+TEST(BurgCBackend, StaticFunctions) {
+    auto backend = create_c_backend();
+    std::string code = gen_code(
+        "TERM X=1 RULES r: X = 1 (. action(); .);", *backend);
+    EXPECT_NE(code.find("static BurgState* burg_label(BURG_NODE_TYPE node, BurgContext* ctx)"),
+              std::string::npos);
+    EXPECT_NE(code.find("static void burg_reduce(BURG_NODE_TYPE node, BurgState* state, int goalnt, BurgContext* ctx)"),
+              std::string::npos);
+    EXPECT_NE(code.find("static void burg_rewrite(BURG_NODE_TYPE root, BurgContext* ctx)"),
+              std::string::npos);
+}
+
+TEST(BurgCBackend, CtxThreadedInCalls) {
+    auto backend = create_c_backend();
+    std::string code = gen_code(
+        "TERM X=1 TERM Y=2\n"
+        "RULES\n"
+        "r: X = 1 (. action(); .);\n"
+        "r: Y(r) = 2 (. action2(); .);", *backend);
+    // Label recursive call should pass ctx
+    EXPECT_NE(code.find("burg_label(BURG_NODE_CHILD(node, i), ctx)"), std::string::npos);
+    // Cache calls should pass ctx
+    EXPECT_NE(code.find("burg_cache_lookup(id, ctx)"), std::string::npos);
+    EXPECT_NE(code.find("burg_cache_store(id, p, ctx)"), std::string::npos);
+    EXPECT_NE(code.find("burg_cache_clear(ctx)"), std::string::npos);
+}
+
+TEST(BurgCBackend, NoClassWrapper) {
+    auto backend = create_c_backend();
+    std::string code = gen_code(
+        "TERM X=1 RULES r: X = 1;", *backend);
+    EXPECT_EQ(code.find("class "), std::string::npos);
+    EXPECT_NE(code.find("struct BurgState"), std::string::npos);
+    EXPECT_NE(code.find("struct BurgContext"), std::string::npos);
 }

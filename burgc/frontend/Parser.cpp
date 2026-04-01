@@ -23,6 +23,7 @@ void Parser::setup_skip() {
 bool Parser::parse_Burg() {
     std::vector<burg_ast::TermDecl*> terms;
        std::string start_sym;
+       std::string members_block;
        std::vector<std::string> headers;
        std::vector<burg_ast::Rule*> rules;
        burg_ast::Rule* r;
@@ -30,7 +31,7 @@ bool Parser::parse_Burg() {
         auto _m0 = save();
         if (![&]() -> bool {
             skip();
-            if (!parse_Decl(terms, start_sym, headers)) return false;
+            if (!parse_Decl(terms, start_sym, members_block, headers)) return false;
             return true;
         }()) { restore(_m0); break; }
     }
@@ -49,13 +50,14 @@ bool Parser::parse_Burg() {
     ast = new burg_ast::Spec();
        ast->terminals = std::move(terms);
        ast->start = std::move(start_sym);
+       ast->members = std::move(members_block);
        ast->headers = std::move(headers);
        ast->rules = std::move(rules);
        ast->loc = {1, 1};
     return true;
 }
 
-bool Parser::parse_Decl(std::vector<burg_ast::TermDecl*>& terms, std::string& start, std::vector<std::string>& headers) {
+bool Parser::parse_Decl(std::vector<burg_ast::TermDecl*>& terms, std::string& start, std::string& members, std::vector<std::string>& headers) {
     {
         auto _m0 = save();
         if ([&]() -> bool {
@@ -70,11 +72,29 @@ bool Parser::parse_Decl(std::vector<burg_ast::TermDecl*>& terms, std::string& st
             return true;
         }()) {} else {
         restore(_m0);
+        if ([&]() -> bool {
+            skip();
+            if (!parse_MembersDecl(members)) return false;
+            return true;
+        }()) {} else {
+        restore(_m0);
         skip();
         if (!parse_HeaderAction_(headers)) return false;
         }
         }
+        }
     }
+    return true;
+}
+
+bool Parser::parse_MembersDecl(std::string& members) {
+    std::string code;
+    skip();
+    if (!keyword("MEMBERS")) return false;
+    skip();
+    if (!match("(.")) return false;
+    if (!scan_to("." ")", code)) return false;
+    members = code;
     return true;
 }
 

@@ -15,25 +15,34 @@ PRODUCTIONS
 Burg
     (. std::vector<burg_ast::TermDecl*> terms;
        std::string start_sym;
+       std::string members_block;
        std::vector<std::string> headers;
        std::vector<burg_ast::Rule*> rules;
        burg_ast::Rule* r; .)
-    = { Decl<terms, start_sym, headers> }
+    = { Decl<terms, start_sym, members_block, headers> }
       "RULES"
       { RuleDecl<&r>  (. rules.push_back(r); .) }
       (. skip(); if (!at_end()) return false; .)
     (. ast = new burg_ast::Spec();
        ast->terminals = std::move(terms);
        ast->start = std::move(start_sym);
+       ast->members = std::move(members_block);
        ast->headers = std::move(headers);
        ast->rules = std::move(rules);
        ast->loc = {1, 1}; .)
 .
 
-Decl <. std::vector<burg_ast::TermDecl*> &terms, std::string &start, std::vector<std::string> &headers .>
+Decl <. std::vector<burg_ast::TermDecl*> &terms, std::string &start, std::string &members, std::vector<std::string> &headers .>
     = TermDecl_<terms>
     | StartDecl<start>
+    | MembersDecl<members>
     | HeaderAction_<headers>
+.
+
+MembersDecl <. std::string &members .>
+    (. std::string code; .)
+    = "MEMBERS" "(." (. if (!scan_to("." ")", code)) return false; .)
+    (. members = code; .)
 .
 
 HeaderAction_ <. std::vector<std::string> &headers .>

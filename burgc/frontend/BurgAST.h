@@ -43,6 +43,7 @@ struct Rule {
 struct Spec {
     std::vector<TermDecl*> terminals;
     std::string start;                  // %start nonterminal (optional)
+    std::string members;                // MEMBERS block (class member declarations)
     std::vector<std::string> headers;   // (. .) header blocks (user includes/decls)
     std::vector<Rule*> rules;
     SourceLoc loc;

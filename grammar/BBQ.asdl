@@ -117,7 +117,7 @@ module BBQ {
                   | EOI
 
     // Reference paths (field access chains)
-    ref_path      = Simple(identifier name)
+    ref_path      = Simple(identifier name, identifier? resolved_path, identifier? resolved_parent)
                   | FieldAcc(ref_path base, identifier field)
                   | IndexAcc(ref_path base, expr index)
 

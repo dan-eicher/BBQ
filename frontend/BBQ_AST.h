@@ -931,13 +931,17 @@ struct RefPath : public ASTNode {
 
 struct Simple : public RefPath {
     Simple(
-        std::string name
+        std::string name,
+        std::optional<std::string> resolved_path,
+        std::optional<std::string> resolved_parent
     )
-        : name(name) {}
+        : name(name), resolved_path(std::move(resolved_path)), resolved_parent(std::move(resolved_parent)) {}
 
     void accept(ASTVisitor& visitor) override { visitor.visit(this); }
 
     std::string name;
+    std::optional<std::string> resolved_path;
+    std::optional<std::string> resolved_parent;
 };
 
 struct FieldAcc : public RefPath {

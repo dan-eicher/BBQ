@@ -666,7 +666,7 @@ PrimaryExpr <. Expr* *result .>
          (*result)->loc = Loc(); .)
     | CallExpr<result>
     | ident<name>
-      (. auto* s = new Simple(std::move(name));
+      (. auto* s = new Simple(std::move(name), std::nullopt, std::nullopt);
          s->loc = Loc();
          *result = new Ref(s);
          (*result)->loc = Loc(); .)

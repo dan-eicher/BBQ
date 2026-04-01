@@ -1454,7 +1454,7 @@ bool Parser::parse_PrimaryExpr(Expr* * result) {
         if ([&]() -> bool {
             skip();
             if (!ident(name)) return false;
-            auto* s = new Simple(std::move(name));
+            auto* s = new Simple(std::move(name), std::nullopt, std::nullopt);
          s->loc = Loc();
          *result = new Ref(s);
          (*result)->loc = Loc();

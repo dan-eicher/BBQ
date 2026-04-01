@@ -803,7 +803,12 @@ std::string ParserEmitter::compile_ref_path(RefPath* path) {
             if (it->fields.count(simple->name))
                 return it->prefix + simple->name;
         }
-        // 2. Parent context stack (runtime resolution via ctx scope pointers)
+        // 2. Sema-resolved cross-rule reference
+        if (simple->resolved_path.has_value() && simple->resolved_parent.has_value()) {
+            return "static_cast<" + *simple->resolved_parent
+                 + "*>(ctx.scope_ptr(0))->" + *simple->resolved_path;
+        }
+        // 3. Parent context stack (runtime resolution via ctx scope pointers)
         for (int idx = (int)parent_contexts_.size() - 1; idx >= 0; idx--) {
             if (parent_contexts_[idx].fields.count(simple->name)) {
                 int levels_up = (int)parent_contexts_.size() - 1 - idx;

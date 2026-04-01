@@ -9,6 +9,9 @@
 #include "Sema.h"
 #include "TypeEmitter.h"
 #include "ParserEmitter.h"
+#include "CTypeEmitter.h"
+#include "CReaderEmitter.h"
+#include "CWriterEmitter.h"
 
 using namespace BBQ;
 using namespace bbqgen;
@@ -20,6 +23,7 @@ static void usage() {
         "  -frames <dir>     Frame file directory (default: ./frames)\n"
         "  -prefix <name>    Generated file prefix (default: from input)\n"
         "  -namespace <ns>   C++ namespace for generated code\n"
+        "  --lang <c|cpp>    Output language (default: cpp)\n"
         "  -trace <flags>    Debug: A(ST) T(ypes) P(arser) S(ema)\n");
 }
 
@@ -30,6 +34,7 @@ int main(int argc, char* argv[]) {
     std::string prefix;
     std::string ns;
     std::string trace;
+    std::string lang = "cpp";
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) {
@@ -40,6 +45,8 @@ int main(int argc, char* argv[]) {
             prefix = argv[++i];
         } else if (strcmp(argv[i], "-namespace") == 0 && i + 1 < argc) {
             ns = argv[++i];
+        } else if (strcmp(argv[i], "--lang") == 0 && i + 1 < argc) {
+            lang = argv[++i];
         } else if (strcmp(argv[i], "-trace") == 0 && i + 1 < argc) {
             trace = argv[++i];
         } else if (argv[i][0] == '-') {
@@ -65,7 +72,7 @@ int main(int argc, char* argv[]) {
         prefix = (dot != std::string::npos) ? base.substr(0, dot) : base;
     }
 
-    // Default frame dir: next to the executable, or ./frames
+    // Default frame dir
     if (frame_dir.empty()) {
         frame_dir = "./frames";
     }
@@ -89,7 +96,6 @@ int main(int argc, char* argv[]) {
 
     Grammar* grammar = parser.ast;
 
-    // Trace: AST
     if (trace.find('A') != std::string::npos) {
         fprintf(stderr, "[trace] AST: %zu directives, %zu rules\n",
             grammar->directives.size(), grammar->rules.size());
@@ -104,7 +110,6 @@ int main(int argc, char* argv[]) {
         errors.print_all(std::cerr);
         return 1;
     }
-    // Print warnings even on success
     for (auto& e : errors.errors()) {
         if (e.is_warning) {
             std::cerr << "warning";
@@ -120,7 +125,80 @@ int main(int argc, char* argv[]) {
             sema.default_endian() == Endianness::Big ? "big" : "little");
     }
 
-    // --- Type Generation ---
+    // --- C backend ---
+    if (lang == "c") {
+        bbqgen_c::CTypeEmitter ctypes(sema);
+
+        // Types
+        {
+            std::string types_frame = frame_dir + "/Types.frame";
+            std::string types_file = output_dir + "/" + prefix + "Types.h";
+            std::ofstream out(types_file);
+            if (!out) { fprintf(stderr, "bbqc: cannot open %s\n", types_file.c_str()); return 1; }
+            if (!ctypes.emit_to_frame(grammar, types_frame, out)) {
+                fprintf(stderr, "bbqc: failed to process frame %s\n", types_frame.c_str());
+                return 1;
+            }
+            if (trace.find('T') != std::string::npos)
+                fprintf(stderr, "[trace] Wrote %s\n", types_file.c_str());
+        }
+
+        std::string types_include = prefix + "Types.h";
+
+        // Reader
+        bbqgen_c::CReaderEmitter reader(sema, ctypes);
+        {
+            std::string hdr_frame = frame_dir + "/ReaderHeader.frame";
+            std::string hdr_file = output_dir + "/" + prefix + "Reader.h";
+            std::ofstream out(hdr_file);
+            if (!out) { fprintf(stderr, "bbqc: cannot open %s\n", hdr_file.c_str()); return 1; }
+            if (!reader.emit_header_to_frame(grammar, hdr_frame, types_include, out)) {
+                fprintf(stderr, "bbqc: failed to process frame %s\n", hdr_frame.c_str());
+                return 1;
+            }
+        }
+        {
+            std::string impl_frame = frame_dir + "/ReaderImpl.frame";
+            std::string impl_file = output_dir + "/" + prefix + "Reader.c";
+            std::ofstream out(impl_file);
+            if (!out) { fprintf(stderr, "bbqc: cannot open %s\n", impl_file.c_str()); return 1; }
+            std::string reader_include = prefix + "Reader.h";
+            if (!reader.emit_impl_to_frame(grammar, impl_frame, reader_include, out)) {
+                fprintf(stderr, "bbqc: failed to process frame %s\n", impl_frame.c_str());
+                return 1;
+            }
+        }
+
+        // Writer
+        bbqgen_c::CWriterEmitter writer(sema, ctypes);
+        {
+            std::string hdr_frame = frame_dir + "/WriterHeader.frame";
+            std::string hdr_file = output_dir + "/" + prefix + "Writer.h";
+            std::ofstream out(hdr_file);
+            if (!out) { fprintf(stderr, "bbqc: cannot open %s\n", hdr_file.c_str()); return 1; }
+            if (!writer.emit_header_to_frame(grammar, hdr_frame, types_include, out)) {
+                fprintf(stderr, "bbqc: failed to process frame %s\n", hdr_frame.c_str());
+                return 1;
+            }
+        }
+        {
+            std::string impl_frame = frame_dir + "/WriterImpl.frame";
+            std::string impl_file = output_dir + "/" + prefix + "Writer.c";
+            std::ofstream out(impl_file);
+            if (!out) { fprintf(stderr, "bbqc: cannot open %s\n", impl_file.c_str()); return 1; }
+            std::string writer_include = prefix + "Writer.h";
+            if (!writer.emit_impl_to_frame(grammar, impl_frame, writer_include, out)) {
+                fprintf(stderr, "bbqc: failed to process frame %s\n", impl_frame.c_str());
+                return 1;
+            }
+        }
+
+        fprintf(stderr, "bbqc: generated %sTypes.h, %sReader.h/.c, %sWriter.h/.c\n",
+            prefix.c_str(), prefix.c_str(), prefix.c_str());
+        return 0;
+    }
+
+    // --- C++ backend (default) ---
     TypeEmitter types(sema, ns);
     {
         std::string types_frame = frame_dir + "/Types.frame";
@@ -138,7 +216,6 @@ int main(int argc, char* argv[]) {
             fprintf(stderr, "[trace] Wrote %s\n", types_file.c_str());
     }
 
-    // --- Parser Generation ---
     ParserEmitter pemit(sema, types, ns);
 
     std::string types_include = prefix + "Types.h";

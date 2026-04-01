@@ -46,6 +46,7 @@ public:
         return (it != rule_map_.end()) ? it->second : nullptr;
     }
 
+
 private:
     // Phase 1: collect rule names, detect duplicates
     void collect_rules(BBQ::Grammar* grammar);
@@ -109,6 +110,16 @@ private:
 
     // Constraint helpers
     static bool body_has_constraint(BBQ::TypeExpr* body);
+
+    // Phase 8: resolve cross-rule references
+    // Populates Simple::resolved_path for refs that aren't local fields
+    void resolve_cross_refs();
+    void resolve_cross_refs_in_expr(BBQ::Expr* expr, const std::string& rule_name,
+                                     const std::unordered_set<std::string>& local_fields);
+    void resolve_cross_refs_in_type(BBQ::TypeExpr* type, const std::string& rule_name,
+                                     const std::unordered_set<std::string>& local_fields);
+    bool find_field_recursive(BBQ::Struct* st, const std::string& name,
+                               std::string& path);
 
     ErrorReporter& errors_;
     std::unordered_map<std::string, BBQ::Rule*> rule_map_;

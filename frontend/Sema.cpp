@@ -60,6 +60,11 @@ bool Sema::analyze(Grammar* grammar) {
         }
     }
 
+    // Phase 8: resolve cross-rule references
+    if (!errors_.has_errors()) {
+        resolve_cross_refs();
+    }
+
     return !errors_.has_errors();
 }
 
@@ -1139,6 +1144,150 @@ void Sema::check_types_struct(Struct* st, TypeCheckScope inherited,
         if (auto* nested_st = dynamic_cast<Struct*>(field->body)) {
             check_types_struct(nested_st, scope, ctx + "." + field->name);
         }
+    }
+}
+
+// --- Phase 8: resolve cross-rule references ---
+
+// Recursively search a struct for a field name, building the access path.
+// Returns true if found, with path set to e.g., "hdr.payload_size"
+bool Sema::find_field_recursive(Struct* st, const std::string& name,
+                                 std::string& path) {
+    for (auto* f : st->fields) {
+        if (dynamic_cast<EndianSwitch*>(f->body)) continue;
+        if (f->name == name) {
+            path = f->name;
+            return true;
+        }
+        // Search through RuleRef fields that are structs
+        if (auto* rr = dynamic_cast<RuleRef*>(f->body)) {
+            auto* child_rule = lookup_rule(rr->name);
+            if (child_rule) {
+                if (auto* cst = dynamic_cast<Struct*>(child_rule->body)) {
+                    std::string sub_path;
+                    if (find_field_recursive(cst, name, sub_path)) {
+                        path = f->name + "." + sub_path;
+                        return true;
+                    }
+                }
+            }
+        }
+        // Search through inline struct fields
+        if (auto* nested = dynamic_cast<Struct*>(f->body)) {
+            std::string sub_path;
+            if (find_field_recursive(nested, name, sub_path)) {
+                path = f->name + "." + sub_path;
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// Collect all Simple name refs from an expression tree
+void Sema::resolve_cross_refs_in_expr(Expr* expr, const std::string& rule_name,
+                                       const std::unordered_set<std::string>& local_fields) {
+    if (auto* bin = dynamic_cast<BinOp*>(expr)) {
+        resolve_cross_refs_in_expr(bin->left, rule_name, local_fields);
+        resolve_cross_refs_in_expr(bin->right, rule_name, local_fields);
+    } else if (auto* un = dynamic_cast<UnaryOp*>(expr)) {
+        resolve_cross_refs_in_expr(un->operand, rule_name, local_fields);
+    } else if (auto* tern = dynamic_cast<Ternary*>(expr)) {
+        resolve_cross_refs_in_expr(tern->cond, rule_name, local_fields);
+        resolve_cross_refs_in_expr(tern->then_branch, rule_name, local_fields);
+        resolve_cross_refs_in_expr(tern->else_branch, rule_name, local_fields);
+    } else if (auto* call = dynamic_cast<Call*>(expr)) {
+        for (auto* arg : call->args)
+            resolve_cross_refs_in_expr(arg, rule_name, local_fields);
+    } else if (auto* ref = dynamic_cast<Ref*>(expr)) {
+        auto* simple = dynamic_cast<Simple*>(ref->path);
+        if (!simple) return;
+
+        // Skip built-ins
+        if (simple->name == "i" || simple->name == "remaining" ||
+            simple->name == "pos" || simple->name == "at_end")
+            return;
+
+        // Skip if already a local field
+        if (local_fields.count(simple->name)) return;
+
+        // Search all rules that reference this rule to find the field
+        for (auto* parent_rule : sorted_) {
+            auto* pst = dynamic_cast<Struct*>(parent_rule->body);
+            if (!pst) continue;
+
+            // Check if this parent contains our rule as a field
+            bool contains_us = false;
+            for (auto* f : pst->fields) {
+                if (auto* rr = dynamic_cast<RuleRef*>(f->body)) {
+                    if (rr->name == rule_name) { contains_us = true; break; }
+                }
+            }
+            if (!contains_us) continue;
+
+            // Search the parent struct for the referenced field
+            std::string path;
+            if (find_field_recursive(pst, simple->name, path)) {
+                simple->resolved_path = path;
+                simple->resolved_parent = parent_rule->name;
+                return;
+            }
+        }
+    }
+}
+
+// Walk a type body collecting expressions to resolve
+void Sema::resolve_cross_refs_in_type(TypeExpr* type, const std::string& rule_name,
+                                       const std::unordered_set<std::string>& local_fields) {
+    if (auto* st = dynamic_cast<Struct*>(type)) {
+        for (auto* f : st->fields) {
+            resolve_cross_refs_in_type(f->body, rule_name, local_fields);
+            if (f->constraint)
+                resolve_cross_refs_in_expr(*f->constraint, rule_name, local_fields);
+            if (f->interval.has_value()) {
+                if (auto* se = dynamic_cast<StartEnd*>(*f->interval)) {
+                    resolve_cross_refs_in_expr(se->start, rule_name, local_fields);
+                    resolve_cross_refs_in_expr(se->end, rule_name, local_fields);
+                } else if (auto* len = dynamic_cast<Length*>(*f->interval)) {
+                    resolve_cross_refs_in_expr(len->length, rule_name, local_fields);
+                }
+            }
+        }
+    } else if (auto* arr = dynamic_cast<Array*>(type)) {
+        resolve_cross_refs_in_type(arr->element, rule_name, local_fields);
+        if (auto* fc = dynamic_cast<FixedCount*>(arr->spec))
+            resolve_cross_refs_in_expr(fc->count, rule_name, local_fields);
+        if (arr->constraint)
+            resolve_cross_refs_in_expr(*arr->constraint, rule_name, local_fields);
+    } else if (auto* opt = dynamic_cast<Optional*>(type)) {
+        resolve_cross_refs_in_type(opt->element, rule_name, local_fields);
+        if (opt->constraint)
+            resolve_cross_refs_in_expr(*opt->constraint, rule_name, local_fields);
+    } else if (auto* prim = dynamic_cast<Primitive*>(type)) {
+        if (prim->constraint)
+            resolve_cross_refs_in_expr(*prim->constraint, rule_name, local_fields);
+        if (prim->interval.has_value()) {
+            if (auto* len = dynamic_cast<Length*>(*prim->interval))
+                resolve_cross_refs_in_expr(len->length, rule_name, local_fields);
+        }
+    } else if (auto* comp = dynamic_cast<Compute*>(type)) {
+        resolve_cross_refs_in_expr(comp->expression, rule_name, local_fields);
+    } else if (auto* sw = dynamic_cast<Switch*>(type)) {
+        resolve_cross_refs_in_expr(sw->discriminator, rule_name, local_fields);
+    }
+}
+
+void Sema::resolve_cross_refs() {
+    for (auto* rule : sorted_) {
+        // Collect local field names
+        std::unordered_set<std::string> local_fields;
+        if (auto* st = dynamic_cast<Struct*>(rule->body)) {
+            for (auto* f : st->fields)
+                if (!dynamic_cast<EndianSwitch*>(f->body))
+                    local_fields.insert(f->name);
+        }
+
+        resolve_cross_refs_in_type(rule->body, rule->name, local_fields);
     }
 }
 

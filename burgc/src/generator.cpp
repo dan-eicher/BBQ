@@ -32,9 +32,17 @@ void BurgGenerator::collect_nonterms() {
     auto& a = analysis_;
     std::unordered_set<std::string> seen;
     for (auto* rule : a.spec->rules) {
+        // Collect LHS nonterminals
         if (!seen.count(rule->nonterm)) {
             seen.insert(rule->nonterm);
             a.nonterms.push_back(rule->nonterm);
+        }
+        // Collect chain rule source nonterminals (leaf patterns that aren't terminals)
+        if (rule->pattern->is_leaf() && !a.term_names.count(rule->pattern->name)) {
+            if (!seen.count(rule->pattern->name)) {
+                seen.insert(rule->pattern->name);
+                a.nonterms.push_back(rule->pattern->name);
+            }
         }
     }
     if (!a.spec->start.empty()) {

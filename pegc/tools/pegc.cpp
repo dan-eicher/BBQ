@@ -7,9 +7,31 @@
 #include "GrammarAST.h"
 #include "PegAnalysis.h"
 #include "ParserEmitter.h"
+#include "CParserEmitter.h"
 
 using namespace PegGrammar;
 using namespace pegc;
+
+static std::string to_snake_case(const std::string& name) {
+    std::string result;
+    for (size_t i = 0; i < name.size(); i++) {
+        char c = name[i];
+        if (c >= 'A' && c <= 'Z') {
+            if (i > 0) {
+                char prev = name[i-1];
+                if ((prev >= 'a' && prev <= 'z') || (prev >= '0' && prev <= '9'))
+                    result += '_';
+                else if ((prev >= 'A' && prev <= 'Z') && i + 1 < name.size() &&
+                         (name[i+1] >= 'a' && name[i+1] <= 'z'))
+                    result += '_';
+            }
+            result += (char)(c - 'A' + 'a');
+        } else {
+            result += c;
+        }
+    }
+    return result;
+}
 
 static void usage() {
     fprintf(stderr,
@@ -18,6 +40,7 @@ static void usage() {
         "  -frames <dir>     Frame file directory\n"
         "  -prefix <name>    Generated file prefix (default: from grammar name)\n"
         "  -namespace <ns>   C++ namespace for generated code\n"
+        "  -lang c|c++       Target language (default: c++)\n"
         "  -trace <flags>    Debug: A(ST) P(arser) N(analysis)\n");
 }
 
@@ -28,6 +51,7 @@ int main(int argc, char* argv[]) {
     std::string prefix;
     bool prefix_set = false;
     std::string ns;
+    std::string lang = "c++";
     std::string trace;
 
     for (int i = 1; i < argc; i++) {
@@ -40,6 +64,8 @@ int main(int argc, char* argv[]) {
             prefix_set = true;
         } else if (strcmp(argv[i], "-namespace") == 0 && i + 1 < argc) {
             ns = argv[++i];
+        } else if (strcmp(argv[i], "-lang") == 0 && i + 1 < argc) {
+            lang = argv[++i];
         } else if (strcmp(argv[i], "-trace") == 0 && i + 1 < argc) {
             trace = argv[++i];
         } else if (argv[i][0] == '-') {
@@ -130,20 +156,41 @@ int main(int argc, char* argv[]) {
     }
 
     // --- Code Generation ---
-    ParserEmitter emitter(result, ns);
+    bool c_mode = (lang == "c");
 
-    std::string parser_include = prefix + "Parser.h";
+    // In C mode, snake_case the prefix for filenames and function names
+    std::string c_prefix;
+    if (c_mode) {
+        c_prefix = to_snake_case(prefix);
+        if (!c_prefix.empty() && c_prefix.back() != '_')
+            c_prefix += '_';
+    }
+
+    std::string impl_ext = c_mode ? ".c" : ".cpp";
+    std::string hdr_frame_name = c_mode ? "CParser.frame" : "Parser.frame";
+    std::string impl_frame_name = c_mode ? "CParserImpl.frame" : "ParserImpl.frame";
+
+    std::string file_prefix = c_mode ? c_prefix + "parser" : prefix + "Parser";
+    std::string parser_include = file_prefix + ".h";
 
     // Emit header
     {
-        std::string hdr_frame = frame_dir + "/Parser.frame";
-        std::string hdr_file = output_dir + "/" + prefix + "Parser.h";
+        std::string hdr_frame = frame_dir + "/" + hdr_frame_name;
+        std::string hdr_file = output_dir + "/" + file_prefix + ".h";
         std::ofstream out(hdr_file);
         if (!out) {
             fprintf(stderr, "pegc: cannot open %s for writing\n", hdr_file.c_str());
             return 1;
         }
-        if (!emitter.emit_header_to_frame(grammar, hdr_frame, out)) {
+        bool ok;
+        if (c_mode) {
+            CParserEmitter emitter(result, c_prefix);
+            ok = emitter.emit_header_to_frame(grammar, hdr_frame, out);
+        } else {
+            ParserEmitter emitter(result, ns);
+            ok = emitter.emit_header_to_frame(grammar, hdr_frame, out);
+        }
+        if (!ok) {
             fprintf(stderr, "pegc: failed to process frame file %s\n", hdr_frame.c_str());
             return 1;
         }
@@ -153,14 +200,22 @@ int main(int argc, char* argv[]) {
 
     // Emit implementation
     {
-        std::string impl_frame = frame_dir + "/ParserImpl.frame";
-        std::string impl_file = output_dir + "/" + prefix + "Parser.cpp";
+        std::string impl_frame = frame_dir + "/" + impl_frame_name;
+        std::string impl_file = output_dir + "/" + file_prefix + impl_ext;
         std::ofstream out(impl_file);
         if (!out) {
             fprintf(stderr, "pegc: cannot open %s for writing\n", impl_file.c_str());
             return 1;
         }
-        if (!emitter.emit_impl_to_frame(grammar, impl_frame, parser_include, out)) {
+        bool ok;
+        if (c_mode) {
+            CParserEmitter emitter(result, c_prefix);
+            ok = emitter.emit_impl_to_frame(grammar, impl_frame, parser_include, out);
+        } else {
+            ParserEmitter emitter(result, ns);
+            ok = emitter.emit_impl_to_frame(grammar, impl_frame, parser_include, out);
+        }
+        if (!ok) {
             fprintf(stderr, "pegc: failed to process frame file %s\n", impl_frame.c_str());
             return 1;
         }
@@ -168,8 +223,8 @@ int main(int argc, char* argv[]) {
             fprintf(stderr, "[trace] Wrote %s\n", impl_file.c_str());
     }
 
-    fprintf(stderr, "pegc: generated %sParser.h, %sParser.cpp\n",
-        prefix.c_str(), prefix.c_str());
+    fprintf(stderr, "pegc: generated %s.h, %s%s\n",
+        file_prefix.c_str(), file_prefix.c_str(), impl_ext.c_str());
 
     return 0;
 }

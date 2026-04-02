@@ -17,6 +17,7 @@ target_include_directories(pegc_frontend PUBLIC
 # Reuses FrameProcessor from BBQ frontend
 add_library(pegc_backend STATIC
     backend/ParserEmitter.cpp
+    backend/CParserEmitter.cpp
     ../frontend/FrameProcessor.cpp
 )
 target_include_directories(pegc_backend PUBLIC

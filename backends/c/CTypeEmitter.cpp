@@ -34,16 +34,22 @@ std::string to_snake_case(const std::string& name) {
     return result;
 }
 
+std::string CTypeEmitter::prefixed_name(const std::string& name) {
+    std::string snake = to_snake_case(name);
+    if (prefix_.empty()) return snake;
+    return prefix_ + "_" + snake;
+}
+
 std::string CTypeEmitter::type_name(const std::string& rule_name) {
-    return to_snake_case(rule_name) + "_t";
+    return prefixed_name(rule_name) + "_t";
 }
 
 std::string CTypeEmitter::read_func(const std::string& rule_name) {
-    return to_snake_case(rule_name) + "_read";
+    return prefixed_name(rule_name) + "_read";
 }
 
 std::string CTypeEmitter::write_func(const std::string& rule_name) {
-    return to_snake_case(rule_name) + "_write";
+    return prefixed_name(rule_name) + "_write";
 }
 
 // ── Public ─────────────────────────────────────────────────
@@ -108,7 +114,7 @@ void CTypeEmitter::emit_forward_decls(std::ostream& out) {
 
     // Forward-declare inline structs
     for (auto& [name, st] : inline_struct_order_)
-        out << "typedef struct " << to_snake_case(name) << " " << to_snake_case(name) << "_t;\n";
+        out << "typedef struct " << prefixed_name(name) << " " << prefixed_name(name) << "_t;\n";
 
     // Forward-declare rule types
     for (auto* rule : sema_.sorted_rules()) {
@@ -118,7 +124,7 @@ void CTypeEmitter::emit_forward_decls(std::ostream& out) {
             dynamic_cast<Switch*>(body) ||
             dynamic_cast<Alternatives*>(body) ||
             dynamic_cast<Bitfield*>(body)) {
-            out << "typedef struct " << to_snake_case(rule->name)
+            out << "typedef struct " << prefixed_name(rule->name)
                 << " " << type_name(rule->name) << ";\n";
         }
     }
@@ -175,7 +181,7 @@ void CTypeEmitter::emit_rule_type(Rule* rule, std::ostream& out) {
         out << "typedef " << ext->cpp_type << " " << tname << ";\n";
 
     } else if (auto* bf = dynamic_cast<Bitfield*>(body)) {
-        out << "struct " << to_snake_case(rule->name) << " {\n";
+        out << "struct " << prefixed_name(rule->name) << " {\n";
         for (auto* entry : bf->entries)
             out << "    " << bitfield_entry_type(entry->width) << " " << entry->name << ";\n";
         out << "};\n";
@@ -185,7 +191,7 @@ void CTypeEmitter::emit_rule_type(Rule* rule, std::ostream& out) {
 // ── Struct ─────────────────────────────────────────────────
 
 void CTypeEmitter::emit_struct_type(const std::string& name, Struct* st, std::ostream& out) {
-    out << "struct " << to_snake_case(name) << " {\n";
+    out << "struct " << prefixed_name(name) << " {\n";
     for (auto* field : st->fields) {
         if (dynamic_cast<EndianSwitch*>(field->body)) continue;
 
@@ -202,7 +208,7 @@ void CTypeEmitter::emit_tagged_union(const std::string& name,
                                       const std::vector<std::string>& variant_types,
                                       const std::vector<std::string>& variant_names,
                                       std::ostream& out) {
-    std::string sname = to_snake_case(name);
+    std::string sname = prefixed_name(name);
 
     // Tag enum
     out << "enum " << sname << "_tag {\n";
@@ -303,7 +309,7 @@ std::string CTypeEmitter::c_type(TypeExpr* type) {
     } else if (auto* st = dynamic_cast<Struct*>(type)) {
         auto it = inline_struct_names_.find(st);
         if (it != inline_struct_names_.end())
-            return to_snake_case(it->second) + "_t";
+            return prefixed_name(it->second) + "_t";
         return "/* anonymous struct */";
     } else if (auto* sw = dynamic_cast<Switch*>(type)) {
         // Inline switch → inline tagged union
@@ -390,7 +396,7 @@ void CTypeEmitter::emit_field_free(TypeExpr* type, const std::string& target,
     } else if (auto* rr = dynamic_cast<RuleRef*>(type)) {
         auto* rule = sema_.lookup_rule(rr->name);
         if (rule && type_needs_free(rule->body)) {
-            out << ind << to_snake_case(rr->name) << "_free(&" << target << ");\n";
+            out << ind << prefixed_name(rr->name) << "_free(&" << target << ");\n";
         }
     } else if (auto* st = dynamic_cast<Struct*>(type)) {
         emit_struct_free_body(st, target + ".", out, indent);
@@ -419,7 +425,7 @@ void CTypeEmitter::emit_free_func(Rule* rule, std::ostream& out) {
     if (!type_needs_free(rule->body)) return;
 
     std::string tname = type_name(rule->name);
-    std::string fname = to_snake_case(rule->name) + "_free";
+    std::string fname = prefixed_name(rule->name) + "_free";
 
     out << "static inline void " << fname << "(" << tname << "* p) {\n";
     out << "    (void)p;\n";

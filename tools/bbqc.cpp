@@ -23,7 +23,7 @@ static void usage() {
         "  -frames <dir>     Frame file directory (default: ./frames)\n"
         "  -prefix <name>    Generated file prefix (default: from input)\n"
         "  -namespace <ns>   C++ namespace for generated code\n"
-        "  --lang <c|cpp>    Output language (default: cpp)\n"
+        "  -lang <c|cpp>     Output language (default: cpp)\n"
         "  -trace <flags>    Debug: A(ST) T(ypes) P(arser) S(ema)\n");
 }
 
@@ -45,7 +45,7 @@ int main(int argc, char* argv[]) {
             prefix = argv[++i];
         } else if (strcmp(argv[i], "-namespace") == 0 && i + 1 < argc) {
             ns = argv[++i];
-        } else if (strcmp(argv[i], "--lang") == 0 && i + 1 < argc) {
+        } else if (strcmp(argv[i], "-lang") == 0 && i + 1 < argc) {
             lang = argv[++i];
         } else if (strcmp(argv[i], "-trace") == 0 && i + 1 < argc) {
             trace = argv[++i];
@@ -127,7 +127,7 @@ int main(int argc, char* argv[]) {
 
     // --- C backend ---
     if (lang == "c") {
-        bbqgen_c::CTypeEmitter ctypes(sema);
+        bbqgen_c::CTypeEmitter ctypes(sema, prefix);
 
         std::string types_name = bbqgen_c::to_snake_case(prefix + "Types");
         std::string reader_name = bbqgen_c::to_snake_case(prefix + "Reader");

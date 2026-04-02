@@ -15,7 +15,8 @@ std::string to_snake_case(const std::string& name);
 
 class CTypeEmitter {
 public:
-    CTypeEmitter(Sema& sema) : sema_(sema) {}
+    CTypeEmitter(Sema& sema, const std::string& prefix = "")
+        : sema_(sema), prefix_(prefix.empty() ? "" : to_snake_case(prefix)) {}
 
     // Emit all type definitions to a string
     std::string emit(BBQ::Grammar* grammar);
@@ -66,7 +67,11 @@ private:
                          std::ostream& out, int indent);
     bool type_needs_free(BBQ::TypeExpr* type);
 
+    // Prepend stored prefix to a snake_cased name
+    std::string prefixed_name(const std::string& name);
+
     Sema& sema_;
+    std::string prefix_;
     std::unordered_map<BBQ::Struct*, std::string> inline_struct_names_;
     std::vector<std::pair<std::string, BBQ::Struct*>> inline_struct_order_;
 };

@@ -157,6 +157,81 @@ TEST(CTypeEmitter, NamingConventions) {
     EXPECT_NE(out.find("foo_bar_t"), std::string::npos);
 }
 
+// ── Prefix support ──
+
+static std::string emit_c_types_prefixed(const char* src, const std::string& prefix) {
+    auto* g = parse(src);
+    if (!g) return "";
+    ErrorReporter errors;
+    Sema sema(errors);
+    if (!sema.analyze(g)) return "";
+    CTypeEmitter emitter(sema, prefix);
+    return emitter.emit(g);
+}
+
+static std::string emit_c_reader_prefixed(const char* src, const std::string& prefix) {
+    Grammar* g;
+    auto* sema = make_sema(src, &g);
+    if (!sema) return "";
+    CTypeEmitter types(*sema, prefix);
+    types.emit(g);
+    CReaderEmitter reader(*sema, types);
+    return reader.emit_impls(g);
+}
+
+static std::string emit_c_writer_prefixed(const char* src, const std::string& prefix) {
+    Grammar* g;
+    auto* sema = make_sema(src, &g);
+    if (!sema) return "";
+    CTypeEmitter types(*sema, prefix);
+    types.emit(g);
+    CWriterEmitter writer(*sema, types);
+    return writer.emit_impls(g);
+}
+
+TEST(CTypeEmitter, PrefixAppliedToTypeNames) {
+    auto out = emit_c_types_prefixed("Foo = struct { x: uint8 }", "DNS");
+    EXPECT_NE(out.find("dns_foo_t"), std::string::npos);
+    EXPECT_NE(out.find("struct dns_foo"), std::string::npos);
+    // No unprefixed type
+    EXPECT_EQ(out.find("typedef struct foo "), std::string::npos);
+}
+
+TEST(CTypeEmitter, PrefixAppliedToUnionTags) {
+    auto out = emit_c_types_prefixed(
+        "A = struct { x: uint8 }\n"
+        "B = struct { y: uint16le }\n"
+        "Msg = union { a: A, b: B }", "Net");
+    EXPECT_NE(out.find("enum net_msg_tag"), std::string::npos);
+    EXPECT_NE(out.find("struct net_msg"), std::string::npos);
+}
+
+TEST(CTypeEmitter, PrefixAppliedToFreeFunc) {
+    auto out = emit_c_types_prefixed(
+        "Item = struct { val: uint8 }\n"
+        "List = struct { items: array<Item>[3] }", "Pkt");
+    EXPECT_NE(out.find("pkt_list_free"), std::string::npos);
+    EXPECT_EQ(out.find("\nstatic inline void list_free"), std::string::npos);
+}
+
+TEST(CReaderEmitter, PrefixAppliedToReadFunc) {
+    auto out = emit_c_reader_prefixed("Foo = struct { x: uint8 }", "DNS");
+    EXPECT_NE(out.find("dns_foo_read"), std::string::npos);
+    EXPECT_EQ(out.find("\nbool foo_read"), std::string::npos);
+}
+
+TEST(CWriterEmitter, PrefixAppliedToWriteFunc) {
+    auto out = emit_c_writer_prefixed("Foo = struct { x: uint8 }", "DNS");
+    EXPECT_NE(out.find("dns_foo_write"), std::string::npos);
+    EXPECT_EQ(out.find("\nbool foo_write"), std::string::npos);
+}
+
+TEST(CTypeEmitter, EmptyPrefixUnchanged) {
+    auto out = emit_c_types_prefixed("Foo = struct { x: uint8 }", "");
+    EXPECT_NE(out.find("foo_t"), std::string::npos);
+    EXPECT_EQ(out.find("_foo_t"), std::string::npos);
+}
+
 // ── Reader tests ──────────────────────────────────────────
 
 TEST(CReaderEmitter, StructReader) {

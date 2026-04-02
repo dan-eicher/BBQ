@@ -129,10 +129,14 @@ int main(int argc, char* argv[]) {
     if (lang == "c") {
         bbqgen_c::CTypeEmitter ctypes(sema);
 
+        std::string types_name = bbqgen_c::to_snake_case(prefix + "Types");
+        std::string reader_name = bbqgen_c::to_snake_case(prefix + "Reader");
+        std::string writer_name = bbqgen_c::to_snake_case(prefix + "Writer");
+
         // Types
         {
             std::string types_frame = frame_dir + "/Types.frame";
-            std::string types_file = output_dir + "/" + prefix + "Types.h";
+            std::string types_file = output_dir + "/" + types_name + ".h";
             std::ofstream out(types_file);
             if (!out) { fprintf(stderr, "bbqc: cannot open %s\n", types_file.c_str()); return 1; }
             if (!ctypes.emit_to_frame(grammar, types_frame, out)) {
@@ -143,13 +147,13 @@ int main(int argc, char* argv[]) {
                 fprintf(stderr, "[trace] Wrote %s\n", types_file.c_str());
         }
 
-        std::string types_include = prefix + "Types.h";
+        std::string types_include = types_name + ".h";
 
         // Reader
         bbqgen_c::CReaderEmitter reader(sema, ctypes);
         {
             std::string hdr_frame = frame_dir + "/ReaderHeader.frame";
-            std::string hdr_file = output_dir + "/" + prefix + "Reader.h";
+            std::string hdr_file = output_dir + "/" + reader_name + ".h";
             std::ofstream out(hdr_file);
             if (!out) { fprintf(stderr, "bbqc: cannot open %s\n", hdr_file.c_str()); return 1; }
             if (!reader.emit_header_to_frame(grammar, hdr_frame, types_include, out)) {
@@ -159,10 +163,10 @@ int main(int argc, char* argv[]) {
         }
         {
             std::string impl_frame = frame_dir + "/ReaderImpl.frame";
-            std::string impl_file = output_dir + "/" + prefix + "Reader.c";
+            std::string impl_file = output_dir + "/" + reader_name + ".c";
             std::ofstream out(impl_file);
             if (!out) { fprintf(stderr, "bbqc: cannot open %s\n", impl_file.c_str()); return 1; }
-            std::string reader_include = prefix + "Reader.h";
+            std::string reader_include = reader_name + ".h";
             if (!reader.emit_impl_to_frame(grammar, impl_frame, reader_include, out)) {
                 fprintf(stderr, "bbqc: failed to process frame %s\n", impl_frame.c_str());
                 return 1;
@@ -173,7 +177,7 @@ int main(int argc, char* argv[]) {
         bbqgen_c::CWriterEmitter writer(sema, ctypes);
         {
             std::string hdr_frame = frame_dir + "/WriterHeader.frame";
-            std::string hdr_file = output_dir + "/" + prefix + "Writer.h";
+            std::string hdr_file = output_dir + "/" + writer_name + ".h";
             std::ofstream out(hdr_file);
             if (!out) { fprintf(stderr, "bbqc: cannot open %s\n", hdr_file.c_str()); return 1; }
             if (!writer.emit_header_to_frame(grammar, hdr_frame, types_include, out)) {
@@ -183,18 +187,18 @@ int main(int argc, char* argv[]) {
         }
         {
             std::string impl_frame = frame_dir + "/WriterImpl.frame";
-            std::string impl_file = output_dir + "/" + prefix + "Writer.c";
+            std::string impl_file = output_dir + "/" + writer_name + ".c";
             std::ofstream out(impl_file);
             if (!out) { fprintf(stderr, "bbqc: cannot open %s\n", impl_file.c_str()); return 1; }
-            std::string writer_include = prefix + "Writer.h";
+            std::string writer_include = writer_name + ".h";
             if (!writer.emit_impl_to_frame(grammar, impl_frame, writer_include, out)) {
                 fprintf(stderr, "bbqc: failed to process frame %s\n", impl_frame.c_str());
                 return 1;
             }
         }
 
-        fprintf(stderr, "bbqc: generated %sTypes.h, %sReader.h/.c, %sWriter.h/.c\n",
-            prefix.c_str(), prefix.c_str(), prefix.c_str());
+        fprintf(stderr, "bbqc: generated %s.h, %s.h/.c, %s.h/.c\n",
+            types_name.c_str(), reader_name.c_str(), writer_name.c_str());
         return 0;
     }
 

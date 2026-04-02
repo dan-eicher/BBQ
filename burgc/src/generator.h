@@ -66,8 +66,8 @@ protected:
     virtual std::string ctx_arg() const { return ""; }    // appended: ", ctx"
     virtual std::string ctx_solo() const { return ""; }   // standalone: "ctx"
 
-    // Shared preamble (identical across C-like backends)
-    void emit_constants(std::ostream& out);
+    // Preamble — virtual for C vs C++ includes/constants
+    virtual void emit_constants(std::ostream& out);
     void emit_user_headers(std::ostream& out);
     void emit_macros_check(std::ostream& out);
     void emit_state_struct(std::ostream& out, int indent);
@@ -78,15 +78,15 @@ protected:
     void emit_dp_body(std::ostream& out, int indent);
     void emit_label_alloc(std::ostream& out, int indent);
     void emit_label_tree_body(std::ostream& out, int indent);
-    void emit_label_body(std::ostream& out, int indent);
+    virtual void emit_label_body(std::ostream& out, int indent);
     void emit_rule_func_body(std::ostream& out, int indent);
     void emit_nt_name_body(std::ostream& out, int indent);
     void emit_reduce_body(std::ostream& out, int indent);
-    void emit_rewrite_body(std::ostream& out, int indent);
+    virtual void emit_rewrite_body(std::ostream& out, int indent);
 
     // Sub-helpers
     void emit_label_dp_switch(std::ostream& out, int indent);
-    void emit_rpo_dfs(std::ostream& out, int indent);
+    virtual void emit_rpo_dfs(std::ostream& out, int indent);
     void emit_child_reductions(std::ostream& out,
                                burg_ast::TreePattern* pat, int indent);
 

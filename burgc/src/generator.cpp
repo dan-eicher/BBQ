@@ -59,10 +59,23 @@ void BurgGenerator::collect_nonterms() {
 
 void BurgGenerator::classify_rules() {
     auto& a = analysis_;
+    std::unordered_map<int64_t, burg_ast::Rule*> seen_numbers;
     for (auto* rule : a.spec->rules) {
         a.rules_by_nt[rule->nonterm].push_back(rule);
         if (rule->rule_number > a.max_rule)
             a.max_rule = rule->rule_number;
+
+        auto it = seen_numbers.find(rule->rule_number);
+        if (it != seen_numbers.end()) {
+            errors_.push_back("duplicate rule number " +
+                std::to_string(rule->rule_number) + ": " +
+                rule->nonterm + ": " + rule->pattern->name +
+                " conflicts with " +
+                it->second->nonterm + ": " + it->second->pattern->name);
+        } else {
+            seen_numbers[rule->rule_number] = rule;
+        }
+
         if (rule->pattern->is_leaf() && !a.term_names.count(rule->pattern->name)) {
             a.chain_rules.push_back({
                 rule->rule_number, rule->cost,
@@ -259,13 +272,13 @@ void BurgBackend::emit_macros_check(std::ostream& out) {
 }
 
 void BurgBackend::emit_state_struct(std::ostream& out, int indent) {
-    pad(out, indent); out << "struct BurgState {\n";
+    pad(out, indent); out << "typedef struct BurgState {\n";
     pad(out, indent); out << "    int op;\n";
-    pad(out, indent); out << "    BurgState** children;\n";
+    pad(out, indent); out << "    struct BurgState** children;\n";
     pad(out, indent); out << "    int child_count;\n";
     pad(out, indent); out << "    short cost[" << (a_->nonterms.size() + 1) << "];\n";
     pad(out, indent); out << "    short rule[" << (a_->nonterms.size() + 1) << "];\n";
-    pad(out, indent); out << "};\n\n";
+    pad(out, indent); out << "} BurgState;\n\n";
 }
 
 // ── Closures ──────────────────────────────────────────────
@@ -366,6 +379,14 @@ void BurgBackend::emit_label_dp_switch(std::ostream& out, int indent) {
 
 // DP switch body — shared between tree and graph label functions
 void BurgBackend::emit_dp_body(std::ostream& out, int indent) {
+    // Suppress unused-parameter warnings — node is only used by guard
+    // predicates, ctx only by context-threaded backends.
+    if (!a_->has_guards) {
+        pad(out, indent); out << "(void)node;\n";
+    }
+    if (!ctx_solo().empty()) {
+        pad(out, indent); out << "(void)ctx;\n";
+    }
     pad(out, indent); out << "int op = p->op;\n";
     emit_label_dp_switch(out, indent);
 }
@@ -373,12 +394,12 @@ void BurgBackend::emit_dp_body(std::ostream& out, int indent) {
 // Arena alloc + BurgState init — shared between tree and graph label
 void BurgBackend::emit_label_alloc(std::ostream& out, int indent) {
     pad(out, indent); out << "int arity = BURG_NODE_ARITY(node);\n";
-    pad(out, indent); out << "auto* p = (BurgState*)arena_alloc(sizeof(BurgState)" << ctx_arg() << ");\n";
+    pad(out, indent); out << "BurgState* p = (BurgState*)arena_alloc(sizeof(BurgState)" << ctx_arg() << ");\n";
     pad(out, indent); out << "p->op = BURG_NODE_OP(node);\n";
     pad(out, indent); out << "p->child_count = arity;\n";
     pad(out, indent); out << "p->children = arity > 0\n";
     pad(out, indent); out << "    ? (BurgState**)arena_alloc(arity * sizeof(BurgState*)" << ctx_arg() << ")\n";
-    pad(out, indent); out << "    : nullptr;\n";
+    pad(out, indent); out << "    : NULL;\n";
     pad(out, indent); out << "for (int i = 0; i <= BURG_MAX_NT; i++) {\n";
     pad(out, indent + 1); out << "p->cost[i] = BURG_MAX_COST;\n";
     pad(out, indent + 1); out << "p->rule[i] = 0;\n";

@@ -207,14 +207,18 @@ void CTypeEmitter::emit_struct_type(const std::string& name, Struct* st, std::os
 void CTypeEmitter::emit_tagged_union(const std::string& name,
                                       const std::vector<std::string>& variant_types,
                                       const std::vector<std::string>& variant_names,
-                                      std::ostream& out) {
+                                      std::ostream& out,
+                                      const std::vector<std::string>& enum_values) {
     std::string sname = prefixed_name(name);
 
     // Tag enum
     out << "enum " << sname << "_tag {\n";
     for (size_t i = 0; i < variant_names.size(); i++) {
         out << "    " << sname << "_" << variant_names[i];
-        if (i == 0) out << " = 0";
+        if (!enum_values.empty())
+            out << " = " << enum_values[i];
+        else if (i == 0)
+            out << " = 0";
         out << ",\n";
     }
     out << "};\n\n";
@@ -240,18 +244,36 @@ void CTypeEmitter::emit_union_type(const std::string& name, Union* u, std::ostre
 }
 
 void CTypeEmitter::emit_switch_type(const std::string& name, Switch* sw, std::ostream& out) {
-    std::vector<std::string> types, names;
-    for (auto* c : sw->cases) {
+    std::vector<std::string> types, names, values;
+    bool has_int_cases = false;
+    for (size_t i = 0; i < sw->cases.size(); i++) {
+        auto* c = sw->cases[i];
         types.push_back(c_type(c->target));
-        // Use case value as name if available
-        std::string case_name = "case_" + std::to_string(types.size() - 1);
-        names.push_back(case_name);
+        names.push_back("case_" + std::to_string(i));
+        if (auto* iv = dynamic_cast<IntValue*>(c->value)) {
+            values.push_back(std::to_string(iv->value));
+            has_int_cases = true;
+        } else if (auto* idv = dynamic_cast<IdentValue*>(c->value)) {
+            values.push_back(idv->name);
+            has_int_cases = true;
+        } else if (auto* rv = dynamic_cast<RefValue*>(c->value)) {
+            std::string path;
+            for (size_t j = 0; j < rv->path.size(); j++) {
+                if (j > 0) path += "_";
+                path += rv->path[j];
+            }
+            values.push_back(path);
+            has_int_cases = true;
+        } else {
+            values.push_back(std::to_string(i));
+        }
     }
     if (sw->default_) {
         types.push_back(c_type((*sw->default_)->target));
         names.push_back("default_val");
+        values.push_back("-1");
     }
-    emit_tagged_union(name, types, names, out);
+    emit_tagged_union(name, types, names, out, has_int_cases ? values : std::vector<std::string>{});
 }
 
 void CTypeEmitter::emit_alternatives_type(const std::string& name, Alternatives* alts, std::ostream& out) {

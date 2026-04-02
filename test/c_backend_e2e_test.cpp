@@ -504,7 +504,7 @@ int main(int argc, char** argv) {
     msg_t msg;
     assert(msg_read(&ctx, &msg));
     assert(msg.tag == 2);
-    assert(msg.body.tag == 1);  // second case (index 1)
+    assert(msg.body.tag == 2);  // actual discriminator value
     assert(msg.body.u.case_1.b == 0x1234);
 
     uint8_t out[256];

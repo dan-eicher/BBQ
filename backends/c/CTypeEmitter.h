@@ -49,10 +49,12 @@ private:
     void emit_alternatives_type(const std::string& name, BBQ::Alternatives* alts, std::ostream& out);
 
     // Tagged union helper: emit tag enum + union struct
+    // If enum_values is non-empty, each enum constant gets an explicit = value.
     void emit_tagged_union(const std::string& name,
                            const std::vector<std::string>& variant_types,
                            const std::vector<std::string>& variant_names,
-                           std::ostream& out);
+                           std::ostream& out,
+                           const std::vector<std::string>& enum_values = {});
 
     // Inline struct support
     void register_inline_structs(const std::string& prefix, BBQ::Struct* st);

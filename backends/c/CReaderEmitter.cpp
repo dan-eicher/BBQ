@@ -393,24 +393,28 @@ void CReaderEmitter::emit_switch_body(const std::string& rule_name, Switch* sw,
         return;
     }
 
-    // Integer switch
+    // Integer switch — tag stores the actual discriminator value, not ordinal
     out << ind(indent) << "switch ((int64_t)(" << disc_expr << ")) {\n";
     size_t variant_idx = 0;
     for (auto* c : sw->cases) {
-        if (auto* iv = dynamic_cast<IntValue*>(c->value))
+        std::string case_value_expr;
+        if (auto* iv = dynamic_cast<IntValue*>(c->value)) {
             out << ind(indent) << "case " << iv->value << ": {\n";
-        else if (auto* idv = dynamic_cast<IdentValue*>(c->value))
+            case_value_expr = std::to_string(iv->value);
+        } else if (auto* idv = dynamic_cast<IdentValue*>(c->value)) {
             out << ind(indent) << "case " << idv->name << ": {\n";
-        else if (auto* rv = dynamic_cast<RefValue*>(c->value)) {
+            case_value_expr = idv->name;
+        } else if (auto* rv = dynamic_cast<RefValue*>(c->value)) {
             std::string path;
             for (size_t j = 0; j < rv->path.size(); j++) {
                 if (j > 0) path += "_";
                 path += rv->path[j];
             }
             out << ind(indent) << "case " << path << ": {\n";
+            case_value_expr = path;
         }
         std::string case_name = "case_" + std::to_string(variant_idx);
-        out << ind(indent + 1) << target << "->tag = " << variant_idx << ";\n";
+        out << ind(indent + 1) << target << "->tag = " << case_value_expr << ";\n";
         emit_read_call(target + "->u." + case_name, c->target, rule_name, out, indent + 1);
         out << ind(indent + 1) << "return true;\n";
         out << ind(indent) << "}\n";
@@ -418,7 +422,7 @@ void CReaderEmitter::emit_switch_body(const std::string& rule_name, Switch* sw,
     }
     if (sw->default_) {
         out << ind(indent) << "default: {\n";
-        out << ind(indent + 1) << target << "->tag = " << variant_idx << ";\n";
+        out << ind(indent + 1) << target << "->tag = -1;\n";
         emit_read_call(target + "->u.default_val", (*sw->default_)->target, rule_name, out, indent + 1);
         out << ind(indent + 1) << "return true;\n";
         out << ind(indent) << "}\n";

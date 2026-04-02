@@ -272,13 +272,14 @@ void BurgBackend::emit_macros_check(std::ostream& out) {
 }
 
 void BurgBackend::emit_state_struct(std::ostream& out, int indent) {
-    pad(out, indent); out << "typedef struct BurgState {\n";
+    auto st = state_type();
+    pad(out, indent); out << "typedef struct " << st << " {\n";
     pad(out, indent); out << "    int op;\n";
-    pad(out, indent); out << "    struct BurgState** children;\n";
+    pad(out, indent); out << "    struct " << st << "** children;\n";
     pad(out, indent); out << "    int child_count;\n";
     pad(out, indent); out << "    short cost[" << (a_->nonterms.size() + 1) << "];\n";
     pad(out, indent); out << "    short rule[" << (a_->nonterms.size() + 1) << "];\n";
-    pad(out, indent); out << "} BurgState;\n\n";
+    pad(out, indent); out << "} " << st << ";\n\n";
 }
 
 // ── Closures ──────────────────────────────────────────────
@@ -292,14 +293,14 @@ void BurgBackend::emit_closures(std::ostream& out, int indent,
     if (fwd_decls) {
         for (auto& [nt, _] : chains_to) {
             pad(out, indent);
-            out << prefix << "void closure_" << nt << "(BurgState* p, int c);\n";
+            out << prefix << "void closure_" << nt << "(" << state_type() << "* p, int c);\n";
         }
         if (!chains_to.empty()) out << "\n";
     }
 
     for (auto& [nt, chains] : chains_to) {
         pad(out, indent);
-        out << prefix << "void closure_" << nt << "(BurgState* p, int c) {\n";
+        out << prefix << "void closure_" << nt << "(" << state_type() << "* p, int c) {\n";
         for (auto* cr : chains) {
             int64_t nt_idx = a_->nonterm_index.at(cr->to_nt);
             pad(out, indent + 1);
@@ -394,11 +395,11 @@ void BurgBackend::emit_dp_body(std::ostream& out, int indent) {
 // Arena alloc + BurgState init — shared between tree and graph label
 void BurgBackend::emit_label_alloc(std::ostream& out, int indent) {
     pad(out, indent); out << "int arity = BURG_NODE_ARITY(node);\n";
-    pad(out, indent); out << "BurgState* p = (BurgState*)arena_alloc(sizeof(BurgState)" << ctx_arg() << ");\n";
+    pad(out, indent); out << state_type() << "* p = (" << state_type() << "*)arena_alloc(sizeof(" << state_type() << ")" << ctx_arg() << ");\n";
     pad(out, indent); out << "p->op = BURG_NODE_OP(node);\n";
     pad(out, indent); out << "p->child_count = arity;\n";
     pad(out, indent); out << "p->children = arity > 0\n";
-    pad(out, indent); out << "    ? (BurgState**)arena_alloc(arity * sizeof(BurgState*)" << ctx_arg() << ")\n";
+    pad(out, indent); out << "    ? (" << state_type() << "**)arena_alloc(arity * sizeof(" << state_type() << "*)" << ctx_arg() << ")\n";
     pad(out, indent); out << "    : NULL;\n";
     pad(out, indent); out << "for (int i = 0; i <= BURG_MAX_NT; i++) {\n";
     pad(out, indent + 1); out << "p->cost[i] = BURG_MAX_COST;\n";
@@ -419,7 +420,7 @@ void BurgBackend::emit_label_tree_body(std::ostream& out, int indent) {
 // Graph label body — cache + arena alloc, calls burg_dp
 void BurgBackend::emit_label_body(std::ostream& out, int indent) {
     pad(out, indent); out << "void* id = BURG_NODE_ID(node);\n";
-    pad(out, indent); out << "BurgState* cached = burg_cache_lookup(id" << ctx_arg() << ");\n";
+    pad(out, indent); out << state_type() << "* cached = burg_cache_lookup(id" << ctx_arg() << ");\n";
     pad(out, indent); out << "if (cached) return cached;\n\n";
 
     emit_label_alloc(out, indent);
@@ -545,7 +546,7 @@ void BurgBackend::emit_rewrite_body(std::ostream& out, int indent) {
 
     // Fast path: tree (no successor edges → skip RPO + cache)
     pad(out, indent); out << "if (BURG_NODE_SUCC_COUNT(root) == 0) {\n";
-    pad(out, indent + 1); out << "BurgState* state = burg_label_tree(root" << ctx_arg() << ");\n";
+    pad(out, indent + 1); out << state_type() << "* state = burg_label_tree(root" << ctx_arg() << ");\n";
     if (a_->has_actions) {
         pad(out, indent + 1); out << "if (state->rule[" << start_idx << "])\n";
         pad(out, indent + 2); out << "burg_reduce(root, state, " << start_idx << ctx_arg() << ");\n";
@@ -566,7 +567,7 @@ void BurgBackend::emit_rewrite_body(std::ostream& out, int indent) {
     if (a_->has_actions) {
         pad(out, indent); out << "// Reduce every node with the start nonterminal\n";
         pad(out, indent); out << "for (auto* n : rpo) {\n";
-        pad(out, indent + 1); out << "BurgState* s = burg_cache_lookup(BURG_NODE_ID(n)" << ctx_arg() << ");\n";
+        pad(out, indent + 1); out << state_type() << "* s = burg_cache_lookup(BURG_NODE_ID(n)" << ctx_arg() << ");\n";
         pad(out, indent + 1); out << "if (s && s->rule[" << start_idx << "])\n";
         pad(out, indent + 2); out << "burg_reduce(n, s, " << start_idx << ctx_arg() << ");\n";
         pad(out, indent); out << "}\n";

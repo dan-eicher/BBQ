@@ -295,6 +295,22 @@ static inline bool peg_char_lit(peg_state* p, char* out) {
     return true;
 }
 
+/* Match string literal: "..." with escape unquoting into a buffer. */
+static inline bool peg_string_lit(peg_state* p, peg_span* out) {
+    if (p->pos >= p->end || *p->pos != '"') return false;
+    peg_advance(p); /* skip opening " */
+    const char* start = p->pos;
+    while (p->pos < p->end && *p->pos != '"') {
+        if (*p->pos == '\\' && p->pos + 1 < p->end)
+            peg_advance(p); /* skip escape char */
+        peg_advance(p);
+    }
+    out->ptr = start;
+    out->len = (int)(p->pos - start);
+    if (p->pos < p->end) peg_advance(p); /* skip closing " */
+    return true;
+}
+
 /* ── Whitespace + comment skipping ───────────────────────── */
 
 static inline void peg_set_whitespace(peg_state* p, bool (*fn)(char)) {

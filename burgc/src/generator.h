@@ -65,6 +65,7 @@ protected:
     // Backend customization — override to thread context parameter
     virtual std::string ctx_arg() const { return ""; }    // appended: ", ctx"
     virtual std::string ctx_solo() const { return ""; }   // standalone: "ctx"
+    virtual std::string state_type() const { return "BurgState"; }  // struct name
 
     // Preamble — virtual for C vs C++ includes/constants
     virtual void emit_constants(std::ostream& out);

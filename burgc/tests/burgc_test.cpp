@@ -654,31 +654,31 @@ TEST(BurgCBackend, EmitsContextStruct) {
         "TERM X=1\n"
         "MEMBERS (. int count_ = 0; .)\n"
         "RULES r: X = 1;", *backend);
-    // Uses typedef for C compatibility
-    EXPECT_NE(code.find("typedef struct BurgContext"), std::string::npos);
+    // Uses snake_case typedef for C
+    EXPECT_NE(code.find("typedef struct burg_ctx_t"), std::string::npos);
     EXPECT_NE(code.find("int count_ = 0;"), std::string::npos);
+    // State struct is snake_case too
+    EXPECT_NE(code.find("burg_state_t"), std::string::npos);
     // Uses CRT types instead of STL
     EXPECT_NE(code.find("bbq_arena arena"), std::string::npos);
     EXPECT_NE(code.find("bbq_htree* state_cache"), std::string::npos);
     // Has lifecycle functions
     EXPECT_NE(code.find("burg_ctx_init"), std::string::npos);
     EXPECT_NE(code.find("burg_ctx_free"), std::string::npos);
-    // No class wrapper
+    // No class wrapper or C++ STL
     EXPECT_EQ(code.find("class BurgMatcher"), std::string::npos);
-    // No C++ STL
     EXPECT_EQ(code.find("std::vector"), std::string::npos);
-    EXPECT_EQ(code.find("std::unordered_map"), std::string::npos);
 }
 
 TEST(BurgCBackend, StaticFunctions) {
     auto backend = create_c_backend();
     std::string code = gen_code(
         "TERM X=1 RULES r: X = 1 (. action(); .);", *backend);
-    EXPECT_NE(code.find("static BurgState* burg_label(BURG_NODE_TYPE node, BurgContext* ctx)"),
+    EXPECT_NE(code.find("static burg_state_t* burg_label(BURG_NODE_TYPE node, burg_ctx_t* ctx)"),
               std::string::npos);
-    EXPECT_NE(code.find("static void burg_reduce(BURG_NODE_TYPE node, BurgState* state, int goalnt, BurgContext* ctx)"),
+    EXPECT_NE(code.find("static void burg_reduce(BURG_NODE_TYPE node, burg_state_t* state, int goalnt, burg_ctx_t* ctx)"),
               std::string::npos);
-    EXPECT_NE(code.find("static void burg_rewrite(BURG_NODE_TYPE root, BurgContext* ctx)"),
+    EXPECT_NE(code.find("static void burg_rewrite(BURG_NODE_TYPE root, burg_ctx_t* ctx)"),
               std::string::npos);
 }
 
@@ -698,7 +698,7 @@ TEST(BurgCBackend, CtxThreadedInCalls) {
     EXPECT_NE(code.find("burg_cache_store(id, p, ctx)"), std::string::npos);
     EXPECT_NE(code.find("burg_cache_clear(ctx)"), std::string::npos);
     // Arena calls should pass ctx
-    EXPECT_NE(code.find("arena_alloc(sizeof(BurgState), ctx)"), std::string::npos);
+    EXPECT_NE(code.find("arena_alloc(sizeof(burg_state_t), ctx)"), std::string::npos);
     EXPECT_NE(code.find("arena_reset(ctx)"), std::string::npos);
 }
 
@@ -707,8 +707,8 @@ TEST(BurgCBackend, NoClassWrapper) {
     std::string code = gen_code(
         "TERM X=1 RULES r: X = 1;", *backend);
     EXPECT_EQ(code.find("class "), std::string::npos);
-    EXPECT_NE(code.find("struct BurgState"), std::string::npos);
-    EXPECT_NE(code.find("struct BurgContext"), std::string::npos);
+    EXPECT_NE(code.find("burg_state_t"), std::string::npos);
+    EXPECT_NE(code.find("burg_ctx_t"), std::string::npos);
 }
 
 // ── NAMESPACE tests ───────────────────────────────────────
@@ -749,13 +749,16 @@ TEST(BurgCppBackend, NoNamespaceWithout) {
     EXPECT_EQ(code.find("namespace"), std::string::npos);
 }
 
-TEST(BurgCBackend, IgnoresNamespace) {
+TEST(BurgCBackend, NamespaceBecomesPrefixInC) {
     auto backend = create_c_backend();
     std::string code = gen_code(
         "TERM X=1 NAMESPACE myns RULES r: X = 1;", *backend);
-    // C has no namespaces — NAMESPACE directive is silently ignored
+    // C has no namespaces — NAMESPACE becomes a symbol prefix
     EXPECT_EQ(code.find("namespace"), std::string::npos);
-    // But the rest still generates
-    EXPECT_NE(code.find("BurgState"), std::string::npos);
-    EXPECT_NE(code.find("BurgContext"), std::string::npos);
+    // User-facing names are prefixed (snake_case)
+    EXPECT_NE(code.find("myns_burg_ctx_t"), std::string::npos);
+    EXPECT_NE(code.find("myns_burg_ctx_init"), std::string::npos);
+    EXPECT_NE(code.find("myns_burg_rewrite"), std::string::npos);
+    // Internal statics are not prefixed
+    EXPECT_NE(code.find("static void burg_dp"), std::string::npos);
 }

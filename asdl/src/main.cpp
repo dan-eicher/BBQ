@@ -6,20 +6,21 @@
 #include "exceptions.h"
 
 static void print_usage(const char* program_name) {
-    std::cerr << "Usage: " << program_name << " -i <input_file> -t <template_file> [-o <output_file>]" << std::endl;
+    std::cerr << "Usage: " << program_name << " -i <input_file> -t <template_file> [-o <output_file>] [-lang c|c++]" << std::endl;
     std::cerr << "  -i <input_file>   : ASDL input file" << std::endl;
     std::cerr << "  -t <template_file>: Template file for code generation" << std::endl;
     std::cerr << "  -o <output_file>  : Output file (optional, defaults to stdout)" << std::endl;
+    std::cerr << "  -lang c|c++       : Target language (default: c++)" << std::endl;
     std::cerr << "  -h                : Show this help message" << std::endl;
 }
 
 int main(int argc, char** argv) {
     try {
-        std::string infile, templatefile, outfile;
+        std::string infile, templatefile, outfile, lang;
         int opt;
         bool show_help = false;
 
-        while ((opt = getopt(argc, argv, "i:o:t:h")) != -1) {
+        while ((opt = getopt(argc, argv, "i:o:t:l:h")) != -1) {
             switch (opt) {
                 case 'i':
                     infile = optarg;
@@ -29,6 +30,9 @@ int main(int argc, char** argv) {
                     break;
                 case 't':
                     templatefile = optarg;
+                    break;
+                case 'l':
+                    lang = optarg;
                     break;
                 case 'h':
                     show_help = true;
@@ -66,6 +70,7 @@ int main(int argc, char** argv) {
         validate_output_path(outfile);
 
         Generator gen;
+        if (lang == "c") gen.types().set_lang_c();
 
         std::cout << "Parsing input file: " << infile << std::endl;
         auto* module_ast = gen.parse(infile);

@@ -10,6 +10,11 @@ TypeRegistry::TypeRegistry() {
     types_["float"] = "float";
 }
 
+void TypeRegistry::set_lang_c() {
+    types_["identifier"] = "const char*";
+    types_["string"]     = "const char*";
+}
+
 void TypeRegistry::register_type(const std::string& asdl_type, const std::string& target_type) {
     types_[asdl_type] = target_type;
 }

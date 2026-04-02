@@ -9,6 +9,7 @@ class TypeRegistry {
 public:
     TypeRegistry();
 
+    void set_lang_c();   // Remap base types for C output
     void register_type(const std::string& asdl_type, const std::string& target_type);
     void register_alias(const std::string& asdl_type, const std::string& target_type);
     std::string get_type(const std::string& asdl_type) const;

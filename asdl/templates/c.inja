@@ -1,0 +1,192 @@
+/* ============================================================
+ * Auto-generated from ASDL — do not edit by hand.
+ * ============================================================ */
+#ifndef {{upper(name)}}_AST_H
+#define {{upper(name)}}_AST_H
+
+#include <stdint.h>
+#include <stddef.h>
+#include <stdbool.h>
+
+#include "bbq_arena.h"
+
+/* ── Tag enums for sum types ────────────────────────────── */
+
+{% for def in definitions %}
+{% if def.type == "sum" %}
+{% if existsIn(def, "is_enum") and def.is_enum %}
+typedef enum {
+{% for type in def.types %}
+    {{upper(name)}}_{{upper(type.name)}}{% if not loop.is_last %},{% endif %}
+
+{% endfor %}
+} {{camelcase(def.name)}};
+
+{% else if length(def.types) > 1 %}
+typedef enum {
+{% for type in def.types %}
+    {{upper(name)}}_{{upper(type.name)}}{% if not loop.is_last %},{% endif %}
+
+{% endfor %}
+} {{camelcase(def.name)}}_tag;
+
+{% endif %}
+{% endif %}
+{% endfor %}
+/* ── Forward declarations ───────────────────────────────── */
+
+{% for def in definitions %}
+{% if def.type == "sum" and not (existsIn(def, "is_enum") and def.is_enum) %}
+{% if length(def.types) == 1 %}
+typedef struct {{def.types.0.name}} {{def.types.0.name}};
+{% else %}
+typedef struct {{camelcase(def.name)}} {{camelcase(def.name)}};
+{% endif %}
+{% endif %}
+{% if def.type == "product" %}
+typedef struct {{def.name}} {{def.name}};
+{% endif %}
+{% endfor %}
+
+/* ── Source location ────────────────────────────────────── */
+
+typedef struct {
+    const char* file;
+    int line;
+    int col;
+} {{name}}_srcloc;
+
+/* ── Single-constructor sum types (plain structs) ───────── */
+
+{% for def in definitions %}
+{% if def.type == "sum" and not (existsIn(def, "is_enum") and def.is_enum) and length(def.types) == 1 %}
+{% set type = def.types.0 %}
+struct {{type.name}} {
+    {{name}}_srcloc loc;
+{% for field in type.fields %}
+{% if field.flag == "sequence" %}
+    {{get_type(field.type)}}* {{safe_name(field.name)}};
+    int {{safe_name(field.name)}}_count;
+{% else %}
+    {{get_type(field.type)}} {{safe_name(field.name)}};
+{% endif %}
+{% endfor %}
+};
+
+{% endif %}
+{% endfor %}
+/* ── Multi-constructor sum types (tagged unions) ────────── */
+
+{% for def in definitions %}
+{% if def.type == "sum" and not (existsIn(def, "is_enum") and def.is_enum) and length(def.types) > 1 %}
+struct {{camelcase(def.name)}} {
+    {{camelcase(def.name)}}_tag tag;
+    {{name}}_srcloc loc;
+    union {
+{% for type in def.types %}
+{% if length(type.fields) > 0 %}
+        struct {
+{% for field in type.fields %}
+{% if field.flag == "sequence" %}
+            {{get_type(field.type)}}* {{safe_name(field.name)}};
+            int {{safe_name(field.name)}}_count;
+{% else %}
+            {{get_type(field.type)}} {{safe_name(field.name)}};
+{% endif %}
+{% endfor %}
+        } {{safe_name(snakecase(type.name))}};
+{% endif %}
+{% endfor %}
+    };
+};
+
+{% endif %}
+{% endfor %}
+/* ── Product types ──────────────────────────────────────── */
+
+{% for def in definitions %}
+{% if def.type == "product" %}
+struct {{def.name}} {
+    {{name}}_srcloc loc;
+{% for field in def.fields %}
+{% if field.flag == "sequence" %}
+    {{get_type(field.type)}}* {{safe_name(field.name)}};
+    int {{safe_name(field.name)}}_count;
+{% else %}
+    {{get_type(field.type)}} {{safe_name(field.name)}};
+{% endif %}
+{% endfor %}
+};
+
+{% endif %}
+{% endfor %}
+/* ── Constructor functions ──────────────────────────────── */
+
+{% for def in definitions %}
+{% if def.type == "sum" and not (existsIn(def, "is_enum") and def.is_enum) %}
+{% if length(def.types) == 1 %}
+{% set type = def.types.0 %}
+{% if length(type.fields) > 0 %}
+static inline {{type.name}}* {{snakecase(name)}}_{{snakecase(type.name)}}(bbq_arena* _a{% for field in type.fields %}{% if field.flag == "sequence" %}, {{get_type(field.type)}}* {{safe_name(field.name)}}, int {{safe_name(field.name)}}_count{% else %}, {{get_type(field.type)}} {{safe_name(field.name)}}{% endif %}{% endfor %}) {
+    {{type.name}}* _n = ({{type.name}}*)bbq_arena_alloc(_a, sizeof({{type.name}}));
+{% for field in type.fields %}
+{% if field.flag == "sequence" %}
+    _n->{{safe_name(field.name)}} = {{safe_name(field.name)}};
+    _n->{{safe_name(field.name)}}_count = {{safe_name(field.name)}}_count;
+{% else %}
+    _n->{{safe_name(field.name)}} = {{safe_name(field.name)}};
+{% endif %}
+{% endfor %}
+    return _n;
+}
+
+{% endif %}
+{% else %}
+{% for type in def.types %}
+{% if length(type.fields) > 0 %}
+static inline {{camelcase(def.name)}}* {{snakecase(name)}}_{{snakecase(type.name)}}(bbq_arena* _a{% for field in type.fields %}{% if field.flag == "sequence" %}, {{get_type(field.type)}}* {{safe_name(field.name)}}, int {{safe_name(field.name)}}_count{% else %}, {{get_type(field.type)}} {{safe_name(field.name)}}{% endif %}{% endfor %}) {
+    {{camelcase(def.name)}}* _n = ({{camelcase(def.name)}}*)bbq_arena_alloc(_a, sizeof({{camelcase(def.name)}}));
+    _n->tag = {{upper(name)}}_{{upper(type.name)}};
+{% for field in type.fields %}
+{% if field.flag == "sequence" %}
+    _n->{{safe_name(snakecase(type.name))}}.{{safe_name(field.name)}} = {{safe_name(field.name)}};
+    _n->{{safe_name(snakecase(type.name))}}.{{safe_name(field.name)}}_count = {{safe_name(field.name)}}_count;
+{% else %}
+    _n->{{safe_name(snakecase(type.name))}}.{{safe_name(field.name)}} = {{safe_name(field.name)}};
+{% endif %}
+{% endfor %}
+    return _n;
+}
+
+{% else %}
+static inline {{camelcase(def.name)}}* {{snakecase(name)}}_{{snakecase(type.name)}}(bbq_arena* _a) {
+    {{camelcase(def.name)}}* _n = ({{camelcase(def.name)}}*)bbq_arena_alloc(_a, sizeof({{camelcase(def.name)}}));
+    _n->tag = {{upper(name)}}_{{upper(type.name)}};
+    return _n;
+}
+
+{% endif %}
+{% endfor %}
+{% endif %}
+{% endif %}
+{% endfor %}
+{% for def in definitions %}
+{% if def.type == "product" %}
+{% if length(def.fields) > 0 %}
+static inline {{def.name}}* {{snakecase(name)}}_{{snakecase(def.name)}}(bbq_arena* _a{% for field in def.fields %}{% if field.flag == "sequence" %}, {{get_type(field.type)}}* {{safe_name(field.name)}}, int {{safe_name(field.name)}}_count{% else %}, {{get_type(field.type)}} {{safe_name(field.name)}}{% endif %}{% endfor %}) {
+    {{def.name}}* _n = ({{def.name}}*)bbq_arena_alloc(_a, sizeof({{def.name}}));
+{% for field in def.fields %}
+{% if field.flag == "sequence" %}
+    _n->{{safe_name(field.name)}} = {{safe_name(field.name)}};
+    _n->{{safe_name(field.name)}}_count = {{safe_name(field.name)}}_count;
+{% else %}
+    _n->{{safe_name(field.name)}} = {{safe_name(field.name)}};
+{% endif %}
+{% endfor %}
+    return _n;
+}
+
+{% endif %}
+{% endif %}
+{% endfor %}
+#endif /* {{upper(name)}}_AST_H */

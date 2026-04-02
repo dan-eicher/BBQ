@@ -58,6 +58,14 @@ class BurgBackend {
 public:
     virtual ~BurgBackend() = default;
     virtual void generate(std::ostream& out, const BurgAnalysis& a) = 0;
+    // Two-file generation (C backend overrides this)
+    // hdr_name is the header filename for #include and guard derivation
+    virtual void generate(std::ostream& hdr, std::ostream& impl,
+                          const BurgAnalysis& a, const std::string& hdr_name) {
+        generate(hdr, a);
+        (void)impl; (void)hdr_name;
+    }
+    virtual bool needs_impl_file() const { return false; }
 
 protected:
     const BurgAnalysis* a_ = nullptr;

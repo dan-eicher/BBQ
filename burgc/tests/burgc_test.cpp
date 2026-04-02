@@ -12,12 +12,18 @@ static std::string source_path(const char* relative) {
 }
 
 // Helper: parse + analyze + generate with a specific backend
+// Returns header + impl concatenated (for searching both)
 static std::string gen_code(const char* input, BurgBackend& backend) {
     Parser parser;
     parser.init(input, (int)strlen(input));
     if (!parser.parse() || !parser.ast) return "";
     BurgGenerator gen;
     if (!gen.analyze(parser.ast)) return "";
+    if (backend.needs_impl_file()) {
+        std::ostringstream hdr, impl;
+        backend.generate(hdr, impl, gen.analysis(), "test.h");
+        return hdr.str() + "\n" + impl.str();
+    }
     std::ostringstream out;
     backend.generate(out, gen.analysis());
     return out.str();
@@ -674,11 +680,13 @@ TEST(BurgCBackend, StaticFunctions) {
     auto backend = create_c_backend();
     std::string code = gen_code(
         "TERM X=1 RULES r: X = 1 (. action(); .);", *backend);
+    // Public functions in impl (not static)
+    EXPECT_NE(code.find("void burg_rewrite(BURG_NODE_TYPE root, burg_ctx_t* ctx)"),
+              std::string::npos);
+    EXPECT_NE(code.find("void burg_reduce(BURG_NODE_TYPE node, burg_state_t* state, int goalnt, burg_ctx_t* ctx)"),
+              std::string::npos);
+    // Internal functions are static
     EXPECT_NE(code.find("static burg_state_t* burg_label(BURG_NODE_TYPE node, burg_ctx_t* ctx)"),
-              std::string::npos);
-    EXPECT_NE(code.find("static void burg_reduce(BURG_NODE_TYPE node, burg_state_t* state, int goalnt, burg_ctx_t* ctx)"),
-              std::string::npos);
-    EXPECT_NE(code.find("static void burg_rewrite(BURG_NODE_TYPE root, burg_ctx_t* ctx)"),
               std::string::npos);
 }
 

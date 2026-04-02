@@ -60,7 +60,33 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    if (output_file.empty()) {
+    if (backend->needs_impl_file()) {
+        if (output_file.empty()) {
+            fprintf(stderr, "error: -o required for C output\n");
+            return 1;
+        }
+        // Derive .c filename from .h
+        std::string hdr_file = output_file;
+        std::string impl_file = hdr_file;
+        if (impl_file.size() > 2 && impl_file.substr(impl_file.size() - 2) == ".h")
+            impl_file = impl_file.substr(0, impl_file.size() - 2) + ".c";
+        else
+            impl_file += ".c";
+
+        // Extract header basename for #include
+        std::string hdr_basename = hdr_file;
+        size_t slash = hdr_basename.find_last_of("/\\");
+        if (slash != std::string::npos) hdr_basename = hdr_basename.substr(slash + 1);
+
+        std::ofstream hdr(hdr_file);
+        std::ofstream imp(impl_file);
+        if (!hdr || !imp) {
+            fprintf(stderr, "error: cannot open output files\n");
+            return 1;
+        }
+        backend->generate(hdr, imp, gen.analysis(), hdr_basename);
+        fprintf(stderr, "burgc: generated %s, %s\n", hdr_file.c_str(), impl_file.c_str());
+    } else if (output_file.empty()) {
         backend->generate(std::cout, gen.analysis());
     } else {
         std::ofstream ofs(output_file);

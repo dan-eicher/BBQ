@@ -1,4 +1,5 @@
 #include "generator.h"
+#include <sstream>
 
 namespace {
 
@@ -12,127 +13,158 @@ class CBurgBackend : public BurgBackend {
     void emit_rpo_dfs(std::ostream& out, int indent) override;
     void emit_rewrite_body(std::ostream& out, int indent) override;
 
-public:
-    void generate(std::ostream& out, const BurgAnalysis& a) override {
+    std::string ns_prefix_;
+    std::string ctx_type_;
+    std::string guard_;
+    std::string impl_include_;
+
+    void setup(const BurgAnalysis& a) {
         a_ = &a;
+        ns_prefix_ = a.spec->ns.empty() ? "" : a.spec->ns + "_";
+        ctx_type_ = ns_prefix_ + "burg_ctx_t";
+    }
 
-        // In C, NAMESPACE becomes a symbol prefix (e.g., "myns_")
-        std::string ns_prefix;
-        if (!a.spec->ns.empty()) {
-            ns_prefix = a.spec->ns + "_";
+    static std::string make_guard(const std::string& hdr_name) {
+        std::string g;
+        for (char c : hdr_name) {
+            if (c == '.' || c == '-' || c == '/') g += '_';
+            else g += (char)toupper(c);
         }
+        return g;
+    }
 
-        emit_constants(out);
-        emit_user_headers(out);
-        emit_macros_check(out);
+public:
+    bool needs_impl_file() const override { return true; }
 
-        // ── State record ──
-        out << "/* ── State record ── */\n\n";
-        emit_state_struct(out, 0);
+    // Single-file fallback
+    void generate(std::ostream& out, const BurgAnalysis& a) override {
+        std::ostringstream dummy;
+        generate(out, dummy, a, "burg_generated.h");
+    }
 
-        // ── Context struct ──
-        out << "/* ── Context ── */\n\n";
-        std::string ctx_type = ns_prefix + "burg_ctx_t";
+    // Two-file generation: header + implementation
+    void generate(std::ostream& hdr, std::ostream& impl,
+                  const BurgAnalysis& a, const std::string& hdr_name) override {
+        setup(a);
+        guard_ = make_guard(hdr_name);
+        impl_include_ = hdr_name;
 
-        out << "typedef struct " << ctx_type << " {\n";
-        out << "    bbq_arena arena;\n";
-        out << "    bbq_htree* state_cache;\n";
+        // ═══ HEADER ═══
+
+        emit_constants(hdr);
+        emit_user_headers(hdr);
+        emit_macros_check(hdr);
+
+        hdr << "/* ── State record ── */\n\n";
+        emit_state_struct(hdr, 0);
+
+        hdr << "/* ── Context ── */\n\n";
+        hdr << "typedef struct " << ctx_type_ << " {\n";
+        hdr << "    bbq_arena arena;\n";
+        hdr << "    bbq_htree* state_cache;\n";
         if (!a.spec->members.empty()) {
             std::string trimmed = trim(a.spec->members);
             if (!trimmed.empty())
-                out << "    " << trimmed << "\n";
+                hdr << "    " << trimmed << "\n";
         }
-        out << "} " << ctx_type << ";\n\n";
+        hdr << "} " << ctx_type_ << ";\n\n";
 
-        // ── Context lifecycle ──
-        out << "static void " << ns_prefix << "burg_ctx_init(" << ctx_type << "* ctx) {\n";
-        out << "    bbq_arena_init(&ctx->arena, 4096);\n";
-        out << "    ctx->state_cache = bbq_htree_create();\n";
-        out << "}\n\n";
-
-        out << "static void " << ns_prefix << "burg_ctx_free(" << ctx_type << "* ctx) {\n";
-        out << "    bbq_arena_free(&ctx->arena);\n";
-        out << "    bbq_htree_destroy(ctx->state_cache);\n";
-        out << "    ctx->state_cache = NULL;\n";
-        out << "}\n\n";
-
-        // ── Arena helper (delegates to CRT) ──
-        out << "static void* arena_alloc(size_t size, " << ctx_type << "* ctx) {\n";
-        out << "    return bbq_arena_alloc(&ctx->arena, size);\n";
-        out << "}\n\n";
-        out << "static void arena_reset(" << ctx_type << "* ctx) {\n";
-        out << "    bbq_arena_reset(&ctx->arena);\n";
-        out << "}\n\n";
-
-        // ── Cache functions (delegate to htree) ──
-        out << "/* ── State cache (graph path only) ── */\n\n";
-        out << "static burg_state_t* burg_cache_lookup(uint32_t id, " << ctx_type << "* ctx) {\n";
-        out << "    return (burg_state_t*)bbq_htree_search(ctx->state_cache, id);\n";
-        out << "}\n\n";
-        out << "static void burg_cache_store(uint32_t id, burg_state_t* state, " << ctx_type << "* ctx) {\n";
-        out << "    bbq_htree_insert(ctx->state_cache, id, state);\n";
-        out << "}\n\n";
-        out << "static void burg_cache_clear(" << ctx_type << "* ctx) {\n";
-        out << "    bbq_htree_clear(ctx->state_cache);\n";
-        out << "}\n\n";
-
-        // Closures (static, with forward declarations)
-        emit_closures(out, 0, "static ", true);
-
-        // DP (static + ctx)
-        out << "/* ── Cost DP (shared by tree and graph label) ── */\n\n";
-        out << "static void burg_dp(burg_state_t* p, BURG_NODE_TYPE node, " << ctx_type << "* ctx) {\n";
-        emit_dp_body(out, 1);
-        out << "}\n\n";
-
-        // Label tree (static + ctx, no cache)
-        out << "/* ── Label (tree path - no cache) ── */\n\n";
-        out << "static burg_state_t* burg_label_tree(BURG_NODE_TYPE node, " << ctx_type << "* ctx) {\n";
-        emit_label_tree_body(out, 1);
-        out << "}\n\n";
-
-        // Label graph (static + ctx, with cache)
-        out << "/* ── Label (graph path - cached) ── */\n\n";
-        out << "static burg_state_t* burg_label(BURG_NODE_TYPE node, " << ctx_type << "* ctx) {\n";
-        emit_label_body(out, 1);
-        out << "}\n\n";
-
-        // Rule lookup
-        out << "/* ── Rule lookup ── */\n\n";
-        out << "static BURG_UNUSED int " << ns_prefix << "burg_rule(burg_state_t* state, int goalnt) {\n";
-        emit_rule_func_body(out, 1);
-        out << "}\n\n";
-
-        // NT name
-        out << "/* ── Nonterminal names (for debugging) ── */\n\n";
-        out << "static BURG_UNUSED const char* " << ns_prefix << "burg_nt_name(int nt) {\n";
-        emit_nt_name_body(out, 1);
-        out << "}\n";
-
-        // Reducer (static + ctx, only if actions)
+        // Public function declarations
+        hdr << "/* ── Public API ── */\n\n";
+        hdr << "void " << ns_prefix_ << "burg_ctx_init(" << ctx_type_ << "* ctx);\n";
+        hdr << "void " << ns_prefix_ << "burg_ctx_free(" << ctx_type_ << "* ctx);\n";
+        hdr << "void " << ns_prefix_ << "burg_rewrite(BURG_NODE_TYPE root, " << ctx_type_ << "* ctx);\n";
+        hdr << "int "  << ns_prefix_ << "burg_rule(burg_state_t* state, int goalnt);\n";
+        hdr << "const char* " << ns_prefix_ << "burg_nt_name(int nt);\n";
         if (a.has_actions) {
-            out << "\n/* ── Reducer (top-down pass) ── */\n\n";
-            out << "static void burg_reduce(BURG_NODE_TYPE node, burg_state_t* state, int goalnt, " << ctx_type << "* ctx) {\n";
-            emit_reduce_body(out, 1);
-            out << "}\n";
+            hdr << "void " << ns_prefix_ << "burg_reduce(BURG_NODE_TYPE node, burg_state_t* state, int goalnt, " << ctx_type_ << "* ctx);\n";
         }
 
-        // Rewriter (public entry point — prefixed)
-        out << "\n/* ── Rewriter ── */\n\n";
-        out << "static void " << ns_prefix << "burg_rewrite(BURG_NODE_TYPE root, " << ctx_type << "* ctx) {\n";
-        emit_rewrite_body(out, 1);
-        out << "}\n";
+        hdr << "\n#endif /* " << guard_ << " */\n";
 
-        out << "\n#endif /* BURG_GENERATED_H */\n";
+        // ═══ IMPLEMENTATION ═══
+
+        impl << "#include \"" << impl_include_ << "\"\n\n";
+
+        // Context lifecycle
+        impl << "void " << ns_prefix_ << "burg_ctx_init(" << ctx_type_ << "* ctx) {\n";
+        impl << "    bbq_arena_init(&ctx->arena, 4096);\n";
+        impl << "    ctx->state_cache = bbq_htree_create();\n";
+        impl << "}\n\n";
+
+        impl << "void " << ns_prefix_ << "burg_ctx_free(" << ctx_type_ << "* ctx) {\n";
+        impl << "    bbq_arena_free(&ctx->arena);\n";
+        impl << "    bbq_htree_destroy(ctx->state_cache);\n";
+        impl << "    ctx->state_cache = NULL;\n";
+        impl << "}\n\n";
+
+        // Internal helpers (static, may be unused if tree-only)
+        impl << "static BURG_UNUSED void* arena_alloc(size_t size, " << ctx_type_ << "* ctx) {\n";
+        impl << "    return bbq_arena_alloc(&ctx->arena, size);\n";
+        impl << "}\n\n";
+        impl << "static BURG_UNUSED void arena_reset(" << ctx_type_ << "* ctx) {\n";
+        impl << "    bbq_arena_reset(&ctx->arena);\n";
+        impl << "}\n\n";
+
+        impl << "static BURG_UNUSED burg_state_t* burg_cache_lookup(uint32_t id, " << ctx_type_ << "* ctx) {\n";
+        impl << "    return (burg_state_t*)bbq_htree_search(ctx->state_cache, id);\n";
+        impl << "}\n\n";
+        impl << "static BURG_UNUSED void burg_cache_store(uint32_t id, burg_state_t* state, " << ctx_type_ << "* ctx) {\n";
+        impl << "    bbq_htree_insert(ctx->state_cache, id, state);\n";
+        impl << "}\n\n";
+        impl << "static BURG_UNUSED void burg_cache_clear(" << ctx_type_ << "* ctx) {\n";
+        impl << "    bbq_htree_clear(ctx->state_cache);\n";
+        impl << "}\n\n";
+
+        // Closures
+        emit_closures(impl, 0, "static ", true);
+
+        // DP
+        impl << "static void burg_dp(burg_state_t* p, BURG_NODE_TYPE node, " << ctx_type_ << "* ctx) {\n";
+        emit_dp_body(impl, 1);
+        impl << "}\n\n";
+
+        // Label tree
+        impl << "static burg_state_t* burg_label_tree(BURG_NODE_TYPE node, " << ctx_type_ << "* ctx) {\n";
+        emit_label_tree_body(impl, 1);
+        impl << "}\n\n";
+
+        // Label graph
+        impl << "static burg_state_t* burg_label(BURG_NODE_TYPE node, " << ctx_type_ << "* ctx) {\n";
+        emit_label_body(impl, 1);
+        impl << "}\n\n";
+
+        // Rule lookup (public)
+        impl << "int " << ns_prefix_ << "burg_rule(burg_state_t* state, int goalnt) {\n";
+        emit_rule_func_body(impl, 1);
+        impl << "}\n\n";
+
+        // NT name (public)
+        impl << "const char* " << ns_prefix_ << "burg_nt_name(int nt) {\n";
+        emit_nt_name_body(impl, 1);
+        impl << "}\n\n";
+
+        // Reducer (public, only if actions)
+        if (a.has_actions) {
+            impl << "void " << ns_prefix_ << "burg_reduce(BURG_NODE_TYPE node, burg_state_t* state, int goalnt, " << ctx_type_ << "* ctx) {\n";
+            emit_reduce_body(impl, 1);
+            impl << "}\n\n";
+        }
+
+        // Rewriter (public)
+        impl << "void " << ns_prefix_ << "burg_rewrite(BURG_NODE_TYPE root, " << ctx_type_ << "* ctx) {\n";
+        emit_rewrite_body(impl, 1);
+        impl << "}\n";
     }
+
 };
 
 // ── C-specific preamble (C11 includes + #define constants) ──
 
 void CBurgBackend::emit_constants(std::ostream& out) {
     out << "/* Generated by burgc -- do not edit */\n";
-    out << "#ifndef BURG_GENERATED_H\n";
-    out << "#define BURG_GENERATED_H\n\n";
+    out << "#ifndef " << guard_ << "\n";
+    out << "#define " << guard_ << "\n\n";
     out << "#include <stdint.h>\n";
     out << "#include <stddef.h>\n";
     out << "#include <limits.h>\n";
@@ -144,6 +176,12 @@ void CBurgBackend::emit_constants(std::ostream& out) {
     out << "#define BURG_UNUSED __attribute__((unused))\n";
     out << "#else\n";
     out << "#define BURG_UNUSED\n";
+    out << "#endif\n\n";
+    out << "/* BURG_NODE_TYPE et al. must be defined before this point.\n";
+    out << "   Define BURG_CONFIG_HEADER to auto-include your definitions, e.g.:\n";
+    out << "     #define BURG_CONFIG_HEADER \"my_node_defs.h\"  */\n";
+    out << "#ifdef BURG_CONFIG_HEADER\n";
+    out << "#include BURG_CONFIG_HEADER\n";
     out << "#endif\n\n";
 
     out << "/* ── Terminal symbols ── */\n\n";
@@ -220,23 +258,20 @@ void CBurgBackend::emit_rewrite_body(std::ostream& out, int indent) {
 
     pad(out, indent); out << "arena_reset(ctx);\n\n";
 
-    // Fast path: tree (no successor edges -> skip RPO + cache)
     pad(out, indent); out << "if (BURG_NODE_SUCC_COUNT(root) == 0) {\n";
     pad(out, indent + 1); out << "burg_state_t* state = burg_label_tree(root, ctx);\n";
     if (a_->has_actions) {
         pad(out, indent + 1); out << "if (state->rule[" << start_idx << "])\n";
-        pad(out, indent + 2); out << "burg_reduce(root, state, " << start_idx << ", ctx);\n";
+        pad(out, indent + 2); out << ns_prefix_ << "burg_reduce(root, state, " << start_idx << ", ctx);\n";
     }
     pad(out, indent + 1); out << "return;\n";
     pad(out, indent); out << "}\n\n";
 
-    // Slow path: graph (RPO + cache)
     pad(out, indent); out << "burg_cache_clear(ctx);\n\n";
-
     pad(out, indent); out << "/* Compute reverse postorder via iterative DFS */\n";
     emit_rpo_dfs(out, indent);
 
-    pad(out, indent); out << "/* Label every node (data-flow children labeled recursively) */\n";
+    pad(out, indent); out << "/* Label every node */\n";
     pad(out, indent); out << "{\n";
     pad(out, indent + 1); out << "int _i, _n = bbq_vec_len(rpo);\n";
     pad(out, indent + 1); out << "for (_i = 0; _i < _n; _i++)\n";
@@ -250,7 +285,7 @@ void CBurgBackend::emit_rewrite_body(std::ostream& out, int indent) {
         pad(out, indent + 1); out << "for (_i = 0; _i < _n; _i++) {\n";
         pad(out, indent + 2); out << "burg_state_t* s = burg_cache_lookup((uint32_t)(uintptr_t)BURG_NODE_ID(rpo[_i]), ctx);\n";
         pad(out, indent + 2); out << "if (s && s->rule[" << start_idx << "])\n";
-        pad(out, indent + 3); out << "burg_reduce(rpo[_i], s, " << start_idx << ", ctx);\n";
+        pad(out, indent + 3); out << ns_prefix_ << "burg_reduce(rpo[_i], s, " << start_idx << ", ctx);\n";
         pad(out, indent + 1); out << "}\n";
         pad(out, indent); out << "}\n";
     }

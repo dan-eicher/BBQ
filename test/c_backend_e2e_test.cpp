@@ -1185,6 +1185,55 @@ int main(int argc, char** argv) {
     ASSERT_TRUE(run_c_e2e(spec, harness, data, sizeof(data), &err)) << err;
 }
 
+// ── Inline bitfield (inside struct) ──
+
+TEST(CBackendE2E, InlineBitfieldRoundTrip) {
+    const char* spec =
+        "@endian big\n"
+        "Pkt = struct {\n"
+        "    flags: bitfield<uint8> { high: 4, low: 4 },\n"
+        "    payload: uint8\n"
+        "}";
+
+    const char* harness = R"(
+#include "testReader.h"
+#include "testWriter.h"
+#include <stdio.h>
+#include <string.h>
+#include <assert.h>
+
+int main(int argc, char** argv) {
+    (void)argc;
+    FILE* f = fopen(argv[1], "rb");
+    fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
+    uint8_t buf[256]; fread(buf, 1, sz, f); fclose(f);
+
+    bbq_ctx_t ctx;
+    bbq_ctx_init(&ctx, buf, sz);
+    pkt_t pkt;
+    assert(pkt_read(&ctx, &pkt));
+    assert(pkt.flags.high == 0x0A);
+    assert(pkt.flags.low == 0x05);
+    assert(pkt.payload == 0xFF);
+
+    uint8_t out[256];
+    bbq_write_ctx_t wctx;
+    bbq_write_ctx_init(&wctx, out, sizeof(out));
+    assert(pkt_write(&wctx, &pkt));
+    assert(wctx.pos == 2);
+    assert(out[0] == 0xA5);
+    assert(out[1] == 0xFF);
+
+    printf("OK: inline bitfield round-trip\n");
+    return 0;
+}
+)";
+
+    uint8_t data[] = { 0xA5, 0xFF };  // flags: high=0xA, low=0x5; payload=0xFF
+    std::string err;
+    ASSERT_TRUE(run_c_e2e(spec, harness, data, sizeof(data), &err)) << err;
+}
+
 // ── Bool field ──
 
 TEST(CBackendE2E, BoolRoundTrip) {

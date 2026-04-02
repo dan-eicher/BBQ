@@ -188,7 +188,7 @@ void CReaderEmitter::emit_impl(Rule* rule, std::ostream& out) {
 
     } else if (auto* bf = dynamic_cast<Bitfield*>(body)) {
         out << "bool " << fname << "(bbq_ctx_t* ctx, " << tname << "* out) {\n";
-        emit_bitfield_read(rule->name, bf, "out", out, 1);
+        emit_bitfield_read(rule->name, bf, "(*out)", out, 1);
         out << ind(1) << "return true;\n";
         out << "}\n";
     }
@@ -590,7 +590,7 @@ void CReaderEmitter::emit_bitfield_read(const std::string& ctx_name, Bitfield* b
             bit_offset -= entry->width;
             uint64_t mask = (1ULL << entry->width) - 1;
             std::string entry_type = types_.bitfield_entry_type(entry->width);
-            out << ind(indent + 1) << target << "->" << entry->name
+            out << ind(indent + 1) << target << "." << entry->name
                 << " = (" << entry_type << ")(";
             if (bit_offset > 0)
                 out << "(_bf >> " << bit_offset << ")";
@@ -603,7 +603,7 @@ void CReaderEmitter::emit_bitfield_read(const std::string& ctx_name, Bitfield* b
         for (auto* entry : bf->entries) {
             uint64_t mask = (1ULL << entry->width) - 1;
             std::string entry_type = types_.bitfield_entry_type(entry->width);
-            out << ind(indent + 1) << target << "->" << entry->name
+            out << ind(indent + 1) << target << "." << entry->name
                 << " = (" << entry_type << ")(";
             if (bit_offset > 0)
                 out << "(_bf >> " << bit_offset << ")";

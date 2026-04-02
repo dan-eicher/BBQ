@@ -127,7 +127,18 @@ void CWriterEmitter::emit_impl(Rule* rule, std::ostream& out) {
         out << ind(1) << "switch (in->tag) {\n";
         for (size_t i = 0; i < sw->cases.size(); i++) {
             std::string case_name = "case_" + std::to_string(i);
-            out << ind(1) << "case " << i << ":\n";
+            if (auto* iv = dynamic_cast<IntValue*>(sw->cases[i]->value)) {
+                out << ind(1) << "case " << iv->value << ":\n";
+            } else if (auto* idv = dynamic_cast<IdentValue*>(sw->cases[i]->value)) {
+                out << ind(1) << "case " << idv->name << ":\n";
+            } else if (auto* rv = dynamic_cast<RefValue*>(sw->cases[i]->value)) {
+                std::string path;
+                for (size_t j = 0; j < rv->path.size(); j++) {
+                    if (j > 0) path += "_";
+                    path += rv->path[j];
+                }
+                out << ind(1) << "case " << path << ":\n";
+            }
             emit_write_call("in->u." + case_name, sw->cases[i]->target, rule->name, out, 2);
             out << ind(2) << "return true;\n";
         }

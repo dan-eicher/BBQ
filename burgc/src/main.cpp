@@ -5,13 +5,19 @@
 #include <iostream>
 
 static void usage() {
-    fprintf(stderr, "Usage: burgc -i <input.burg> [-o <output.h>] [-lang c++|c]\n");
+    fprintf(stderr,
+        "Usage: burgc -i <input.burg> [-o <output.h>] [-lang c++|c] [-frames <dir>]\n"
+        "  -i <file>      Input .burg file\n"
+        "  -o <file>      Output file (.h for C++, .h+.c for C)\n"
+        "  -lang c++|c    Target language (default: c++)\n"
+        "  -frames <dir>  Frame template directory\n");
 }
 
 int main(int argc, char** argv) {
     std::string input_file;
     std::string output_file;
     std::string lang = "c++";
+    std::string frame_dir;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-i") == 0 && i + 1 < argc) {
@@ -20,6 +26,8 @@ int main(int argc, char** argv) {
             output_file = argv[++i];
         } else if (strcmp(argv[i], "-lang") == 0 && i + 1 < argc) {
             lang = argv[++i];
+        } else if (strcmp(argv[i], "-frames") == 0 && i + 1 < argc) {
+            frame_dir = argv[++i];
         } else if (strcmp(argv[i], "-h") == 0) {
             usage();
             return 0;
@@ -65,7 +73,6 @@ int main(int argc, char** argv) {
             fprintf(stderr, "error: -o required for C output\n");
             return 1;
         }
-        // Derive .c filename from .h
         std::string hdr_file = output_file;
         std::string impl_file = hdr_file;
         if (impl_file.size() > 2 && impl_file.substr(impl_file.size() - 2) == ".h")
@@ -73,7 +80,6 @@ int main(int argc, char** argv) {
         else
             impl_file += ".c";
 
-        // Extract header basename for #include
         std::string hdr_basename = hdr_file;
         size_t slash = hdr_basename.find_last_of("/\\");
         if (slash != std::string::npos) hdr_basename = hdr_basename.substr(slash + 1);
@@ -84,17 +90,17 @@ int main(int argc, char** argv) {
             fprintf(stderr, "error: cannot open output files\n");
             return 1;
         }
-        backend->generate(hdr, imp, gen.analysis(), hdr_basename);
+        backend->generate(hdr, imp, gen.analysis(), hdr_basename, frame_dir);
         fprintf(stderr, "burgc: generated %s, %s\n", hdr_file.c_str(), impl_file.c_str());
     } else if (output_file.empty()) {
-        backend->generate(std::cout, gen.analysis());
+        backend->generate(std::cout, gen.analysis(), frame_dir);
     } else {
         std::ofstream ofs(output_file);
         if (!ofs) {
             fprintf(stderr, "error: cannot open output file: %s\n", output_file.c_str());
             return 1;
         }
-        backend->generate(ofs, gen.analysis());
+        backend->generate(ofs, gen.analysis(), frame_dir);
         fprintf(stderr, "burgc: generated %s\n", output_file.c_str());
     }
 

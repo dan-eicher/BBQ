@@ -34,8 +34,10 @@ add_library(burgc_lib STATIC
     src/generator.cpp
     src/cpp_backend.cpp
     src/c_backend.cpp)
-target_include_directories(burgc_lib PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_link_libraries(burgc_lib PUBLIC burgc_frontend)
+target_include_directories(burgc_lib PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/src)
+# Link bbq_frontend for FrameProcessor (no source recompilation)
+target_link_libraries(burgc_lib PUBLIC burgc_frontend bbq_frontend)
 
 # Executable
 add_executable(burgc src/main.cpp)

@@ -42,7 +42,7 @@ public:
     const std::vector<std::string>& errors() const { return errors_; }
 
     // Convenience: generate with default (C++) backend
-    void generate(std::ostream& out);
+    void generate(std::ostream& out, const std::string& frame_dir = "");
 
 private:
     BurgAnalysis analysis_;
@@ -57,13 +57,16 @@ private:
 class BurgBackend {
 public:
     virtual ~BurgBackend() = default;
-    virtual void generate(std::ostream& out, const BurgAnalysis& a) = 0;
+    virtual void generate(std::ostream& out, const BurgAnalysis& a,
+                          const std::string& frame_dir = "") = 0;
     // Two-file generation (C backend overrides this)
     // hdr_name is the header filename for #include and guard derivation
+    // frame_dir is the directory containing frame templates
     virtual void generate(std::ostream& hdr, std::ostream& impl,
-                          const BurgAnalysis& a, const std::string& hdr_name) {
+                          const BurgAnalysis& a, const std::string& hdr_name,
+                          const std::string& frame_dir) {
         generate(hdr, a);
-        (void)impl; (void)hdr_name;
+        (void)impl; (void)hdr_name; (void)frame_dir;
     }
     virtual bool needs_impl_file() const { return false; }
 
@@ -75,8 +78,8 @@ protected:
     virtual std::string ctx_solo() const { return ""; }   // standalone: "ctx"
     virtual std::string state_type() const { return "BurgState"; }  // struct name
 
-    // Preamble — virtual for C vs C++ includes/constants
-    virtual void emit_constants(std::ostream& out);
+    // Terminal/nonterminal constant definitions (constexpr for C++, #define for C)
+    void emit_defines(std::ostream& out);
     void emit_user_headers(std::ostream& out);
     void emit_macros_check(std::ostream& out);
     void emit_state_struct(std::ostream& out, int indent);

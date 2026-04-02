@@ -1,4 +1,5 @@
 #include "generator.h"
+#include "FrameProcessor.h"
 #include <sstream>
 
 namespace {
@@ -8,15 +9,12 @@ class CBurgBackend : public BurgBackend {
     std::string ctx_solo() const override { return "ctx"; }
     std::string state_type() const override { return "burg_state_t"; }
 
-    void emit_constants(std::ostream& out) override;
     void emit_label_body(std::ostream& out, int indent) override;
     void emit_rpo_dfs(std::ostream& out, int indent) override;
     void emit_rewrite_body(std::ostream& out, int indent) override;
 
     std::string ns_prefix_;
     std::string ctx_type_;
-    std::string guard_;
-    std::string impl_include_;
 
     void setup(const BurgAnalysis& a) {
         a_ = &a;
@@ -33,169 +31,190 @@ class CBurgBackend : public BurgBackend {
         return g;
     }
 
-public:
-    bool needs_impl_file() const override { return true; }
+    // Emit terminal/nonterminal #defines (no includes — those are in the frame)
+    void emit_c_constants(std::ostream& out) {
+        out << "/* ── Terminal symbols ── */\n\n";
+        for (auto* t : a_->spec->terminals)
+            out << "#define BURG_" << t->name << " " << t->number << "\n";
 
-    // Single-file fallback
-    void generate(std::ostream& out, const BurgAnalysis& a) override {
-        std::ostringstream dummy;
-        generate(out, dummy, a, "burg_generated.h");
+        out << "\n/* ── Nonterminal indices ── */\n\n";
+        for (size_t i = 0; i < a_->nonterms.size(); i++)
+            out << "#define " << a_->nonterms[i] << "_NT " << (i + 1) << "\n";
+        out << "#define BURG_MAX_NT " << a_->nonterms.size() << "\n";
+        out << "#define BURG_MAX_COST SHRT_MAX\n";
     }
 
-    // Two-file generation: header + implementation
-    void generate(std::ostream& hdr, std::ostream& impl,
-                  const BurgAnalysis& a, const std::string& hdr_name) override {
-        setup(a);
-        guard_ = make_guard(hdr_name);
-        impl_include_ = hdr_name;
-
-        // ═══ HEADER ═══
-
-        emit_constants(hdr);
-        emit_user_headers(hdr);
-        emit_macros_check(hdr);
-
-        hdr << "/* ── State record ── */\n\n";
-        emit_state_struct(hdr, 0);
-
-        hdr << "/* ── Context ── */\n\n";
-        hdr << "typedef struct " << ctx_type_ << " {\n";
-        hdr << "    bbq_arena arena;\n";
-        hdr << "    bbq_htree* state_cache;\n";
-        if (!a.spec->members.empty()) {
-            std::string trimmed = trim(a.spec->members);
+    void emit_context_struct(std::ostream& out) {
+        out << "typedef struct " << ctx_type_ << " {\n";
+        out << "    bbq_arena arena;\n";
+        out << "    bbq_htree* state_cache;\n";
+        if (!a_->spec->members.empty()) {
+            std::string trimmed = trim(a_->spec->members);
             if (!trimmed.empty())
-                hdr << "    " << trimmed << "\n";
+                out << "    " << trimmed << "\n";
         }
-        hdr << "} " << ctx_type_ << ";\n\n";
+        out << "} " << ctx_type_ << ";\n";
+    }
 
-        // Public function declarations
-        hdr << "/* ── Public API ── */\n\n";
-        hdr << "void " << ns_prefix_ << "burg_ctx_init(" << ctx_type_ << "* ctx);\n";
-        hdr << "void " << ns_prefix_ << "burg_ctx_free(" << ctx_type_ << "* ctx);\n";
-        hdr << "void " << ns_prefix_ << "burg_rewrite(BURG_NODE_TYPE root, " << ctx_type_ << "* ctx);\n";
-        hdr << "int "  << ns_prefix_ << "burg_rule(burg_state_t* state, int goalnt);\n";
-        hdr << "const char* " << ns_prefix_ << "burg_nt_name(int nt);\n";
-        if (a.has_actions) {
-            hdr << "void " << ns_prefix_ << "burg_reduce(BURG_NODE_TYPE node, burg_state_t* state, int goalnt, " << ctx_type_ << "* ctx);\n";
+    void emit_public_api(std::ostream& out) {
+        out << "void " << ns_prefix_ << "burg_ctx_init(" << ctx_type_ << "* ctx);\n";
+        out << "void " << ns_prefix_ << "burg_ctx_free(" << ctx_type_ << "* ctx);\n";
+        out << "void " << ns_prefix_ << "burg_rewrite(BURG_NODE_TYPE root, " << ctx_type_ << "* ctx);\n";
+        out << "int "  << ns_prefix_ << "burg_rule(burg_state_t* state, int goalnt);\n";
+        out << "const char* " << ns_prefix_ << "burg_nt_name(int nt);\n";
+        if (a_->has_actions) {
+            out << "void " << ns_prefix_ << "burg_reduce(BURG_NODE_TYPE node, burg_state_t* state, int goalnt, " << ctx_type_ << "* ctx);\n";
         }
+    }
 
-        hdr << "\n#endif /* " << guard_ << " */\n";
+    void emit_ctx_lifecycle(std::ostream& out) {
+        out << "void " << ns_prefix_ << "burg_ctx_init(" << ctx_type_ << "* ctx) {\n";
+        out << "    bbq_arena_init(&ctx->arena, 4096);\n";
+        out << "    ctx->state_cache = bbq_htree_create();\n";
+        out << "}\n\n";
 
-        // ═══ IMPLEMENTATION ═══
+        out << "void " << ns_prefix_ << "burg_ctx_free(" << ctx_type_ << "* ctx) {\n";
+        out << "    bbq_arena_free(&ctx->arena);\n";
+        out << "    bbq_htree_destroy(ctx->state_cache);\n";
+        out << "    ctx->state_cache = NULL;\n";
+        out << "}\n";
+    }
 
-        impl << "#include \"" << impl_include_ << "\"\n\n";
+    void emit_internal_helpers(std::ostream& out) {
+        out << "static BURG_UNUSED void* arena_alloc(size_t size, " << ctx_type_ << "* ctx) {\n";
+        out << "    return bbq_arena_alloc(&ctx->arena, size);\n";
+        out << "}\n\n";
+        out << "static BURG_UNUSED void arena_reset(" << ctx_type_ << "* ctx) {\n";
+        out << "    bbq_arena_reset(&ctx->arena);\n";
+        out << "}\n\n";
 
-        // Context lifecycle
-        impl << "void " << ns_prefix_ << "burg_ctx_init(" << ctx_type_ << "* ctx) {\n";
-        impl << "    bbq_arena_init(&ctx->arena, 4096);\n";
-        impl << "    ctx->state_cache = bbq_htree_create();\n";
-        impl << "}\n\n";
+        out << "static BURG_UNUSED burg_state_t* burg_cache_lookup(uint32_t id, " << ctx_type_ << "* ctx) {\n";
+        out << "    return (burg_state_t*)bbq_htree_search(ctx->state_cache, id);\n";
+        out << "}\n\n";
+        out << "static BURG_UNUSED void burg_cache_store(uint32_t id, burg_state_t* state, " << ctx_type_ << "* ctx) {\n";
+        out << "    bbq_htree_insert(ctx->state_cache, id, state);\n";
+        out << "}\n\n";
+        out << "static BURG_UNUSED void burg_cache_clear(" << ctx_type_ << "* ctx) {\n";
+        out << "    bbq_htree_clear(ctx->state_cache);\n";
+        out << "}\n";
+    }
 
-        impl << "void " << ns_prefix_ << "burg_ctx_free(" << ctx_type_ << "* ctx) {\n";
-        impl << "    bbq_arena_free(&ctx->arena);\n";
-        impl << "    bbq_htree_destroy(ctx->state_cache);\n";
-        impl << "    ctx->state_cache = NULL;\n";
-        impl << "}\n\n";
-
-        // Internal helpers (static, may be unused if tree-only)
-        impl << "static BURG_UNUSED void* arena_alloc(size_t size, " << ctx_type_ << "* ctx) {\n";
-        impl << "    return bbq_arena_alloc(&ctx->arena, size);\n";
-        impl << "}\n\n";
-        impl << "static BURG_UNUSED void arena_reset(" << ctx_type_ << "* ctx) {\n";
-        impl << "    bbq_arena_reset(&ctx->arena);\n";
-        impl << "}\n\n";
-
-        impl << "static BURG_UNUSED burg_state_t* burg_cache_lookup(uint32_t id, " << ctx_type_ << "* ctx) {\n";
-        impl << "    return (burg_state_t*)bbq_htree_search(ctx->state_cache, id);\n";
-        impl << "}\n\n";
-        impl << "static BURG_UNUSED void burg_cache_store(uint32_t id, burg_state_t* state, " << ctx_type_ << "* ctx) {\n";
-        impl << "    bbq_htree_insert(ctx->state_cache, id, state);\n";
-        impl << "}\n\n";
-        impl << "static BURG_UNUSED void burg_cache_clear(" << ctx_type_ << "* ctx) {\n";
-        impl << "    bbq_htree_clear(ctx->state_cache);\n";
-        impl << "}\n\n";
-
-        // Closures
-        emit_closures(impl, 0, "static ", true);
-
+    void emit_functions(std::ostream& out) {
         // DP
-        impl << "static void burg_dp(burg_state_t* p, BURG_NODE_TYPE node, " << ctx_type_ << "* ctx) {\n";
-        emit_dp_body(impl, 1);
-        impl << "}\n\n";
+        out << "static void burg_dp(burg_state_t* p, BURG_NODE_TYPE node, " << ctx_type_ << "* ctx) {\n";
+        emit_dp_body(out, 1);
+        out << "}\n\n";
 
         // Label tree
-        impl << "static burg_state_t* burg_label_tree(BURG_NODE_TYPE node, " << ctx_type_ << "* ctx) {\n";
-        emit_label_tree_body(impl, 1);
-        impl << "}\n\n";
+        out << "static burg_state_t* burg_label_tree(BURG_NODE_TYPE node, " << ctx_type_ << "* ctx) {\n";
+        emit_label_tree_body(out, 1);
+        out << "}\n\n";
 
         // Label graph
-        impl << "static burg_state_t* burg_label(BURG_NODE_TYPE node, " << ctx_type_ << "* ctx) {\n";
-        emit_label_body(impl, 1);
-        impl << "}\n\n";
+        out << "static burg_state_t* burg_label(BURG_NODE_TYPE node, " << ctx_type_ << "* ctx) {\n";
+        emit_label_body(out, 1);
+        out << "}\n\n";
 
         // Rule lookup (public)
-        impl << "int " << ns_prefix_ << "burg_rule(burg_state_t* state, int goalnt) {\n";
-        emit_rule_func_body(impl, 1);
-        impl << "}\n\n";
+        out << "int " << ns_prefix_ << "burg_rule(burg_state_t* state, int goalnt) {\n";
+        emit_rule_func_body(out, 1);
+        out << "}\n\n";
 
         // NT name (public)
-        impl << "const char* " << ns_prefix_ << "burg_nt_name(int nt) {\n";
-        emit_nt_name_body(impl, 1);
-        impl << "}\n\n";
+        out << "const char* " << ns_prefix_ << "burg_nt_name(int nt) {\n";
+        emit_nt_name_body(out, 1);
+        out << "}\n\n";
 
         // Reducer (public, only if actions)
-        if (a.has_actions) {
-            impl << "void " << ns_prefix_ << "burg_reduce(BURG_NODE_TYPE node, burg_state_t* state, int goalnt, " << ctx_type_ << "* ctx) {\n";
-            emit_reduce_body(impl, 1);
-            impl << "}\n\n";
+        if (a_->has_actions) {
+            out << "void " << ns_prefix_ << "burg_reduce(BURG_NODE_TYPE node, burg_state_t* state, int goalnt, " << ctx_type_ << "* ctx) {\n";
+            emit_reduce_body(out, 1);
+            out << "}\n\n";
         }
 
         // Rewriter (public)
-        impl << "void " << ns_prefix_ << "burg_rewrite(BURG_NODE_TYPE root, " << ctx_type_ << "* ctx) {\n";
-        emit_rewrite_body(impl, 1);
-        impl << "}\n";
+        out << "void " << ns_prefix_ << "burg_rewrite(BURG_NODE_TYPE root, " << ctx_type_ << "* ctx) {\n";
+        emit_rewrite_body(out, 1);
+        out << "}\n";
     }
 
+public:
+    bool needs_impl_file() const override { return true; }
+
+    // Single-file not supported for C — requires -o for .h/.c split
+    void generate(std::ostream& out, const BurgAnalysis& a,
+                  const std::string& frame_dir) override {
+        // Delegate to two-file with a dummy impl stream
+        std::ostringstream dummy;
+        generate(out, dummy, a, "burg_generated.h", frame_dir);
+        out << "\n";
+        out << dummy.str();
+    }
+
+    // Two-file generation with frame templates
+    void generate(std::ostream& hdr, std::ostream& impl,
+                  const BurgAnalysis& a, const std::string& hdr_name,
+                  const std::string& frame_dir) override {
+        setup(a);
+        std::string guard = make_guard(hdr_name);
+
+        // ═══ HEADER (via frame) ═══
+
+        bbqgen::FrameProcessor hfp(frame_dir + "/CBurg.frame", hdr);
+        if (!hfp.ok()) {
+            // Fallback: emit without frame
+            generate(hdr, a, "");
+            return;
+        }
+
+        hfp.CopyFramePart("guard_open");
+        hdr << "#ifndef " << guard << "\n";
+        hdr << "#define " << guard << "\n";
+
+        hfp.CopyFramePart("constants");
+        emit_c_constants(hdr);
+
+        hfp.CopyFramePart("user_headers");
+        emit_user_headers(hdr);
+
+        hfp.CopyFramePart("macros_check");
+        emit_macros_check(hdr);
+
+        hfp.CopyFramePart("state_struct");
+        emit_state_struct(hdr, 0);
+
+        hfp.CopyFramePart("context_struct");
+        emit_context_struct(hdr);
+
+        hfp.CopyFramePart("public_api");
+        emit_public_api(hdr);
+
+        hfp.CopyFramePart("guard_close");
+        hdr << "#endif /* " << guard << " */\n";
+
+        // ═══ IMPLEMENTATION (via frame) ═══
+
+        bbqgen::FrameProcessor ifp(frame_dir + "/CBurgImpl.frame", impl);
+        if (!ifp.ok()) return;
+
+        ifp.CopyFramePart("impl_include");
+        impl << "#include \"" << hdr_name << "\"\n";
+
+        ifp.CopyFramePart("ctx_lifecycle");
+        emit_ctx_lifecycle(impl);
+
+        ifp.CopyFramePart("internal_helpers");
+        emit_internal_helpers(impl);
+
+        ifp.CopyFramePart("closures");
+        emit_closures(impl, 0, "static ", true);
+
+        ifp.CopyFramePart("functions");
+        emit_functions(impl);
+    }
 };
 
-// ── C-specific preamble (C11 includes + #define constants) ──
-
-void CBurgBackend::emit_constants(std::ostream& out) {
-    out << "/* Generated by burgc -- do not edit */\n";
-    out << "#ifndef " << guard_ << "\n";
-    out << "#define " << guard_ << "\n\n";
-    out << "#include <stdint.h>\n";
-    out << "#include <stddef.h>\n";
-    out << "#include <limits.h>\n";
-    out << "#include <stdbool.h>\n\n";
-    out << "#include \"bbq_arena.h\"\n";
-    out << "#include \"bbq_htree.h\"\n";
-    out << "#include \"bbq_vec.h\"\n\n";
-    out << "#ifdef __GNUC__\n";
-    out << "#define BURG_UNUSED __attribute__((unused))\n";
-    out << "#else\n";
-    out << "#define BURG_UNUSED\n";
-    out << "#endif\n\n";
-    out << "/* BURG_NODE_TYPE et al. must be defined before this point.\n";
-    out << "   Define BURG_CONFIG_HEADER to auto-include your definitions, e.g.:\n";
-    out << "     #define BURG_CONFIG_HEADER \"my_node_defs.h\"  */\n";
-    out << "#ifdef BURG_CONFIG_HEADER\n";
-    out << "#include BURG_CONFIG_HEADER\n";
-    out << "#endif\n\n";
-
-    out << "/* ── Terminal symbols ── */\n\n";
-    for (auto* t : a_->spec->terminals)
-        out << "#define BURG_" << t->name << " " << t->number << "\n";
-
-    out << "\n/* ── Nonterminal indices ── */\n\n";
-    for (size_t i = 0; i < a_->nonterms.size(); i++)
-        out << "#define " << a_->nonterms[i] << "_NT " << (i + 1) << "\n";
-    out << "#define BURG_MAX_NT " << a_->nonterms.size() << "\n";
-    out << "#define BURG_MAX_COST SHRT_MAX\n\n";
-}
-
-// ── C-specific label body (uint32_t cache key) ──────────
+// ── C-specific overrides ─────────────────────────────────
 
 void CBurgBackend::emit_label_body(std::ostream& out, int indent) {
     pad(out, indent); out << "uint32_t id = (uint32_t)(uintptr_t)BURG_NODE_ID(node);\n";
@@ -214,8 +233,6 @@ void CBurgBackend::emit_label_body(std::ostream& out, int indent) {
     pad(out, indent); out << "burg_dp(p, node, ctx);\n";
     pad(out, indent); out << "return p;\n";
 }
-
-// ── C-specific RPO DFS (uses bbq_vec + bbq_htree) ───────
 
 void CBurgBackend::emit_rpo_dfs(std::ostream& out, int indent) {
     pad(out, indent); out << "BURG_NODE_TYPE* rpo = NULL;\n";
@@ -250,8 +267,6 @@ void CBurgBackend::emit_rpo_dfs(std::ostream& out, int indent) {
     pad(out, indent + 1); out << "bbq_htree_destroy(visited);\n";
     pad(out, indent); out << "}\n\n";
 }
-
-// ── C-specific rewrite body (C loops instead of range-for) ──
 
 void CBurgBackend::emit_rewrite_body(std::ostream& out, int indent) {
     int64_t start_idx = a_->nonterm_index.at(a_->start_nonterm);

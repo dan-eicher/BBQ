@@ -28,7 +28,8 @@ int main(int argc, char** argv) {
     JitContext ctx;
     jit_ctx = &ctx;
     ctx.emit_entry();
-    burg_rewrite(ir);
+    BurgMatcher matcher;
+    matcher.burg_rewrite(ir);
     ctx.backpatch_all();
 
     // ── Execute ──

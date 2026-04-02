@@ -26,6 +26,7 @@ constexpr int reg_NT = 2;
 constexpr int BURG_MAX_NT = 2;
 constexpr int BURG_MAX_COST = SHRT_MAX;
 
+
 // ── User headers ──
 
 #include "compiler.h"
@@ -37,6 +38,7 @@ constexpr int BURG_MAX_COST = SHRT_MAX;
    #define BURG_NODE_ID(n)       ((void*)(n))
    #define BURG_NODE_SUCC_COUNT(n) (successor_count(n))
    #define BURG_NODE_SUCC(n,i)   (successor(n, i))
+
 
 // ── Node access macros (must be defined by consumer) ──
 
@@ -62,322 +64,374 @@ constexpr int BURG_MAX_COST = SHRT_MAX;
 #error "Define BURG_NODE_SUCC before including this header"
 #endif
 
-// ── State record ──
 
-struct BurgState {
-    int op;
-    BurgState** children;
-    int child_count;
-    short cost[3];
-    short rule[3];
-};
 
-// ── State cache ──
+class BurgMatcher {
+public:
 
-static std::unordered_map<void*, BurgState*> burg_state_cache;
+    typedef struct BurgState {
+        int op;
+        struct BurgState** children;
+        int child_count;
+        short cost[3];
+        short rule[3];
+    } BurgState;
 
-static BurgState* burg_cache_lookup(void* id) {
-    auto it = burg_state_cache.find(id);
-    return (it != burg_state_cache.end()) ? it->second : nullptr;
-}
 
-static void burg_cache_store(void* id, BurgState* state) {
-    burg_state_cache[id] = state;
-}
+private:
+    // ── Arena allocator ──
 
-static void burg_cache_clear() {
-    burg_state_cache.clear();
-}
+    static constexpr size_t ARENA_PAGE_SIZE = 4096;
+    std::vector<char*> arena_pages_;
+    int arena_cur_ = -1;
+    size_t arena_pos_ = 0;
 
-static void closure_reg(BurgState* p, int c);
-
-static void closure_reg(BurgState* p, int c) {
-    if (c + 0 < p->cost[1]) {
-        p->cost[1] = c + 0;
-        p->rule[1] = 100;
-    }
-}
-
-// ── Label function (bottom-up, cached) ──
-
-static BurgState* burg_label(BURG_NODE_TYPE node) {
-    void* id = BURG_NODE_ID(node);
-    BurgState* cached = burg_cache_lookup(id);
-    if (cached) return cached;
-
-    int op = BURG_NODE_OP(node);
-    int arity = BURG_NODE_ARITY(node);
-
-    auto* p = (BurgState*)malloc(sizeof(BurgState));
-    p->op = op;
-    p->child_count = arity;
-    p->children = arity > 0
-        ? (BurgState**)malloc(arity * sizeof(BurgState*))
-        : nullptr;
-    for (int i = 0; i <= BURG_MAX_NT; i++) {
-        p->cost[i] = BURG_MAX_COST;
-        p->rule[i] = 0;
+    void* arena_alloc(size_t size) {
+        size = (size + 7) & ~7;
+        if (arena_cur_ < 0 || arena_pos_ + size > ARENA_PAGE_SIZE) {
+            if (++arena_cur_ >= (int)arena_pages_.size())
+                arena_pages_.push_back(new char[ARENA_PAGE_SIZE]);
+            arena_pos_ = 0;
+        }
+        void* p = arena_pages_[arena_cur_] + arena_pos_;
+        arena_pos_ += size;
+        return p;
     }
 
-    // Cache BEFORE DP (back-edge cut-point safety)
-    burg_cache_store(id, p);
+    void arena_reset() { arena_cur_ = -1; arena_pos_ = 0; }
 
-    // Label children recursively (cache handles cycles)
-    for (int i = 0; i < arity; i++)
-        p->children[i] = burg_label(BURG_NODE_CHILD(node, i));
+public:
+    ~BurgMatcher() { for (auto* p : arena_pages_) delete[] p; }
 
-    // ── Cost DP ──
-    switch (op) {
-    case BURG_Halt:
+private:
+    // ── State cache (graph path only) ──
+
+    std::unordered_map<void*, BurgState*> burg_state_cache;
+
+    BurgState* burg_cache_lookup(void* id) {
+        auto it = burg_state_cache.find(id);
+        return (it != burg_state_cache.end()) ? it->second : nullptr;
+    }
+
+    void burg_cache_store(void* id, BurgState* state) {
+        burg_state_cache[id] = state;
+    }
+
+    void burg_cache_clear() {
+        burg_state_cache.clear();
+    }
+
+    void closure_reg(BurgState* p, int c) {
+        if (c + 0 < p->cost[1]) {
+            p->cost[1] = c + 0;
+            p->rule[1] = 100;
+        }
+    }
+
+
+    void burg_dp(BurgState* p, BURG_NODE_TYPE node) {
+        int op = p->op;
+        switch (op) {
+        case BURG_Halt:
+            {
+                int c = 0 + 0;
+                if (c < p->cost[1]) {
+                    p->cost[1] = c;
+                    p->rule[1] = 1;
+                }
+            }
+            break;
+        case BURG_Sub:
+            if (p->child_count >= 2 && p->children[0]->rule[2] && p->children[1]->rule[2]) {
+                int c = p->children[0]->cost[2] + p->children[1]->cost[2] + 1;
+                if (c < p->cost[2]) {
+                    p->cost[2] = c;
+                    p->rule[2] = 21;
+                    closure_reg(p, c);
+                }
+            }
+            if (p->child_count >= 2 && p->children[0]->op == BURG_LoadConst && p->children[1]->op == BURG_LoadConst) {
+                int c = 0 + 0;
+                if (c < p->cost[2]) {
+                    p->cost[2] = c;
+                    p->rule[2] = 31;
+                    closure_reg(p, c);
+                }
+            }
+            break;
+        case BURG_Add:
+            if (p->child_count >= 2 && p->children[0]->rule[2] && p->children[1]->rule[2]) {
+                int c = p->children[0]->cost[2] + p->children[1]->cost[2] + 1;
+                if (c < p->cost[2]) {
+                    p->cost[2] = c;
+                    p->rule[2] = 20;
+                    closure_reg(p, c);
+                }
+            }
+            if (p->child_count >= 2 && p->children[0]->op == BURG_LoadConst && p->children[1]->op == BURG_LoadConst) {
+                int c = 0 + 0;
+                if (c < p->cost[2]) {
+                    p->cost[2] = c;
+                    p->rule[2] = 30;
+                    closure_reg(p, c);
+                }
+            }
+            if (p->child_count >= 2 && p->children[0]->op == BURG_LoadConst && p->children[1]->rule[2] && (const_val(node, 0) == 0)) {
+                int c = p->children[1]->cost[2] + 0;
+                if (c < p->cost[2]) {
+                    p->cost[2] = c;
+                    p->rule[2] = 40;
+                    closure_reg(p, c);
+                }
+            }
+            break;
+        case BURG_LoadConst:
+            {
+                int c = 0 + 1;
+                if (c < p->cost[2]) {
+                    p->cost[2] = c;
+                    p->rule[2] = 10;
+                    closure_reg(p, c);
+                }
+            }
+            break;
+        case BURG_Neg:
+            if (p->child_count >= 1 && p->children[0]->rule[2]) {
+                int c = p->children[0]->cost[2] + 1;
+                if (c < p->cost[2]) {
+                    p->cost[2] = c;
+                    p->rule[2] = 23;
+                    closure_reg(p, c);
+                }
+            }
+            break;
+        case BURG_Mul:
+            if (p->child_count >= 2 && p->children[0]->rule[2] && p->children[1]->rule[2]) {
+                int c = p->children[0]->cost[2] + p->children[1]->cost[2] + 1;
+                if (c < p->cost[2]) {
+                    p->cost[2] = c;
+                    p->rule[2] = 22;
+                    closure_reg(p, c);
+                }
+            }
+            if (p->child_count >= 2 && p->children[0]->op == BURG_LoadConst && p->children[1]->op == BURG_LoadConst) {
+                int c = 0 + 0;
+                if (c < p->cost[2]) {
+                    p->cost[2] = c;
+                    p->rule[2] = 32;
+                    closure_reg(p, c);
+                }
+            }
+            if (p->child_count >= 2 && p->children[0]->op == BURG_LoadConst && p->children[1]->rule[2] && (const_val(node, 0) == 1)) {
+                int c = p->children[1]->cost[2] + 0;
+                if (c < p->cost[2]) {
+                    p->cost[2] = c;
+                    p->rule[2] = 41;
+                    closure_reg(p, c);
+                }
+            }
+            if (p->child_count >= 2 && p->children[0]->op == BURG_LoadConst && p->children[1]->rule[2] && (const_val(node, 0) == 0)) {
+                int c = p->children[1]->cost[2] + 0;
+                if (c < p->cost[2]) {
+                    p->cost[2] = c;
+                    p->rule[2] = 42;
+                    closure_reg(p, c);
+                }
+            }
+            break;
+        case BURG_SlotRef:
+            {
+                int c = 0 + 0;
+                if (c < p->cost[2]) {
+                    p->cost[2] = c;
+                    p->rule[2] = 11;
+                    closure_reg(p, c);
+                }
+            }
+            break;
+        }
+    }
+
+    BurgState* burg_label_tree(BURG_NODE_TYPE node) {
+        int arity = BURG_NODE_ARITY(node);
+        BurgState* p = (BurgState*)arena_alloc(sizeof(BurgState));
+        p->op = BURG_NODE_OP(node);
+        p->child_count = arity;
+        p->children = arity > 0
+            ? (BurgState**)arena_alloc(arity * sizeof(BurgState*))
+            : NULL;
+        for (int i = 0; i <= BURG_MAX_NT; i++) {
+            p->cost[i] = BURG_MAX_COST;
+            p->rule[i] = 0;
+        }
+
+        for (int i = 0; i < arity; i++)
+            p->children[i] = burg_label_tree(BURG_NODE_CHILD(node, i));
+
+        burg_dp(p, node);
+        return p;
+    }
+
+    BurgState* burg_label(BURG_NODE_TYPE node) {
+        void* id = BURG_NODE_ID(node);
+        BurgState* cached = burg_cache_lookup(id);
+        if (cached) return cached;
+
+        int arity = BURG_NODE_ARITY(node);
+        BurgState* p = (BurgState*)arena_alloc(sizeof(BurgState));
+        p->op = BURG_NODE_OP(node);
+        p->child_count = arity;
+        p->children = arity > 0
+            ? (BurgState**)arena_alloc(arity * sizeof(BurgState*))
+            : NULL;
+        for (int i = 0; i <= BURG_MAX_NT; i++) {
+            p->cost[i] = BURG_MAX_COST;
+            p->rule[i] = 0;
+        }
+
+        // Cache BEFORE DP (back-edge cut-point safety)
+        burg_cache_store(id, p);
+
+        for (int i = 0; i < arity; i++)
+            p->children[i] = burg_label(BURG_NODE_CHILD(node, i));
+
+        burg_dp(p, node);
+        return p;
+    }
+
+    static int burg_rule(BurgState* state, int goalnt) {
+        if (!state || goalnt < 1 || goalnt > BURG_MAX_NT) return 0;
+        return state->rule[goalnt];
+    }
+
+    static const char* burg_nt_name(int nt) {
+        static const char* names[] = {
+            "<invalid>",
+            "stmt",
+            "reg",
+        };
+        if (nt >= 1 && nt <= BURG_MAX_NT) return names[nt];
+        return names[0];
+    }
+
+    void burg_reduce(BURG_NODE_TYPE node, BurgState* state, int goalnt) {
+        int rule = burg_rule(state, goalnt);
+        switch (rule) {
+        case 11: { // reg: SlotRef
+            break;
+        }
+        case 10: { // reg: LoadConst
+            jit_emit_load_const(node);
+            break;
+        }
+        case 20: { // reg: Add(reg, reg)
+            burg_reduce(BURG_NODE_CHILD(node, 0), state->children[0], 2);
+            burg_reduce(BURG_NODE_CHILD(node, 1), state->children[1], 2);
+            jit_emit_binop(node, STENCIL_ADD);
+            break;
+        }
+        case 21: { // reg: Sub(reg, reg)
+            burg_reduce(BURG_NODE_CHILD(node, 0), state->children[0], 2);
+            burg_reduce(BURG_NODE_CHILD(node, 1), state->children[1], 2);
+            jit_emit_binop(node, STENCIL_SUB);
+            break;
+        }
+        case 22: { // reg: Mul(reg, reg)
+            burg_reduce(BURG_NODE_CHILD(node, 0), state->children[0], 2);
+            burg_reduce(BURG_NODE_CHILD(node, 1), state->children[1], 2);
+            jit_emit_binop(node, STENCIL_MUL);
+            break;
+        }
+        case 23: { // reg: Neg(reg)
+            burg_reduce(BURG_NODE_CHILD(node, 0), state->children[0], 2);
+            jit_emit_neg(node);
+            break;
+        }
+        case 30: { // reg: Add(LoadConst, LoadConst)
+            jit_fold_binop(node, '+');
+            break;
+        }
+        case 31: { // reg: Sub(LoadConst, LoadConst)
+            jit_fold_binop(node, '-');
+            break;
+        }
+        case 32: { // reg: Mul(LoadConst, LoadConst)
+            jit_fold_binop(node, '*');
+            break;
+        }
+        case 40: { // reg: Add(LoadConst, reg)
+            burg_reduce(BURG_NODE_CHILD(node, 1), state->children[1], 2);
+            break;
+        }
+        case 41: { // reg: Mul(LoadConst, reg)
+            burg_reduce(BURG_NODE_CHILD(node, 1), state->children[1], 2);
+            break;
+        }
+        case 42: { // reg: Mul(LoadConst, reg)
+            burg_reduce(BURG_NODE_CHILD(node, 1), state->children[1], 2);
+            jit_fold_zero(node);
+            break;
+        }
+        case 1: { // stmt: Halt
+            jit_emit_halt(node);
+            break;
+        }
+        case 100: { // stmt: reg
+            burg_reduce(node, state, 2);
+            break;
+        }
+        }
+    }
+
+public:
+    void burg_rewrite(BURG_NODE_TYPE root) {
+        arena_reset();
+
+        if (BURG_NODE_SUCC_COUNT(root) == 0) {
+            BurgState* state = burg_label_tree(root);
+            if (state->rule[1])
+                burg_reduce(root, state, 1);
+            return;
+        }
+
+        burg_cache_clear();
+
+        // Compute reverse postorder via iterative DFS
+        std::vector<BURG_NODE_TYPE> rpo;
         {
-            int c = 0 + 0;
-            if (c < p->cost[1]) {
-                p->cost[1] = c;
-                p->rule[1] = 1;
-            }
-        }
-        break;
-    case BURG_Sub:
-        if (p->child_count >= 2 && p->children[0]->rule[2] && p->children[1]->rule[2]) {
-            int c = p->children[0]->cost[2] + p->children[1]->cost[2] + 1;
-            if (c < p->cost[2]) {
-                p->cost[2] = c;
-                p->rule[2] = 21;
-                closure_reg(p, c);
-            }
-        }
-        if (p->child_count >= 2 && p->children[0]->op == BURG_LoadConst && p->children[1]->op == BURG_LoadConst) {
-            int c = 0 + 0;
-            if (c < p->cost[2]) {
-                p->cost[2] = c;
-                p->rule[2] = 31;
-                closure_reg(p, c);
-            }
-        }
-        break;
-    case BURG_Add:
-        if (p->child_count >= 2 && p->children[0]->rule[2] && p->children[1]->rule[2]) {
-            int c = p->children[0]->cost[2] + p->children[1]->cost[2] + 1;
-            if (c < p->cost[2]) {
-                p->cost[2] = c;
-                p->rule[2] = 20;
-                closure_reg(p, c);
-            }
-        }
-        if (p->child_count >= 2 && p->children[0]->op == BURG_LoadConst && p->children[1]->op == BURG_LoadConst) {
-            int c = 0 + 0;
-            if (c < p->cost[2]) {
-                p->cost[2] = c;
-                p->rule[2] = 30;
-                closure_reg(p, c);
-            }
-        }
-        if (p->child_count >= 2 && p->children[0]->op == BURG_LoadConst && p->children[1]->rule[2] && (const_val(node, 0) == 0)) {
-            int c = p->children[1]->cost[2] + 0;
-            if (c < p->cost[2]) {
-                p->cost[2] = c;
-                p->rule[2] = 40;
-                closure_reg(p, c);
-            }
-        }
-        break;
-    case BURG_LoadConst:
-        {
-            int c = 0 + 1;
-            if (c < p->cost[2]) {
-                p->cost[2] = c;
-                p->rule[2] = 10;
-                closure_reg(p, c);
-            }
-        }
-        break;
-    case BURG_Neg:
-        if (p->child_count >= 1 && p->children[0]->rule[2]) {
-            int c = p->children[0]->cost[2] + 1;
-            if (c < p->cost[2]) {
-                p->cost[2] = c;
-                p->rule[2] = 23;
-                closure_reg(p, c);
-            }
-        }
-        break;
-    case BURG_Mul:
-        if (p->child_count >= 2 && p->children[0]->rule[2] && p->children[1]->rule[2]) {
-            int c = p->children[0]->cost[2] + p->children[1]->cost[2] + 1;
-            if (c < p->cost[2]) {
-                p->cost[2] = c;
-                p->rule[2] = 22;
-                closure_reg(p, c);
-            }
-        }
-        if (p->child_count >= 2 && p->children[0]->op == BURG_LoadConst && p->children[1]->op == BURG_LoadConst) {
-            int c = 0 + 0;
-            if (c < p->cost[2]) {
-                p->cost[2] = c;
-                p->rule[2] = 32;
-                closure_reg(p, c);
-            }
-        }
-        if (p->child_count >= 2 && p->children[0]->op == BURG_LoadConst && p->children[1]->rule[2] && (const_val(node, 0) == 1)) {
-            int c = p->children[1]->cost[2] + 0;
-            if (c < p->cost[2]) {
-                p->cost[2] = c;
-                p->rule[2] = 41;
-                closure_reg(p, c);
-            }
-        }
-        if (p->child_count >= 2 && p->children[0]->op == BURG_LoadConst && p->children[1]->rule[2] && (const_val(node, 0) == 0)) {
-            int c = p->children[1]->cost[2] + 0;
-            if (c < p->cost[2]) {
-                p->cost[2] = c;
-                p->rule[2] = 42;
-                closure_reg(p, c);
-            }
-        }
-        break;
-    case BURG_SlotRef:
-        {
-            int c = 0 + 0;
-            if (c < p->cost[2]) {
-                p->cost[2] = c;
-                p->rule[2] = 11;
-                closure_reg(p, c);
-            }
-        }
-        break;
-    }
-    return p;
-}
+            std::unordered_set<void*> visited;
+            struct Frame { BURG_NODE_TYPE node; int succ; };
+            std::vector<Frame> stack;
+            stack.push_back({root, 0});
+            visited.insert(BURG_NODE_ID(root));
 
-// ── Rule lookup ──
-
-static int burg_rule(BurgState* state, int goalnt) {
-    if (!state || goalnt < 1 || goalnt > BURG_MAX_NT) return 0;
-    return state->rule[goalnt];
-}
-
-// ── Nonterminal names (for debugging) ──
-
-static const char* burg_nt_name(int nt) {
-    static const char* names[] = {
-        "<invalid>",
-        "stmt",
-        "reg",
-    };
-    if (nt >= 1 && nt <= BURG_MAX_NT) return names[nt];
-    return names[0];
-}
-
-// ── Reducer (top-down pass) ──
-
-static void burg_reduce(BURG_NODE_TYPE node, BurgState* state, int goalnt) {
-    int rule = burg_rule(state, goalnt);
-    switch (rule) {
-    case 11: { // reg: SlotRef
-        break;
-    }
-    case 10: { // reg: LoadConst
-        jit_emit_load_const(node);
-        break;
-    }
-    case 20: { // reg: Add(reg, reg)
-        burg_reduce(BURG_NODE_CHILD(node, 0), state->children[0], 2);
-        burg_reduce(BURG_NODE_CHILD(node, 1), state->children[1], 2);
-        jit_emit_binop(node, STENCIL_ADD);
-        break;
-    }
-    case 21: { // reg: Sub(reg, reg)
-        burg_reduce(BURG_NODE_CHILD(node, 0), state->children[0], 2);
-        burg_reduce(BURG_NODE_CHILD(node, 1), state->children[1], 2);
-        jit_emit_binop(node, STENCIL_SUB);
-        break;
-    }
-    case 22: { // reg: Mul(reg, reg)
-        burg_reduce(BURG_NODE_CHILD(node, 0), state->children[0], 2);
-        burg_reduce(BURG_NODE_CHILD(node, 1), state->children[1], 2);
-        jit_emit_binop(node, STENCIL_MUL);
-        break;
-    }
-    case 23: { // reg: Neg(reg)
-        burg_reduce(BURG_NODE_CHILD(node, 0), state->children[0], 2);
-        jit_emit_neg(node);
-        break;
-    }
-    case 30: { // reg: Add(LoadConst, LoadConst)
-        jit_fold_binop(node, '+');
-        break;
-    }
-    case 31: { // reg: Sub(LoadConst, LoadConst)
-        jit_fold_binop(node, '-');
-        break;
-    }
-    case 32: { // reg: Mul(LoadConst, LoadConst)
-        jit_fold_binop(node, '*');
-        break;
-    }
-    case 40: { // reg: Add(LoadConst, reg)
-        burg_reduce(BURG_NODE_CHILD(node, 1), state->children[1], 2);
-        break;
-    }
-    case 41: { // reg: Mul(LoadConst, reg)
-        burg_reduce(BURG_NODE_CHILD(node, 1), state->children[1], 2);
-        break;
-    }
-    case 42: { // reg: Mul(LoadConst, reg)
-        burg_reduce(BURG_NODE_CHILD(node, 1), state->children[1], 2);
-        jit_fold_zero(node);
-        break;
-    }
-    case 1: { // stmt: Halt
-        jit_emit_halt(node);
-        break;
-    }
-    case 100: { // stmt: reg
-        burg_reduce(node, state, 2);
-        break;
-    }
-    }
-}
-
-// ── Graph rewriter (RPO walk over successor edges) ──
-
-static void burg_rewrite(BURG_NODE_TYPE root) {
-    burg_cache_clear();
-
-    // Compute reverse postorder via iterative DFS
-    std::vector<BURG_NODE_TYPE> rpo;
-    {
-        std::unordered_set<void*> visited;
-        struct Frame { BURG_NODE_TYPE node; int succ; };
-        std::vector<Frame> stack;
-        stack.push_back({root, 0});
-        visited.insert(BURG_NODE_ID(root));
-
-        while (!stack.empty()) {
-            auto& f = stack.back();
-            int sc = BURG_NODE_SUCC_COUNT(f.node);
-            if (f.succ < sc) {
-                BURG_NODE_TYPE s = BURG_NODE_SUCC(f.node, f.succ);
-                f.succ++;
-                if (s && visited.insert(BURG_NODE_ID(s)).second)
-                    stack.push_back({s, 0});
-            } else {
-                rpo.push_back(f.node);
-                stack.pop_back();
+            while (!stack.empty()) {
+                auto& f = stack.back();
+                int sc = BURG_NODE_SUCC_COUNT(f.node);
+                if (f.succ < sc) {
+                    BURG_NODE_TYPE s = BURG_NODE_SUCC(f.node, f.succ);
+                    f.succ++;
+                    if (s && visited.insert(BURG_NODE_ID(s)).second)
+                        stack.push_back({s, 0});
+                } else {
+                    rpo.push_back(f.node);
+                    stack.pop_back();
+                }
             }
+            std::reverse(rpo.begin(), rpo.end());
         }
-        // Reverse: postorder → reverse postorder
-        std::reverse(rpo.begin(), rpo.end());
+
+        // Label every node (data-flow children labeled recursively)
+        for (auto* n : rpo)
+            burg_label(n);
+
+        // Reduce every node with the start nonterminal
+        for (auto* n : rpo) {
+            BurgState* s = burg_cache_lookup(BURG_NODE_ID(n));
+            if (s && s->rule[1])
+                burg_reduce(n, s, 1);
+        }
     }
 
-    // Label every node (data-flow children labeled recursively)
-    for (auto* n : rpo)
-        burg_label(n);
+}; // class BurgMatcher
 
-    // Reduce every node with the start nonterminal
-    for (auto* n : rpo) {
-        BurgState* s = burg_cache_lookup(BURG_NODE_ID(n));
-        if (s && s->rule[1])
-            burg_reduce(n, s, 1);
-    }
-}

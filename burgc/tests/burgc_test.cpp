@@ -11,6 +11,10 @@ static std::string source_path(const char* relative) {
     return std::string(SOURCE_DIR) + "/" + relative;
 }
 
+static std::string frame_dir() {
+    return std::string(SOURCE_DIR) + "/frames";
+}
+
 // Helper: parse + analyze + generate with a specific backend
 // Returns header + impl concatenated (for searching both)
 static std::string gen_code(const char* input, BurgBackend& backend) {
@@ -21,11 +25,11 @@ static std::string gen_code(const char* input, BurgBackend& backend) {
     if (!gen.analyze(parser.ast)) return "";
     if (backend.needs_impl_file()) {
         std::ostringstream hdr, impl;
-        backend.generate(hdr, impl, gen.analysis(), "test.h");
+        backend.generate(hdr, impl, gen.analysis(), "test.h", frame_dir());
         return hdr.str() + "\n" + impl.str();
     }
     std::ostringstream out;
-    backend.generate(out, gen.analysis());
+    backend.generate(out, gen.analysis(), frame_dir());
     return out.str();
 }
 
@@ -175,7 +179,7 @@ TEST(BurgCppBackend, GeneratesOutput) {
     ASSERT_NE(spec, nullptr);
     ASSERT_TRUE(gen.analyze(spec));
     std::ostringstream out;
-    gen.generate(out);
+    gen.generate(out, frame_dir());
     std::string code = out.str();
     EXPECT_FALSE(code.empty());
     EXPECT_NE(code.find("#pragma once"), std::string::npos);
@@ -187,7 +191,7 @@ TEST(BurgCppBackend, EmitsTerminalConstants) {
     ASSERT_NE(spec, nullptr);
     ASSERT_TRUE(gen.analyze(spec));
     std::ostringstream out;
-    gen.generate(out);
+    gen.generate(out, frame_dir());
     std::string code = out.str();
     EXPECT_NE(code.find("BURG_Const"), std::string::npos);
     EXPECT_NE(code.find("BURG_Add"), std::string::npos);
@@ -201,7 +205,7 @@ TEST(BurgCppBackend, EmitsNonterminalConstants) {
     ASSERT_NE(spec, nullptr);
     ASSERT_TRUE(gen.analyze(spec));
     std::ostringstream out;
-    gen.generate(out);
+    gen.generate(out, frame_dir());
     std::string code = out.str();
     EXPECT_NE(code.find("reg_NT"), std::string::npos);
     EXPECT_NE(code.find("BURG_MAX_NT"), std::string::npos);
@@ -213,7 +217,7 @@ TEST(BurgCppBackend, EmitsClassWrapper) {
     ASSERT_NE(spec, nullptr);
     ASSERT_TRUE(gen.analyze(spec));
     std::ostringstream out;
-    gen.generate(out);
+    gen.generate(out, frame_dir());
     std::string code = out.str();
     EXPECT_NE(code.find("class BurgMatcher {"), std::string::npos);
     EXPECT_NE(code.find("}; // class BurgMatcher"), std::string::npos);
@@ -225,7 +229,7 @@ TEST(BurgCppBackend, EmitsStateStruct) {
     ASSERT_NE(spec, nullptr);
     ASSERT_TRUE(gen.analyze(spec));
     std::ostringstream out;
-    gen.generate(out);
+    gen.generate(out, frame_dir());
     std::string code = out.str();
     EXPECT_NE(code.find("struct BurgState"), std::string::npos);
     EXPECT_NE(code.find("int op;"), std::string::npos);
@@ -238,7 +242,7 @@ TEST(BurgCppBackend, EmitsClosuresForChainRules) {
     ASSERT_NE(spec, nullptr);
     ASSERT_TRUE(gen.analyze(spec));
     std::ostringstream out;
-    gen.generate(out);
+    gen.generate(out, frame_dir());
     EXPECT_NE(out.str().find("closure_"), std::string::npos);
 }
 
@@ -248,7 +252,7 @@ TEST(BurgCppBackend, EmitsRuleLookup) {
     ASSERT_NE(spec, nullptr);
     ASSERT_TRUE(gen.analyze(spec));
     std::ostringstream out;
-    gen.generate(out);
+    gen.generate(out, frame_dir());
     std::string code = out.str();
     EXPECT_NE(code.find("burg_rule"), std::string::npos);
     EXPECT_NE(code.find("burg_label"), std::string::npos);
@@ -261,7 +265,7 @@ TEST(BurgCppBackend, NontermNameTable) {
     ASSERT_NE(spec, nullptr);
     ASSERT_TRUE(gen.analyze(spec));
     std::ostringstream out;
-    gen.generate(out);
+    gen.generate(out, frame_dir());
     std::string code = out.str();
     EXPECT_NE(code.find("\"stmt\""), std::string::npos);
     EXPECT_NE(code.find("\"reg\""), std::string::npos);
@@ -274,7 +278,7 @@ TEST(BurgCppBackend, CostsInGeneratedCode) {
     ASSERT_NE(spec, nullptr);
     ASSERT_TRUE(gen.analyze(spec));
     std::ostringstream out;
-    gen.generate(out);
+    gen.generate(out, frame_dir());
     std::string code = out.str();
     EXPECT_NE(code.find("+ 1"), std::string::npos);
     EXPECT_NE(code.find("+ 2"), std::string::npos);
@@ -337,7 +341,7 @@ TEST(BurgCppBackend, EmitsReducerForActions) {
     ASSERT_NE(spec, nullptr);
     ASSERT_TRUE(gen.analyze(spec));
     std::ostringstream out;
-    gen.generate(out);
+    gen.generate(out, frame_dir());
     std::string code = out.str();
     EXPECT_NE(code.find("burg_reduce"), std::string::npos);
     EXPECT_NE(code.find("emit_const(node)"), std::string::npos);
@@ -351,7 +355,7 @@ TEST(BurgCppBackend, ReducerHasChildReductions) {
     ASSERT_NE(spec, nullptr);
     ASSERT_TRUE(gen.analyze(spec));
     std::ostringstream out;
-    gen.generate(out);
+    gen.generate(out, frame_dir());
     std::string code = out.str();
     EXPECT_NE(code.find("BURG_NODE_CHILD(node, 0)"), std::string::npos);
     EXPECT_NE(code.find("BURG_NODE_CHILD(node, 1)"), std::string::npos);
@@ -365,7 +369,7 @@ TEST(BurgCppBackend, NoReducerWithoutActions) {
     ASSERT_NE(spec, nullptr);
     ASSERT_TRUE(gen.analyze(spec));
     std::ostringstream out;
-    gen.generate(out);
+    gen.generate(out, frame_dir());
     EXPECT_EQ(out.str().find("burg_reduce"), std::string::npos);
 }
 
@@ -375,7 +379,7 @@ TEST(BurgCppBackend, EmitsUserHeaders) {
     ASSERT_NE(spec, nullptr);
     ASSERT_TRUE(gen.analyze(spec));
     std::ostringstream out;
-    gen.generate(out);
+    gen.generate(out, frame_dir());
     EXPECT_NE(out.str().find("#include \"emitter.h\""), std::string::npos);
 }
 
@@ -385,7 +389,7 @@ TEST(BurgCppBackend, StartSymbolIsFirstNonterminal) {
     ASSERT_NE(spec, nullptr);
     ASSERT_TRUE(gen.analyze(spec));
     std::ostringstream out;
-    gen.generate(out);
+    gen.generate(out, frame_dir());
     EXPECT_NE(out.str().find("stmt_NT = 1"), std::string::npos);
 }
 
@@ -397,7 +401,7 @@ TEST(BurgCppBackend, EmitsStateCache) {
     ASSERT_NE(spec, nullptr);
     ASSERT_TRUE(gen.analyze(spec));
     std::ostringstream out;
-    gen.generate(out);
+    gen.generate(out, frame_dir());
     std::string code = out.str();
     EXPECT_NE(code.find("burg_state_cache"), std::string::npos);
     EXPECT_NE(code.find("burg_cache_lookup"), std::string::npos);
@@ -410,7 +414,7 @@ TEST(BurgCppBackend, EmitsMacroChecks) {
     ASSERT_NE(spec, nullptr);
     ASSERT_TRUE(gen.analyze(spec));
     std::ostringstream out;
-    gen.generate(out);
+    gen.generate(out, frame_dir());
     std::string code = out.str();
     EXPECT_NE(code.find("BURG_NODE_TYPE"), std::string::npos);
     EXPECT_NE(code.find("BURG_NODE_OP"), std::string::npos);
@@ -424,7 +428,7 @@ TEST(BurgCppBackend, LabelFuncIsMethod) {
     ASSERT_NE(spec, nullptr);
     ASSERT_TRUE(gen.analyze(spec));
     std::ostringstream out;
-    gen.generate(out);
+    gen.generate(out, frame_dir());
     std::string code = out.str();
     EXPECT_NE(code.find("BurgState* burg_label(BURG_NODE_TYPE node)"), std::string::npos);
     EXPECT_NE(code.find("BurgState* burg_label_tree(BURG_NODE_TYPE node)"), std::string::npos);
@@ -439,7 +443,7 @@ TEST(BurgCppBackend, GraphLabelCachesBeforeDP) {
     ASSERT_NE(spec, nullptr);
     ASSERT_TRUE(gen.analyze(spec));
     std::ostringstream out;
-    gen.generate(out);
+    gen.generate(out, frame_dir());
     std::string code = out.str();
     // In the graph label function, cache_store should appear before burg_dp call
     auto label_pos = code.find("BurgState* burg_label(BURG_NODE_TYPE node)");
@@ -457,7 +461,7 @@ TEST(BurgCppBackend, IndexedChildrenInDP) {
     ASSERT_NE(spec, nullptr);
     ASSERT_TRUE(gen.analyze(spec));
     std::ostringstream out;
-    gen.generate(out);
+    gen.generate(out, frame_dir());
     std::string code = out.str();
     EXPECT_NE(code.find("p->children[0]->rule["), std::string::npos);
     EXPECT_NE(code.find("p->children[1]->rule["), std::string::npos);
@@ -470,7 +474,7 @@ TEST(BurgCppBackend, ReducerIsMethod) {
     ASSERT_NE(spec, nullptr);
     ASSERT_TRUE(gen.analyze(spec));
     std::ostringstream out;
-    gen.generate(out);
+    gen.generate(out, frame_dir());
     EXPECT_NE(out.str().find("void burg_reduce(BURG_NODE_TYPE node, BurgState* state, int goalnt)"),
               std::string::npos);
 }
@@ -481,7 +485,7 @@ TEST(BurgCppBackend, EmitsArenaAllocator) {
     ASSERT_NE(spec, nullptr);
     ASSERT_TRUE(gen.analyze(spec));
     std::ostringstream out;
-    gen.generate(out);
+    gen.generate(out, frame_dir());
     std::string code = out.str();
     EXPECT_NE(code.find("arena_alloc"), std::string::npos);
     EXPECT_NE(code.find("arena_reset"), std::string::npos);
@@ -496,7 +500,7 @@ TEST(BurgCppBackend, TreeFastPathInRewrite) {
     ASSERT_NE(spec, nullptr);
     ASSERT_TRUE(gen.analyze(spec));
     std::ostringstream out;
-    gen.generate(out);
+    gen.generate(out, frame_dir());
     std::string code = out.str();
     // Fast path: check SUCC_COUNT, call burg_label_tree directly
     EXPECT_NE(code.find("BURG_NODE_SUCC_COUNT(root) == 0"), std::string::npos);
@@ -512,7 +516,7 @@ TEST(BurgCppBackend, TreeLabelHasNoCache) {
     ASSERT_NE(spec, nullptr);
     ASSERT_TRUE(gen.analyze(spec));
     std::ostringstream out;
-    gen.generate(out);
+    gen.generate(out, frame_dir());
     std::string code = out.str();
     // Find burg_label_tree body — should NOT have cache calls
     auto tree_pos = code.find("BurgState* burg_label_tree(BURG_NODE_TYPE node)");
@@ -575,7 +579,7 @@ TEST(BurgCppBackend, EmitsRewriteFunc) {
     ASSERT_NE(spec, nullptr);
     ASSERT_TRUE(gen.analyze(spec));
     std::ostringstream out;
-    gen.generate(out);
+    gen.generate(out, frame_dir());
     std::string code = out.str();
     EXPECT_NE(code.find("void burg_rewrite(BURG_NODE_TYPE root)"), std::string::npos);
     EXPECT_NE(code.find("BURG_NODE_SUCC_COUNT"), std::string::npos);
@@ -589,7 +593,7 @@ TEST(BurgCppBackend, RewriteFuncReducesWhenActions) {
     ASSERT_NE(spec, nullptr);
     ASSERT_TRUE(gen.analyze(spec));
     std::ostringstream out;
-    gen.generate(out);
+    gen.generate(out, frame_dir());
     EXPECT_NE(out.str().find("burg_reduce(n, s,"), std::string::npos);
 }
 
@@ -599,7 +603,7 @@ TEST(BurgCppBackend, RewriteResetsArenaFirst) {
     ASSERT_NE(spec, nullptr);
     ASSERT_TRUE(gen.analyze(spec));
     std::ostringstream out;
-    gen.generate(out);
+    gen.generate(out, frame_dir());
     std::string code = out.str();
     // arena_reset should be the first thing in burg_rewrite
     auto rewrite_pos = code.find("void burg_rewrite(");
@@ -646,7 +650,7 @@ TEST(BurgCppBackend, NoMembersBlockStillWorks) {
     ASSERT_NE(spec, nullptr);
     ASSERT_TRUE(gen.analyze(spec));
     std::ostringstream out;
-    gen.generate(out);
+    gen.generate(out, frame_dir());
     std::string code = out.str();
     EXPECT_NE(code.find("class BurgMatcher {"), std::string::npos);
     EXPECT_NE(code.find("}; // class BurgMatcher"), std::string::npos);

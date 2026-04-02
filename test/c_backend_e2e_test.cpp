@@ -526,6 +526,69 @@ int main(int argc, char** argv) {
     ASSERT_TRUE(run_c_e2e(spec, harness, data, sizeof(data), &err)) << err;
 }
 
+// ── Switch as inline field with trailing fields ──
+//
+// Regression: inline switch inside a struct must not return early —
+// fields after the switch must still be parsed.
+
+TEST(CBackendE2E, InlineSwitchWithTrailingFields) {
+    const char* spec =
+        "@endian big\n"
+        "HeaderA = struct { a: uint8 }\n"
+        "HeaderB = struct { b: uint16be }\n"
+        "Packet = struct {\n"
+        "    tag: uint8,\n"
+        "    header: switch(tag) {\n"
+        "        1: HeaderA;\n"
+        "        2: HeaderB;\n"
+        "    },\n"
+        "    payload: uint32be\n"
+        "}";
+
+    const char* harness = R"(
+#include "testReader.h"
+#include "testWriter.h"
+#include <stdio.h>
+#include <string.h>
+#include <assert.h>
+
+int main(int argc, char** argv) {
+    (void)argc;
+    FILE* f = fopen(argv[1], "rb");
+    fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
+    uint8_t buf[256]; fread(buf, 1, sz, f); fclose(f);
+
+    bbq_ctx_t ctx;
+    bbq_ctx_init(&ctx, buf, sz);
+    packet_t pkt;
+    assert(packet_read(&ctx, &pkt));
+    assert(pkt.tag == 1);
+    assert(pkt.header.tag == 1);
+    assert(pkt.header.u.case_0.a == 0x42);
+    // This field comes AFTER the switch — must not be skipped
+    assert(pkt.payload == 0xDEADBEEF);
+
+    uint8_t out[256];
+    bbq_write_ctx_t wctx;
+    bbq_write_ctx_init(&wctx, out, sizeof(out));
+    assert(packet_write(&wctx, &pkt));
+    assert(wctx.pos == (size_t)sz);
+    assert(memcmp(buf, out, sz) == 0);
+
+    printf("OK: inline switch with trailing fields round-trip\n");
+    return 0;
+}
+)";
+
+    uint8_t data[] = {
+        0x01,                       // tag = 1 (HeaderA)
+        0x42,                       // header.a = 0x42
+        0xDE, 0xAD, 0xBE, 0xEF     // payload = 0xDEADBEEF
+    };
+    std::string err;
+    ASSERT_TRUE(run_c_e2e(spec, harness, data, sizeof(data), &err)) << err;
+}
+
 // ── Error: truncated input ──
 
 TEST(CBackendE2E, TruncatedInput) {

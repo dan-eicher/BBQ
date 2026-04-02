@@ -260,6 +260,33 @@ void CWriterEmitter::emit_write_call(const std::string& src, TypeExpr* type,
 
     } else if (auto* bf = dynamic_cast<Bitfield*>(type)) {
         emit_bitfield_write(ctx, bf, src + ".", out, indent);
+
+    } else if (auto* sw = dynamic_cast<Switch*>(type)) {
+        // Inline switch field: dispatch on the stored tag to write the active variant
+        out << ind(indent) << "switch (" << src << ".tag) {\n";
+        for (size_t i = 0; i < sw->cases.size(); i++) {
+            std::string case_name = "case_" + std::to_string(i);
+            if (auto* iv = dynamic_cast<IntValue*>(sw->cases[i]->value)) {
+                out << ind(indent) << "case " << iv->value << ":\n";
+            } else if (auto* idv = dynamic_cast<IdentValue*>(sw->cases[i]->value)) {
+                out << ind(indent) << "case " << idv->name << ":\n";
+            } else if (auto* rv = dynamic_cast<RefValue*>(sw->cases[i]->value)) {
+                std::string path;
+                for (size_t j = 0; j < rv->path.size(); j++) {
+                    if (j > 0) path += "_";
+                    path += rv->path[j];
+                }
+                out << ind(indent) << "case " << path << ":\n";
+            }
+            emit_write_call(src + ".u." + case_name, sw->cases[i]->target, ctx, out, indent + 1);
+            out << ind(indent + 1) << "break;\n";
+        }
+        if (sw->default_) {
+            out << ind(indent) << "default:\n";
+            emit_write_call(src + ".u.default_val", (*sw->default_)->target, ctx, out, indent + 1);
+            out << ind(indent + 1) << "break;\n";
+        }
+        out << ind(indent) << "}\n";
     }
 }
 

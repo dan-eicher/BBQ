@@ -320,7 +320,7 @@ void CReaderEmitter::emit_read_call(const std::string& target, TypeExpr* type,
         out << ind(indent) << "if (!" << ext->func_name << "(ctx, &" << target << "))\n";
         out << ind(indent + 1) << "return bbq_fail(ctx, \"" << ctx << ": read failed\");\n";
     } else if (auto* sw = dynamic_cast<Switch*>(type)) {
-        emit_switch_body(ctx, sw, compile_expr(sw->discriminator), "(&" + target + ")", out, indent);
+        emit_switch_body(ctx, sw, compile_expr(sw->discriminator), "(&" + target + ")", out, indent, /*is_inline=*/true);
     } else if (auto* nested_st = dynamic_cast<Struct*>(type)) {
         CEmitScope nested_scope;
         nested_scope.prefix = target + ".";
@@ -363,7 +363,10 @@ bool CReaderEmitter::has_string_cases(Switch* sw) {
 
 void CReaderEmitter::emit_switch_body(const std::string& rule_name, Switch* sw,
                                        const std::string& disc_expr, const std::string& target,
-                                       std::ostream& out, int indent) {
+                                       std::ostream& out, int indent, bool is_inline) {
+    // When inline (switch is a field inside a struct), use break instead of
+    // return so that subsequent struct fields are parsed after the switch.
+    const char* exit_stmt = is_inline ? "break" : "return true";
     if (has_string_cases(sw)) {
         bool first = true;
         size_t variant_idx = 0;
@@ -376,7 +379,7 @@ void CReaderEmitter::emit_switch_body(const std::string& rule_name, Switch* sw,
             out << ind(indent + 1) << target << "->tag = " << variant_idx << ";\n";
             std::string case_name = "case_" + std::to_string(variant_idx);
             emit_read_call(target + "->u." + case_name, c->target, rule_name, out, indent + 1);
-            out << ind(indent + 1) << "return true;\n";
+            out << ind(indent + 1) << exit_stmt << ";\n";
             first = false;
             variant_idx++;
         }
@@ -384,7 +387,7 @@ void CReaderEmitter::emit_switch_body(const std::string& rule_name, Switch* sw,
             out << ind(indent) << "} else {\n";
             out << ind(indent + 1) << target << "->tag = " << variant_idx << ";\n";
             emit_read_call(target + "->u.default_val", (*sw->default_)->target, rule_name, out, indent + 1);
-            out << ind(indent + 1) << "return true;\n";
+            out << ind(indent + 1) << exit_stmt << ";\n";
             out << ind(indent) << "}\n";
         } else {
             out << ind(indent) << "}\n";
@@ -416,7 +419,7 @@ void CReaderEmitter::emit_switch_body(const std::string& rule_name, Switch* sw,
         std::string case_name = "case_" + std::to_string(variant_idx);
         out << ind(indent + 1) << target << "->tag = " << case_value_expr << ";\n";
         emit_read_call(target + "->u." + case_name, c->target, rule_name, out, indent + 1);
-        out << ind(indent + 1) << "return true;\n";
+        out << ind(indent + 1) << exit_stmt << ";\n";
         out << ind(indent) << "}\n";
         variant_idx++;
     }
@@ -424,12 +427,14 @@ void CReaderEmitter::emit_switch_body(const std::string& rule_name, Switch* sw,
         out << ind(indent) << "default: {\n";
         out << ind(indent + 1) << target << "->tag = -1;\n";
         emit_read_call(target + "->u.default_val", (*sw->default_)->target, rule_name, out, indent + 1);
-        out << ind(indent + 1) << "return true;\n";
+        out << ind(indent + 1) << exit_stmt << ";\n";
         out << ind(indent) << "}\n";
     }
+    if (!sw->default_) {
+        out << ind(indent) << "default:\n";
+        out << ind(indent + 1) << "return bbq_fail(ctx, \"" << rule_name << ": unhandled case\");\n";
+    }
     out << ind(indent) << "}\n";
-    if (!sw->default_)
-        out << ind(indent) << "return bbq_fail(ctx, \"" << rule_name << ": unhandled case\");\n";
 }
 
 // ── Alternatives body ──────────────────────────────────────

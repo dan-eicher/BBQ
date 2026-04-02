@@ -1,8 +1,19 @@
 cmake_minimum_required(VERSION 3.16)
-project(BBQ LANGUAGES CXX)
+project(BBQ LANGUAGES CXX C)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
+# --- C runtime library (for generated C code) ---
+add_library(bbq_crt STATIC
+    crt/bbq_arena.c
+    crt/bbq_buf.c
+    crt/bbq_htree.c
+)
+set_target_properties(bbq_crt PROPERTIES
+    C_STANDARD 11
+    C_STANDARD_REQUIRED ON)
+target_include_directories(bbq_crt PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/crt)
 
 # --- shared frontend library ---
 add_library(bbq_frontend STATIC
@@ -66,8 +77,9 @@ add_executable(bbq_tests
     test/cek_test.cpp
     test/c_type_emitter_test.cpp
     test/c_backend_e2e_test.cpp
+    test/crt_test.cpp
 )
-target_link_libraries(bbq_tests PRIVATE bbq_cpp_backend bbq_c_backend bbq_cek_backend GTest::GTest GTest::Main)
+target_link_libraries(bbq_tests PRIVATE bbq_cpp_backend bbq_c_backend bbq_cek_backend bbq_crt GTest::GTest GTest::Main)
 target_compile_definitions(bbq_tests PRIVATE
     SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
 gtest_discover_tests(bbq_tests)

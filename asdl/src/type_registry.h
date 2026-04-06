@@ -10,6 +10,7 @@ public:
     TypeRegistry();
 
     void set_lang_c();   // Remap base types for C output
+    bool is_c_mode() const { return c_mode_; }
     void register_type(const std::string& asdl_type, const std::string& target_type);
     void register_alias(const std::string& asdl_type, const std::string& target_type);
     std::string get_type(const std::string& asdl_type) const;
@@ -17,6 +18,7 @@ public:
     bool has_type(const std::string& type) const;
 
 private:
+    bool c_mode_ = false;
     std::map<std::string, std::string> types_;
     std::set<std::string> aliases_;  // Types that are aliases (treated as base types)
 };

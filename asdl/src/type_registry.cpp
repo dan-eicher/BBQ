@@ -11,6 +11,7 @@ TypeRegistry::TypeRegistry() {
 }
 
 void TypeRegistry::set_lang_c() {
+    c_mode_ = true;
     types_["identifier"] = "const char*";
     types_["string"]     = "const char*";
 }

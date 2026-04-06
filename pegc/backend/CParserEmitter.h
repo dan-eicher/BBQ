@@ -64,6 +64,10 @@ private:
     std::string prefix_;
     int var_counter_ = 0;
     std::set<std::string> production_names_;
+
+    // Tracks failure action: "return false" at production level,
+    // "break" inside do { } while(0) backtracking blocks.
+    std::string fail_ = "return false";
 };
 
 } // namespace pegc

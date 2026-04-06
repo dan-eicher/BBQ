@@ -50,6 +50,14 @@ void Generator::setup_callbacks() {
         std::string b = args.at(1)->get<std::string>();
         return a + b;
     });
+
+    // C type name: module_name + "_" + def_name in snake_case
+    // e.g., c_name("ast", "expr") → "ast_expr_t"
+    env_.add_callback("c_name", 2, [](inja::Arguments& args) {
+        std::string mod = SnakeCase(args.at(0)->get<std::string>());
+        std::string def = SnakeCase(args.at(1)->get<std::string>());
+        return mod + "_" + def + "_t";
+    });
 }
 
 asdl_ast::Module* Generator::parse(const std::string& input_file) {
@@ -154,8 +162,11 @@ void Generator::process(json& module) {
         defined_types.insert(def["name"].get<std::string>());
     }
 
+    std::string mod = module["name"].get<std::string>();
+
     for (json& def : module["definitions"]) {
-        std::string name, base;
+        std::string def_name = def["name"].get<std::string>();
+        std::string c_type = SnakeCase(mod) + "_" + SnakeCase(def_name) + "_t";
 
         if (def["type"] == "sum") {
             // Detect enum-like sum types: all constructors have zero fields
@@ -168,31 +179,40 @@ void Generator::process(json& module) {
             }
             def["is_enum"] = is_enum;
 
-            if (is_enum) {
-                // Enum type: register as value type, no base class needed
-                name = CamelCase(def["name"]);
-                types_.register_type(def["name"], name);
-            } else if (def["types"].size() == 1) {
-                name = def["types"][0]["name"];
-                base = "ASTNode";
-                types_.register_type(def["name"], name + "*");
-                module["bases"].push_back(name);
-                for (json& value : def["types"]) {
-                    value["base"] = base;
+            if (types_.is_c_mode()) {
+                if (is_enum) {
+                    types_.register_type(def_name, c_type);
+                } else {
+                    types_.register_type(def_name, c_type + "*");
+                    module["bases"].push_back(c_type);
                 }
             } else {
-                name = CamelCase(def["name"]);
-                base = name;
-                types_.register_type(def["name"], name + "*");
-                module["bases"].push_back(name);
-                for (json& value : def["types"]) {
-                    value["base"] = base;
+                if (is_enum) {
+                    std::string name = CamelCase(def_name);
+                    types_.register_type(def_name, name);
+                } else if (def["types"].size() == 1) {
+                    std::string name = def["types"][0]["name"];
+                    types_.register_type(def_name, name + "*");
+                    module["bases"].push_back(name);
+                    for (json& value : def["types"]) {
+                        value["base"] = "ASTNode";
+                    }
+                } else {
+                    std::string name = CamelCase(def_name);
+                    types_.register_type(def_name, name + "*");
+                    module["bases"].push_back(name);
+                    for (json& value : def["types"]) {
+                        value["base"] = name;
+                    }
                 }
             }
         } else {
             def["is_enum"] = false;
-            name = def["name"];
-            types_.register_type(name, name);
+            if (types_.is_c_mode()) {
+                types_.register_type(def_name, c_type);
+            } else {
+                types_.register_type(def_name, def_name);
+            }
         }
     }
 

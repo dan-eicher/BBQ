@@ -87,6 +87,12 @@ bool CParserEmitter::emit_impl_to_frame(Grammar* grammar,
     fp.CopyFramePart("skip_setup");
     emit_skip_setup(grammar, out);
 
+    // Forward declarations for all parse functions (before init/parse use them)
+    for (auto* prod : grammar->productions) {
+        emit_production_decl(prod, out);
+    }
+    out << "\n";
+
     fp.CopyFramePart("init_impl");
     // init function
     out << "void " << prefix_ << "parser_init(peg_state* p, const char* input, int length) {\n";
@@ -144,9 +150,10 @@ void CParserEmitter::emit_public_decls(Grammar* grammar, std::ostream& out) {
 }
 
 void CParserEmitter::emit_parse_method_decls(Grammar* grammar, std::ostream& out) {
-    for (auto* p : grammar->productions) {
-        emit_production_decl(p, out);
-    }
+    // Production functions are static — don't declare them in the header.
+    // Forward declarations go into the .c file (see emit_parse_method_impls).
+    (void)grammar;
+    (void)out;
 }
 
 void CParserEmitter::emit_production_decl(Production* prod, std::ostream& out) {
@@ -247,7 +254,7 @@ void CParserEmitter::emit_expr(PegExpr* expr, std::ostream& out, int indent) {
     } else if (auto* grp = dynamic_cast<Group*>(expr)) {
         emit_expr(grp->body, out, indent);
     } else if (dynamic_cast<AnyExpr*>(expr)) {
-        out << indent_str(indent) << "if (peg_at_end(p)) return false;\n";
+        out << indent_str(indent) << "if (peg_at_end(p)) " << fail_ << ";\n";
         out << indent_str(indent) << "peg_advance(p);\n";
     }
 }
@@ -332,7 +339,9 @@ void CParserEmitter::emit_choice(Choice* ch, std::ostream& out, int indent) {
             out << ind << "    {\n";
             out << ind << "        bool _ok" << vid << " = false;\n";
             out << ind << "        do {\n";
-            emit_expr(ch->alternatives[i], out, indent + 3);
+            { auto saved = fail_; fail_ = "break";
+              emit_expr(ch->alternatives[i], out, indent + 3);
+              fail_ = saved; }
             out << ind << "            _ok" << vid << " = true;\n";
             out << ind << "        } while(0);\n";
             out << ind << "        if (!_ok" << vid << ") {\n";
@@ -357,7 +366,9 @@ void CParserEmitter::emit_star(Star* star, std::ostream& out, int indent) {
     out << ind << "    peg_mark _m" << vid << " = peg_save(p);\n";
     out << ind << "    bool _ok" << vid << " = false;\n";
     out << ind << "    do {\n";
-    emit_expr(star->body, out, indent + 2);
+    { auto saved = fail_; fail_ = "break";
+      emit_expr(star->body, out, indent + 2);
+      fail_ = saved; }
     out << ind << "        _ok" << vid << " = true;\n";
     out << ind << "    } while(0);\n";
     out << ind << "    if (!_ok" << vid << ") { peg_restore(p, _m" << vid << "); break; }\n";
@@ -379,7 +390,9 @@ void CParserEmitter::emit_optional(Optional* opt, std::ostream& out, int indent)
     out << ind << "    peg_mark _m" << vid << " = peg_save(p);\n";
     out << ind << "    bool _ok" << vid << " = false;\n";
     out << ind << "    do {\n";
-    emit_expr(opt->body, out, indent + 2);
+    { auto saved = fail_; fail_ = "break";
+      emit_expr(opt->body, out, indent + 2);
+      fail_ = saved; }
     out << ind << "        _ok" << vid << " = true;\n";
     out << ind << "    } while(0);\n";
     out << ind << "    if (!_ok" << vid << ") peg_restore(p, _m" << vid << ");\n";
@@ -394,11 +407,13 @@ void CParserEmitter::emit_and(And* a, std::ostream& out, int indent) {
     out << ind << "    peg_mark _m" << vid << " = peg_save(p);\n";
     out << ind << "    bool _ok" << vid << " = false;\n";
     out << ind << "    do {\n";
-    emit_expr(a->body, out, indent + 2);
+    { auto saved = fail_; fail_ = "break";
+      emit_expr(a->body, out, indent + 2);
+      fail_ = saved; }
     out << ind << "        _ok" << vid << " = true;\n";
     out << ind << "    } while(0);\n";
     out << ind << "    peg_restore(p, _m" << vid << ");\n";
-    out << ind << "    if (!_ok" << vid << ") return false;\n";
+    out << ind << "    if (!_ok" << vid << ") " << fail_ << ";\n";
     out << ind << "}\n";
 }
 
@@ -410,11 +425,13 @@ void CParserEmitter::emit_not(Not* n, std::ostream& out, int indent) {
     out << ind << "    peg_mark _m" << vid << " = peg_save(p);\n";
     out << ind << "    bool _ok" << vid << " = false;\n";
     out << ind << "    do {\n";
-    emit_expr(n->body, out, indent + 2);
+    { auto saved = fail_; fail_ = "break";
+      emit_expr(n->body, out, indent + 2);
+      fail_ = saved; }
     out << ind << "        _ok" << vid << " = true;\n";
     out << ind << "    } while(0);\n";
     out << ind << "    peg_restore(p, _m" << vid << ");\n";
-    out << ind << "    if (_ok" << vid << ") return false;\n";
+    out << ind << "    if (_ok" << vid << ") " << fail_ << ";\n";
     out << ind << "}\n";
 }
 
@@ -423,9 +440,9 @@ void CParserEmitter::emit_literal(Literal* lit, std::ostream& out, int indent) {
     std::string ind = indent_str(indent);
     out << ind << "peg_skip(p);\n";
     if (is_keyword_literal(lit)) {
-        out << ind << "if (!peg_keyword(p, \"" << escape_string(lit->value) << "\")) return false;\n";
+        out << ind << "if (!peg_keyword(p, \"" << escape_string(lit->value) << "\")) " << fail_ << ";\n";
     } else {
-        out << ind << "if (!peg_match(p, \"" << escape_string(lit->value) << "\")) return false;\n";
+        out << ind << "if (!peg_match(p, \"" << escape_string(lit->value) << "\")) " << fail_ << ";\n";
     }
 }
 
@@ -439,15 +456,21 @@ void CParserEmitter::emit_rule_call(RuleCall* rc, std::ostream& out, int indent)
         for (auto* arg : rc->args) {
             out << ", " << arg->expr;
         }
-        out << ")) return false;\n";
+        out << ")) " << fail_ << ";\n";
     } else {
         // Built-in: peg_ident, peg_integer, etc.
+        // In C, built-in output params are pointers, so add & if needed.
         out << ind << "peg_skip(p);\n";
         out << ind << "if (!peg_" << rc->name << "(p";
         for (auto* arg : rc->args) {
-            out << ", " << arg->expr;
+            const auto& e = arg->expr;
+            if (!e.empty() && e[0] != '&') {
+                out << ", &" << e;
+            } else {
+                out << ", " << e;
+            }
         }
-        out << ")) return false;\n";
+        out << ")) " << fail_ << ";\n";
     }
 }
 

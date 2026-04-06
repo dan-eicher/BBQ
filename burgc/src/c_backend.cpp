@@ -162,8 +162,16 @@ public:
 
         bbqgen::FrameProcessor hfp(frame_dir + "/CBurg.frame", hdr);
         if (!hfp.ok()) {
-            // Fallback: emit without frame
-            generate(hdr, a, "");
+            // Fallback: emit without frame — inline everything into header
+            hdr << "#ifndef " << guard << "\n#define " << guard << "\n\n";
+            hdr << "#include <limits.h>\n#include <stdint.h>\n#include <stdbool.h>\n";
+            hdr << "#include \"bbq_arena.h\"\n#include \"bbq_htree.h\"\n\n";
+            emit_c_constants(hdr);
+            hdr << "\n";
+            emit_context_struct(hdr);
+            hdr << "\n";
+            emit_public_api(hdr);
+            hdr << "\n#endif /* " << guard << " */\n";
             return;
         }
 

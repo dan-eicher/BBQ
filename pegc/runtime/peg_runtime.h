@@ -73,6 +73,8 @@ typedef struct {
     int error_count;
 
     peg_mark furthest;
+
+    void* user_data;
 } peg_state;
 
 /* ── Init ────────────────────────────────────────────────── */

@@ -164,15 +164,16 @@ bool BurgBackend::is_terminal(const std::string& name) const {
     return a_->term_names.count(name) > 0;
 }
 
-std::string BurgBackend::pattern_guard(burg_ast::TreePattern* pat) {
-    std::string guard;
-    int arity = (int)pat->children.size();
-    if (arity > 0)
-        guard = "p->child_count >= " + std::to_string(arity);
-
-    for (int i = 0; i < arity; i++) {
+/* Recursively emit guard checks for a pattern subtree.
+ * Leaf nonterminals: check rule[nt_idx].
+ * Leaf terminals: check op == BURG_<name>.
+ * Non-leaf (compound): check op, then recurse into children. */
+void BurgBackend::emit_pattern_guards(burg_ast::TreePattern* pat,
+                                       const std::string& state_var,
+                                       std::string& guard) {
+    for (size_t i = 0; i < pat->children.size(); i++) {
         auto* child = pat->children[i];
-        std::string cv = "p->children[" + std::to_string(i) + "]";
+        std::string cv = state_var + "->children[" + std::to_string(i) + "]";
         if (child->is_leaf() && !is_terminal(child->name)) {
             int64_t idx = a_->nonterm_index.at(child->name);
             if (!guard.empty()) guard += " && ";
@@ -183,16 +184,17 @@ std::string BurgBackend::pattern_guard(burg_ast::TreePattern* pat) {
         } else if (!child->is_leaf()) {
             if (!guard.empty()) guard += " && ";
             guard += cv + "->op == BURG_" + child->name;
-            for (size_t j = 0; j < child->children.size(); j++) {
-                auto* gc = child->children[j];
-                std::string gv = cv + "->children[" + std::to_string(j) + "]";
-                if (gc->is_leaf() && !is_terminal(gc->name)) {
-                    int64_t idx = a_->nonterm_index.at(gc->name);
-                    guard += " && " + gv + "->rule[" + std::to_string(idx) + "]";
-                }
-            }
+            emit_pattern_guards(child, cv, guard);
         }
     }
+}
+
+std::string BurgBackend::pattern_guard(burg_ast::TreePattern* pat) {
+    std::string guard;
+    int arity = (int)pat->children.size();
+    if (arity > 0)
+        guard = "p->child_count >= " + std::to_string(arity);
+    emit_pattern_guards(pat, "p", guard);
     return guard;
 }
 

@@ -103,6 +103,9 @@ protected:
                                burg_ast::TreePattern* pat, int indent);
 
     // Pattern analysis helpers
+    void emit_pattern_guards(burg_ast::TreePattern* pat,
+                             const std::string& state_var,
+                             std::string& guard);
     std::string pattern_guard(burg_ast::TreePattern* pat);
     std::string pattern_cost_expr(burg_ast::TreePattern* pat);
     bool is_terminal(const std::string& name) const;

@@ -495,14 +495,16 @@ struct EndianSwitch : public TypeExpr {
 struct BitfieldEntry : public ASTNode {
     BitfieldEntry(
         std::string name,
-        int64_t width
+        int64_t width,
+        std::optional<Expr*> constraint
     )
-        : name(name), width(width) {}
+        : name(name), width(width), constraint(std::move(constraint)) {}
 
     void accept(ASTVisitor& visitor) override { visitor.visit(this); }
 
     std::string name;
     int64_t width;
+    std::optional<Expr*> constraint;
 };
 
 struct Field : public ASTNode {
@@ -510,9 +512,10 @@ struct Field : public ASTNode {
         std::string name,
         TypeExpr* body,
         std::optional<Expr*> constraint,
-        std::optional<Interval*> interval
+        std::optional<Interval*> interval,
+        bool scopes_rest
     )
-        : name(name), body(body), constraint(std::move(constraint)), interval(std::move(interval)) {}
+        : name(name), body(body), constraint(std::move(constraint)), interval(std::move(interval)), scopes_rest(scopes_rest) {}
 
     void accept(ASTVisitor& visitor) override { visitor.visit(this); }
 
@@ -520,6 +523,7 @@ struct Field : public ASTNode {
     TypeExpr* body;
     std::optional<Expr*> constraint;
     std::optional<Interval*> interval;
+    bool scopes_rest;
 };
 
 struct Variant : public ASTNode {
@@ -933,16 +937,17 @@ struct Simple : public RefPath {
     Simple(
         std::string name,
         std::optional<std::string> resolved_path,
-        std::optional<std::string> resolved_parent
+        std::optional<std::string> resolved_parent,
+        int64_t resolved_depth
     )
-        : name(name), resolved_path(std::move(resolved_path)), resolved_parent(std::move(resolved_parent)) {}
+        : name(name), resolved_path(std::move(resolved_path)), resolved_parent(std::move(resolved_parent)), resolved_depth(resolved_depth) {}
 
     void accept(ASTVisitor& visitor) override { visitor.visit(this); }
 
     std::string name;
     std::optional<std::string> resolved_path;
     std::optional<std::string> resolved_parent;
-    int resolved_depth = 0;  // scope stack depth: 0 = immediate parent, 1 = grandparent, etc.
+    int64_t resolved_depth;
 };
 
 struct FieldAcc : public RefPath {

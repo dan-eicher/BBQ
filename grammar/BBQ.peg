@@ -127,7 +127,7 @@ EndianDirectiveField <. std::vector<Field*> *fields .>
       Expr_<&expr>
     (. auto* es = new EndianSwitch(expr);
        es->loc = Loc();
-       auto* f = new Field("", es, std::nullopt, std::nullopt);
+       auto* f = new Field("", es, std::nullopt, std::nullopt, false);
        f->loc = es->loc;
        fields->push_back(f); .)
 .
@@ -136,15 +136,18 @@ FieldDecl <. std::vector<Field*> *fields .>
     (. std::string name;
        TypeExpr* body;
        Expr* constr = nullptr;
-       Interval* iv = nullptr; .)
+       Interval* iv = nullptr;
+       bool scopes_rest = false; .)
     = ident<name>            (. SourceLoc loc = Loc(); .)
       ":"
       TypeBody<&body>
       [ ConstraintBlock<&constr> ]
       [ IntervalSpec<&iv> ]
+      [ "@" "rest"           (. scopes_rest = true; .) ]
     (. auto* f = new Field(std::move(name), body,
            constr ? std::optional<Expr*>(constr) : std::nullopt,
-           iv     ? std::optional<Interval*>(iv) : std::nullopt);
+           iv     ? std::optional<Interval*>(iv) : std::nullopt,
+           scopes_rest);
        f->loc = loc;
        fields->push_back(f); .)
 .
@@ -372,11 +375,14 @@ BitfieldBody <. TypeExpr* *result .>
 .
 
 BitfieldEntryRule <. std::vector<BitfieldEntry*> *entries .>
-    (. std::string name; int64_t width; .)
+    (. std::string name; int64_t width;
+       Expr* constr = nullptr; .)
     = ident<name>       (. SourceLoc loc = Loc(); .)
       ":"
       integer<width>
-    (. auto* e = new BitfieldEntry(std::move(name), width);
+      [ ConstraintBlock<&constr> ]
+    (. auto* e = new BitfieldEntry(std::move(name), width,
+               constr ? std::optional<Expr*>(constr) : std::nullopt);
        e->loc = loc;
        entries->push_back(e); .)
 .
@@ -666,7 +672,7 @@ PrimaryExpr <. Expr* *result .>
          (*result)->loc = Loc(); .)
     | CallExpr<result>
     | ident<name>
-      (. auto* s = new Simple(std::move(name), std::nullopt, std::nullopt);
+      (. auto* s = new Simple(std::move(name), std::nullopt, std::nullopt, 0);
          s->loc = Loc();
          *result = new Ref(s);
          (*result)->loc = Loc(); .)

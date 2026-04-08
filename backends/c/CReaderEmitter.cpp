@@ -218,6 +218,14 @@ void CReaderEmitter::emit_struct_body(const std::string& rule_name, Struct* st,
                                        std::ostream& out, int indent) {
     for (auto* field : st->fields)
         emit_field_read(rule_name, field, out, indent);
+
+    /* Pop interval pushed by any @rest field */
+    for (auto* field : st->fields) {
+        if (field->scopes_rest) {
+            out << ind(indent) << "bbq_pop_interval(ctx);\n";
+            break;
+        }
+    }
 }
 
 void CReaderEmitter::emit_field_read(const std::string& rule_name, Field* field,
@@ -239,13 +247,18 @@ void CReaderEmitter::emit_field_read(const std::string& rule_name, Field* field,
         if (rr->interval.has_value()) interval_node = *rr->interval;
     } else if (auto* ext = dynamic_cast<Extern*>(field->body)) {
         if (ext->interval.has_value()) interval_node = *ext->interval;
+    } else if (auto* arr = dynamic_cast<Array*>(field->body)) {
+        if (arr->interval.has_value()) interval_node = *arr->interval;
     }
+
 
     bool has_interval = false;
     if (interval_node) {
         if (auto* se = dynamic_cast<StartEnd*>(interval_node)) {
             has_interval = true;
             out << ind(indent) << "{\n";
+            out << ind(indent + 1) << "bbq_seek(ctx, (size_t)("
+                << compile_expr(se->start) << "));\n";
             out << ind(indent + 1) << "bbq_push_interval(ctx, (size_t)("
                 << compile_expr(se->end) << "));\n";
             indent++;
@@ -261,6 +274,11 @@ void CReaderEmitter::emit_field_read(const std::string& rule_name, Field* field,
     if (field->constraint) {
         out << ind(indent) << "if (!(" << compile_expr(*field->constraint) << "))\n";
         out << ind(indent + 1) << "return bbq_fail(ctx, \"" << ctx_name << ": constraint failed\");\n";
+    }
+
+    if (field->scopes_rest) {
+        out << ind(indent) << "bbq_push_interval(ctx, bbq_pos(ctx) + (size_t)("
+            << target << "));\n";
     }
 
     if (has_interval) {
@@ -611,6 +629,22 @@ void CReaderEmitter::emit_bitfield_read(const std::string& ctx_name, Bitfield* b
     bool msb_first = (e == Endianness::Big);
     int container_bits = width_to_bits(ik->width);
 
+    // Push a scope so constraint expressions resolve entry names to target.name
+    CEmitScope bf_scope;
+    bf_scope.prefix = target + ".";
+    for (auto* entry : bf->entries)
+        bf_scope.fields.insert(entry->name);
+    scopes_.push_back(std::move(bf_scope));
+
+    auto emit_constraint = [&](BitfieldEntry* entry) {
+        if (entry->constraint.has_value()) {
+            std::string cond = compile_expr(*entry->constraint);
+            out << ind(indent + 1) << "if (!(" << cond << "))\n";
+            out << ind(indent + 2) << "return bbq_fail(ctx, \""
+                << ctx_name << "." << entry->name << ": constraint failed\");\n";
+        }
+    };
+
     if (msb_first) {
         int bit_offset = container_bits;
         for (auto* entry : bf->entries) {
@@ -624,6 +658,7 @@ void CReaderEmitter::emit_bitfield_read(const std::string& ctx_name, Bitfield* b
             else
                 out << "_bf";
             out << " & 0x" << hex_mask(mask) << ");\n";
+            emit_constraint(entry);
         }
     } else {
         int bit_offset = 0;
@@ -637,10 +672,12 @@ void CReaderEmitter::emit_bitfield_read(const std::string& ctx_name, Bitfield* b
             else
                 out << "_bf";
             out << " & 0x" << hex_mask(mask) << ");\n";
+            emit_constraint(entry);
             bit_offset += entry->width;
         }
     }
 
+    scopes_.pop_back();
     out << ind(indent) << "}\n";
 }
 

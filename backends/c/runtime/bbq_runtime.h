@@ -87,6 +87,7 @@ static inline void bbq_ctx_init(bbq_ctx_t* ctx, const uint8_t* data, size_t len)
 }
 
 static inline size_t bbq_pos(const bbq_ctx_t* ctx) { return ctx->pos; }
+static inline void bbq_seek(bbq_ctx_t* ctx, size_t pos) { ctx->pos = pos; }
 static inline size_t bbq_total_size(const bbq_ctx_t* ctx) { return ctx->length; }
 static inline bool bbq_at_end(const bbq_ctx_t* ctx) { return ctx->pos >= ctx->length; }
 

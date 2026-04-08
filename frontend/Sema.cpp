@@ -1288,9 +1288,12 @@ void Sema::resolve_cross_refs_in_expr(Expr* expr, const std::string& rule_name,
                         }
                     }
 
-                    // Field not here — continue up the chain
+                    // Field not here — continue up the chain.
+                    // Only count depth for struct containment (which pushes
+                    // a scope at runtime). Switches don't push scopes.
                     current_rule = candidate->name;
-                    depth++;
+                    if (dynamic_cast<Struct*>(candidate->body))
+                        depth++;
                     found_parent = true;
                     break;
                 }

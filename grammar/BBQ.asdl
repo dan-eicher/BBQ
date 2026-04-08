@@ -49,10 +49,12 @@ module BBQ {
                   | Bitfield(primitive_kind container, bitfield_entry* entries)
                   | EndianSwitch(expr endian_expr)
 
-    bitfield_entry = BitfieldEntry(identifier name, int64 width)
+    bitfield_entry = BitfieldEntry(identifier name, int64 width,
+                                   expr? constraint)
 
     field         = Field(identifier name, type_expr body,
-                          expr? constraint, interval? interval)
+                          expr? constraint, interval? interval,
+                          bool scopes_rest)
 
     variant       = Variant(identifier name, type_expr body,
                             expr? constraint, interval? interval)
@@ -117,7 +119,7 @@ module BBQ {
                   | EOI
 
     // Reference paths (field access chains)
-    ref_path      = Simple(identifier name, identifier? resolved_path, identifier? resolved_parent)
+    ref_path      = Simple(identifier name, identifier? resolved_path, identifier? resolved_parent, int64 resolved_depth)
                   | FieldAcc(ref_path base, identifier field)
                   | IndexAcc(ref_path base, expr index)
 

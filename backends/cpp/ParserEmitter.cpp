@@ -232,6 +232,14 @@ void ParserEmitter::emit_struct_body(const std::string& rule_name, Struct* st, s
     for (auto* field : st->fields) {
         emit_field_read(rule_name, field, out, indent);
     }
+
+    /* Pop interval pushed by any @rest field */
+    for (auto* field : st->fields) {
+        if (field->scopes_rest) {
+            out << ind(indent) << "{ auto _scope = ctx.pop_interval(); }\n";
+            break;
+        }
+    }
 }
 
 void ParserEmitter::emit_field_read(const std::string& rule_name, Field* field, std::ostream& out, int indent) {
@@ -254,8 +262,10 @@ void ParserEmitter::emit_field_read(const std::string& rule_name, Field* field, 
         if (rr->interval.has_value()) interval_node = *rr->interval;
     } else if (auto* ext = dynamic_cast<Extern*>(field->body)) {
         if (ext->interval.has_value()) interval_node = *ext->interval;
+    } else if (auto* arr = dynamic_cast<Array*>(field->body)) {
+        if (arr->interval.has_value()) interval_node = *arr->interval;
     }
-    // Note: Primitive intervals are length-style (bytes[N]) and handled in emit_read_call
+    // Note: Primitive Length intervals (bytes[N]) are handled in emit_read_call
 
     bool has_interval = false;
     if (interval_node) {
@@ -280,6 +290,12 @@ void ParserEmitter::emit_field_read(const std::string& rule_name, Field* field, 
     if (field->constraint) {
         out << ind(indent) << "if (!(" << compile_expr(*field->constraint) << "))\n";
         out << ind(indent + 1) << "return ctx.fail(\"" << ctx_name << ": constraint failed\");\n";
+    }
+
+    // @rest: scope remaining fields to pos + value
+    if (field->scopes_rest) {
+        out << ind(indent) << "ctx.push_interval(ctx.pos() + (size_t)("
+            << target << "));\n";
     }
 
     // Close interval scope
@@ -677,6 +693,22 @@ void ParserEmitter::emit_bitfield_read(const std::string& ctx_name, Bitfield* bf
 
     int container_bits = width_to_bits(ik->width);
 
+    // Push a scope so constraint expressions resolve entry names to target.name
+    EmitScope bf_scope;
+    bf_scope.prefix = target + ".";
+    for (auto* entry : bf->entries)
+        bf_scope.fields.insert(entry->name);
+    scopes_.push_back(std::move(bf_scope));
+
+    auto emit_constraint = [&](BitfieldEntry* entry) {
+        if (entry->constraint.has_value()) {
+            std::string cond = compile_expr(*entry->constraint);
+            out << ind(indent+1) << "if (!(" << cond << "))\n";
+            out << ind(indent+2) << "return ctx.fail(\""
+                << ctx_name << "." << entry->name << ": constraint failed\");\n";
+        }
+    };
+
     if (msb_first) {
         int bit_offset = container_bits;
         for (auto* entry : bf->entries) {
@@ -690,6 +722,7 @@ void ParserEmitter::emit_bitfield_read(const std::string& ctx_name, Bitfield* bf
             else
                 out << "_bf";
             out << " & 0x" << hex_mask(mask) << ");\n";
+            emit_constraint(entry);
         }
     } else {
         int bit_offset = 0;
@@ -703,10 +736,12 @@ void ParserEmitter::emit_bitfield_read(const std::string& ctx_name, Bitfield* bf
             else
                 out << "_bf";
             out << " & 0x" << hex_mask(mask) << ");\n";
+            emit_constraint(entry);
             bit_offset += entry->width;
         }
     }
 
+    scopes_.pop_back();
     out << ind(indent) << "}\n";
 }
 

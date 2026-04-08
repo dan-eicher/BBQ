@@ -298,7 +298,7 @@ bool Parser::parse_EndianDirectiveField(std::vector<Field*> * fields) {
     if (!parse_Expr_(&expr)) return false;
     auto* es = new EndianSwitch(expr);
        es->loc = Loc();
-       auto* f = new Field("", es, std::nullopt, std::nullopt);
+       auto* f = new Field("", es, std::nullopt, std::nullopt, false);
        f->loc = es->loc;
        fields->push_back(f);
     return true;
@@ -309,6 +309,7 @@ bool Parser::parse_FieldDecl(std::vector<Field*> * fields) {
        TypeExpr* body;
        Expr* constr = nullptr;
        Interval* iv = nullptr;
+       bool scopes_rest = false;
     skip();
     if (!ident(name)) return false;
     SourceLoc loc = Loc();
@@ -332,9 +333,21 @@ bool Parser::parse_FieldDecl(std::vector<Field*> * fields) {
             return true;
         }()) restore(_m1);
     }
+    {
+        auto _m2 = save();
+        if (![&]() -> bool {
+            skip();
+            if (!match("@")) return false;
+            skip();
+            if (!keyword("rest")) return false;
+            scopes_rest = true;
+            return true;
+        }()) restore(_m2);
+    }
     auto* f = new Field(std::move(name), body,
            constr ? std::optional<Expr*>(constr) : std::nullopt,
-           iv     ? std::optional<Interval*>(iv) : std::nullopt);
+           iv     ? std::optional<Interval*>(iv) : std::nullopt,
+           scopes_rest);
        f->loc = loc;
        fields->push_back(f);
     return true;
@@ -857,6 +870,7 @@ bool Parser::parse_BitfieldBody(TypeExpr* * result) {
 
 bool Parser::parse_BitfieldEntryRule(std::vector<BitfieldEntry*> * entries) {
     std::string name; int64_t width;
+       Expr* constr = nullptr;
     skip();
     if (!ident(name)) return false;
     SourceLoc loc = Loc();
@@ -864,7 +878,16 @@ bool Parser::parse_BitfieldEntryRule(std::vector<BitfieldEntry*> * entries) {
     if (!match(":")) return false;
     skip();
     if (!integer(width)) return false;
-    auto* e = new BitfieldEntry(std::move(name), width);
+    {
+        auto _m0 = save();
+        if (![&]() -> bool {
+            skip();
+            if (!parse_ConstraintBlock(&constr)) return false;
+            return true;
+        }()) restore(_m0);
+    }
+    auto* e = new BitfieldEntry(std::move(name), width,
+               constr ? std::optional<Expr*>(constr) : std::nullopt);
        e->loc = loc;
        entries->push_back(e);
     return true;
@@ -1454,7 +1477,7 @@ bool Parser::parse_PrimaryExpr(Expr* * result) {
         if ([&]() -> bool {
             skip();
             if (!ident(name)) return false;
-            auto* s = new Simple(std::move(name), std::nullopt, std::nullopt);
+            auto* s = new Simple(std::move(name), std::nullopt, std::nullopt, 0);
          s->loc = Loc();
          *result = new Ref(s);
          (*result)->loc = Loc();

@@ -77,6 +77,17 @@ bool CTypeEmitter::emit_to_frame(Grammar* grammar,
     FrameProcessor fp(frame_path, out);
     if (!fp.ok()) return false;
 
+    // Guard: PREFIX_TYPES_H
+    fp.CopyFramePart("guard_begin");
+    {
+        std::string guard = prefix();
+        for (auto& c : guard) c = (char)toupper((unsigned char)c);
+        if (!guard.empty()) guard += "_";
+        guard += "TYPES_H";
+        fp.EmitLine("#ifndef " + guard);
+        fp.EmitLine("#define " + guard);
+    }
+
     fp.CopyFramePart("forward_declarations");
     {
         std::ostringstream fwd;
@@ -98,7 +109,14 @@ bool CTypeEmitter::emit_to_frame(Grammar* grammar,
         fp.Emit(frees.str());
     }
 
-    // Copy remainder of frame
+    fp.CopyFramePart("guard_end");
+    {
+        std::string guard = prefix();
+        for (auto& c : guard) c = (char)toupper((unsigned char)c);
+        if (!guard.empty()) guard += "_";
+        guard += "TYPES_H";
+        fp.EmitLine("#endif /* " + guard + " */");
+    }
     fp.CopyFramePart("");
     return true;
 }

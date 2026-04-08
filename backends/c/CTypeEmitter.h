@@ -18,6 +18,9 @@ public:
     CTypeEmitter(Sema& sema, const std::string& prefix = "")
         : sema_(sema), prefix_(prefix.empty() ? "" : to_snake_case(prefix)) {}
 
+    // Get the raw prefix for guard generation
+    const std::string& prefix() const { return prefix_; }
+
     // Emit all type definitions to a string
     std::string emit(BBQ::Grammar* grammar);
 

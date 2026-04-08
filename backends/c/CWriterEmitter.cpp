@@ -35,6 +35,17 @@ bool CWriterEmitter::emit_header_to_frame(Grammar* grammar,
                                             std::ostream& out) {
     FrameProcessor fp(frame_path, out);
     if (!fp.ok()) return false;
+
+    fp.CopyFramePart("guard_begin");
+    {
+        std::string guard = types_.prefix();
+        for (auto& c : guard) c = (char)toupper((unsigned char)c);
+        if (!guard.empty()) guard += "_";
+        guard += "WRITER_H";
+        fp.EmitLine("#ifndef " + guard);
+        fp.EmitLine("#define " + guard);
+    }
+
     fp.CopyFramePart("types_include");
     fp.EmitLine("#include \"" + types_include + "\"");
     fp.CopyFramePart("write_declarations");
@@ -43,6 +54,15 @@ bool CWriterEmitter::emit_header_to_frame(Grammar* grammar,
         for (auto* rule : sema_.sorted_rules())
             emit_decl(rule, decls);
         fp.Emit(decls.str());
+    }
+
+    fp.CopyFramePart("guard_end");
+    {
+        std::string guard = types_.prefix();
+        for (auto& c : guard) c = (char)toupper((unsigned char)c);
+        if (!guard.empty()) guard += "_";
+        guard += "WRITER_H";
+        fp.EmitLine("#endif /* " + guard + " */");
     }
     fp.CopyFramePart("");
     return true;

@@ -41,6 +41,16 @@ bool CReaderEmitter::emit_header_to_frame(Grammar* grammar,
     FrameProcessor fp(frame_path, out);
     if (!fp.ok()) return false;
 
+    fp.CopyFramePart("guard_begin");
+    {
+        std::string guard = types_.prefix();
+        for (auto& c : guard) c = (char)toupper((unsigned char)c);
+        if (!guard.empty()) guard += "_";
+        guard += "READER_H";
+        fp.EmitLine("#ifndef " + guard);
+        fp.EmitLine("#define " + guard);
+    }
+
     fp.CopyFramePart("types_include");
     fp.EmitLine("#include \"" + types_include + "\"");
 
@@ -52,6 +62,14 @@ bool CReaderEmitter::emit_header_to_frame(Grammar* grammar,
         fp.Emit(decls.str());
     }
 
+    fp.CopyFramePart("guard_end");
+    {
+        std::string guard = types_.prefix();
+        for (auto& c : guard) c = (char)toupper((unsigned char)c);
+        if (!guard.empty()) guard += "_";
+        guard += "READER_H";
+        fp.EmitLine("#endif /* " + guard + " */");
+    }
     fp.CopyFramePart("");
     return true;
 }

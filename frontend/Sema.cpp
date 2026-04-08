@@ -1217,9 +1217,17 @@ void Sema::resolve_cross_refs_in_expr(Expr* expr, const std::string& rule_name,
             if (!pst) continue;
 
             // Check if this parent contains our rule as a field
+            // (unwrap Array and Optional wrappers to find RuleRef)
             bool contains_us = false;
             for (auto* f : pst->fields) {
-                if (auto* rr = dynamic_cast<RuleRef*>(f->body)) {
+                TypeExpr* body = f->body;
+                // Unwrap Array → element, Optional → element
+                for (;;) {
+                    if (auto* arr = dynamic_cast<Array*>(body)) { body = arr->element; continue; }
+                    if (auto* opt = dynamic_cast<Optional*>(body)) { body = opt->element; continue; }
+                    break;
+                }
+                if (auto* rr = dynamic_cast<RuleRef*>(body)) {
                     if (rr->name == rule_name) { contains_us = true; break; }
                 }
             }

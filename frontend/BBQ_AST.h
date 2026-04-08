@@ -942,6 +942,7 @@ struct Simple : public RefPath {
     std::string name;
     std::optional<std::string> resolved_path;
     std::optional<std::string> resolved_parent;
+    int resolved_depth = 0;  // scope stack depth: 0 = immediate parent, 1 = grandparent, etc.
 };
 
 struct FieldAcc : public RefPath {

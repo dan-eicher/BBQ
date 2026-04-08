@@ -723,10 +723,11 @@ std::string CReaderEmitter::compile_ref_path(RefPath* path) {
             if (it->fields.count(simple->name))
                 return it->prefix + simple->name;
         }
-        // Sema-resolved cross-rule reference (field lives in parent struct)
+        // Sema-resolved cross-rule reference (field lives in ancestor struct)
         if (simple->resolved_path.has_value() && simple->resolved_parent.has_value()) {
             return "((" + types_.type_name(*simple->resolved_parent)
-                 + "*)bbq_scope_ptr(ctx, 0))->" + *simple->resolved_path;
+                 + "*)bbq_scope_ptr(ctx, " + std::to_string(simple->resolved_depth)
+                 + "))->" + *simple->resolved_path;
         }
         // Parent context stack (runtime)
         for (int idx = (int)parent_contexts_.size() - 1; idx >= 0; idx--) {

@@ -1211,34 +1211,90 @@ void Sema::resolve_cross_refs_in_expr(Expr* expr, const std::string& rule_name,
         // Skip if already a local field
         if (local_fields.count(simple->name)) return;
 
-        // Search all rules that reference this rule to find the field
-        for (auto* parent_rule : sorted_) {
-            auto* pst = dynamic_cast<Struct*>(parent_rule->body);
-            if (!pst) continue;
+        // Walk the containment chain transitively: find our parent,
+        // check if it has the field. If not, find our parent's parent,
+        // and so on up to the root. The runtime scope stack mirrors
+        // this chain, so scope_ptr(0) = immediate parent, scope_ptr(1)
+        // = grandparent, etc.
+        {
+            std::string current_rule = rule_name;
+            int depth = 0;
+            std::unordered_set<std::string> visited;
 
-            // Check if this parent contains our rule as a field
-            // (unwrap Array and Optional wrappers to find RuleRef)
-            bool contains_us = false;
-            for (auto* f : pst->fields) {
-                TypeExpr* body = f->body;
-                // Unwrap Array → element, Optional → element
-                for (;;) {
-                    if (auto* arr = dynamic_cast<Array*>(body)) { body = arr->element; continue; }
-                    if (auto* opt = dynamic_cast<Optional*>(body)) { body = opt->element; continue; }
+            while (visited.insert(current_rule).second) {
+                // Find which rule contains current_rule as a field or switch case
+                bool found_parent = false;
+                for (auto* candidate : sorted_) {
+                    bool contains_current = false;
+
+                    // Case 1: candidate body is a Struct — check fields
+                    if (auto* pst = dynamic_cast<Struct*>(candidate->body)) {
+                        for (auto* f : pst->fields) {
+                            TypeExpr* body = f->body;
+                            for (;;) {
+                                if (auto* arr = dynamic_cast<Array*>(body)) { body = arr->element; continue; }
+                                if (auto* opt = dynamic_cast<Optional*>(body)) { body = opt->element; continue; }
+                                break;
+                            }
+                            if (auto* rr = dynamic_cast<RuleRef*>(body)) {
+                                if (rr->name == current_rule) { contains_current = true; break; }
+                            }
+                            // Check inline Switch on a field
+                            if (auto* sw = dynamic_cast<Switch*>(f->body)) {
+                                for (auto* sc : sw->cases) {
+                                    TypeExpr* cb = sc->target;
+                                    for (;;) {
+                                        if (auto* a2 = dynamic_cast<Array*>(cb)) { cb = a2->element; continue; }
+                                        if (auto* o2 = dynamic_cast<Optional*>(cb)) { cb = o2->element; continue; }
+                                        break;
+                                    }
+                                    if (auto* rr = dynamic_cast<RuleRef*>(cb)) {
+                                        if (rr->name == current_rule) { contains_current = true; break; }
+                                    }
+                                }
+                                if (contains_current) break;
+                            }
+                        }
+                    }
+
+                    // Case 2: candidate body is a Switch — check cases directly
+                    if (!contains_current) {
+                        if (auto* sw = dynamic_cast<Switch*>(candidate->body)) {
+                            for (auto* sc : sw->cases) {
+                                TypeExpr* cb = sc->target;
+                                for (;;) {
+                                    if (auto* arr = dynamic_cast<Array*>(cb)) { cb = arr->element; continue; }
+                                    if (auto* opt = dynamic_cast<Optional*>(cb)) { cb = opt->element; continue; }
+                                    break;
+                                }
+                                if (auto* rr = dynamic_cast<RuleRef*>(cb)) {
+                                    if (rr->name == current_rule) { contains_current = true; break; }
+                                }
+                            }
+                        }
+                    }
+
+                    if (!contains_current) continue;
+
+                    // candidate contains current_rule — check if it has our field
+                    // (only structs have searchable fields)
+                    if (auto* cst = dynamic_cast<Struct*>(candidate->body)) {
+                        std::string path;
+                        if (find_field_recursive(cst, simple->name, path)) {
+                            simple->resolved_path = path;
+                            simple->resolved_parent = candidate->name;
+                            simple->resolved_depth = depth;
+                            return;
+                        }
+                    }
+
+                    // Field not here — continue up the chain
+                    current_rule = candidate->name;
+                    depth++;
+                    found_parent = true;
                     break;
                 }
-                if (auto* rr = dynamic_cast<RuleRef*>(body)) {
-                    if (rr->name == rule_name) { contains_us = true; break; }
-                }
-            }
-            if (!contains_us) continue;
-
-            // Search the parent struct for the referenced field
-            std::string path;
-            if (find_field_recursive(pst, simple->name, path)) {
-                simple->resolved_path = path;
-                simple->resolved_parent = parent_rule->name;
-                return;
+                if (!found_parent) break;
             }
         }
     }

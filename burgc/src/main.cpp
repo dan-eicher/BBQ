@@ -58,6 +58,9 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    for (auto& w : gen.warnings())
+        fprintf(stderr, "warning: %s\n", w.c_str());
+
     std::unique_ptr<BurgBackend> backend;
     if (lang == "c")
         backend = create_c_backend();

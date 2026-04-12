@@ -40,6 +40,7 @@ public:
 
     const BurgAnalysis& analysis() const { return analysis_; }
     const std::vector<std::string>& errors() const { return errors_; }
+    const std::vector<std::string>& warnings() const { return warnings_; }
 
     // Convenience: generate with default (C++) backend
     void generate(std::ostream& out, const std::string& frame_dir = "");
@@ -47,9 +48,12 @@ public:
 private:
     BurgAnalysis analysis_;
     std::vector<std::string> errors_;
+    std::vector<std::string> warnings_;
 
     void collect_nonterms();
     void classify_rules();
+    void check_coverage();
+    void check_reachability();
 };
 
 // ── Backend base class ────────────────────────────────────
@@ -112,8 +116,9 @@ protected:
 
     // Utilities
     static std::string trim(const std::string& s);
-    static std::string pattern_string(burg_ast::TreePattern* pat);
     static void pad(std::ostream& out, int indent);
+public:
+    static std::string pattern_string(burg_ast::TreePattern* pat);
 };
 
 // ── Backend factories ─────────────────────────────────────

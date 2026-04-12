@@ -124,8 +124,129 @@ bool BurgGenerator::analyze(burg_ast::Spec* spec) {
     if (a.nonterms.empty())
         errors_.push_back("no rules defined");
 
+    if (errors_.empty()) {
+        check_coverage();
+        check_reachability();
+    }
+
     return errors_.empty();
 }
+
+// ── Static analysis: terminal × nonterminal coverage ─────
+//
+// Build the set of nonterminals that each terminal produces. Then
+// compare terminals with the SAME arity: if most N-ary terminals
+// produce a nonterminal but one doesn't, warn. This catches cases
+// like InvokeVirtual having sreg but not ireg/aref when the other
+// invoke terminals do, without false-positiving on Add not producing
+// aref (since NO arithmetic terminal produces aref).
+
+void BurgGenerator::check_coverage() {
+    auto& a = analysis_;
+
+    // For each terminal, collect which nonterminals it produces
+    std::unordered_map<std::string, std::unordered_set<std::string>> term_nts;
+    std::unordered_map<std::string, size_t> term_arity;
+    for (auto* rule : a.spec->rules) {
+        if (!rule->pattern->is_leaf()) {
+            term_nts[rule->pattern->name].insert(rule->nonterm);
+            term_arity[rule->pattern->name] = rule->pattern->children.size();
+        }
+    }
+
+    // Group terminals by their nonterminal "signature" — the set of
+    // nonterminals they produce. Terminals that produce overlapping
+    // nonterminal sets are peers; a peer that's missing a nonterminal
+    // the others have is suspicious.
+    //
+    // Build a signature string for each terminal (sorted nt names)
+    // and group by shared nonterminals using pairwise overlap.
+
+    // For each pair of value nonterminals (excluding start), find
+    // terminals that produce both. If terminal T produces nt A and
+    // most terminals that produce A also produce B, but T doesn't
+    // produce B, warn.
+    std::vector<std::string> value_nts;
+    for (auto& nt : a.nonterms)
+        if (nt != a.start_nonterm)
+            value_nts.push_back(nt);
+
+    for (auto& nt : value_nts) {
+        // Collect terminals that produce this nonterminal
+        std::vector<std::string> producers;
+        for (auto& [term, nts] : term_nts)
+            if (nts.count(nt))
+                producers.push_back(term);
+
+        if (producers.size() < 3) continue;
+
+        // For each other value nonterminal, check if most producers
+        // of 'nt' also produce it
+        for (auto& other_nt : value_nts) {
+            if (other_nt == nt) continue;
+            int have = 0, missing = 0;
+            std::vector<std::string> missing_terms;
+            for (auto& term : producers) {
+                if (term_nts[term].count(other_nt))
+                    have++;
+                else {
+                    missing++;
+                    missing_terms.push_back(term);
+                }
+            }
+            // Warn if a small minority (1-2) are missing what the
+            // rest have — strong signal of an oversight
+            if (have >= 3 && missing >= 1 && missing <= 2) {
+                for (auto& term : missing_terms) {
+                    warnings_.push_back("terminal '" + term +
+                        "' produces '" + nt + "' but not '" +
+                        other_nt + "' (" + std::to_string(have) +
+                        "/" + std::to_string(have + missing) +
+                        " peers do)");
+                }
+            }
+        }
+    }
+}
+
+// ── Static analysis: nonterminal reachability ────────────
+//
+// Every nonterminal must be reachable from some terminal (directly
+// or via chain rules). A nonterminal only reachable through chains
+// from itself is dead.
+
+void BurgGenerator::check_reachability() {
+    auto& a = analysis_;
+
+    // Collect nonterminals that appear as direct rule results (non-chain)
+    std::unordered_set<std::string> produced;
+    for (auto* rule : a.spec->rules) {
+        if (!rule->pattern->is_leaf() || a.term_names.count(rule->pattern->name)) {
+            produced.insert(rule->nonterm);
+        }
+    }
+
+    // Propagate through chain rules: if chain A→B exists and A is
+    // produced, then B is produced
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        for (auto& cr : a.chain_rules) {
+            if (produced.count(cr.from_nt) && !produced.count(cr.to_nt)) {
+                produced.insert(cr.to_nt);
+                changed = true;
+            }
+        }
+    }
+
+    for (auto& nt : a.nonterms) {
+        if (!produced.count(nt)) {
+            warnings_.push_back("nonterminal '" + nt +
+                "' is never produced by any terminal or chain rule");
+        }
+    }
+}
+
 
 void BurgGenerator::generate(std::ostream& out, const std::string& frame_dir) {
     auto backend = create_cpp_backend();
@@ -471,6 +592,18 @@ void BurgBackend::emit_child_reductions(std::ostream& out,
             }
         }
     }
+    /* Variable-arity support: reduce any children beyond the declared
+     * pattern with the start nonterminal. This handles nodes like
+     * invoke-with-args where the pattern only declares the receiver. */
+    int64_t start_nt = a_->nonterm_index.at(a_->start_nonterm);
+    pad(out, indent);
+    out << "for (int _ci = " << pat->children.size()
+        << "; _ci < state->child_count; _ci++) {\n";
+    pad(out, indent + 1);
+    out << "burg_reduce(BURG_NODE_CHILD(node, _ci), "
+        << "state->children[_ci], " << start_nt << ctx_arg() << ");\n";
+    pad(out, indent);
+    out << "}\n";
 }
 
 void BurgBackend::emit_reduce_body(std::ostream& out, int indent) {

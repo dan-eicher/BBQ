@@ -348,8 +348,12 @@ std::string BurgBackend::pattern_cost_expr(burg_ast::TreePattern* pat) {
 
 void BurgBackend::emit_defines(std::ostream& out) {
     out << "// ── Terminal symbols ──\n\n";
-    for (auto* t : a_->spec->terminals)
-        out << "constexpr int BURG_" << t->name << " = " << t->number << ";\n";
+    for (auto* t : a_->spec->terminals) {
+        out << "constexpr int BURG_" << t->name << " = ";
+        if (!t->symbol.empty()) out << t->symbol;
+        else                    out << t->number;
+        out << ";\n";
+    }
 
     out << "\n// ── Nonterminal indices ──\n\n";
     for (size_t i = 0; i < a_->nonterms.size(); i++)

@@ -12,10 +12,17 @@ struct SourceLoc {
     int col = 0;
 };
 
-// A terminal declaration: %term LoadInt=1 LoadFloat=2
+// A terminal declaration: TERM LoadInt = 1   /* numeric form */
+//                         TERM LoadInt = SIR_LOADINT  /* symbolic form */
+// Emitted into the generated matcher as the value of `BURG_<name>` —
+// numeric form emits the integer literal; symbolic form emits the
+// identifier verbatim so the C preprocessor substitutes it at
+// compile time (letting an external enum drive terminal IDs without
+// the .burg file having to restate them).
 struct TermDecl {
     std::string name;
-    int64_t number;     // external symbol number
+    int64_t number;         // set when symbol is empty
+    std::string symbol;     // non-empty → emit as identifier
     SourceLoc loc;
 };
 

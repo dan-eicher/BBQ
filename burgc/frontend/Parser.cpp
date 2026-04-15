@@ -125,7 +125,8 @@ bool Parser::parse_HeaderAction_(std::vector<std::string>& headers) {
 }
 
 bool Parser::parse_TermDecl_(std::vector<burg_ast::TermDecl*>& terms) {
-    std::string name; int64_t num;
+    std::string name; int64_t num = 0;
+       std::string sym; bool is_sym = false;
     skip();
     if (!keyword("TERM")) return false;
     for (;;) {
@@ -135,13 +136,27 @@ bool Parser::parse_TermDecl_(std::vector<burg_ast::TermDecl*>& terms) {
             if (!ident(name)) return false;
             skip();
             if (!match("=")) return false;
-            skip();
-            if (!integer(num)) return false;
+            {
+                auto _m1 = save();
+                if ([&]() -> bool {
+                    skip();
+                    if (!integer(num)) return false;
+                    is_sym = false;
+                    return true;
+                }()) {} else {
+                restore(_m1);
+                skip();
+                if (!ident(sym)) return false;
+                is_sym = true;
+                }
+            }
             auto* t = new burg_ast::TermDecl();
            t->name = std::move(name);
-           t->number = num;
+           if (is_sym) t->symbol = std::move(sym);
+           else        t->number = num;
            t->loc = {line(), col()};
            terms.push_back(t);
+           name.clear(); sym.clear(); num = 0; is_sym = false;
             return true;
         }()) { restore(_m0); break; }
     }

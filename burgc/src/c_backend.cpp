@@ -34,8 +34,12 @@ class CBurgBackend : public BurgBackend {
     // Emit terminal/nonterminal #defines (no includes — those are in the frame)
     void emit_c_constants(std::ostream& out) {
         out << "/* ── Terminal symbols ── */\n\n";
-        for (auto* t : a_->spec->terminals)
-            out << "#define BURG_" << t->name << " " << t->number << "\n";
+        for (auto* t : a_->spec->terminals) {
+            out << "#define BURG_" << t->name << " ";
+            if (!t->symbol.empty()) out << t->symbol;
+            else                    out << t->number;
+            out << "\n";
+        }
 
         out << "\n/* ── Nonterminal indices ── */\n\n";
         for (size_t i = 0; i < a_->nonterms.size(); i++)

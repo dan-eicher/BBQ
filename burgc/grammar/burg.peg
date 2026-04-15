@@ -59,14 +59,20 @@ HeaderAction_ <. std::vector<std::string> &headers .>
 .
 
 TermDecl_ <. std::vector<burg_ast::TermDecl*> &terms .>
-    (. std::string name; int64_t num; .)
+    (. std::string name; int64_t num = 0;
+       std::string sym; bool is_sym = false; .)
     = "TERM"
-      { ident<name> "=" integer<num>
+      { ident<name> "="
+        ( integer<num>   (. is_sym = false; .)
+        | ident<sym>     (. is_sym = true;  .)
+        )
         (. auto* t = new burg_ast::TermDecl();
            t->name = std::move(name);
-           t->number = num;
+           if (is_sym) t->symbol = std::move(sym);
+           else        t->number = num;
            t->loc = {line(), col()};
-           terms.push_back(t); .)
+           terms.push_back(t);
+           name.clear(); sym.clear(); num = 0; is_sym = false; .)
       }
 .
 

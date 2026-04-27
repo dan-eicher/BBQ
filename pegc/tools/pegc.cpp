@@ -41,7 +41,12 @@ static void usage() {
         "  -prefix <name>    Generated file prefix (default: from grammar name)\n"
         "  -namespace <ns>   C++ namespace for generated code\n"
         "  -lang c|c++       Target language (default: c++)\n"
-        "  -trace <flags>    Debug: A(ST) P(arser) N(analysis)\n");
+        "  -trace <flags>    Debug: A(ST) P(arser) N(analysis)\n"
+        "  --strict          Treat analysis warnings as errors (CI gating)\n"
+        "  --coverage        Enable shape-enumeration warnings (ordered-choice\n"
+        "                    masking, Star/Plus + suffix conflicts). Off by\n"
+        "                    default — these fire on legitimate shared-prefix\n"
+        "                    alternatives in real grammars.\n");
 }
 
 int main(int argc, char* argv[]) {
@@ -53,6 +58,8 @@ int main(int argc, char* argv[]) {
     std::string ns;
     std::string lang = "c++";
     std::string trace;
+    bool strict = false;
+    bool coverage = false;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) {
@@ -68,6 +75,10 @@ int main(int argc, char* argv[]) {
             lang = argv[++i];
         } else if (strcmp(argv[i], "-trace") == 0 && i + 1 < argc) {
             trace = argv[++i];
+        } else if (strcmp(argv[i], "--strict") == 0) {
+            strict = true;
+        } else if (strcmp(argv[i], "--coverage") == 0) {
+            coverage = true;
         } else if (argv[i][0] == '-') {
             fprintf(stderr, "Unknown option: %s\n", argv[i]);
             usage();
@@ -132,17 +143,24 @@ int main(int argc, char* argv[]) {
 
     // --- PEG Analysis ---
     PegAnalysis analysis;
-    auto result = analysis.analyze(grammar);
+    PegAnalysisConfig acfg;
+    acfg.emit_coverage_warnings = coverage;
+    auto result = analysis.analyze(grammar, acfg);
 
-    // Print warnings
+    // Print warnings; --strict promotes them to errors so CI can gate
+    // on them.
+    const char* warn_prefix = strict ? "error" : "warning";
     for (auto& w : result.warnings) {
-        fprintf(stderr, "pegc: warning: %s\n", w.c_str());
+        fprintf(stderr, "pegc: %s: %s\n", warn_prefix, w.c_str());
     }
 
     if (!result.ok()) {
         for (auto& e : result.errors) {
             fprintf(stderr, "pegc: error: %s\n", e.c_str());
         }
+        return 1;
+    }
+    if (strict && !result.warnings.empty()) {
         return 1;
     }
 

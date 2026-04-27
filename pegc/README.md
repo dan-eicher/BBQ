@@ -45,6 +45,55 @@ produces identical output (fixpoint).
 : Diagnostic output. Flags: **A** (AST dump), **P** (generated file paths),
   **N** (analysis info: production dependencies, first-set testability).
 
+**--strict**
+: Treat analysis warnings as errors. Use for CI gating.
+
+**--coverage**
+: Enable shape-comparison checks: ordered-choice masking (alternatives
+  whose FIRST sets are subsumed by an earlier alternative) and
+  Star/Plus + suffix conflicts (greedy repetition that consumes what
+  the suffix needs). Off by default — these fire on legitimate
+  shared-prefix alternatives in real grammars where PEG correctly
+  backtracks, so the warnings are informational.
+
+## ANALYSIS
+
+pegc runs a unified semantic-analysis pass on every grammar:
+
+- **Duplicate / left-recursive productions** — errors.
+- **Undeclared identifiers** — error if a `RuleCall` references a
+  name that isn't a declared production, charset, token, or pegc
+  built-in (`ident`, `integer`, `qualified_ident`, `string_lit`,
+  `char_lit`, `scan_to`, `match`, `keyword`, `at_end`,
+  `match_charset`, `peek_at`, `peek_charset`, `peek_keyword`,
+  `floating`).
+- **Always-failing productions** — warning when a production has
+  empty FIRST and is not nullable (it can never match).
+- **Useless lookahead predicates** — warning when `&X` always
+  succeeds (X nullable) or `!X` always fails (X nullable) /
+  always succeeds (X has empty FIRST and isn't nullable).
+- **Unused tokens / charsets** — warning when declared but never
+  referenced by any production or other token.
+- **Unreachable productions** — warning (existing).
+
+FIRST and FOLLOW sets are computed via Kildall worklist iteration
+using `lib/Worklist.h`, propagating until quiescent. Nullable is
+tracked alongside FIRST as `ε ∈ FIRST(P)`. The reverse call graph
+is built once; FIRST changes re-process callers, FOLLOW changes
+re-process callees.
+
+`--coverage` adds two more checks gated behind opt-in (real
+grammars use these patterns intentionally and the warnings are
+noisy without further annotation):
+
+- **Ordered-choice masking** — alternative *j* of a Choice may be
+  masked by an earlier alternative *i* if FIRST(i) ⊇ FIRST(j).
+  PEG can backtrack after a partial commit, so this is informational
+  only.
+- **Star/Plus + suffix conflict** — `Star(B) suffix` where
+  FIRST(suffix) ⊆ FIRST(B). The greedy repetition will consume
+  what the suffix needs to match.
+
 ## GRAMMAR FORMAT
 
 A `.peg` file has this overall structure:

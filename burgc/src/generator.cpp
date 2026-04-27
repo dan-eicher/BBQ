@@ -1,4 +1,5 @@
 #include "generator.h"
+#include "completeness.h"
 #include "Parser.h"
 #include <fstream>
 #include <algorithm>
@@ -59,8 +60,6 @@ void BurgGenerator::collect_nonterms() {
 
 void BurgGenerator::classify_rules() {
     auto& a = analysis_;
-    // TODO: dedup check on (nonterm, pattern signature, guard text) so
-    // two rules that would compute the same thing get flagged.
     int64_t auto_id = 1;
     for (auto* rule : a.spec->rules) {
         rule->rule_number = auto_id++;
@@ -118,7 +117,9 @@ bool BurgGenerator::analyze(burg_ast::Spec* spec) {
 
     if (errors_.empty()) {
         check_coverage();
-        check_reachability();
+        AnalysisReport report = run_completeness_analysis(a, completeness_cfg_);
+        for (auto& e : report.errors)   errors_.push_back(e);
+        for (auto& w : report.warnings) warnings_.push_back(w);
     }
 
     return errors_.empty();
@@ -200,45 +201,6 @@ void BurgGenerator::check_coverage() {
         }
     }
 }
-
-// ── Static analysis: nonterminal reachability ────────────
-//
-// Every nonterminal must be reachable from some terminal (directly
-// or via chain rules). A nonterminal only reachable through chains
-// from itself is dead.
-
-void BurgGenerator::check_reachability() {
-    auto& a = analysis_;
-
-    // Collect nonterminals that appear as direct rule results (non-chain)
-    std::unordered_set<std::string> produced;
-    for (auto* rule : a.spec->rules) {
-        if (!rule->pattern->is_leaf() || a.term_names.count(rule->pattern->name)) {
-            produced.insert(rule->nonterm);
-        }
-    }
-
-    // Propagate through chain rules: if chain A→B exists and A is
-    // produced, then B is produced
-    bool changed = true;
-    while (changed) {
-        changed = false;
-        for (auto& cr : a.chain_rules) {
-            if (produced.count(cr.from_nt) && !produced.count(cr.to_nt)) {
-                produced.insert(cr.to_nt);
-                changed = true;
-            }
-        }
-    }
-
-    for (auto& nt : a.nonterms) {
-        if (!produced.count(nt)) {
-            warnings_.push_back("nonterminal '" + nt +
-                "' is never produced by any terminal or chain rule");
-        }
-    }
-}
-
 
 void BurgGenerator::generate(std::ostream& out, const std::string& frame_dir) {
     auto backend = create_cpp_backend();

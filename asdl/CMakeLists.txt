@@ -2,27 +2,22 @@ cmake_minimum_required(VERSION 3.16)
 project(asdl LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 
-# Third-party (inja + nlohmann-json)
-add_library(asdl_third_party INTERFACE)
-target_include_directories(asdl_third_party INTERFACE
-    ${CMAKE_CURRENT_SOURCE_DIR}/third_party
-    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/inja)
-
-# Frontend (pegc-generated parser)
 add_library(asdl_frontend STATIC
     frontend/Parser.cpp)
 target_include_directories(asdl_frontend PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/frontend
     ${CMAKE_CURRENT_SOURCE_DIR}/runtime)
 
-# Core library
 add_library(asdl_lib STATIC
     src/generator.cpp
     src/validator.cpp
     src/type_registry.cpp
     src/string_utils.cpp)
-target_include_directories(asdl_lib PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_link_libraries(asdl_lib PUBLIC asdl_frontend asdl_third_party)
+target_include_directories(asdl_lib PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_SOURCE_DIR}/lib/third_party
+    ${CMAKE_SOURCE_DIR}/lib/third_party/inja)
+target_link_libraries(asdl_lib PUBLIC asdl_frontend)
 
 # Executable
 add_executable(asdl src/main.cpp)

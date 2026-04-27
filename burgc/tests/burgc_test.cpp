@@ -1,7 +1,9 @@
 #include <gtest/gtest.h>
+#include <fstream>
 #include <sstream>
 #include "generator.h"
 #include "Parser.h"
+#include "completeness.h"
 
 #ifndef SOURCE_DIR
 #define SOURCE_DIR "."
@@ -163,6 +165,221 @@ TEST(BurgAnalysis, AutoAssignsRuleNumbers) {
     ASSERT_EQ(parser.ast->rules.size(), 2u);
     EXPECT_EQ(parser.ast->rules[0]->rule_number, 1);
     EXPECT_EQ(parser.ast->rules[1]->rule_number, 2);
+}
+
+TEST(BurgAnalysis, RejectsDuplicateRules) {
+    // Two rules with same (nonterm, pattern, guard) — must error.
+    // Replaces the old "duplicate rule number" check that became
+    // moot when rule numbers became auto-assigned.
+    Parser parser;
+    const char* input = "TERM X=1 RULES r: X = 1; r: X = 2;";
+    parser.init(input, (int)strlen(input));
+    ASSERT_TRUE(parser.parse());
+    BurgGenerator gen;
+    EXPECT_FALSE(gen.analyze(parser.ast));
+    ASSERT_FALSE(gen.errors().empty());
+    bool found = false;
+    for (auto& e : gen.errors())
+        if (e.find("duplicate rule") != std::string::npos) found = true;
+    EXPECT_TRUE(found) << "expected 'duplicate rule' in errors";
+}
+
+TEST(BurgAnalysis, AcceptsRulesDifferingOnlyByGuard) {
+    // Same (nonterm, pattern), different guards — NOT duplicates.
+    Parser parser;
+    const char* input =
+        "TERM X=1 RULES "
+        "r: X where (. cond_a(node) .) = 1; "
+        "r: X where (. cond_b(node) .) = 2;";
+    parser.init(input, (int)strlen(input));
+    ASSERT_TRUE(parser.parse());
+    BurgGenerator gen;
+    EXPECT_TRUE(gen.analyze(parser.ast));
+}
+
+TEST(BurgAnalysis, ReportsUncoverableTreeShapeWithCoverage) {
+    // Add has rules `reg: Add(reg, A)` and `reg: Add(A, B)` — multiple
+    // terminals can appear at each position. Tuple (B-state, B-state)
+    // is uncoverable: pos-1 demand of A doesn't match terminal=B,
+    // and the (A, B) rule wants terminal=A at pos 0.
+    Parser parser;
+    const char* input =
+        "TERM A=1 TERM B=2 TERM Add=3\n"
+        "RULES "
+        "reg: A = 1; "
+        "reg: B = 1; "
+        "reg: Add(reg, A) = 1; "
+        "reg: Add(A, B) = 1;";
+    parser.init(input, (int)strlen(input));
+    ASSERT_TRUE(parser.parse());
+
+    // Default: shape warnings off
+    {
+        BurgGenerator gen;
+        EXPECT_TRUE(gen.analyze(parser.ast));
+        for (auto& w : gen.warnings())
+            EXPECT_EQ(w.find("uncovered"), std::string::npos)
+                << "default analyze should not emit shape warnings";
+    }
+
+    // --coverage on: shape warnings emitted
+    {
+        BurgGenerator gen;
+        AnalysisConfig cfg;
+        cfg.emit_coverage_warnings = true;
+        gen.set_completeness_config(cfg);
+        EXPECT_TRUE(gen.analyze(parser.ast));
+        bool found_add = false;
+        for (auto& w : gen.warnings()) {
+            if (w.find("Add") != std::string::npos &&
+                w.find("uncovered") != std::string::npos) {
+                found_add = true;
+                break;
+            }
+        }
+        EXPECT_TRUE(found_add) << "expected uncovered-Add warning under --coverage";
+    }
+}
+
+TEST(BurgAnalysis, AsdlSchemaTightensDemandFilter) {
+    // For an AST-shaped IR (where BURG arity matches ASDL node-field
+    // count), the schema-aware filter enumerates child states based
+    // on ASDL types instead of the heuristic. This surfaces uncovered
+    // shapes that the heuristic misses — the heuristic only enumerates
+    // states matching some rule's literal position demand, so a rule
+    // like `expr: Add(expr, Const)` makes the heuristic enumerate
+    // only Const-state at position 1; the schema demands "any expr
+    // constructor", which includes Var, surfacing Add(_, Var) as
+    // uncovered.
+    AsdlSchema schema;
+    schema.constructor_node_fields["Const"] = {};
+    schema.constructor_node_fields["Var"] = {};
+    schema.constructor_node_fields["Add"] = {"expr", "expr"};
+    schema.sum_constructors["expr"] = {"Add", "Const", "Var"};
+
+    Parser parser;
+    const char* input =
+        "TERM Const=1 TERM Var=2 TERM Add=3\n"
+        "RULES "
+        "expr: Const = 1; "
+        "expr: Var = 1; "
+        "expr: Add(expr, Const) = 1;";
+    parser.init(input, (int)strlen(input));
+    ASSERT_TRUE(parser.parse());
+
+    auto count_add_uncovered = [](const std::vector<std::string>& ws) {
+        int n = 0;
+        for (auto& w : ws)
+            if (w.find("Add") != std::string::npos &&
+                w.find("uncovered") != std::string::npos) n++;
+        return n;
+    };
+
+    // Heuristic only — no warning surfaces (heuristic restricts pos 1
+    // to terminal=Const).
+    {
+        BurgGenerator gen;
+        AnalysisConfig cfg;
+        cfg.emit_coverage_warnings = true;
+        gen.set_completeness_config(cfg);
+        EXPECT_TRUE(gen.analyze(parser.ast));
+        EXPECT_EQ(count_add_uncovered(gen.warnings()), 0);
+    }
+
+    // With schema — Add(*, Var) shape surfaces.
+    {
+        BurgGenerator gen;
+        AnalysisConfig cfg;
+        cfg.emit_coverage_warnings = true;
+        cfg.asdl = &schema;
+        gen.set_completeness_config(cfg);
+        EXPECT_TRUE(gen.analyze(parser.ast));
+        EXPECT_GE(count_add_uncovered(gen.warnings()), 1);
+    }
+}
+
+TEST(AsdlSchema, LoadsJsonSidecar) {
+    // Write a tiny ASDL JSON sidecar (in the shape `asdl --json`
+    // produces) and load it via load_asdl_schema().
+    std::string tmp = "/tmp/burgc_test_asdl_schema.json";
+    {
+        std::ofstream f(tmp);
+        f << R"({
+            "definitions": [
+                {
+                    "name": "expr",
+                    "type": "sum",
+                    "types": [
+                        {
+                            "name": "Add",
+                            "fields": [
+                                {"type": "expr", "name": "l", "flag": "none"},
+                                {"type": "expr", "name": "r", "flag": "none"}
+                            ]
+                        },
+                        {
+                            "name": "Const",
+                            "fields": [
+                                {"type": "int64", "name": "v", "flag": "none"}
+                            ]
+                        }
+                    ]
+                }
+            ]
+        })";
+    }
+
+    AsdlSchema schema;
+    std::string err;
+    ASSERT_TRUE(load_asdl_schema(tmp, schema, err)) << err;
+
+    ASSERT_EQ(schema.constructor_node_fields.count("Add"), 1u);
+    ASSERT_EQ(schema.constructor_node_fields.at("Add").size(), 2u);
+    EXPECT_EQ(schema.constructor_node_fields.at("Add")[0], "expr");
+    EXPECT_EQ(schema.constructor_node_fields.at("Add")[1], "expr");
+
+    ASSERT_EQ(schema.constructor_node_fields.count("Const"), 1u);
+    EXPECT_TRUE(schema.constructor_node_fields.at("Const").empty());
+
+    ASSERT_EQ(schema.sum_constructors.count("expr"), 1u);
+    EXPECT_EQ(schema.sum_constructors.at("expr").size(), 2u);
+}
+
+TEST(BurgAnalysis, ReportsDeadRule) {
+    // 'aux' is produced by a rule but never demanded as a child of a
+    // reg-rooted derivation. Should be flagged dead.
+    Parser parser;
+    const char* input =
+        "TERM X=1\n"
+        "START reg\n"
+        "RULES "
+        "reg: X = 1; "
+        "aux: X = 1;";
+    parser.init(input, (int)strlen(input));
+    ASSERT_TRUE(parser.parse());
+    BurgGenerator gen;
+    EXPECT_TRUE(gen.analyze(parser.ast));
+    bool found_dead = false;
+    for (auto& w : gen.warnings()) {
+        if (w.find("dead") != std::string::npos &&
+            w.find("aux") != std::string::npos) {
+            found_dead = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(found_dead) << "expected dead-rule warning for aux";
+}
+
+TEST(BurgAnalysis, NoFalsePositivesOnSimpleGrammar) {
+    // simple.burg is well-formed and complete; the analysis should
+    // produce zero warnings on it.
+    BurgGenerator gen;
+    auto* spec = gen.parse(source_path("tests/data/simple.burg"));
+    ASSERT_NE(spec, nullptr);
+    ASSERT_TRUE(gen.analyze(spec));
+    EXPECT_TRUE(gen.warnings().empty())
+        << "first warning was: "
+        << (gen.warnings().empty() ? "" : gen.warnings()[0]);
 }
 
 TEST(BurgAnalysis, RejectsUndeclaredTerminalInPattern) {

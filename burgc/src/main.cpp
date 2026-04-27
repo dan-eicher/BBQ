@@ -1,4 +1,5 @@
 #include "generator.h"
+#include "completeness.h"
 #include <cstdio>
 #include <fstream>
 #include <cstring>
@@ -7,10 +8,18 @@
 static void usage() {
     fprintf(stderr,
         "Usage: burgc -i <input.burg> [-o <output.h>] [-lang c++|c] [-frames <dir>]\n"
-        "  -i <file>      Input .burg file\n"
-        "  -o <file>      Output file (.h for C++, .h+.c for C)\n"
-        "  -lang c++|c    Target language (default: c++)\n"
-        "  -frames <dir>  Frame template directory\n");
+        "             [-asdl <file.json>] [--strict] [--coverage]\n"
+        "  -i <file>          Input .burg file\n"
+        "  -o <file>          Output file (.h for C++, .h+.c for C)\n"
+        "  -lang c++|c        Target language (default: c++)\n"
+        "  -frames <dir>      Frame template directory\n"
+        "  -asdl <file.json>  ASDL JSON sidecar from `asdl --json`. When supplied,\n"
+        "                     completeness analysis uses precise per-position\n"
+        "                     demand from the IR's constructor schema instead of\n"
+        "                     the heuristic derived from rule patterns alone.\n"
+        "  --strict           Treat warnings as errors (CI gating).\n"
+        "  --coverage         Enable shape-enumeration warnings for uncovered\n"
+        "                     tree shapes.\n");
 }
 
 int main(int argc, char** argv) {
@@ -18,6 +27,9 @@ int main(int argc, char** argv) {
     std::string output_file;
     std::string lang = "c++";
     std::string frame_dir;
+    std::string asdl_file;
+    bool strict = false;
+    bool coverage = false;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-i") == 0 && i + 1 < argc) {
@@ -28,6 +40,12 @@ int main(int argc, char** argv) {
             lang = argv[++i];
         } else if (strcmp(argv[i], "-frames") == 0 && i + 1 < argc) {
             frame_dir = argv[++i];
+        } else if (strcmp(argv[i], "-asdl") == 0 && i + 1 < argc) {
+            asdl_file = argv[++i];
+        } else if (strcmp(argv[i], "--strict") == 0) {
+            strict = true;
+        } else if (strcmp(argv[i], "--coverage") == 0) {
+            coverage = true;
         } else if (strcmp(argv[i], "-h") == 0) {
             usage();
             return 0;
@@ -44,6 +62,19 @@ int main(int argc, char** argv) {
     }
 
     BurgGenerator gen;
+    AnalysisConfig acfg;
+    acfg.emit_coverage_warnings = coverage;
+
+    AsdlSchema schema;
+    if (!asdl_file.empty()) {
+        std::string err;
+        if (!load_asdl_schema(asdl_file, schema, err)) {
+            fprintf(stderr, "error: %s\n", err.c_str());
+            return 1;
+        }
+        acfg.asdl = &schema;
+    }
+    gen.set_completeness_config(acfg);
 
     auto* spec = gen.parse(input_file);
     if (!spec) {
@@ -58,8 +89,19 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    // Surface warnings; --strict treats them as fatal so CI can gate
+    // on completeness regressions.
+    const char* prefix = strict ? "error" : "warning";
     for (auto& w : gen.warnings())
-        fprintf(stderr, "warning: %s\n", w.c_str());
+        fprintf(stderr, "%s: %s\n", prefix, w.c_str());
+    if (strict && !gen.warnings().empty())
+        return 1;
+
+    // Analysis-only mode: no codegen requested (no -o and no
+    // -frames). Useful for `burgc -i foo.burg --coverage` style
+    // checks where the user just wants the warnings.
+    if (output_file.empty() && frame_dir.empty())
+        return 0;
 
     std::unique_ptr<BurgBackend> backend;
     if (lang == "c")

@@ -1,3 +1,4 @@
+#include <fstream>
 #include <iostream>
 #include <unistd.h>
 
@@ -6,44 +7,34 @@
 #include "exceptions.h"
 
 static void print_usage(const char* program_name) {
-    std::cerr << "Usage: " << program_name << " -i <input_file> -t <template_file> [-o <output_file>] [-lang c|c++]" << std::endl;
+    std::cerr << "Usage: " << program_name << " -i <input_file> [-t <template_file>] [-o <output_file>] [-lang c|c++] [--json <file>]" << std::endl;
     std::cerr << "  -i <input_file>   : ASDL input file" << std::endl;
-    std::cerr << "  -t <template_file>: Template file for code generation" << std::endl;
+    std::cerr << "  -t <template_file>: Template file for code generation (omit with --json to skip)" << std::endl;
     std::cerr << "  -o <output_file>  : Output file (optional, defaults to stdout)" << std::endl;
     std::cerr << "  -lang c|c++       : Target language (default: c++)" << std::endl;
+    std::cerr << "  --json <file>     : Write processed module JSON to <file> for downstream tools (e.g. burgc -asdl)" << std::endl;
     std::cerr << "  -h                : Show this help message" << std::endl;
 }
 
 int main(int argc, char** argv) {
     try {
-        std::string infile, templatefile, outfile, lang;
-        int opt;
+        std::string infile, templatefile, outfile, lang, jsonfile;
         bool show_help = false;
 
-        while ((opt = getopt(argc, argv, "i:o:t:l:h")) != -1) {
-            switch (opt) {
-                case 'i':
-                    infile = optarg;
-                    break;
-                case 'o':
-                    outfile = optarg;
-                    break;
-                case 't':
-                    templatefile = optarg;
-                    break;
-                case 'l':
-                    lang = optarg;
-                    break;
-                case 'h':
-                    show_help = true;
-                    break;
-                case '?':
-                    std::cerr << "Unknown option: " << static_cast<char>(optopt) << std::endl;
-                    print_usage(argv[0]);
-                    return 1;
-                default:
-                    print_usage(argv[0]);
-                    return 1;
+        // Custom arg parsing: getopt doesn't support --json long option
+        // alongside the existing single-letter flags.
+        for (int i = 1; i < argc; i++) {
+            std::string a = argv[i];
+            if (a == "-i" && i + 1 < argc) infile = argv[++i];
+            else if (a == "-o" && i + 1 < argc) outfile = argv[++i];
+            else if (a == "-t" && i + 1 < argc) templatefile = argv[++i];
+            else if (a == "-l" && i + 1 < argc) lang = argv[++i];
+            else if (a == "--json" && i + 1 < argc) jsonfile = argv[++i];
+            else if (a == "-h") show_help = true;
+            else {
+                std::cerr << "Unknown option: " << a << std::endl;
+                print_usage(argv[0]);
+                return 1;
             }
         }
 
@@ -58,15 +49,16 @@ int main(int argc, char** argv) {
             return 1;
         }
 
-        if (templatefile.empty()) {
-            std::cerr << "Error: Template file (-t) is required" << std::endl;
+        // -t is required only when generating templated output.
+        if (templatefile.empty() && jsonfile.empty()) {
+            std::cerr << "Error: -t <template> or --json <file> is required" << std::endl;
             print_usage(argv[0]);
             return 1;
         }
 
         std::cout << "Validating input files..." << std::endl;
         validate_file_exists(infile);
-        validate_template_file(templatefile);
+        if (!templatefile.empty()) validate_template_file(templatefile);
         validate_output_path(outfile);
 
         Generator gen;
@@ -79,15 +71,27 @@ int main(int argc, char** argv) {
         auto module = gen.to_json(module_ast);
         gen.process(module);
 
-        std::cout << "Loading template: " << templatefile << std::endl;
+        if (!jsonfile.empty()) {
+            std::ofstream js(jsonfile);
+            if (!js) {
+                std::cerr << "Error: cannot open --json output: " << jsonfile << std::endl;
+                return 1;
+            }
+            js << module.dump(2) << "\n";
+            std::cout << "JSON sidecar written to: " << jsonfile << std::endl;
+        }
 
-        std::cout << "Generating output..." << std::endl;
-        if (outfile.empty()) {
-            gen.generate(module, templatefile, std::cout);
-            std::cout << std::endl;
-        } else {
-            gen.generate(module, templatefile, outfile);
-            std::cout << "Output written to: " << outfile << std::endl;
+        if (!templatefile.empty()) {
+            std::cout << "Loading template: " << templatefile << std::endl;
+
+            std::cout << "Generating output..." << std::endl;
+            if (outfile.empty()) {
+                gen.generate(module, templatefile, std::cout);
+                std::cout << std::endl;
+            } else {
+                gen.generate(module, templatefile, outfile);
+                std::cout << "Output written to: " << outfile << std::endl;
+            }
         }
 
         std::cout << "ASDL generation completed successfully!" << std::endl;

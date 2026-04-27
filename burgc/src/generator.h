@@ -1,6 +1,7 @@
 #pragma once
 
 #include "BurgAST.h"
+#include "completeness.h"
 #include <string>
 #include <vector>
 #include <unordered_map>
@@ -42,6 +43,13 @@ public:
     const std::vector<std::string>& errors() const { return errors_; }
     const std::vector<std::string>& warnings() const { return warnings_; }
 
+    // Tunables for the unified completeness analysis. Today: just
+    // the opt-in for coverage warnings; ASDL-aware filtering will
+    // populate this when zany-painting-spark.md lands.
+    void set_completeness_config(AnalysisConfig cfg) {
+        completeness_cfg_ = std::move(cfg);
+    }
+
     // Convenience: generate with default (C++) backend
     void generate(std::ostream& out, const std::string& frame_dir = "");
 
@@ -49,11 +57,11 @@ private:
     BurgAnalysis analysis_;
     std::vector<std::string> errors_;
     std::vector<std::string> warnings_;
+    AnalysisConfig completeness_cfg_;
 
     void collect_nonterms();
     void classify_rules();
     void check_coverage();
-    void check_reachability();
 };
 
 // ── Backend base class ────────────────────────────────────

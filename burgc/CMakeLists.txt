@@ -29,14 +29,15 @@ target_include_directories(burgc_frontend PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/frontend
     ${CMAKE_CURRENT_SOURCE_DIR}/../pegc/runtime)
 
-# Core library (generator + backends)
 add_library(burgc_lib STATIC
     src/generator.cpp
+    src/completeness.cpp
     src/cpp_backend.cpp
     src/c_backend.cpp)
 target_include_directories(burgc_lib PUBLIC
-    ${CMAKE_CURRENT_SOURCE_DIR}/src)
-# Link bbq_frontend for FrameProcessor (no source recompilation)
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_SOURCE_DIR}/lib
+    ${CMAKE_SOURCE_DIR}/lib/third_party)
 target_link_libraries(burgc_lib PUBLIC burgc_frontend bbq_frontend)
 
 # Executable

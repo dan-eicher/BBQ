@@ -84,6 +84,11 @@ target_compile_definitions(bbq_tests PRIVATE
     SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
 gtest_discover_tests(bbq_tests)
 
+add_executable(lib_tests lib/tests/test_worklist.cpp)
+target_include_directories(lib_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/lib)
+target_link_libraries(lib_tests PRIVATE GTest::GTest GTest::Main)
+gtest_discover_tests(lib_tests)
+
 # --- Python extension module (optional) ---
 find_package(Python3 COMPONENTS Development)
 if(Python3_FOUND)

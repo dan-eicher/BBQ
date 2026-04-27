@@ -315,3 +315,20 @@ TEST(PegKildall, StarSuffixConflictUnderCoverage) {
     auto r = analyze_with_coverage(g);
     EXPECT_TRUE(warnings_contain(r, "greedily"));
 }
+
+TEST(PegKildall, StarFollowConflictUnderCoverage) {
+    // The Star/follow conflict from Redziejowski 2009: name's body
+    // ends in [a-z]*, and name is followed by name in term — so
+    // [a-z]* greedily eats letters that the next name() needs.
+    // Detected via FOLLOW(name) ⊇ FIRST([a-z]*-body).
+    auto* g = parse(
+        "COMPILER Test\n"
+        "PRODUCTIONS\n"
+        "term = name name .\n"
+        "name = letter { letter } .\n"
+        "letter = \"a\" | \"b\" .\n"
+        "END Test.\n");
+    ASSERT_NE(g, nullptr);
+    auto r = analyze_with_coverage(g);
+    EXPECT_TRUE(warnings_contain(r, "FOLLOW("));
+}

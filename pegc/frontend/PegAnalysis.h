@@ -143,6 +143,12 @@ private:
     void detect_useless_predicates(PegGrammar::Grammar* grammar);
     void detect_unused_terminals(PegGrammar::Grammar* grammar);
 
+    // Star/Plus where the body's FIRST overlaps FOLLOW of the
+    // containing production. Adapts Redziejowski 2009's "Conflict
+    // with follow" check (FI 93:325–336) to the trailing-iteration
+    // case that the in-sequence detect_star_suffix_conflict misses.
+    void detect_star_follow_conflict(PegGrammar::Grammar* grammar);
+
     // Topological sort (for forward declarations)
     void topological_sort();
 

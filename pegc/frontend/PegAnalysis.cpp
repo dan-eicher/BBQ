@@ -1,6 +1,7 @@
 #include "PegAnalysis.h"
 
 #include <functional>
+#include <sstream>
 
 using namespace PegGrammar;
 
@@ -44,7 +45,9 @@ AnalysisResult PegAnalysis::analyze(Grammar* grammar,
     // Validate that every RuleCall references a declared production,
     // a charset, a token, or a known pegc-runtime built-in. Reject
     // typos before the analyses that consume the call graph.
-    for (auto& [name, info] : result_.productions) {
+    for (auto& entry : result_.productions) {
+        const std::string& prod_name = entry.first;
+        ProductionInfo& info = entry.second;
         std::function<void(PegGrammar::PegExpr*)> check =
             [&](PegGrammar::PegExpr* expr) {
             if (!expr) return;
@@ -54,7 +57,7 @@ AnalysisResult PegAnalysis::analyze(Grammar* grammar,
                     !result_.productions.count(rc->name) &&
                     !is_builtin(rc->name)) {
                     result_.errors.push_back(
-                        "undeclared identifier '" + rc->name + "' in production " + name);
+                        "undeclared identifier '" + rc->name + "' in production " + prod_name);
                 }
             } else if (auto* seq = dynamic_cast<PegGrammar::Sequence*>(expr)) {
                 for (auto* e : seq->elements) check(e);
@@ -81,6 +84,7 @@ AnalysisResult PegAnalysis::analyze(Grammar* grammar,
         // alternatives intentionally. Opt-in via --coverage.
         detect_masked_alternatives();
         detect_star_suffix_conflict(grammar);
+        detect_star_follow_conflict(grammar);
     }
     detect_always_failing();
     detect_useless_predicates(grammar);
@@ -698,6 +702,92 @@ void PegAnalysis::detect_star_suffix_conflict(Grammar* grammar) {
         else if (auto* r = dynamic_cast<Resolver*>(expr)) walk(r->body, owner);
     };
     for (auto* p : grammar->productions) walk(p->body, p->name);
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Star/Plus + FOLLOW conflict (Redziejowski 2009 "Conflict with
+// follow"). For a Star/Plus at the trailing position of a
+// production's body, the FIRST of the body must not overlap
+// FOLLOW(production) — otherwise the iteration greedily consumes
+// what callers expect to come *after* the production.
+// ═══════════════════════════════════════════════════════════════
+
+void PegAnalysis::detect_star_follow_conflict(Grammar* grammar) {
+    // Walk each production body looking for trailing Star/Plus
+    // expressions: the Star/Plus is "trailing" if every successor
+    // in its enclosing scope is nullable, so the iteration's tail
+    // is FOLLOW of the containing production.
+    std::function<void(PegExpr*, ProductionInfo&, bool)> walk =
+        [&](PegExpr* expr, ProductionInfo& owner, bool tail_is_follow) {
+        if (!expr) return;
+        if (auto* seq = dynamic_cast<Sequence*>(expr)) {
+            // Only the LAST element inherits the parent's tail.
+            // Earlier elements are followed by their successors;
+            // those are the in-sequence cases handled by
+            // detect_star_suffix_conflict.
+            for (size_t i = 0; i + 1 < seq->elements.size(); i++)
+                walk(seq->elements[i], owner, false);
+            if (!seq->elements.empty())
+                walk(seq->elements.back(), owner, tail_is_follow);
+            return;
+        }
+        if (auto* ch = dynamic_cast<Choice*>(expr)) {
+            for (auto* alt : ch->alternatives)
+                walk(alt, owner, tail_is_follow);
+            return;
+        }
+        if (auto* g = dynamic_cast<Group*>(expr)) {
+            walk(g->body, owner, tail_is_follow);
+            return;
+        }
+        if (auto* r = dynamic_cast<Resolver*>(expr)) {
+            walk(r->body, owner, tail_is_follow);
+            return;
+        }
+        // Trailing Star/Plus: compare body's FIRST to FOLLOW(owner).
+        PegExpr* body = nullptr;
+        const char* op = nullptr;
+        if (auto* s = dynamic_cast<Star*>(expr)) { body = s->body; op = "Star"; }
+        else if (auto* p = dynamic_cast<Plus*>(expr)) { body = p->body; op = "Plus"; }
+        if (!body) return;
+        if (!tail_is_follow) {
+            // Inner Star/Plus — the suffix-within-Sequence check
+            // (detect_star_suffix_conflict) handles it.
+            walk(body, owner, false);
+            return;
+        }
+        auto body_first = first_set_without_epsilon(first_of(body));
+        if (body_first.empty()) {
+            walk(body, owner, false);
+            return;
+        }
+        // Redziejowski's `e ≍ FOLLOW(E)` — body FIRST and FOLLOW
+        // are not disjoint. Even partial overlap means the
+        // iteration consumes some terminal that the caller expected
+        // to come *after* the production.
+        std::vector<FirstElement> overlap;
+        for (auto& f : owner.follow_set) {
+            if (f.kind == FirstElement::Epsilon) continue;
+            for (auto& b : body_first)
+                if (first_element_eq(f, b)) { overlap.push_back(f); break; }
+        }
+        if (!overlap.empty()) {
+            std::ostringstream os;
+            os << "trailing " << op << " in " << owner.name
+               << ": body FIRST overlaps FOLLOW(" << owner.name
+               << ") — iteration will greedily consume what callers "
+               << "expect to follow";
+            result_.warnings.push_back(os.str());
+        }
+        walk(body, owner, false);
+    };
+
+    for (auto* p : grammar->productions) {
+        auto it = result_.productions.find(p->name);
+        if (it == result_.productions.end()) continue;
+        if (it->second.left_recursive) continue;
+        walk(p->body, it->second, /*tail_is_follow=*/true);
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════

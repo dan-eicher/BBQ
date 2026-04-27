@@ -172,6 +172,19 @@ TEST(CodegenCompile, InlineSwitchInStruct) {
         "}"));
 }
 
+// Regression: an inline switch must use break (not return) so that
+// fields declared after the switch are still parsed.
+TEST(CodegenCompile, InlineSwitchWithTrailingFields) {
+    EXPECT_TRUE(compiles(
+        "HeaderA = struct { a: uint8 }\n"
+        "HeaderB = struct { b: uint16be }\n"
+        "Packet = struct {\n"
+        "    tag: uint8,\n"
+        "    header: switch(tag) { 1: HeaderA; 2: HeaderB; },\n"
+        "    payload: uint32be\n"
+        "}"));
+}
+
 TEST(CodegenCompile, ArrayEof) {
     EXPECT_TRUE(compiles(
         "Entry = struct { x: uint8 }\n"

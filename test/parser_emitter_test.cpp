@@ -217,6 +217,32 @@ TEST(ParserEmitter, SwitchInlineUsesExpr) {
     EXPECT_NE(out.find("switch (static_cast<int64_t>(out.type))"), std::string::npos);
 }
 
+// Regression: inline switch must exit cases with break, not return true,
+// or fields after the switch will be unreachable. Standalone switches
+// still use return true since they live in their own parse function.
+TEST(ParserEmitter, InlineSwitchUsesBreakNotReturn) {
+    auto inline_out = emit_parser(
+        "Text = struct { data: uint8 }\n"
+        "Bin = struct { data: uint16le }\n"
+        "Packet = struct {\n"
+        "    tag: uint8,\n"
+        "    header: switch(tag) { 1: Text; 2: Bin; },\n"
+        "    payload: uint32be\n"
+        "}");
+    // Inline cases should break out of the switch, not return.
+    EXPECT_NE(inline_out.find("break;"), std::string::npos);
+
+    auto standalone_out = emit_parser(
+        "Text = struct { data: uint8 }\n"
+        "Bin = struct { data: uint16le }\n"
+        "P = switch(t) {\n"
+        "    1: Text;\n"
+        "    2: Bin;\n"
+        "}");
+    // Standalone switch cases still return true.
+    EXPECT_NE(standalone_out.find("return true;"), std::string::npos);
+}
+
 TEST(ParserEmitter, ArrayWithTypeSeparator) {
     auto out = emit_parser(
         "Comma = struct { sep: uint8 }\n"

@@ -44,7 +44,7 @@ private:
     // Code generation per construct
     void emit_struct_body(const std::string& rule_name, BBQ::Struct* st, std::ostream& out, int indent);
     void emit_union_body(const std::string& rule_name, BBQ::Union* u, const std::string& target, std::ostream& out, int indent);
-    void emit_switch_body(const std::string& rule_name, BBQ::Switch* sw, const std::string& disc_expr, const std::string& target, std::ostream& out, int indent);
+    void emit_switch_body(const std::string& rule_name, BBQ::Switch* sw, const std::string& disc_expr, const std::string& target, std::ostream& out, int indent, bool is_inline = false);
     void emit_alternatives_body(const std::string& rule_name, BBQ::Alternatives* alts, const std::string& target, std::ostream& out, int indent);
     void emit_array_body(const std::string& rule_name, BBQ::Array* arr, const std::string& target, std::ostream& out, int indent);
     void emit_optional_body(const std::string& rule_name, BBQ::Optional* opt, const std::string& target, std::ostream& out, int indent);

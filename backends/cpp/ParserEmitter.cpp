@@ -375,7 +375,7 @@ void ParserEmitter::emit_read_call(const std::string& target, TypeExpr* type, co
         }
     } else if (auto* sw = dynamic_cast<Switch*>(type)) {
         // Inline switch — discriminator from compiled expression, target is the field
-        emit_switch_body(ctx, sw, compile_expr(sw->discriminator), target, out, indent);
+        emit_switch_body(ctx, sw, compile_expr(sw->discriminator), target, out, indent, /*is_inline=*/true);
     } else if (auto* nested_st = dynamic_cast<Struct*>(type)) {
         // Inline nested struct: push a new scope and emit field reads
         EmitScope nested_scope;
@@ -415,7 +415,10 @@ bool ParserEmitter::has_string_cases(Switch* sw) {
     return false;
 }
 
-void ParserEmitter::emit_switch_body(const std::string& rule_name, Switch* sw, const std::string& disc_expr, const std::string& target, std::ostream& out, int indent) {
+void ParserEmitter::emit_switch_body(const std::string& rule_name, Switch* sw, const std::string& disc_expr, const std::string& target, std::ostream& out, int indent, bool is_inline) {
+    // When inline (switch is a field inside a struct), use break instead of
+    // return so that subsequent struct fields are parsed after the switch.
+    const char* exit_stmt = is_inline ? "break" : "return true";
     if (has_string_cases(sw)) {
         // String switch — emit if-else chain
         bool first = true;
@@ -428,7 +431,7 @@ void ParserEmitter::emit_switch_body(const std::string& rule_name, Switch* sw, c
             out << "if (" << disc_expr << " == \"" << sv->value << "\") {\n";
             out << ind(indent + 1) << "auto& val = " << target << ".emplace<" << variant_idx << ">();\n";
             emit_read_call("val", c->target, rule_name, out, indent + 1);
-            out << ind(indent + 1) << "return true;\n";
+            out << ind(indent + 1) << exit_stmt << ";\n";
             first = false;
             variant_idx++;
         }
@@ -436,7 +439,7 @@ void ParserEmitter::emit_switch_body(const std::string& rule_name, Switch* sw, c
             out << ind(indent) << "} else {\n";
             out << ind(indent + 1) << "auto& val = " << target << ".emplace<" << variant_idx << ">();\n";
             emit_read_call("val", (*sw->default_)->target, rule_name, out, indent + 1);
-            out << ind(indent + 1) << "return true;\n";
+            out << ind(indent + 1) << exit_stmt << ";\n";
             out << ind(indent) << "}\n";
         } else {
             out << ind(indent) << "}\n";
@@ -463,7 +466,7 @@ void ParserEmitter::emit_switch_body(const std::string& rule_name, Switch* sw, c
         }
         out << ind(indent + 1) << "auto& val = " << target << ".emplace<" << variant_idx << ">();\n";
         emit_read_call("val", c->target, rule_name, out, indent + 1);
-        out << ind(indent + 1) << "return true;\n";
+        out << ind(indent + 1) << exit_stmt << ";\n";
         out << ind(indent) << "}\n";
         variant_idx++;
     }
@@ -471,13 +474,14 @@ void ParserEmitter::emit_switch_body(const std::string& rule_name, Switch* sw, c
         out << ind(indent) << "default: {\n";
         out << ind(indent + 1) << "auto& val = " << target << ".emplace<" << variant_idx << ">();\n";
         emit_read_call("val", (*sw->default_)->target, rule_name, out, indent + 1);
-        out << ind(indent + 1) << "return true;\n";
+        out << ind(indent + 1) << exit_stmt << ";\n";
         out << ind(indent) << "}\n";
     }
-    out << ind(indent) << "}\n";
     if (!sw->default_) {
-        out << ind(indent) << "return ctx.fail(\"" << rule_name << ": unhandled case\");\n";
+        out << ind(indent) << "default:\n";
+        out << ind(indent + 1) << "return ctx.fail(\"" << rule_name << ": unhandled case\");\n";
     }
+    out << ind(indent) << "}\n";
 }
 
 // --- Alternatives body ---

@@ -52,6 +52,9 @@ class CBurgBackend : public BurgBackend {
         out << "typedef struct " << ctx_type_ << " {\n";
         out << "    bbq_arena arena;\n";
         out << "    bbq_htree* state_cache;\n";
+        out << "    /* Error sink: first-error-wins. Cleared by burg_rewrite() */\n";
+        out << "    const char* burg_error_msg;\n";
+        out << "    int burg_error_arg;\n";
         if (!a_->spec->members.empty()) {
             std::string trimmed = trim(a_->spec->members);
             if (!trimmed.empty())
@@ -66,6 +69,12 @@ class CBurgBackend : public BurgBackend {
         out << "void " << ns_prefix_ << "burg_rewrite(BURG_NODE_TYPE root, " << ctx_type_ << "* ctx);\n";
         out << "int "  << ns_prefix_ << "burg_rule(burg_state_t* state, int goalnt);\n";
         out << "const char* " << ns_prefix_ << "burg_nt_name(int nt);\n";
+        out << "/* Error API — check after burg_rewrite() */\n";
+        out << "bool burg_has_error(const " << ctx_type_ << "* ctx);\n";
+        out << "const char* burg_get_error(const " << ctx_type_ << "* ctx);\n";
+        out << "int burg_get_error_arg(const " << ctx_type_ << "* ctx);\n";
+        out << "void burg_clear_error(" << ctx_type_ << "* ctx);\n";
+        out << "void burg_set_error(const char* msg, int arg, " << ctx_type_ << "* ctx);\n";
         if (a_->has_actions) {
             out << "void " << ns_prefix_ << "burg_reduce(BURG_NODE_TYPE node, burg_state_t* state, int goalnt, " << ctx_type_ << "* ctx);\n";
         }
@@ -75,12 +84,34 @@ class CBurgBackend : public BurgBackend {
         out << "void " << ns_prefix_ << "burg_ctx_init(" << ctx_type_ << "* ctx) {\n";
         out << "    bbq_arena_init(&ctx->arena, 4096);\n";
         out << "    ctx->state_cache = bbq_htree_create();\n";
+        out << "    ctx->burg_error_msg = NULL;\n";
+        out << "    ctx->burg_error_arg = 0;\n";
         out << "}\n\n";
 
         out << "void " << ns_prefix_ << "burg_ctx_free(" << ctx_type_ << "* ctx) {\n";
         out << "    bbq_arena_free(&ctx->arena);\n";
         out << "    bbq_htree_destroy(ctx->state_cache);\n";
         out << "    ctx->state_cache = NULL;\n";
+        out << "}\n\n";
+
+        out << "bool burg_has_error(const " << ctx_type_ << "* ctx) {\n";
+        out << "    return ctx->burg_error_msg != NULL;\n";
+        out << "}\n\n";
+        out << "const char* burg_get_error(const " << ctx_type_ << "* ctx) {\n";
+        out << "    return ctx->burg_error_msg;\n";
+        out << "}\n\n";
+        out << "int burg_get_error_arg(const " << ctx_type_ << "* ctx) {\n";
+        out << "    return ctx->burg_error_arg;\n";
+        out << "}\n\n";
+        out << "void burg_clear_error(" << ctx_type_ << "* ctx) {\n";
+        out << "    ctx->burg_error_msg = NULL;\n";
+        out << "    ctx->burg_error_arg = 0;\n";
+        out << "}\n\n";
+        out << "void burg_set_error(const char* msg, int arg, " << ctx_type_ << "* ctx) {\n";
+        out << "    if (ctx->burg_error_msg == NULL) {\n";
+        out << "        ctx->burg_error_msg = msg;\n";
+        out << "        ctx->burg_error_arg = arg;\n";
+        out << "    }\n";
         out << "}\n";
     }
 
@@ -214,6 +245,15 @@ public:
 
         ifp.CopyFramePart("ctx_lifecycle");
         emit_ctx_lifecycle(impl);
+
+        ifp.CopyFramePart("private_helpers");
+        if (!a.spec->private_helpers.empty()) {
+            std::string trimmed = trim(a.spec->private_helpers);
+            if (!trimmed.empty()) {
+                impl << "/* ── PRIVATE block (file-local) ── */\n";
+                impl << trimmed << "\n\n";
+            }
+        }
 
         ifp.CopyFramePart("internal_helpers");
         emit_internal_helpers(impl);

@@ -81,6 +81,11 @@ protected:
     virtual std::string ctx_arg() const { return ""; }    // appended: ", ctx"
     virtual std::string ctx_solo() const { return ""; }   // standalone: "ctx"
     virtual std::string state_type() const { return "BurgState"; }  // struct name
+    // Whether the backend stores errors and the consumer polls
+    // burg_has_error() to detect them. The C++ backend overrides to
+    // false because burg_set_error() throws; the polling checks would
+    // be dead code.
+    virtual bool needs_error_polling() const { return true; }
 
     // Terminal/nonterminal constant definitions (constexpr for C++, #define for C)
     void emit_defines(std::ostream& out);

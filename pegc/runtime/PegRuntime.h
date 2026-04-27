@@ -170,6 +170,26 @@ public:
         return true;
     }
 
+    // Match C++-style qualified identifier: ident("::" ident)*.  Used by
+    // grammars whose symbols can refer to enum values / namespaced
+    // constants (e.g. burgc's `TERM Foo = ns::KOP_FOO`).
+    bool qualified_ident(std::string& out) {
+        if (pos_ >= end_ || !is_ident_start(*pos_)) return false;
+        const char* start = pos_;
+        advance();
+        while (pos_ < end_ && is_ident_continue(*pos_)) advance();
+        for (;;) {
+            if (pos_ + 1 >= end_ || pos_[0] != ':' || pos_[1] != ':') break;
+            const char* save = pos_;
+            advance(); advance();  // consume "::"
+            if (pos_ >= end_ || !is_ident_start(*pos_)) { pos_ = save; break; }
+            advance();
+            while (pos_ < end_ && is_ident_continue(*pos_)) advance();
+        }
+        out.assign(start, pos_);
+        return true;
+    }
+
     // Match integer literal: decimal, hex (0x), binary (0b)
     bool integer(int64_t& out) {
         if (pos_ >= end_ || !is_digit(*pos_)) return false;

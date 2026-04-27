@@ -24,9 +24,10 @@ private:
 
 
     bool parse_Burg();
-    bool parse_Decl(std::vector<burg_ast::TermDecl*>& terms, std::string& start, std::string& ns, std::string& members, std::vector<std::string>& headers);
+    bool parse_Decl(std::vector<burg_ast::TermDecl*>& terms, std::string& start, std::string& ns, std::string& members, std::string& priv, std::vector<std::string>& headers);
     bool parse_NamespaceDecl(std::string& ns);
     bool parse_MembersDecl(std::string& members);
+    bool parse_PrivateDecl(std::string& priv);
     bool parse_HeaderAction_(std::vector<std::string>& headers);
     bool parse_TermDecl_(std::vector<burg_ast::TermDecl*>& terms);
     bool parse_StartDecl(std::string& start);

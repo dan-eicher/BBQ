@@ -4,6 +4,8 @@
 #include <cstdint>
 #include <cstdlib>
 #include <climits>
+#include <stdexcept>
+#include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -17,13 +19,34 @@
 
 -->namespace_open
 
+// Thrown by the matcher when it cannot continue — typically the
+// consumer's IR carries a tag that wasn't declared as a TERM, or no
+// rule produces the start nonterminal at the root. User actions can
+// also throw this (or any other exception) to abort the rewrite.
+class BurgError : public std::runtime_error {
+public:
+    int arg;
+    BurgError(const char* msg, int a = 0)
+        : std::runtime_error(msg), arg(a) {}
+};
+
 class BurgMatcher {
 public:
 -->members
 
 -->state_struct
 
+    // Error reporting. Consumers receive errors as exceptions, so
+    // burg_has_error() always returns false here — the only way an
+    // error surfaces is via a thrown BurgError from burg_rewrite().
+    // Actions inside the matcher use burg_set_error() to throw.
+    [[noreturn]] static void burg_set_error(const char* msg, int arg = 0) {
+        throw BurgError(msg, arg);
+    }
+
 private:
+-->private_helpers
+
     // ── Arena allocator ──
 
     static constexpr size_t ARENA_PAGE_SIZE = 4096;

@@ -9,6 +9,6 @@ START reg
 RULES
 
 reg  : Const            = 1;
-reg  : Add(reg, reg)    = 2;
-reg  : Mul(reg, reg)    = 3;
-reg  : Load             = 4;
+reg  : Add(reg, reg)    = 1;
+reg  : Mul(reg, reg)    = 1;
+reg  : Load             = 1;

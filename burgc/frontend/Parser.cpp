@@ -25,6 +25,7 @@ bool Parser::parse_Burg() {
        std::string start_sym;
        std::string ns;
        std::string members_block;
+       std::string private_block;
        std::vector<std::string> headers;
        std::vector<burg_ast::Rule*> rules;
        burg_ast::Rule* r;
@@ -32,7 +33,7 @@ bool Parser::parse_Burg() {
         auto _m0 = save();
         if (![&]() -> bool {
             skip();
-            if (!parse_Decl(terms, start_sym, ns, members_block, headers)) return false;
+            if (!parse_Decl(terms, start_sym, ns, members_block, private_block, headers)) return false;
             return true;
         }()) { restore(_m0); break; }
     }
@@ -53,13 +54,14 @@ bool Parser::parse_Burg() {
        ast->start = std::move(start_sym);
        ast->ns = std::move(ns);
        ast->members = std::move(members_block);
+       ast->private_helpers = std::move(private_block);
        ast->headers = std::move(headers);
        ast->rules = std::move(rules);
        ast->loc = {1, 1};
     return true;
 }
 
-bool Parser::parse_Decl(std::vector<burg_ast::TermDecl*>& terms, std::string& start, std::string& ns, std::string& members, std::vector<std::string>& headers) {
+bool Parser::parse_Decl(std::vector<burg_ast::TermDecl*>& terms, std::string& start, std::string& ns, std::string& members, std::string& priv, std::vector<std::string>& headers) {
     {
         auto _m0 = save();
         if ([&]() -> bool {
@@ -86,8 +88,15 @@ bool Parser::parse_Decl(std::vector<burg_ast::TermDecl*>& terms, std::string& st
             return true;
         }()) {} else {
         restore(_m0);
+        if ([&]() -> bool {
+            skip();
+            if (!parse_PrivateDecl(priv)) return false;
+            return true;
+        }()) {} else {
+        restore(_m0);
         skip();
         if (!parse_HeaderAction_(headers)) return false;
+        }
         }
         }
         }
@@ -112,6 +121,17 @@ bool Parser::parse_MembersDecl(std::string& members) {
     if (!match("(.")) return false;
     if (!scan_to("." ")", code)) return false;
     members = code;
+    return true;
+}
+
+bool Parser::parse_PrivateDecl(std::string& priv) {
+    std::string code;
+    skip();
+    if (!keyword("PRIVATE")) return false;
+    skip();
+    if (!match("(.")) return false;
+    if (!scan_to("." ")", code)) return false;
+    priv = code;
     return true;
 }
 
@@ -146,7 +166,7 @@ bool Parser::parse_TermDecl_(std::vector<burg_ast::TermDecl*>& terms) {
                 }()) {} else {
                 restore(_m1);
                 skip();
-                if (!ident(sym)) return false;
+                if (!qualified_ident(sym)) return false;
                 is_sym = true;
                 }
             }
@@ -174,7 +194,6 @@ bool Parser::parse_StartDecl(std::string& start) {
 bool Parser::parse_RuleDecl(burg_ast::Rule* * result) {
     std::string nt;
        burg_ast::TreePattern* pat;
-       int64_t rulenum;
        int64_t cost = 0;
        std::string guard;
        std::string action;
@@ -199,34 +218,21 @@ bool Parser::parse_RuleDecl(burg_ast::Rule* * result) {
     skip();
     if (!match("=")) return false;
     skip();
-    if (!integer(rulenum)) return false;
+    if (!integer(cost)) return false;
     {
         auto _m1 = save();
-        if (![&]() -> bool {
-            skip();
-            if (!match("(")) return false;
-            skip();
-            if (!integer(cost)) return false;
-            skip();
-            if (!match(")")) return false;
-            return true;
-        }()) restore(_m1);
-    }
-    {
-        auto _m2 = save();
         if (![&]() -> bool {
             skip();
             if (!match("(.")) return false;
             if (!scan_to("." ")", action)) return false;
             return true;
-        }()) restore(_m2);
+        }()) restore(_m1);
     }
     skip();
     if (!match(";")) return false;
     *result = new burg_ast::Rule();
        (*result)->nonterm = std::move(nt);
        (*result)->pattern = pat;
-       (*result)->rule_number = rulenum;
        (*result)->cost = cost;
        (*result)->guard = std::move(guard);
        (*result)->action = std::move(action);

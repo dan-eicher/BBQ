@@ -4,6 +4,11 @@
 namespace {
 
 class CppBurgBackend : public BurgBackend {
+    // C++ uses exceptions instead of polling: burg_set_error() throws
+    // BurgError, so the codegen's `if (burg_has_error()) return;` and
+    // `burg_clear_error()` would be dead code.
+    bool needs_error_polling() const override { return false; }
+
 public:
     void generate(std::ostream& out, const BurgAnalysis& a,
                   const std::string& frame_dir = "") override {
@@ -38,6 +43,13 @@ public:
 
         fp.CopyFramePart("state_struct");
         emit_state_struct(out, 1);
+
+        fp.CopyFramePart("private_helpers");
+        if (!a.spec->private_helpers.empty()) {
+            std::string trimmed = trim(a.spec->private_helpers);
+            if (!trimmed.empty())
+                out << "    " << trimmed << "\n\n";
+        }
 
         fp.CopyFramePart("closures");
         emit_closures(out, 1, "", false);

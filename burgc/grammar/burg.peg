@@ -17,10 +17,11 @@ Burg
        std::string start_sym;
        std::string ns;
        std::string members_block;
+       std::string private_block;
        std::vector<std::string> headers;
        std::vector<burg_ast::Rule*> rules;
        burg_ast::Rule* r; .)
-    = { Decl<terms, start_sym, ns, members_block, headers> }
+    = { Decl<terms, start_sym, ns, members_block, private_block, headers> }
       "RULES"
       { RuleDecl<&r>  (. rules.push_back(r); .) }
       (. skip(); if (!at_end()) return false; .)
@@ -29,16 +30,18 @@ Burg
        ast->start = std::move(start_sym);
        ast->ns = std::move(ns);
        ast->members = std::move(members_block);
+       ast->private_helpers = std::move(private_block);
        ast->headers = std::move(headers);
        ast->rules = std::move(rules);
        ast->loc = {1, 1}; .)
 .
 
-Decl <. std::vector<burg_ast::TermDecl*> &terms, std::string &start, std::string &ns, std::string &members, std::vector<std::string> &headers .>
+Decl <. std::vector<burg_ast::TermDecl*> &terms, std::string &start, std::string &ns, std::string &members, std::string &priv, std::vector<std::string> &headers .>
     = TermDecl_<terms>
     | StartDecl<start>
     | NamespaceDecl<ns>
     | MembersDecl<members>
+    | PrivateDecl<priv>
     | HeaderAction_<headers>
 .
 
@@ -52,6 +55,12 @@ MembersDecl <. std::string &members .>
     (. members = code; .)
 .
 
+PrivateDecl <. std::string &priv .>
+    (. std::string code; .)
+    = "PRIVATE" "(." (. if (!scan_to("." ")", code)) return false; .)
+    (. priv = code; .)
+.
+
 HeaderAction_ <. std::vector<std::string> &headers .>
     (. std::string code; .)
     = "(." (. if (!scan_to("." ")", code)) return false; .)
@@ -63,8 +72,8 @@ TermDecl_ <. std::vector<burg_ast::TermDecl*> &terms .>
        std::string sym; bool is_sym = false; .)
     = "TERM"
       { ident<name> "="
-        ( integer<num>   (. is_sym = false; .)
-        | ident<sym>     (. is_sym = true;  .)
+        ( integer<num>          (. is_sym = false; .)
+        | qualified_ident<sym>  (. is_sym = true;  .)
         )
         (. auto* t = new burg_ast::TermDecl();
            t->name = std::move(name);
@@ -83,7 +92,6 @@ StartDecl <. std::string &start .>
 RuleDecl <. burg_ast::Rule* *result .>
     (. std::string nt;
        burg_ast::TreePattern* pat;
-       int64_t rulenum;
        int64_t cost = 0;
        std::string guard;
        std::string action; .)
@@ -91,14 +99,12 @@ RuleDecl <. burg_ast::Rule* *result .>
       ":"
       TreePat<&pat>
       [ "where" "(." (. if (!scan_to("." ")", guard)) return false; .) ]
-      "=" integer<rulenum>
-      [ "(" integer<cost> ")" ]
+      "=" integer<cost>
       [ "(." (. if (!scan_to("." ")", action)) return false; .) ]
       ";"
     (. *result = new burg_ast::Rule();
        (*result)->nonterm = std::move(nt);
        (*result)->pattern = pat;
-       (*result)->rule_number = rulenum;
        (*result)->cost = cost;
        (*result)->guard = std::move(guard);
        (*result)->action = std::move(action);

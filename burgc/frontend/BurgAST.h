@@ -52,6 +52,8 @@ struct Spec {
     std::string start;                  // %start nonterminal (optional)
     std::string ns;                     // NAMESPACE name (optional)
     std::string members;                // MEMBERS block (class member declarations)
+    std::string private_helpers;        // PRIVATE block. C++: private section
+                                        // of BurgMatcher. C: file-local in .c.
     std::vector<std::string> headers;   // (. .) header blocks (user includes/decls)
     std::vector<Rule*> rules;
     SourceLoc loc;

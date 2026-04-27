@@ -91,12 +91,12 @@ TEST(BurgParser, TreePatternStructure) {
     EXPECT_EQ(spec->rules[1]->pattern->children[1]->name, "reg");
 }
 
-TEST(BurgParser, DefaultCostIsZero) {
+TEST(BurgParser, ParsesSimpleCosts) {
     BurgGenerator gen;
     auto* spec = gen.parse(source_path("tests/data/simple.burg"));
     ASSERT_NE(spec, nullptr);
     for (auto* rule : spec->rules)
-        EXPECT_EQ(rule->cost, 0);
+        EXPECT_EQ(rule->cost, 1);
 }
 
 TEST(BurgParser, RejectsInvalidInput) {
@@ -151,15 +151,18 @@ TEST(BurgAnalysis, RejectsDuplicateTerminals) {
     EXPECT_FALSE(gen.errors().empty());
 }
 
-TEST(BurgAnalysis, RejectsDuplicateRuleNumbers) {
+TEST(BurgAnalysis, AutoAssignsRuleNumbers) {
     Parser parser;
     const char* input = "TERM X=1 TERM Y=2 RULES r: X = 1; s: Y = 1;";
     parser.init(input, (int)strlen(input));
     ASSERT_TRUE(parser.parse());
     BurgGenerator gen;
-    EXPECT_FALSE(gen.analyze(parser.ast));
-    ASSERT_FALSE(gen.errors().empty());
-    EXPECT_NE(gen.errors()[0].find("duplicate rule number"), std::string::npos);
+    EXPECT_TRUE(gen.analyze(parser.ast));
+    EXPECT_TRUE(gen.errors().empty());
+    // Rules are renumbered sequentially starting at 1, regardless of source order.
+    ASSERT_EQ(parser.ast->rules.size(), 2u);
+    EXPECT_EQ(parser.ast->rules[0]->rule_number, 1);
+    EXPECT_EQ(parser.ast->rules[1]->rule_number, 2);
 }
 
 TEST(BurgAnalysis, RejectsUndeclaredTerminalInPattern) {
@@ -326,7 +329,7 @@ TEST(BurgParser, InlineParseAction) {
 
 TEST(BurgParser, InlineParseActionWithCost) {
     Parser parser;
-    const char* input = "TERM X=1 RULES r: X = 1 (3) (. do_thing(); .);";
+    const char* input = "TERM X=1 RULES r: X = 3 (. do_thing(); .);";
     parser.init(input, (int)strlen(input));
     EXPECT_TRUE(parser.parse());
     ASSERT_NE(parser.ast, nullptr);
@@ -544,7 +547,7 @@ TEST(BurgParser, ParsesWhereGuard) {
 
 TEST(BurgParser, ParsesWhereGuardWithCostAndAction) {
     Parser parser;
-    const char* input = "TERM X=1 RULES r: X where (. pred(n) .) = 1 (2) (. action(); .);";
+    const char* input = "TERM X=1 RULES r: X where (. pred(n) .) = 2 (. action(); .);";
     parser.init(input, (int)strlen(input));
     EXPECT_TRUE(parser.parse());
     ASSERT_NE(parser.ast, nullptr);
@@ -597,6 +600,54 @@ TEST(BurgCppBackend, RewriteFuncReducesWhenActions) {
     EXPECT_NE(out.str().find("burg_reduce(n, s,"), std::string::npos);
 }
 
+// Error reporting regression tests.
+//
+// C++: burg_set_error() throws BurgError. Consumers handle errors by
+// catching, so the codegen does NOT emit polling checks (they'd be
+// dead code under the throw model).
+//
+// C: burg_set_error() stores in the context. Consumers call
+// burg_has_error() after burg_rewrite() to detect failure. Codegen
+// emits short-circuit polling checks at the top of burg_reduce and
+// between phases of burg_rewrite.
+//
+// Without these, the consumer either sees a process abort (assert)
+// or silent miscompilation when its IR carries an unknown op.
+TEST(BurgCppBackend, ErrorReportingThrowsBurgError) {
+    BurgGenerator gen;
+    auto* spec = gen.parse(source_path("tests/data/actions.burg"));
+    ASSERT_NE(spec, nullptr);
+    ASSERT_TRUE(gen.analyze(spec));
+    std::ostringstream out;
+    gen.generate(out, frame_dir());
+    std::string code = out.str();
+    // BurgError class is defined and burg_set_error throws it
+    EXPECT_NE(code.find("class BurgError"), std::string::npos);
+    EXPECT_NE(code.find("throw BurgError"), std::string::npos);
+    EXPECT_NE(code.find("burg_set_error("), std::string::npos);
+    // No assert/abort calls in generated code
+    EXPECT_EQ(code.find("assert(false"), std::string::npos);
+    // No polling — exception model unwinds the stack instead
+    EXPECT_EQ(code.find("burg_clear_error()"), std::string::npos);
+    EXPECT_EQ(code.find("if (burg_has_error()"), std::string::npos);
+}
+
+TEST(BurgCBackend, ErrorReportingPollsContext) {
+    auto backend = create_c_backend();
+    std::string code = gen_code(
+        "TERM X=1\n"
+        "RULES r: X = 1 (. emit_x(node); .);", *backend);
+    // Public error API on the context struct
+    EXPECT_NE(code.find("burg_error_msg"), std::string::npos);
+    EXPECT_NE(code.find("bool burg_has_error("), std::string::npos);
+    EXPECT_NE(code.find("burg_set_error("), std::string::npos);
+    // burg_rewrite clears errors first; reduce/rewrite poll between phases
+    EXPECT_NE(code.find("burg_clear_error("), std::string::npos);
+    EXPECT_NE(code.find("if (burg_has_error("), std::string::npos);
+    // No assert/abort calls
+    EXPECT_EQ(code.find("assert(false"), std::string::npos);
+}
+
 TEST(BurgCppBackend, RewriteResetsArenaFirst) {
     BurgGenerator gen;
     auto* spec = gen.parse(source_path("tests/data/simple.burg"));
@@ -628,6 +679,52 @@ TEST(BurgParser, ParsesMembersBlock) {
     ASSERT_NE(parser.ast, nullptr);
     EXPECT_NE(parser.ast->members.find("count_"), std::string::npos);
     EXPECT_NE(parser.ast->members.find("heap_"), std::string::npos);
+}
+
+TEST(BurgParser, ParsesPrivateBlock) {
+    Parser parser;
+    const char* input =
+        "TERM X=1\n"
+        "PRIVATE (. static int helper() { return 42; } .)\n"
+        "RULES r: X = 1;";
+    parser.init(input, (int)strlen(input));
+    EXPECT_TRUE(parser.parse());
+    ASSERT_NE(parser.ast, nullptr);
+    EXPECT_NE(parser.ast->private_helpers.find("helper"), std::string::npos);
+    EXPECT_NE(parser.ast->private_helpers.find("return 42"), std::string::npos);
+}
+
+TEST(BurgCppBackend, EmitsPrivateBlockInPrivateSection) {
+    std::string code = gen_cpp(
+        "TERM X=1\n"
+        "PRIVATE (. int magic_helper() { return 7; } .)\n"
+        "RULES r: X = 1;");
+    // The PRIVATE block lands inside the class
+    EXPECT_NE(code.find("magic_helper"), std::string::npos);
+    // …after the first `private:` keyword (i.e. in the private section)
+    auto private_pos = code.find("private:");
+    auto helper_pos = code.find("magic_helper");
+    ASSERT_NE(private_pos, std::string::npos);
+    ASSERT_NE(helper_pos, std::string::npos);
+    EXPECT_LT(private_pos, helper_pos);
+}
+
+TEST(BurgCBackend, EmitsPrivateBlockInImpl) {
+    auto backend = create_c_backend();
+    std::string code = gen_code(
+        "TERM X=1\n"
+        "PRIVATE (. static int magic_helper(void) { return 7; } .)\n"
+        "RULES r: X = 1 (. (void)node; .);", *backend);
+    // The PRIVATE block lands at file scope in the .c
+    EXPECT_NE(code.find("magic_helper"), std::string::npos);
+    // …and is NOT exposed in the public context struct
+    auto ctx_pos = code.find("typedef struct burg_ctx_t");
+    auto ctx_end = code.find("} burg_ctx_t");
+    ASSERT_NE(ctx_pos, std::string::npos);
+    ASSERT_NE(ctx_end, std::string::npos);
+    auto helper_pos_in_struct = code.find("magic_helper", ctx_pos);
+    EXPECT_TRUE(helper_pos_in_struct == std::string::npos
+             || helper_pos_in_struct > ctx_end);
 }
 
 TEST(BurgCppBackend, EmitsMembersInClass) {

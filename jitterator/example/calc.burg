@@ -27,31 +27,31 @@ START stmt
 RULES
 
 // ── Slot references (cost 0 = value already in slot, no stencil) ──
-reg: SlotRef                   = 11 (0);
+reg: SlotRef                   = 0;
 
 // ── Operations (cost 1 = emit a stencil) ──
-reg: LoadConst                 = 10 (1) (. jit_emit_load_const(node); .);
-reg: Add(reg, reg)             = 20 (1) (. jit_emit_binop(node, STENCIL_ADD); .);
-reg: Sub(reg, reg)             = 21 (1) (. jit_emit_binop(node, STENCIL_SUB); .);
-reg: Mul(reg, reg)             = 22 (1) (. jit_emit_binop(node, STENCIL_MUL); .);
-reg: Neg(reg)                  = 23 (1) (. jit_emit_neg(node); .);
+reg: LoadConst                 = 1 (. jit_emit_load_const(node); .);
+reg: Add(reg, reg)             = 1 (. jit_emit_binop(node, STENCIL_ADD); .);
+reg: Sub(reg, reg)             = 1 (. jit_emit_binop(node, STENCIL_SUB); .);
+reg: Mul(reg, reg)             = 1 (. jit_emit_binop(node, STENCIL_MUL); .);
+reg: Neg(reg)                  = 1 (. jit_emit_neg(node); .);
 
 // ── Constant folding (cost 0 = fold at compile time) ──
-reg: Add(LoadConst, LoadConst) = 30 (0) (. jit_fold_binop(node, '+'); .);
-reg: Sub(LoadConst, LoadConst) = 31 (0) (. jit_fold_binop(node, '-'); .);
-reg: Mul(LoadConst, LoadConst) = 32 (0) (. jit_fold_binop(node, '*'); .);
+reg: Add(LoadConst, LoadConst) = 0 (. jit_fold_binop(node, '+'); .);
+reg: Sub(LoadConst, LoadConst) = 0 (. jit_fold_binop(node, '-'); .);
+reg: Mul(LoadConst, LoadConst) = 0 (. jit_fold_binop(node, '*'); .);
 
 // ── Algebraic identities (cost 0 = eliminate the operation) ──
 reg: Add(LoadConst, reg)
     where (. const_val(node, 0) == 0 .)
-    = 40 (0);
+    = 0;
 reg: Mul(LoadConst, reg)
     where (. const_val(node, 0) == 1 .)
-    = 41 (0);
+    = 0;
 reg: Mul(LoadConst, reg)
     where (. const_val(node, 0) == 0 .)
-    = 42 (0) (. jit_fold_zero(node); .);
+    = 0 (. jit_fold_zero(node); .);
 
 // ── Statements ──
 stmt: Halt                     = 1 (. jit_emit_halt(node); .);
-stmt: reg                      = 100;
+stmt: reg                      = 0;

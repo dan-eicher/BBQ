@@ -59,22 +59,14 @@ void BurgGenerator::collect_nonterms() {
 
 void BurgGenerator::classify_rules() {
     auto& a = analysis_;
-    std::unordered_map<int64_t, burg_ast::Rule*> seen_numbers;
+    // TODO: dedup check on (nonterm, pattern signature, guard text) so
+    // two rules that would compute the same thing get flagged.
+    int64_t auto_id = 1;
     for (auto* rule : a.spec->rules) {
+        rule->rule_number = auto_id++;
         a.rules_by_nt[rule->nonterm].push_back(rule);
         if (rule->rule_number > a.max_rule)
             a.max_rule = rule->rule_number;
-
-        auto it = seen_numbers.find(rule->rule_number);
-        if (it != seen_numbers.end()) {
-            errors_.push_back("duplicate rule number " +
-                std::to_string(rule->rule_number) + ": " +
-                rule->nonterm + ": " + rule->pattern->name +
-                " conflicts with " +
-                it->second->nonterm + ": " + it->second->pattern->name);
-        } else {
-            seen_numbers[rule->rule_number] = rule;
-        }
 
         if (rule->pattern->is_leaf() && !a.term_names.count(rule->pattern->name)) {
             a.chain_rules.push_back({
@@ -492,6 +484,15 @@ void BurgBackend::emit_label_dp_switch(std::ostream& out, int indent) {
         }
         pad(out, indent + 1); out << "break;\n";
     }
+    // Default: the consumer's BURG_NODE_OP(node) returned a value not
+    // declared as a TERM in the grammar. Report it through the error
+    // sink so the caller can recover instead of silently falling
+    // through to burg_reduce with rule[goalnt] = 0 (which is the bug
+    // this default arm prevents).
+    pad(out, indent); out << "default:\n";
+    pad(out, indent + 1);
+    out << "burg_set_error(\"burg: unknown opcode in match\", op" << ctx_arg() << ");\n";
+    pad(out, indent + 1); out << "break;\n";
     pad(out, indent); out << "}\n";
 }
 
@@ -611,6 +612,14 @@ void BurgBackend::emit_child_reductions(std::ostream& out,
 }
 
 void BurgBackend::emit_reduce_body(std::ostream& out, int indent) {
+    // Short-circuit: once an error is set anywhere in the rewrite, all
+    // subsequent reduce calls become no-ops. This stops parent actions
+    // from running with stale child state after a recursive reduce
+    // failed. C++ uses exceptions, so this check is unnecessary there
+    // (the throw unwinds the whole stack naturally).
+    if (needs_error_polling()) {
+        pad(out, indent); out << "if (burg_has_error(" << ctx_solo() << ")) return;\n";
+    }
     pad(out, indent); out << "int rule = burg_rule(state, goalnt);\n";
     pad(out, indent); out << "switch (rule) {\n";
 
@@ -636,7 +645,16 @@ void BurgBackend::emit_reduce_body(std::ostream& out, int indent) {
         pad(out, indent + 1); out << "break;\n";
         pad(out, indent); out << "}\n";
     }
-
+    // Default: rule == 0 means the labeler found no rule that produces
+    // goalnt at this node. Without this the action sequence in the
+    // parent's case body runs as if children were reduced — see the
+    // "fall-through and crashing" footgun in the README of failure
+    // modes.
+    pad(out, indent); out << "default:\n";
+    pad(out, indent + 1);
+    out << "burg_set_error(\"burg: no rule for goal nonterminal\", goalnt"
+        << ctx_arg() << ");\n";
+    pad(out, indent + 1); out << "break;\n";
     pad(out, indent); out << "}\n";
 }
 
@@ -671,14 +689,24 @@ void BurgBackend::emit_rpo_dfs(std::ostream& out, int indent) {
 void BurgBackend::emit_rewrite_body(std::ostream& out, int indent) {
     int64_t start_idx = a_->nonterm_index.at(a_->start_nonterm);
 
+    if (needs_error_polling()) {
+        pad(out, indent); out << "burg_clear_error(" << ctx_solo() << ");\n";
+    }
     pad(out, indent); out << "arena_reset(" << ctx_solo() << ");\n\n";
 
     // Fast path: tree (no successor edges → skip RPO + cache)
     pad(out, indent); out << "if (BURG_NODE_SUCC_COUNT(root) == 0) {\n";
     pad(out, indent + 1); out << state_type() << "* state = burg_label_tree(root" << ctx_arg() << ");\n";
+    if (needs_error_polling()) {
+        pad(out, indent + 1); out << "if (burg_has_error(" << ctx_solo() << ")) return;\n";
+    }
     if (a_->has_actions) {
         pad(out, indent + 1); out << "if (state->rule[" << start_idx << "])\n";
         pad(out, indent + 2); out << "burg_reduce(root, state, " << start_idx << ctx_arg() << ");\n";
+        pad(out, indent + 1); out << "else\n";
+        pad(out, indent + 2);
+        out << "burg_set_error(\"burg: start nonterminal has no rule at root\", "
+            << start_idx << ctx_arg() << ");\n";
     }
     pad(out, indent + 1); out << "return;\n";
     pad(out, indent); out << "}\n\n";
@@ -692,6 +720,10 @@ void BurgBackend::emit_rewrite_body(std::ostream& out, int indent) {
     pad(out, indent); out << "// Label every node (data-flow children labeled recursively)\n";
     pad(out, indent); out << "for (auto* n : rpo)\n";
     pad(out, indent + 1); out << "burg_label(n" << ctx_arg() << ");\n\n";
+
+    if (needs_error_polling()) {
+        pad(out, indent); out << "if (burg_has_error(" << ctx_solo() << ")) return;\n\n";
+    }
 
     if (a_->has_actions) {
         pad(out, indent); out << "// Reduce every node with the start nonterminal\n";

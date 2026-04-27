@@ -8,7 +8,7 @@ START stmt
 RULES
 
 con  : Const          = 1;
-reg  : Add(reg, reg)  = 2;
-reg  : Load           = 3;
-reg  : con            = 4 (0);
-stmt : reg            = 5 (0);
+reg  : Add(reg, reg)  = 1;
+reg  : Load           = 1;
+reg  : con            = 0;
+stmt : reg            = 0;

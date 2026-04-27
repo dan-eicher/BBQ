@@ -477,27 +477,17 @@ void ParserEmitter::emit_literal(Literal* lit, std::ostream& out, int indent) {
 // ── RuleCall (DDCG §16): parse_Foo(args) ────────────────────
 // OP_CALL A / OP_JUMP A (tail call)
 // → skip(); if(!parse_Foo(args)) return false;
+//
+// Args are now an opaque raw string — whatever the user wrote between
+// `<` and `>` (or `<.` and `.>`) gets emitted verbatim into the call.
+// pegc no longer parses or validates the contents; nonsense surfaces
+// as a C++ compile error instead.
 void ParserEmitter::emit_rule_call(RuleCall* rc, std::ostream& out, int indent) {
     std::string ind = indent_str(indent);
+    const char* fn_prefix = production_names_.count(rc->name) ? "parse_" : "";
 
-    if (production_names_.count(rc->name)) {
-        out << ind << "skip();\n";
-        out << ind << "if (!parse_" << rc->name << "(";
-        for (size_t i = 0; i < rc->args.size(); i++) {
-            if (i > 0) out << ", ";
-            out << rc->args[i]->expr;
-        }
-        out << ")) return false;\n";
-    } else {
-        // Unknown reference — built-in token function (ident, integer, etc.)
-        out << ind << "skip();\n";
-        out << ind << "if (!" << rc->name << "(";
-        for (size_t i = 0; i < rc->args.size(); i++) {
-            if (i > 0) out << ", ";
-            out << rc->args[i]->expr;
-        }
-        out << ")) return false;\n";
-    }
+    out << ind << "skip();\n";
+    out << ind << "if (!" << fn_prefix << rc->name << "(" << rc->args << ")) return false;\n";
 }
 
 // ── Action: (. code .) ──────────────────────────────────────

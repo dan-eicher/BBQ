@@ -98,7 +98,6 @@ private:
     bool parse_PegSeq(PegExpr*& result);
     bool parse_PegFactor(PegExpr*& result);
     bool parse_PegAtom(PegExpr*& result);
-    bool parse_ArgExpr(std::vector<Arg*>& args);
 
 };
 

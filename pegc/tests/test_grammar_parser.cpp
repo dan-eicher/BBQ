@@ -212,8 +212,39 @@ TEST(GrammarParse, RuleCallWithArgs) {
     auto* call = dynamic_cast<RuleCall*>(body);
     ASSERT_NE(call, nullptr);
     EXPECT_EQ(call->name, "Foo");
-    ASSERT_EQ(call->args.size(), 1u);
-    EXPECT_EQ(call->args[0]->expr, "result");
+    // Args are now an opaque raw string — pegc captures whatever's
+    // between `<...>` verbatim and trims surrounding whitespace.
+    EXPECT_EQ(call->args, "result");
+}
+
+TEST(GrammarParse, RuleCallWithMultipleArgs) {
+    auto* g = parse(
+        "COMPILER Test\n"
+        "PRODUCTIONS\n"
+        "Test = Foo<&out, ctx> .\n"
+        "Foo = \"x\" .\n"
+        "END Test.\n"
+    );
+    ASSERT_NE(g, nullptr);
+    auto* call = dynamic_cast<RuleCall*>(g->productions[0]->body);
+    ASSERT_NE(call, nullptr);
+    EXPECT_EQ(call->args, "&out, ctx");
+}
+
+TEST(GrammarParse, RuleCallDottedArgsForm) {
+    // <. ... .> form lets args contain `>` (templates, etc.) by
+    // using `." >` as the close delimiter instead of `>`.
+    auto* g = parse(
+        "COMPILER Test\n"
+        "PRODUCTIONS\n"
+        "Test = Foo<. std::vector<int>& out .> .\n"
+        "Foo = \"x\" .\n"
+        "END Test.\n"
+    );
+    ASSERT_NE(g, nullptr);
+    auto* call = dynamic_cast<RuleCall*>(g->productions[0]->body);
+    ASSERT_NE(call, nullptr);
+    EXPECT_EQ(call->args, "std::vector<int>& out");
 }
 
 // ═══════════════════════════════════════════════════════════════

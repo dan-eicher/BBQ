@@ -447,31 +447,22 @@ void CParserEmitter::emit_literal(Literal* lit, std::ostream& out, int indent) {
 }
 
 // ── Rule call: parse_Foo(p, args) ──────────────────────────
+//
+// Args are an opaque raw string — whatever the user wrote between
+// `<...>` (or `<. ... .>`) flows verbatim into the call. This means
+// the .peg author is responsible for matching the C signature
+// (including `&` prefix on pointer-output params for built-ins like
+// `peg_ident`); pegc no longer auto-prefixes.
 void CParserEmitter::emit_rule_call(RuleCall* rc, std::ostream& out, int indent) {
     std::string ind = indent_str(indent);
+    std::string fn_name = production_names_.count(rc->name)
+        ? prefix_ + "parse_" + to_snake_case(rc->name)
+        : "peg_" + rc->name;
 
-    if (production_names_.count(rc->name)) {
-        out << ind << "peg_skip(p);\n";
-        out << ind << "if (!" << prefix_ << "parse_" << to_snake_case(rc->name) << "(p";
-        for (auto* arg : rc->args) {
-            out << ", " << arg->expr;
-        }
-        out << ")) " << fail_ << ";\n";
-    } else {
-        // Built-in: peg_ident, peg_integer, etc.
-        // In C, built-in output params are pointers, so add & if needed.
-        out << ind << "peg_skip(p);\n";
-        out << ind << "if (!peg_" << rc->name << "(p";
-        for (auto* arg : rc->args) {
-            const auto& e = arg->expr;
-            if (!e.empty() && e[0] != '&') {
-                out << ", &" << e;
-            } else {
-                out << ", " << e;
-            }
-        }
-        out << ")) " << fail_ << ";\n";
-    }
+    out << ind << "peg_skip(p);\n";
+    out << ind << "if (!" << fn_name << "(p";
+    if (!rc->args.empty()) out << ", " << rc->args;
+    out << ")) " << fail_ << ";\n";
 }
 
 // ── Action: (. code .) ─────────────────────────────────────

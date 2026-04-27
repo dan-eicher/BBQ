@@ -49,7 +49,7 @@ module PegGrammar {
     peg_expr = Literal(string value)
              | CharsetRef(identifier name)
              | TokenRef(identifier name)
-             | RuleCall(identifier name, arg* args)
+             | RuleCall(identifier name, string args)
              | Sequence(peg_expr* elements)
              | Choice(peg_expr* alternatives)
              | Star(peg_expr body)
@@ -61,7 +61,4 @@ module PegGrammar {
              | Action(string code)
              | Resolver(string code, peg_expr body)
              | AnyExpr
-
-    // Arguments to rule calls
-    arg = Arg(string expr)
 }

@@ -31,7 +31,6 @@ struct CommentDef;
 struct Production;
 struct Param;
 struct PegExpr;
-struct Arg;
 struct Grammar;
 struct Header;
 struct CharsetDef;
@@ -68,7 +67,6 @@ struct Group;
 struct Action;
 struct Resolver;
 struct AnyExpr;
-struct Arg;
 
 // ── Source location ─────────────────────────────────────────
 
@@ -176,7 +174,6 @@ struct ASTVisitor {
     virtual void visit(Action* node) {}
     virtual void visit(Resolver* node) {}
     virtual void visit(AnyExpr* node) {}
-    virtual void visit(Arg* node) {}
 };
 
 // ── AST node base ───────────────────────────────────────────
@@ -211,7 +208,7 @@ struct Grammar : public ASTNode {
         std::optional<CharsetExpr*> ignore,
         std::vector<Production*> productions
     )
-        : name(name), headers(std::move(headers)), charsets(std::move(charsets)), tokens(std::move(tokens)), comments(std::move(comments)), has_ignore(has_ignore), ignore(std::move(ignore)), productions(std::move(productions)) {}
+        : name(name), headers(std::move(headers)), charsets(std::move(charsets)), tokens(std::move(tokens)), comments(std::move(comments)), has_ignore(has_ignore), ignore(std::move(ignore)), productions(std::move(productions)){}
 
     void accept(ASTVisitor& visitor) override { visitor.visit(this); }
 
@@ -229,7 +226,7 @@ struct Header : public ASTNode {
     Header(
         std::string code
     )
-        : code(code) {}
+        : code(code){}
 
     void accept(ASTVisitor& visitor) override { visitor.visit(this); }
 
@@ -241,7 +238,7 @@ struct CharsetDef : public ASTNode {
         std::string name,
         CharsetExpr* body
     )
-        : name(name), body(body) {}
+        : name(name), body(body){}
 
     void accept(ASTVisitor& visitor) override { visitor.visit(this); }
 
@@ -259,7 +256,7 @@ struct Range : public CharsetExpr {
         int from,
         int to
     )
-        : from(from), to(to) {}
+        : from(from), to(to){}
 
     void accept(ASTVisitor& visitor) override { visitor.visit(this); }
 
@@ -271,7 +268,7 @@ struct Single : public CharsetExpr {
     Single(
         int ch
     )
-        : ch(ch) {}
+        : ch(ch){}
 
     void accept(ASTVisitor& visitor) override { visitor.visit(this); }
 
@@ -283,7 +280,7 @@ struct Union : public CharsetExpr {
         CharsetExpr* left,
         CharsetExpr* right
     )
-        : left(left), right(right) {}
+        : left(left), right(right){}
 
     void accept(ASTVisitor& visitor) override { visitor.visit(this); }
 
@@ -296,7 +293,7 @@ struct Diff : public CharsetExpr {
         CharsetExpr* base,
         CharsetExpr* minus
     )
-        : base(base), minus(minus) {}
+        : base(base), minus(minus){}
 
     void accept(ASTVisitor& visitor) override { visitor.visit(this); }
 
@@ -308,7 +305,7 @@ struct NameRef : public CharsetExpr {
     NameRef(
         std::string name
     )
-        : name(name) {}
+        : name(name){}
 
     void accept(ASTVisitor& visitor) override { visitor.visit(this); }
 
@@ -326,7 +323,7 @@ struct TokenDef : public ASTNode {
         std::string name,
         TokenExpr* pattern
     )
-        : name(name), pattern(pattern) {}
+        : name(name), pattern(pattern){}
 
     void accept(ASTVisitor& visitor) override { visitor.visit(this); }
 
@@ -343,7 +340,7 @@ struct TLiteral : public TokenExpr {
     TLiteral(
         std::string value
     )
-        : value(value) {}
+        : value(value){}
 
     void accept(ASTVisitor& visitor) override { visitor.visit(this); }
 
@@ -354,7 +351,7 @@ struct TCharset : public TokenExpr {
     TCharset(
         std::string name
     )
-        : name(name) {}
+        : name(name){}
 
     void accept(ASTVisitor& visitor) override { visitor.visit(this); }
 
@@ -365,7 +362,7 @@ struct TSequence : public TokenExpr {
     TSequence(
         std::vector<TokenExpr*> elements
     )
-        : elements(std::move(elements)) {}
+        : elements(std::move(elements)){}
 
     void accept(ASTVisitor& visitor) override { visitor.visit(this); }
 
@@ -376,7 +373,7 @@ struct TAlternation : public TokenExpr {
     TAlternation(
         std::vector<TokenExpr*> alternatives
     )
-        : alternatives(std::move(alternatives)) {}
+        : alternatives(std::move(alternatives)){}
 
     void accept(ASTVisitor& visitor) override { visitor.visit(this); }
 
@@ -387,7 +384,7 @@ struct TStar : public TokenExpr {
     TStar(
         TokenExpr* body
     )
-        : body(body) {}
+        : body(body){}
 
     void accept(ASTVisitor& visitor) override { visitor.visit(this); }
 
@@ -398,7 +395,7 @@ struct TPlus : public TokenExpr {
     TPlus(
         TokenExpr* body
     )
-        : body(body) {}
+        : body(body){}
 
     void accept(ASTVisitor& visitor) override { visitor.visit(this); }
 
@@ -409,7 +406,7 @@ struct TOptional : public TokenExpr {
     TOptional(
         TokenExpr* body
     )
-        : body(body) {}
+        : body(body){}
 
     void accept(ASTVisitor& visitor) override { visitor.visit(this); }
 
@@ -421,7 +418,7 @@ struct TRange : public TokenExpr {
         int from,
         int to
     )
-        : from(from), to(to) {}
+        : from(from), to(to){}
 
     void accept(ASTVisitor& visitor) override { visitor.visit(this); }
 
@@ -435,7 +432,7 @@ struct CommentDef : public ASTNode {
         std::string close,
         bool nested
     )
-        : open(open), close(close), nested(nested) {}
+        : open(open), close(close), nested(nested){}
 
     void accept(ASTVisitor& visitor) override { visitor.visit(this); }
 
@@ -451,7 +448,7 @@ struct Production : public ASTNode {
         std::optional<std::string> locals_code,
         PegExpr* body
     )
-        : name(name), params(std::move(params)), locals_code(std::move(locals_code)), body(body) {}
+        : name(name), params(std::move(params)), locals_code(std::move(locals_code)), body(body){}
 
     void accept(ASTVisitor& visitor) override { visitor.visit(this); }
 
@@ -467,7 +464,7 @@ struct Param : public ASTNode {
         std::string name,
         bool is_ref
     )
-        : type_code(type_code), name(name), is_ref(is_ref) {}
+        : type_code(type_code), name(name), is_ref(is_ref){}
 
     void accept(ASTVisitor& visitor) override { visitor.visit(this); }
 
@@ -485,7 +482,7 @@ struct Literal : public PegExpr {
     Literal(
         std::string value
     )
-        : value(value) {}
+        : value(value){}
 
     void accept(ASTVisitor& visitor) override { visitor.visit(this); }
 
@@ -496,7 +493,7 @@ struct CharsetRef : public PegExpr {
     CharsetRef(
         std::string name
     )
-        : name(name) {}
+        : name(name){}
 
     void accept(ASTVisitor& visitor) override { visitor.visit(this); }
 
@@ -507,7 +504,7 @@ struct TokenRef : public PegExpr {
     TokenRef(
         std::string name
     )
-        : name(name) {}
+        : name(name){}
 
     void accept(ASTVisitor& visitor) override { visitor.visit(this); }
 
@@ -517,21 +514,21 @@ struct TokenRef : public PegExpr {
 struct RuleCall : public PegExpr {
     RuleCall(
         std::string name,
-        std::vector<Arg*> args
+        std::string args
     )
-        : name(name), args(std::move(args)) {}
+        : name(name), args(args){}
 
     void accept(ASTVisitor& visitor) override { visitor.visit(this); }
 
     std::string name;
-    std::vector<Arg*> args;
+    std::string args;
 };
 
 struct Sequence : public PegExpr {
     Sequence(
         std::vector<PegExpr*> elements
     )
-        : elements(std::move(elements)) {}
+        : elements(std::move(elements)){}
 
     void accept(ASTVisitor& visitor) override { visitor.visit(this); }
 
@@ -542,7 +539,7 @@ struct Choice : public PegExpr {
     Choice(
         std::vector<PegExpr*> alternatives
     )
-        : alternatives(std::move(alternatives)) {}
+        : alternatives(std::move(alternatives)){}
 
     void accept(ASTVisitor& visitor) override { visitor.visit(this); }
 
@@ -553,7 +550,7 @@ struct Star : public PegExpr {
     Star(
         PegExpr* body
     )
-        : body(body) {}
+        : body(body){}
 
     void accept(ASTVisitor& visitor) override { visitor.visit(this); }
 
@@ -564,7 +561,7 @@ struct Plus : public PegExpr {
     Plus(
         PegExpr* body
     )
-        : body(body) {}
+        : body(body){}
 
     void accept(ASTVisitor& visitor) override { visitor.visit(this); }
 
@@ -575,7 +572,7 @@ struct Optional : public PegExpr {
     Optional(
         PegExpr* body
     )
-        : body(body) {}
+        : body(body){}
 
     void accept(ASTVisitor& visitor) override { visitor.visit(this); }
 
@@ -586,7 +583,7 @@ struct And : public PegExpr {
     And(
         PegExpr* body
     )
-        : body(body) {}
+        : body(body){}
 
     void accept(ASTVisitor& visitor) override { visitor.visit(this); }
 
@@ -597,7 +594,7 @@ struct Not : public PegExpr {
     Not(
         PegExpr* body
     )
-        : body(body) {}
+        : body(body){}
 
     void accept(ASTVisitor& visitor) override { visitor.visit(this); }
 
@@ -608,7 +605,7 @@ struct Group : public PegExpr {
     Group(
         PegExpr* body
     )
-        : body(body) {}
+        : body(body){}
 
     void accept(ASTVisitor& visitor) override { visitor.visit(this); }
 
@@ -619,7 +616,7 @@ struct Action : public PegExpr {
     Action(
         std::string code
     )
-        : code(code) {}
+        : code(code){}
 
     void accept(ASTVisitor& visitor) override { visitor.visit(this); }
 
@@ -631,7 +628,7 @@ struct Resolver : public PegExpr {
         std::string code,
         PegExpr* body
     )
-        : code(code), body(body) {}
+        : code(code), body(body){}
 
     void accept(ASTVisitor& visitor) override { visitor.visit(this); }
 
@@ -643,17 +640,6 @@ struct AnyExpr : public PegExpr {
 
     void accept(ASTVisitor& visitor) override { visitor.visit(this); }
 
-};
-
-struct Arg : public ASTNode {
-    Arg(
-        std::string expr
-    )
-        : expr(expr) {}
-
-    void accept(ASTVisitor& visitor) override { visitor.visit(this); }
-
-    std::string expr;
 };
 
 // ── Product types ───────────────────────────────────────────

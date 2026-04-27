@@ -300,13 +300,17 @@ PegAtom <. PegExpr* &result .>
          result->loc = Loc(); .)
     | ident<s>
       (. std::string rname = std::move(s); SourceLoc loc = Loc();
-         std::vector<Arg*> args; .)
-      [ "<"
-        ArgExpr<args>
-        { ","
-          ArgExpr<args>
-        }
-        ">"
+         std::string args; .)
+      [ "<."
+        (. if (!scan_to("." ">", args)) return false;
+           size_t b = args.find_first_not_of(" \t\r\n");
+           size_t e = args.find_last_not_of(" \t\r\n");
+           args = (b == std::string::npos) ? "" : args.substr(b, e - b + 1); .)
+      | "<"
+        (. if (!scan_to(">", args)) return false;
+           size_t b = args.find_first_not_of(" \t\r\n");
+           size_t e = args.find_last_not_of(" \t\r\n");
+           args = (b == std::string::npos) ? "" : args.substr(b, e - b + 1); .)
       ]
       (. result = new RuleCall(std::move(rname), std::move(args));
          result->loc = loc; .)
@@ -333,17 +337,6 @@ PegAtom <. PegExpr* &result .>
              result = new Star(inner);
          }
          result->loc = inner->loc; .)
-.
-
-// ── Actual argument expression ───────────────────────────────
-
-ArgExpr <. std::vector<Arg*> &args .>
-    (. std::string expr; std::string aname; .)
-    = [ "&"           (. expr = "&"; .) ]
-      ident<aname>    (. expr += aname; .)
-    (. auto* a = new Arg(std::move(expr));
-       a->loc = Loc();
-       args.push_back(a); .)
 .
 
 END Peg.

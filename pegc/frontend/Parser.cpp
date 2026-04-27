@@ -600,26 +600,26 @@ bool Parser::parse_PegAtom(PegExpr*& result) {
             skip();
             if (!ident(s)) return false;
             std::string rname = std::move(s); SourceLoc loc = Loc();
-         std::vector<Arg*> args;
+         std::string args;
             {
                 auto _m1 = save();
                 if (![&]() -> bool {
                     skip();
-                    if (!match("<")) return false;
-                    skip();
-                    if (!parse_ArgExpr(args)) return false;
-                    for (;;) {
-                        auto _m2 = save();
-                        if (![&]() -> bool {
-                            skip();
-                            if (!match(",")) return false;
-                            skip();
-                            if (!parse_ArgExpr(args)) return false;
-                            return true;
-                        }()) { restore(_m2); break; }
+                    if (peek_at("<.")) {
+                        skip();
+                        if (!match("<.")) return false;
+                        if (!scan_to("." ">", args)) return false;
+           size_t b = args.find_first_not_of(" \t\r\n");
+           size_t e = args.find_last_not_of(" \t\r\n");
+           args = (b == std::string::npos) ? "" : args.substr(b, e - b + 1);
+                    } else {
+                        skip();
+                        if (!match("<")) return false;
+                        if (!scan_to(">", args)) return false;
+           size_t b = args.find_first_not_of(" \t\r\n");
+           size_t e = args.find_last_not_of(" \t\r\n");
+           args = (b == std::string::npos) ? "" : args.substr(b, e - b + 1);
                     }
-                    skip();
-                    if (!match(">")) return false;
                     return true;
                 }()) restore(_m1);
             }
@@ -660,13 +660,13 @@ bool Parser::parse_PegAtom(PegExpr*& result) {
         skip();
         if (!match("}")) return false;
         {
-            auto _m3 = save();
+            auto _m2 = save();
             if (![&]() -> bool {
                 skip();
                 if (!match("+")) return false;
                 is_plus = true;
                 return true;
-            }()) restore(_m3);
+            }()) restore(_m2);
         }
         if (is_plus) {
              result = new Plus(inner);
@@ -681,26 +681,6 @@ bool Parser::parse_PegAtom(PegExpr*& result) {
         }
         }
     }
-    return true;
-}
-
-bool Parser::parse_ArgExpr(std::vector<Arg*>& args) {
-    std::string expr; std::string aname;
-    {
-        auto _m0 = save();
-        if (![&]() -> bool {
-            skip();
-            if (!match("&")) return false;
-            expr = "&";
-            return true;
-        }()) restore(_m0);
-    }
-    skip();
-    if (!ident(aname)) return false;
-    expr += aname;
-    auto* a = new Arg(std::move(expr));
-       a->loc = Loc();
-       args.push_back(a);
     return true;
 }
 

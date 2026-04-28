@@ -8,6 +8,7 @@
    #include <vector>
    #include <optional>
    #include <cstdlib>
+   #include "PegRuntime.h"
 
 using namespace BBQ;
 
@@ -121,6 +122,10 @@ private:
     bool parse_PrimaryExpr(Expr* * result);
     bool parse_FloatLitExpr(Expr* * result);
     bool parse_CallExpr(Expr* * result);
+    bool ident(peg::Span& out);
+    bool integer(peg::Span& out);
+    bool floating(peg::Span& out);
+    bool string_lit(peg::Span& out);
 
 };
 

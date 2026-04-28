@@ -51,72 +51,6 @@ TEST(PegRuntime, SaveRestore) {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// Keywords (context-sensitive)
-// ═══════════════════════════════════════════════════════════════
-
-TEST(PegRuntime, KeywordMatch) {
-    auto c = make_cursor("big endian");
-    EXPECT_TRUE(c.keyword("big"));
-    EXPECT_TRUE(c.match(' '));
-    EXPECT_TRUE(c.keyword("endian"));
-}
-
-TEST(PegRuntime, KeywordNotPrefix) {
-    // "bigger" should NOT match keyword "big"
-    auto c = make_cursor("bigger");
-    EXPECT_FALSE(c.keyword("big"));
-    EXPECT_EQ(c.peek(), 'b');  // position unchanged
-}
-
-TEST(PegRuntime, PeekKeyword) {
-    auto c = make_cursor("struct Foo");
-    EXPECT_TRUE(c.peek_keyword("struct"));
-    EXPECT_FALSE(c.peek_keyword("str"));
-    // Position unchanged after peek
-    EXPECT_EQ(c.peek(), 's');
-}
-
-// ═══════════════════════════════════════════════════════════════
-// Built-in Token Patterns
-// ═══════════════════════════════════════════════════════════════
-
-TEST(PegRuntime, Ident) {
-    auto c = make_cursor("foo_bar 123");
-    std::string id;
-    EXPECT_TRUE(c.ident(id));
-    EXPECT_EQ(id, "foo_bar");
-    EXPECT_EQ(c.peek(), ' ');
-}
-
-TEST(PegRuntime, Integer) {
-    auto c = make_cursor("42");
-    int64_t v;
-    EXPECT_TRUE(c.integer(v));
-    EXPECT_EQ(v, 42);
-}
-
-TEST(PegRuntime, IntegerHex) {
-    auto c = make_cursor("0xFF");
-    int64_t v;
-    EXPECT_TRUE(c.integer(v));
-    EXPECT_EQ(v, 255);
-}
-
-TEST(PegRuntime, IntegerBinary) {
-    auto c = make_cursor("0b1010");
-    int64_t v;
-    EXPECT_TRUE(c.integer(v));
-    EXPECT_EQ(v, 10);
-}
-
-TEST(PegRuntime, StringLit) {
-    auto c = make_cursor("\"hello\\nworld\"");
-    std::string s;
-    EXPECT_TRUE(c.string_lit(s));
-    EXPECT_EQ(s, "hello\nworld");
-}
-
-// ═══════════════════════════════════════════════════════════════
 // SPAN Optimization
 // ═══════════════════════════════════════════════════════════════
 
@@ -224,4 +158,53 @@ TEST(PegRuntime, PegStar) {
     }
     EXPECT_EQ(count, 3);
     EXPECT_EQ(c.peek(), 'b');
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Span and unescape helpers (token payload decoding)
+// ═══════════════════════════════════════════════════════════════
+
+static Span span_of(const char* s) {
+    return Span{s, static_cast<int>(strlen(s))};
+}
+
+TEST(PegRuntime, SpanToString) {
+    EXPECT_EQ(span_of("hello").to_string(), std::string("hello"));
+    Span partial{"abc", 2};
+    EXPECT_EQ(partial.to_string(), std::string("ab"));
+    EXPECT_EQ(Span{}.to_string(), std::string(""));
+}
+
+TEST(PegRuntime, UnescapeStringLitStripsQuotes) {
+    EXPECT_EQ(unescape_string_lit(span_of("\"hello\"")), std::string("hello"));
+    EXPECT_EQ(unescape_string_lit(span_of("\"\"")), std::string(""));
+}
+
+TEST(PegRuntime, UnescapeStringLitWithoutQuotes) {
+    // Caller already stripped quotes — still works.
+    EXPECT_EQ(unescape_string_lit(span_of("hello")), std::string("hello"));
+}
+
+TEST(PegRuntime, UnescapeStringLitEscapes) {
+    EXPECT_EQ(unescape_string_lit(span_of("\"a\\nb\"")), std::string("a\nb"));
+    EXPECT_EQ(unescape_string_lit(span_of("\"a\\tb\"")), std::string("a\tb"));
+    EXPECT_EQ(unescape_string_lit(span_of("\"a\\\\b\"")), std::string("a\\b"));
+    EXPECT_EQ(unescape_string_lit(span_of("\"a\\\"b\"")), std::string("a\"b"));
+}
+
+TEST(PegRuntime, UnescapeCharLitStripsQuotes) {
+    EXPECT_EQ(unescape_char_lit(span_of("'a'")), 'a');
+    EXPECT_EQ(unescape_char_lit(span_of("'Z'")), 'Z');
+}
+
+TEST(PegRuntime, UnescapeCharLitEscapes) {
+    EXPECT_EQ(unescape_char_lit(span_of("'\\n'")), '\n');
+    EXPECT_EQ(unescape_char_lit(span_of("'\\t'")), '\t');
+    EXPECT_EQ(unescape_char_lit(span_of("'\\\\'")), '\\');
+    EXPECT_EQ(unescape_char_lit(span_of("'\\''")), '\'');
+}
+
+TEST(PegRuntime, UnescapeCharLitWithoutQuotes) {
+    EXPECT_EQ(unescape_char_lit(span_of("a")), 'a');
+    EXPECT_EQ(unescape_char_lit(span_of("\\n")), '\n');
 }

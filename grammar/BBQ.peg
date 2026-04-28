@@ -14,7 +14,22 @@ COMPILER BBQ
    #include <vector>
    #include <optional>
    #include <cstdlib>
+   #include "PegRuntime.h"
 .)
+
+CHARACTERS
+  letter         = 'a'..'z' + 'A'..'Z' + '_' .
+  digit          = '0'..'9' .
+  hex_digit      = digit + 'a'..'f' + 'A'..'F' .
+  ident_continue = letter + digit .
+
+TOKENS
+  ident      = letter { ident_continue } .
+  integer    = '0' 'x' hex_digit { hex_digit }
+             | '0' 'X' hex_digit { hex_digit }
+             | digit { digit } .
+  floating   = digit { digit } '.' digit { digit } .
+  string_lit = '"' { '\\' ANY | !'"' ANY } '"' .
 
 COMMENTS FROM "#" TO "\n"
 COMMENTS FROM "//" TO "\n"
@@ -50,8 +65,8 @@ Directive <. std::vector<EndianDirective*> *dirs .>
 .
 
 Rule_ <. std::vector<Rule*> *rules .>
-    (. std::string name; TypeExpr* body; .)
-    = ident<name>       (. SourceLoc loc = Loc(); .)
+    (. peg::Span name_span; std::string name; TypeExpr* body; .)
+    = ident<name_span>  (. name = name_span.to_string(); SourceLoc loc = Loc(); .)
       "="
       TypeBody<&body>
     (. auto* r = new Rule(std::move(name), body);
@@ -133,12 +148,13 @@ EndianDirectiveField <. std::vector<Field*> *fields .>
 .
 
 FieldDecl <. std::vector<Field*> *fields .>
-    (. std::string name;
+    (. peg::Span name_span;
+       std::string name;
        TypeExpr* body;
        Expr* constr = nullptr;
        Interval* iv = nullptr;
        bool scopes_rest = false; .)
-    = ident<name>            (. SourceLoc loc = Loc(); .)
+    = ident<name_span>       (. name = name_span.to_string(); SourceLoc loc = Loc(); .)
       ":"
       TypeBody<&body>
       [ ConstraintBlock<&constr> ]
@@ -168,11 +184,12 @@ UnionBody <. TypeExpr* *result .>
 .
 
 VariantDecl <. std::vector<Variant*> *variants .>
-    (. std::string name;
+    (. peg::Span name_span;
+       std::string name;
        TypeExpr* body;
        Expr* constr = nullptr;
        Interval* iv = nullptr; .)
-    = ident<name>            (. SourceLoc loc = Loc(); .)
+    = ident<name_span>       (. name = name_span.to_string(); SourceLoc loc = Loc(); .)
       ":"
       TypeBody<&body>
       [ ConstraintBlock<&constr> ]
@@ -302,23 +319,27 @@ DefaultCaseRule <. SwitchDefault* *result .>
 .
 
 CaseValueRule <. CaseValue* *result .>
-    (. std::vector<std::string> path;
+    (. peg::Span span;
+       std::vector<std::string> path;
        std::string s;
        int64_t ival; .)
     = DottedRef<result>
-    | integer<ival>           (. *result = new IntValue(ival); (*result)->loc = Loc(); .)
-    | string_lit<s>           (. *result = new StrValue(std::move(s)); (*result)->loc = Loc(); .)
-    | !"default" ident<s>     (. *result = new IdentValue(std::move(s)); (*result)->loc = Loc(); .)
+    | integer<span>           (. ival = std::stoll(span.to_string(), nullptr, 0);
+                                *result = new IntValue(ival); (*result)->loc = Loc(); .)
+    | string_lit<span>        (. s = peg::unescape_string_lit(span);
+                                *result = new StrValue(std::move(s)); (*result)->loc = Loc(); .)
+    | !"default" ident<span>  (. s = span.to_string();
+                                *result = new IdentValue(std::move(s)); (*result)->loc = Loc(); .)
 .
 
 DottedRef <. CaseValue* *result .>
-    (. std::vector<std::string> path;
-       std::string s; .)
-    = ident<s>               (. path.push_back(std::move(s)); .)
+    (. peg::Span span;
+       std::vector<std::string> path; .)
+    = ident<span>            (. path.push_back(span.to_string()); .)
       "."
-      ident<s>               (. path.push_back(std::move(s)); .)
+      ident<span>            (. path.push_back(span.to_string()); .)
       { "."
-        ident<s>             (. path.push_back(std::move(s)); .)
+        ident<span>          (. path.push_back(span.to_string()); .)
       }
     (. *result = new RefValue(std::move(path)); (*result)->loc = Loc(); .)
 .
@@ -341,13 +362,14 @@ ComputeBody <. TypeExpr* *result .>
 // ── Extern ──────────────────────────────────────────────
 
 ExternBody <. TypeExpr* *result .>
-    (. std::string func; std::string ctype;
+    (. peg::Span func_span; peg::Span ctype_span;
+       std::string func; std::string ctype;
        Expr* constr = nullptr; Interval* iv = nullptr;
        SourceLoc loc = Loc(); .)
     = "("
-      string_lit<func>
+      string_lit<func_span>   (. func = peg::unescape_string_lit(func_span); .)
       ","
-      string_lit<ctype>
+      string_lit<ctype_span>  (. ctype = peg::unescape_string_lit(ctype_span); .)
       ")"
       [ ConstraintBlock<&constr> ]
       [ IntervalSpec<&iv> ]
@@ -375,11 +397,12 @@ BitfieldBody <. TypeExpr* *result .>
 .
 
 BitfieldEntryRule <. std::vector<BitfieldEntry*> *entries .>
-    (. std::string name; int64_t width;
+    (. peg::Span name_span; peg::Span width_span;
+       std::string name; int64_t width;
        Expr* constr = nullptr; .)
-    = ident<name>       (. SourceLoc loc = Loc(); .)
+    = ident<name_span>  (. name = name_span.to_string(); SourceLoc loc = Loc(); .)
       ":"
-      integer<width>
+      integer<width_span> (. width = std::stoll(width_span.to_string(), nullptr, 0); .)
       [ ConstraintBlock<&constr> ]
     (. auto* e = new BitfieldEntry(std::move(name), width,
                constr ? std::optional<Expr*>(constr) : std::nullopt);
@@ -404,19 +427,21 @@ PrimitiveType <. TypeExpr* *result .>
 .
 
 PrimKeyword <. PrimitiveKind* *result .>
-    (. std::string s; .)
-    = ident<s>
-      (. *result = DecodePrimitive(s, Loc());
+    (. peg::Span span; std::string s; .)
+    = ident<span>
+      (. s = span.to_string();
+         *result = DecodePrimitive(s, Loc());
          if (!*result) return false; .)
 .
 
 // ── Rule Reference ──────────────────────────────────────────
 
 RuleRefType <. TypeExpr* *result .>
-    (. std::string name;
+    (. peg::Span name_span;
+       std::string name;
        Expr* constr = nullptr;
        Interval* iv = nullptr; .)
-    = ident<name>        (. SourceLoc loc = Loc(); .)
+    = ident<name_span>   (. name = name_span.to_string(); SourceLoc loc = Loc(); .)
       [ ConstraintBlock<&constr> ]
       [ IntervalSpec<&iv> ]
     (. *result = new RuleRef(std::move(name),
@@ -619,7 +644,7 @@ Unary <. Expr* *result .>
 .
 
 Postfix <. Expr* *result .>
-    (. Expr* idx; std::string fname; .)
+    (. peg::Span fname_span; Expr* idx; std::string fname; .)
     = PrimaryExpr<result>
       { "["
         Expr_<&idx>
@@ -631,8 +656,9 @@ Postfix <. Expr* *result .>
                ref->path = ia;
            } .)
       | "."
-        ident<fname>
-        (. auto* ref = dynamic_cast<Ref*>(*result);
+        ident<fname_span>
+        (. fname = fname_span.to_string();
+           auto* ref = dynamic_cast<Ref*>(*result);
            if (ref) {
                auto* fa = new FieldAcc(ref->path, std::move(fname));
                fa->loc = ref->loc;
@@ -642,18 +668,21 @@ Postfix <. Expr* *result .>
 .
 
 PrimaryExpr <. Expr* *result .>
-    (. std::string name;
+    (. peg::Span span;
+       std::string name;
        std::vector<Expr*> args;
        Expr* arg;
        int64_t ival;
        double fval;
        std::string sval; .)
     = FloatLitExpr<result>
-    | integer<ival>
-      (. *result = new IntLit(ival);
+    | integer<span>
+      (. ival = std::stoll(span.to_string(), nullptr, 0);
+         *result = new IntLit(ival);
          (*result)->loc = Loc(); .)
-    | string_lit<sval>
-      (. *result = new StrLit(std::move(sval));
+    | string_lit<span>
+      (. sval = peg::unescape_string_lit(span);
+         *result = new StrLit(std::move(sval));
          (*result)->loc = Loc(); .)
     | "true"
       (. *result = new BoolLit(true);
@@ -671,8 +700,9 @@ PrimaryExpr <. Expr* *result .>
       (. *result = new EOI();
          (*result)->loc = Loc(); .)
     | CallExpr<result>
-    | ident<name>
-      (. auto* s = new Simple(std::move(name), std::nullopt, std::nullopt, 0);
+    | ident<span>
+      (. name = span.to_string();
+         auto* s = new Simple(std::move(name), std::nullopt, std::nullopt, 0);
          s->loc = Loc();
          *result = new Ref(s);
          (*result)->loc = Loc(); .)
@@ -680,17 +710,19 @@ PrimaryExpr <. Expr* *result .>
 .
 
 FloatLitExpr <. Expr* *result .>
-    (. double fval; .)
-    = floating<fval>
-      (. *result = new FloatLit(static_cast<float>(fval));
+    (. peg::Span span; double fval; .)
+    = floating<span>
+      (. fval = std::stod(span.to_string());
+         *result = new FloatLit(static_cast<float>(fval));
          (*result)->loc = Loc(); .)
 .
 
 CallExpr <. Expr* *result .>
-    (. std::string name;
+    (. peg::Span name_span;
+       std::string name;
        std::vector<Expr*> args;
        Expr* arg; .)
-    = ident<name>        (. SourceLoc loc = Loc(); .)
+    = ident<name_span>   (. name = name_span.to_string(); SourceLoc loc = Loc(); .)
       "("
       [ Expr_<&arg>      (. args.push_back(arg); .)
         { ","

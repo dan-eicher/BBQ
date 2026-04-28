@@ -12,6 +12,18 @@ bool Parser::parse() {
     return parse_Asdl();
 }
 
+static bool is_letter(char c) {
+    return (((c >= 97 && c <= 122) || (c >= 65 && c <= 90)) || (c == 95));
+}
+
+static bool is_digit(char c) {
+    return (c >= 48 && c <= 57);
+}
+
+static bool is_ident_continue(char c) {
+    return (is_letter(c) || is_digit(c));
+}
+
 void Parser::setup_skip() {
     set_whitespace([](char c) -> bool {
         return ((((c == 13) || (c == 10)) || (c == 9)) || (c == 32));
@@ -20,14 +32,68 @@ void Parser::setup_skip() {
 }
 
 
+bool Parser::ident(peg::Span& out) {
+    const char* _start = pos();
+    if (at_end() || !is_letter(peek())) return false;
+    advance();
+    for (;;) {
+        auto _m0 = save();
+        if (![&]() -> bool {
+            if (at_end() || !is_ident_continue(peek())) return false;
+            advance();
+            return true;
+        }()) { restore(_m0); break; }
+    }
+    out.ptr = _start; out.len = static_cast<int>(pos() - _start);
+    return true;
+}
+
+bool Parser::string_lit(peg::Span& out) {
+    const char* _start = pos();
+    if (!match("\"")) return false;
+    for (;;) {
+        auto _m0 = save();
+        if (![&]() -> bool {
+            {
+                auto _m1 = save();
+                if ([&]() -> bool {
+                    if (!match("\\")) return false;
+                    if (at_end()) return false;
+                    advance();
+                    return true;
+                }()) {} else {
+                restore(_m1);
+                {
+                    auto _m2 = save();
+                    bool _ok2 = [&]() -> bool {
+                        if (!match("\"")) return false;
+                        return true;
+                    }();
+                    restore(_m2);
+                    if (_ok2) return false;
+                }
+                if (at_end()) return false;
+                advance();
+                }
+            }
+            return true;
+        }()) { restore(_m0); break; }
+    }
+    if (!match("\"")) return false;
+    out.ptr = _start; out.len = static_cast<int>(pos() - _start);
+    return true;
+}
+
 bool Parser::parse_Asdl() {
-    std::string name;
+    peg::Span name_span;
+       std::string name;
        std::vector<asdl_ast::TypeAlias*> aliases;
        std::vector<asdl_ast::Definition*> definitions;
     skip();
-    if (!keyword("module")) return false;
+    if (!match("module")) return false;
     skip();
-    if (!ident(name)) return false;
+    if (!ident(name_span)) return false;
+    name = name_span.to_string();
     skip();
     if (!match("{")) return false;
     for (;;) {
@@ -56,15 +122,16 @@ bool Parser::parse_Asdl() {
 }
 
 bool Parser::parse_TypeAliasDecl(std::vector<asdl_ast::TypeAlias*>& aliases) {
-    std::string name; std::string ctype;
+    peg::Span ctype_span; std::string name; std::string ctype;
     skip();
-    if (!keyword("type")) return false;
+    if (!match("type")) return false;
     skip();
     if (!parse_TypId(name)) return false;
     skip();
     if (!match("=")) return false;
     skip();
-    if (!string_lit(ctype)) return false;
+    if (!string_lit(ctype_span)) return false;
+    ctype = peg::unescape_string_lit(ctype_span);
     aliases.push_back(new asdl_ast::TypeAlias(std::move(name), std::move(ctype)));
     return true;
 }
@@ -127,7 +194,17 @@ bool Parser::parse_SumBody(asdl_ast::TypeBody*& result) {
         auto _m1 = save();
         if (![&]() -> bool {
             skip();
-            if (!keyword("attributes")) return false;
+            if (!match("attributes")) return false;
+            {
+                auto _m2 = save();
+                bool _ok2 = [&]() -> bool {
+                    if (at_end() || !is_ident_continue(peek())) return false;
+                    advance();
+                    return true;
+                }();
+                restore(_m2);
+                if (_ok2) return false;
+            }
             skip();
             if (!parse_FieldList(attributes)) return false;
             return true;
@@ -207,22 +284,28 @@ bool Parser::parse_FieldDecl(asdl_ast::Field*& result) {
 }
 
 bool Parser::parse_TypId(std::string& name) {
+    peg::Span span;
     if (!std::islower(peek())) return false;
     skip();
-    if (!ident(name)) return false;
+    if (!ident(span)) return false;
+    name = span.to_string();
     return true;
 }
 
 bool Parser::parse_ConId(std::string& name) {
+    peg::Span span;
     if (!std::isupper(peek())) return false;
     skip();
-    if (!ident(name)) return false;
+    if (!ident(span)) return false;
+    name = span.to_string();
     return true;
 }
 
 bool Parser::parse_AnyId(std::string& name) {
+    peg::Span span;
     skip();
-    if (!ident(name)) return false;
+    if (!ident(span)) return false;
+    name = span.to_string();
     return true;
 }
 

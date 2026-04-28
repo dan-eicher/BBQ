@@ -32,12 +32,17 @@ private:
     void emit_parse_method_decls(PegGrammar::Grammar* grammar, std::ostream& out);
 
     // Implementation emission
+    void emit_charset_defs(PegGrammar::Grammar* grammar, std::ostream& out);
     void emit_skip_setup(PegGrammar::Grammar* grammar, std::ostream& out);
     void emit_parse_method_impls(PegGrammar::Grammar* grammar, std::ostream& out);
+    void emit_token_method_impls(PegGrammar::Grammar* grammar, std::ostream& out);
+    void emit_token_forward_decls(PegGrammar::Grammar* grammar, std::ostream& out);
 
     // Per-production
     void emit_production_decl(PegGrammar::Production* prod, std::ostream& out);
     void emit_production_impl(PegGrammar::Production* prod, std::ostream& out);
+    void emit_token_forward_decl(PegGrammar::TokenDef* tok, std::ostream& out);
+    void emit_token_impl(PegGrammar::TokenDef* tok, std::ostream& out);
 
     // PEG expression code generation (DDCG → C)
     void emit_expr(PegGrammar::PegExpr* expr, std::ostream& out, int indent);
@@ -64,6 +69,9 @@ private:
     std::string prefix_;
     int var_counter_ = 0;
     std::set<std::string> production_names_;
+    std::set<std::string> token_names_;
+    std::set<std::string> charset_names_;
+    bool in_lex_mode_ = false;
 
     // Tracks failure action: "return false" at production level,
     // "break" inside do { } while(0) backtracking blocks.

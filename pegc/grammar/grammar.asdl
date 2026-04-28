@@ -27,15 +27,9 @@ module PegGrammar {
                  | Any
 
     // Token definitions (TOKENS section)
-    token_def = TokenDef(identifier name, token_expr pattern)
-    token_expr = TLiteral(string value)
-               | TCharset(identifier name)
-               | TSequence(token_expr* elements)
-               | TAlternation(token_expr* alternatives)
-               | TStar(token_expr body)
-               | TPlus(token_expr body)
-               | TOptional(token_expr body)
-               | TRange(int from, int to)
+    // Body uses peg_expr — same AST as productions; tokens differ only
+    // in emission (no auto-skip between atoms).
+    token_def = TokenDef(identifier name, peg_expr body)
 
     // Comment definitions (COMMENTS section)
     comment_def = CommentDef(string open, string close, bool nested)
@@ -47,6 +41,7 @@ module PegGrammar {
 
     // PEG expressions
     peg_expr = Literal(string value)
+             | CharRange(int from, int to)
              | CharsetRef(identifier name)
              | TokenRef(identifier name)
              | RuleCall(identifier name, string args)

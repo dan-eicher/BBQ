@@ -33,6 +33,71 @@ struct CommentSpec {
     bool nested;
 };
 
+// ── Zero-copy span (pointer into input buffer) ──────────────
+
+struct Span {
+    const char* ptr = nullptr;
+    int len = 0;
+
+    std::string to_string() const { return std::string(ptr, ptr + len); }
+};
+
+// ── Span helpers (token payload decoding) ───────────────────
+
+// Decode a string-literal token's captured span into the unescaped
+// payload. Span may be the whole quoted form (including surrounding
+// double quotes) or just the inner content; surrounding quotes are
+// stripped if present. Resolves: \n \r \t \\ \" \' \0 (others pass).
+inline std::string unescape_string_lit(Span s) {
+    const char* p = s.ptr;
+    const char* end = s.ptr + s.len;
+    if (s.len >= 2 && *p == '"' && *(end - 1) == '"') { ++p; --end; }
+    std::string out;
+    out.reserve(static_cast<size_t>(end - p));
+    while (p < end) {
+        if (*p == '\\' && p + 1 < end) {
+            ++p;
+            switch (*p) {
+                case 'n': out += '\n'; break;
+                case 'r': out += '\r'; break;
+                case 't': out += '\t'; break;
+                case '\\': out += '\\'; break;
+                case '"': out += '"'; break;
+                case '\'': out += '\''; break;
+                case '0': out += '\0'; break;
+                default: out += *p; break;
+            }
+        } else {
+            out += *p;
+        }
+        ++p;
+    }
+    return out;
+}
+
+// Decode a char-literal token's captured span into the unescaped char.
+// Span may be the whole quoted form ('x' or '\\n') or just the inner
+// content; surrounding single quotes are stripped if present.
+inline char unescape_char_lit(Span s) {
+    const char* p = s.ptr;
+    const char* end = s.ptr + s.len;
+    if (s.len >= 2 && *p == '\'' && *(end - 1) == '\'') { ++p; --end; }
+    if (p >= end) return '\0';
+    if (*p == '\\' && p + 1 < end) {
+        switch (p[1]) {
+            case 'n': return '\n';
+            case 'r': return '\r';
+            case 't': return '\t';
+            case '\\': return '\\';
+            case '\'': return '\'';
+            case '"': return '"';
+            case '0': return '\0';
+            default: return p[1];
+        }
+    }
+    return *p;
+}
+
 // ── Parse error ─────────────────────────────────────────────
 
 struct ParseError {
@@ -135,125 +200,6 @@ public:
         }
     }
 
-    // ── Keyword matching ────────────────────────────────────
-    // Match literal + verify next char is NOT ident-continue.
-    // This is the key context-sensitive keyword mechanism.
-
-    bool keyword(const char* kw) {
-        int len = static_cast<int>(strlen(kw));
-        if (pos_ + len > end_) return false;
-        if (memcmp(pos_, kw, len) != 0) return false;
-        // Check that keyword is not followed by ident char
-        if (pos_ + len < end_ && is_ident_continue(pos_[len])) return false;
-        for (int i = 0; i < len; i++) advance();
-        return true;
-    }
-
-    // Peek at keyword (no consume).
-    bool peek_keyword(const char* kw) const {
-        int len = static_cast<int>(strlen(kw));
-        if (pos_ + len > end_) return false;
-        if (memcmp(pos_, kw, len) != 0) return false;
-        if (pos_ + len < end_ && is_ident_continue(pos_[len])) return false;
-        return true;
-    }
-
-    // ── Built-in token patterns ─────────────────────────────
-
-    // Match identifier: [a-zA-Z_][a-zA-Z0-9_]*
-    bool ident(std::string& out) {
-        if (pos_ >= end_ || !is_ident_start(*pos_)) return false;
-        const char* start = pos_;
-        advance();
-        while (pos_ < end_ && is_ident_continue(*pos_)) advance();
-        out.assign(start, pos_);
-        return true;
-    }
-
-    // Match C++-style qualified identifier: ident("::" ident)*.  Used by
-    // grammars whose symbols can refer to enum values / namespaced
-    // constants (e.g. burgc's `TERM Foo = ns::KOP_FOO`).
-    bool qualified_ident(std::string& out) {
-        if (pos_ >= end_ || !is_ident_start(*pos_)) return false;
-        const char* start = pos_;
-        advance();
-        while (pos_ < end_ && is_ident_continue(*pos_)) advance();
-        for (;;) {
-            if (pos_ + 1 >= end_ || pos_[0] != ':' || pos_[1] != ':') break;
-            const char* save = pos_;
-            advance(); advance();  // consume "::"
-            if (pos_ >= end_ || !is_ident_start(*pos_)) { pos_ = save; break; }
-            advance();
-            while (pos_ < end_ && is_ident_continue(*pos_)) advance();
-        }
-        out.assign(start, pos_);
-        return true;
-    }
-
-    // Match integer literal: decimal, hex (0x), binary (0b)
-    bool integer(int64_t& out) {
-        if (pos_ >= end_ || !is_digit(*pos_)) return false;
-        const char* start = pos_;
-        if (*pos_ == '0' && pos_ + 1 < end_) {
-            char next = pos_[1];
-            if (next == 'x' || next == 'X') {
-                advance(); advance(); // skip 0x
-                if (pos_ >= end_ || !is_hex_digit(*pos_)) return false;
-                while (pos_ < end_ && is_hex_digit(*pos_)) advance();
-                out = static_cast<int64_t>(strtoll(start, nullptr, 16));
-                return true;
-            }
-            if (next == 'b' || next == 'B') {
-                advance(); advance(); // skip 0b
-                if (pos_ >= end_ || (*pos_ != '0' && *pos_ != '1')) return false;
-                while (pos_ < end_ && (*pos_ == '0' || *pos_ == '1')) advance();
-                out = static_cast<int64_t>(strtoll(start + 2, nullptr, 2));
-                return true;
-            }
-        }
-        while (pos_ < end_ && is_digit(*pos_)) advance();
-        out = static_cast<int64_t>(strtoll(start, nullptr, 10));
-        return true;
-    }
-
-    // Match floating point: digits '.' digits
-    bool floating(double& out) {
-        if (pos_ >= end_ || !is_digit(*pos_)) return false;
-        const char* start = pos_;
-        while (pos_ < end_ && is_digit(*pos_)) advance();
-        if (pos_ >= end_ || *pos_ != '.') { pos_ = start; return false; }
-        advance(); // '.'
-        while (pos_ < end_ && is_digit(*pos_)) advance();
-        out = strtod(start, nullptr);
-        return true;
-    }
-
-    // Match string literal: "..." with basic unquoting
-    bool string_lit(std::string& out) {
-        if (pos_ >= end_ || *pos_ != '"') return false;
-        advance(); // skip opening "
-        out.clear();
-        while (pos_ < end_ && *pos_ != '"') {
-            if (*pos_ == '\\' && pos_ + 1 < end_) {
-                advance();
-                switch (*pos_) {
-                    case 'n': out += '\n'; break;
-                    case 'r': out += '\r'; break;
-                    case 't': out += '\t'; break;
-                    case '\\': out += '\\'; break;
-                    case '"': out += '"'; break;
-                    case '0': out += '\0'; break;
-                    default: out += *pos_; break;
-                }
-            } else {
-                out += *pos_;
-            }
-            advance();
-        }
-        if (pos_ < end_) advance(); // skip closing "
-        return true;
-    }
-
     // Scan forward to delimiter, capturing raw content. Advances past delimiter.
     bool scan_to(const char* delim, std::string& out) {
         int dlen = static_cast<int>(strlen(delim));
@@ -267,30 +213,6 @@ public:
             advance();
         }
         return false;
-    }
-
-    // Match char literal: '.'
-    bool char_lit(char& out) {
-        if (pos_ >= end_ || *pos_ != '\'') return false;
-        advance(); // skip opening '
-        if (pos_ >= end_) return false;
-        if (*pos_ == '\\' && pos_ + 1 < end_) {
-            advance();
-            switch (*pos_) {
-                case 'n': out = '\n'; break;
-                case 'r': out = '\r'; break;
-                case 't': out = '\t'; break;
-                case '\\': out = '\\'; break;
-                case '\'': out = '\''; break;
-                case '0': out = '\0'; break;
-                default: out = *pos_; break;
-            }
-        } else {
-            out = *pos_;
-        }
-        advance();
-        if (pos_ < end_ && *pos_ == '\'') advance(); // skip closing '
-        return true;
     }
 
     // ── Whitespace + comment skipping ───────────────────────
@@ -341,7 +263,7 @@ public:
     // Furthest position reached (for better error messages)
     Mark furthest() const { return furthest_; }
 
-private:
+protected:
     void advance() {
         if (pos_ >= end_) return;
         if (*pos_ == '\n') {

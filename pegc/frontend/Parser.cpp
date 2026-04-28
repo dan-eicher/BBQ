@@ -15,6 +15,18 @@ bool Parser::parse() {
     return parse_Peg();
 }
 
+static bool is_letter(char c) {
+    return (((c >= 97 && c <= 122) || (c >= 65 && c <= 90)) || (c == 95));
+}
+
+static bool is_digit(char c) {
+    return (c >= 48 && c <= 57);
+}
+
+static bool is_ident_continue(char c) {
+    return (is_letter(c) || is_digit(c));
+}
+
 void Parser::setup_skip() {
     set_whitespace([](char c) -> bool {
         return ((((c == 13) || (c == 10)) || (c == 9)) || (c == 32));
@@ -23,8 +35,92 @@ void Parser::setup_skip() {
 }
 
 
+bool Parser::ident(peg::Span& out) {
+    const char* _start = pos();
+    if (at_end() || !is_letter(peek())) return false;
+    advance();
+    for (;;) {
+        auto _m0 = save();
+        if (![&]() -> bool {
+            if (at_end() || !is_ident_continue(peek())) return false;
+            advance();
+            return true;
+        }()) { restore(_m0); break; }
+    }
+    out.ptr = _start; out.len = static_cast<int>(pos() - _start);
+    return true;
+}
+
+bool Parser::char_lit(peg::Span& out) {
+    const char* _start = pos();
+    if (!match("'")) return false;
+    {
+        auto _m0 = save();
+        if ([&]() -> bool {
+            if (!match("\\")) return false;
+            if (at_end()) return false;
+            advance();
+            return true;
+        }()) {} else {
+        restore(_m0);
+        {
+            auto _m1 = save();
+            bool _ok1 = [&]() -> bool {
+                if (!match("'")) return false;
+                return true;
+            }();
+            restore(_m1);
+            if (_ok1) return false;
+        }
+        if (at_end()) return false;
+        advance();
+        }
+    }
+    if (!match("'")) return false;
+    out.ptr = _start; out.len = static_cast<int>(pos() - _start);
+    return true;
+}
+
+bool Parser::string_lit(peg::Span& out) {
+    const char* _start = pos();
+    if (!match("\"")) return false;
+    for (;;) {
+        auto _m0 = save();
+        if (![&]() -> bool {
+            {
+                auto _m1 = save();
+                if ([&]() -> bool {
+                    if (!match("\\")) return false;
+                    if (at_end()) return false;
+                    advance();
+                    return true;
+                }()) {} else {
+                restore(_m1);
+                {
+                    auto _m2 = save();
+                    bool _ok2 = [&]() -> bool {
+                        if (!match("\"")) return false;
+                        return true;
+                    }();
+                    restore(_m2);
+                    if (_ok2) return false;
+                }
+                if (at_end()) return false;
+                advance();
+                }
+            }
+            return true;
+        }()) { restore(_m0); break; }
+    }
+    if (!match("\"")) return false;
+    out.ptr = _start; out.len = static_cast<int>(pos() - _start);
+    return true;
+}
+
 bool Parser::parse_Peg() {
-    std::string name;
+    peg::Span name_span;
+       peg::Span endname_span;
+       std::string name;
        std::string endname;
        std::vector<Header*> headers;
        std::vector<CharsetDef*> charsets;
@@ -34,9 +130,10 @@ bool Parser::parse_Peg() {
        CharsetExpr* ignore_expr = nullptr;
        std::vector<Production*> productions;
     skip();
-    if (!keyword("COMPILER")) return false;
+    if (!match("COMPILER")) return false;
     skip();
-    if (!ident(name)) return false;
+    if (!ident(name_span)) return false;
+    name = name_span.to_string();
     for (;;) {
         auto _m0 = save();
         if (![&]() -> bool {
@@ -49,7 +146,7 @@ bool Parser::parse_Peg() {
         auto _m1 = save();
         if (![&]() -> bool {
             skip();
-            if (!keyword("CHARACTERS")) return false;
+            if (!match("CHARACTERS")) return false;
             for (;;) {
                 auto _m2 = save();
                 if (![&]() -> bool {
@@ -65,7 +162,7 @@ bool Parser::parse_Peg() {
         auto _m3 = save();
         if (![&]() -> bool {
             skip();
-            if (!keyword("TOKENS")) return false;
+            if (!match("TOKENS")) return false;
             for (;;) {
                 auto _m4 = save();
                 if (![&]() -> bool {
@@ -89,7 +186,7 @@ bool Parser::parse_Peg() {
         auto _m6 = save();
         if (![&]() -> bool {
             skip();
-            if (!keyword("IGNORE")) return false;
+            if (!match("IGNORE")) return false;
             skip();
             if (!parse_CharsetExpr_(ignore_expr)) return false;
             has_ignore = true;
@@ -97,7 +194,7 @@ bool Parser::parse_Peg() {
         }()) restore(_m6);
     }
     skip();
-    if (!keyword("PRODUCTIONS")) return false;
+    if (!match("PRODUCTIONS")) return false;
     for (;;) {
         auto _m7 = save();
         if (![&]() -> bool {
@@ -107,9 +204,10 @@ bool Parser::parse_Peg() {
         }()) { restore(_m7); break; }
     }
     skip();
-    if (!keyword("END")) return false;
+    if (!match("END")) return false;
     skip();
-    if (!ident(endname)) return false;
+    if (!ident(endname_span)) return false;
+    endname = endname_span.to_string();
     skip();
     if (!match(".")) return false;
     ast = new Grammar(std::move(name), std::move(headers),
@@ -133,10 +231,10 @@ bool Parser::parse_SemAction_(std::vector<Header*>& headers) {
 }
 
 bool Parser::parse_CharsetDecl(std::vector<CharsetDef*>& defs) {
-    std::string csname; CharsetExpr* body;
+    peg::Span csname_span; std::string csname; CharsetExpr* body;
     skip();
-    if (!ident(csname)) return false;
-    SourceLoc loc = Loc();
+    if (!ident(csname_span)) return false;
+    csname = csname_span.to_string(); SourceLoc loc = Loc();
     skip();
     if (!match("=")) return false;
     skip();
@@ -186,159 +284,15 @@ bool Parser::parse_CharsetDiff(CharsetExpr*& result) {
 }
 
 bool Parser::parse_CharsetPrimary(CharsetExpr*& result) {
-    char ch1, ch2; std::string csname;
+    peg::Span ch_span; peg::Span csname_span;
+       char ch1 = 0, ch2 = 0; std::string csname;
     {
         auto _m0 = save();
         if ([&]() -> bool {
             skip();
-            if (!char_lit(ch1)) return false;
-            result = new Single(static_cast<int>(ch1)); result->loc = Loc();
-            {
-                auto _m1 = save();
-                if (![&]() -> bool {
-                    skip();
-                    if (!match("..")) return false;
-                    skip();
-                    if (!char_lit(ch2)) return false;
-                    result = new Range(static_cast<int>(ch1), static_cast<int>(ch2)); result->loc = Loc();
-                    return true;
-                }()) restore(_m1);
-            }
-            return true;
-        }()) {} else {
-        restore(_m0);
-        if ([&]() -> bool {
-            skip();
-            if (!keyword("ANY")) return false;
-            result = new Any(); result->loc = Loc();
-            return true;
-        }()) {} else {
-        restore(_m0);
-        skip();
-        if (!ident(csname)) return false;
-        result = new NameRef(std::move(csname)); result->loc = Loc();
-        }
-        }
-    }
-    return true;
-}
-
-bool Parser::parse_TokenDecl(std::vector<TokenDef*>& defs) {
-    std::string tname; TokenExpr* pat;
-    skip();
-    if (!ident(tname)) return false;
-    SourceLoc loc = Loc();
-    skip();
-    if (!match("=")) return false;
-    skip();
-    if (!parse_TokenExpr_(pat)) return false;
-    skip();
-    if (!match(".")) return false;
-    auto* d = new TokenDef(std::move(tname), pat);
-       d->loc = loc;
-       defs.push_back(d);
-    return true;
-}
-
-bool Parser::parse_TokenExpr_(TokenExpr*& result) {
-    TokenExpr* alt;
-       std::vector<TokenExpr*> alts;
-    skip();
-    if (!parse_TokenSeq(result)) return false;
-    alts.push_back(result);
-    for (;;) {
-        auto _m0 = save();
-        if (![&]() -> bool {
-            skip();
-            if (!match("|")) return false;
-            skip();
-            if (!parse_TokenSeq(alt)) return false;
-            alts.push_back(alt);
-            return true;
-        }()) { restore(_m0); break; }
-    }
-    if (alts.size() > 1) {
-           auto loc = result->loc;
-           result = new TAlternation(std::move(alts));
-           result->loc = loc;
-       }
-    return true;
-}
-
-bool Parser::parse_TokenSeq(TokenExpr*& result) {
-    TokenExpr* elem;
-       std::vector<TokenExpr*> elems;
-    skip();
-    if (!parse_TokenFactor(elem)) return false;
-    elems.push_back(elem);
-    for (;;) {
-        auto _m0 = save();
-        if (![&]() -> bool {
-            skip();
-            if (!parse_TokenFactor(elem)) return false;
-            elems.push_back(elem);
-            return true;
-        }()) { restore(_m0); break; }
-    }
-    if (elems.size() == 1)
-           result = elems[0];
-       else {
-           auto loc = elems[0]->loc;
-           result = new TSequence(std::move(elems));
-           result->loc = loc;
-       }
-    return true;
-}
-
-bool Parser::parse_TokenFactor(TokenExpr*& result) {
-    TokenExpr* inner;
-    {
-        auto _m0 = save();
-        if ([&]() -> bool {
-            skip();
-            if (!parse_TokenAtom(result)) return false;
-            return true;
-        }()) {} else {
-        restore(_m0);
-        if ([&]() -> bool {
-            skip();
-            if (!match("{")) return false;
-            skip();
-            if (!parse_TokenExpr_(inner)) return false;
-            skip();
-            if (!match("}")) return false;
-            result = new TStar(inner); result->loc = inner->loc;
-            return true;
-        }()) {} else {
-        restore(_m0);
-        skip();
-        if (!match("[")) return false;
-        skip();
-        if (!parse_TokenExpr_(inner)) return false;
-        skip();
-        if (!match("]")) return false;
-        result = new TOptional(inner); result->loc = inner->loc;
-        }
-        }
-    }
-    return true;
-}
-
-bool Parser::parse_TokenAtom(TokenExpr*& result) {
-    std::string s; char ch1, ch2; TokenExpr* inner;
-    {
-        auto _m0 = save();
-        if ([&]() -> bool {
-            skip();
-            if (!string_lit(s)) return false;
-            result = new TLiteral(std::move(s)); result->loc = Loc();
-            return true;
-        }()) {} else {
-        restore(_m0);
-        if ([&]() -> bool {
-            skip();
-            if (!char_lit(ch1)) return false;
-            result = new TLiteral(std::string(1, ch1));
+            if (!char_lit(ch_span)) return false;
+            ch1 = peg::unescape_char_lit(ch_span);
+                           result = new Single(static_cast<int>(ch1));
                            result->loc = Loc();
             {
                 auto _m1 = save();
@@ -346,8 +300,10 @@ bool Parser::parse_TokenAtom(TokenExpr*& result) {
                     skip();
                     if (!match("..")) return false;
                     skip();
-                    if (!char_lit(ch2)) return false;
-                    result = new TRange(static_cast<int>(ch1), static_cast<int>(ch2)); result->loc = Loc();
+                    if (!char_lit(ch_span)) return false;
+                    ch2 = peg::unescape_char_lit(ch_span);
+                             result = new Range(static_cast<int>(ch1), static_cast<int>(ch2));
+                             result->loc = Loc();
                     return true;
                 }()) restore(_m1);
             }
@@ -356,54 +312,71 @@ bool Parser::parse_TokenAtom(TokenExpr*& result) {
         restore(_m0);
         if ([&]() -> bool {
             skip();
-            if (!ident(s)) return false;
-            result = new TCharset(std::move(s)); result->loc = Loc();
+            if (!match("ANY")) return false;
+            result = new Any(); result->loc = Loc();
             return true;
         }()) {} else {
         restore(_m0);
         skip();
-        if (!match("(")) return false;
-        skip();
-        if (!parse_TokenExpr_(inner)) return false;
-        skip();
-        if (!match(")")) return false;
-        result = inner;
-        }
+        if (!ident(csname_span)) return false;
+        csname = csname_span.to_string();
+                            result = new NameRef(std::move(csname));
+                            result->loc = Loc();
         }
         }
     }
     return true;
 }
 
+bool Parser::parse_TokenDecl(std::vector<TokenDef*>& defs) {
+    peg::Span tname_span; std::string tname; PegExpr* body;
+    skip();
+    if (!ident(tname_span)) return false;
+    tname = tname_span.to_string(); SourceLoc loc = Loc();
+    skip();
+    if (!match("=")) return false;
+    skip();
+    if (!parse_PegBody(body)) return false;
+    skip();
+    if (!match(".")) return false;
+    auto* d = new TokenDef(std::move(tname), body);
+       d->loc = loc;
+       defs.push_back(d);
+    return true;
+}
+
 bool Parser::parse_CommentDecl(std::vector<CommentDef*>& defs) {
-    bool nested = false; std::string open; std::string close_str; std::string tname;
+    peg::Span open_span; peg::Span close_span; peg::Span tname_span;
+       bool nested = false; std::string open; std::string close_str; std::string tname;
     skip();
-    if (!keyword("COMMENTS")) return false;
+    if (!match("COMMENTS")) return false;
     skip();
-    if (!keyword("FROM")) return false;
+    if (!match("FROM")) return false;
     skip();
-    if (!string_lit(open)) return false;
-    SourceLoc loc = Loc();
+    if (!string_lit(open_span)) return false;
+    open = peg::unescape_string_lit(open_span);
+                              SourceLoc loc = Loc();
     skip();
-    if (!keyword("TO")) return false;
+    if (!match("TO")) return false;
     {
         auto _m0 = save();
         if ([&]() -> bool {
             skip();
-            if (!string_lit(close_str)) return false;
+            if (!string_lit(close_span)) return false;
+            close_str = peg::unescape_string_lit(close_span);
             return true;
         }()) {} else {
         restore(_m0);
         skip();
-        if (!ident(tname)) return false;
-        close_str = std::move(tname);
+        if (!ident(tname_span)) return false;
+        close_str = tname_span.to_string();
         }
     }
     {
         auto _m1 = save();
         if (![&]() -> bool {
             skip();
-            if (!keyword("NESTED")) return false;
+            if (!match("NESTED")) return false;
             nested = true;
             return true;
         }()) restore(_m1);
@@ -415,15 +388,16 @@ bool Parser::parse_CommentDecl(std::vector<CommentDef*>& defs) {
 }
 
 bool Parser::parse_ProductionDecl(std::vector<Production*>& prods) {
-    std::string pname;
+    peg::Span pname_span;
+       std::string pname;
        std::vector<Param*> params;
        std::string locals;
        std::string raw;
        bool has_locals = false;
        PegExpr* body;
     skip();
-    if (!ident(pname)) return false;
-    SourceLoc loc = Loc();
+    if (!ident(pname_span)) return false;
+    pname = pname_span.to_string(); SourceLoc loc = Loc();
     {
         auto _m0 = save();
         if (![&]() -> bool {
@@ -548,7 +522,7 @@ bool Parser::parse_PegFactor(PegExpr*& result) {
         }()) {} else {
         restore(_m0);
         skip();
-        if (!keyword("IF")) return false;
+        if (!match("IF")) return false;
         skip();
         if (!match("(")) return false;
         skip();
@@ -569,28 +543,44 @@ bool Parser::parse_PegFactor(PegExpr*& result) {
 }
 
 bool Parser::parse_PegAtom(PegExpr*& result) {
-    PegExpr* inner; std::string s; char ch;
+    peg::Span s_span; peg::Span ch_span; peg::Span name_span;
+       PegExpr* inner; std::string s; char ch1 = 0, ch2 = 0;
     {
         auto _m0 = save();
         if ([&]() -> bool {
             skip();
-            if (!string_lit(s)) return false;
-            result = new Literal(std::move(s));
+            if (!string_lit(s_span)) return false;
+            s = peg::unescape_string_lit(s_span);
+         result = new Literal(std::move(s));
          result->loc = Loc();
             return true;
         }()) {} else {
         restore(_m0);
         if ([&]() -> bool {
             skip();
-            if (!char_lit(ch)) return false;
-            result = new Literal(std::string(1, ch));
+            if (!char_lit(ch_span)) return false;
+            ch1 = peg::unescape_char_lit(ch_span);
+         result = new Literal(std::string(1, ch1));
          result->loc = Loc();
+            {
+                auto _m1 = save();
+                if (![&]() -> bool {
+                    skip();
+                    if (!match("..")) return false;
+                    skip();
+                    if (!char_lit(ch_span)) return false;
+                    ch2 = peg::unescape_char_lit(ch_span);
+           result = new CharRange(static_cast<int>(ch1), static_cast<int>(ch2));
+           result->loc = Loc();
+                    return true;
+                }()) restore(_m1);
+            }
             return true;
         }()) {} else {
         restore(_m0);
         if ([&]() -> bool {
             skip();
-            if (!keyword("ANY")) return false;
+            if (!match("ANY")) return false;
             result = new AnyExpr();
          result->loc = Loc();
             return true;
@@ -598,11 +588,11 @@ bool Parser::parse_PegAtom(PegExpr*& result) {
         restore(_m0);
         if ([&]() -> bool {
             skip();
-            if (!ident(s)) return false;
-            std::string rname = std::move(s); SourceLoc loc = Loc();
+            if (!ident(name_span)) return false;
+            std::string rname = name_span.to_string(); SourceLoc loc = Loc();
          std::string args;
             {
-                auto _m1 = save();
+                auto _m2 = save();
                 if (![&]() -> bool {
                     skip();
                     if (peek_at("<.")) {
@@ -621,7 +611,7 @@ bool Parser::parse_PegAtom(PegExpr*& result) {
            args = (b == std::string::npos) ? "" : args.substr(b, e - b + 1);
                     }
                     return true;
-                }()) restore(_m1);
+                }()) restore(_m2);
             }
             result = new RuleCall(std::move(rname), std::move(args));
          result->loc = loc;
@@ -660,13 +650,13 @@ bool Parser::parse_PegAtom(PegExpr*& result) {
         skip();
         if (!match("}")) return false;
         {
-            auto _m2 = save();
+            auto _m3 = save();
             if (![&]() -> bool {
                 skip();
                 if (!match("+")) return false;
                 is_plus = true;
                 return true;
-            }()) restore(_m2);
+            }()) restore(_m3);
         }
         if (is_plus) {
              result = new Plus(inner);

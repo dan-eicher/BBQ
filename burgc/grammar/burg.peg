@@ -3,7 +3,18 @@ COMPILER Burg
 (. #include <string>
    #include <vector>
    #include <cstdint>
+   #include "PegRuntime.h"
 .)
+
+CHARACTERS
+  letter         = 'a'..'z' + 'A'..'Z' + '_' .
+  digit          = '0'..'9' .
+  ident_continue = letter + digit .
+
+TOKENS
+  ident           = letter { ident_continue } .
+  integer         = digit { digit } .
+  qualified_ident = letter { ident_continue } { ':' ':' letter { ident_continue } } .
 
 COMMENTS FROM "//" TO "\n"
 COMMENTS FROM "/*" TO "*/"
@@ -46,18 +57,22 @@ Decl <. std::vector<burg_ast::TermDecl*> &terms, std::string &start, std::string
 .
 
 NamespaceDecl <. std::string &ns .>
-    = "NAMESPACE" ident<ns>
+    (. peg::Span ns_span; .)
+    = "NAMESPACE"
+      ident<ns_span>  (. ns = ns_span.to_string(); .)
 .
 
 MembersDecl <. std::string &members .>
     (. std::string code; .)
-    = "MEMBERS" "(." (. if (!scan_to("." ")", code)) return false; .)
+    = "MEMBERS"
+      "(." (. if (!scan_to("." ")", code)) return false; .)
     (. members = code; .)
 .
 
 PrivateDecl <. std::string &priv .>
     (. std::string code; .)
-    = "PRIVATE" "(." (. if (!scan_to("." ")", code)) return false; .)
+    = "PRIVATE"
+      "(." (. if (!scan_to("." ")", code)) return false; .)
     (. priv = code; .)
 .
 
@@ -68,12 +83,16 @@ HeaderAction_ <. std::vector<std::string> &headers .>
 .
 
 TermDecl_ <. std::vector<burg_ast::TermDecl*> &terms .>
-    (. std::string name; int64_t num = 0;
+    (. peg::Span name_span; peg::Span num_span; peg::Span sym_span;
+       std::string name; int64_t num = 0;
        std::string sym; bool is_sym = false; .)
     = "TERM"
-      { ident<name> "="
-        ( integer<num>          (. is_sym = false; .)
-        | qualified_ident<sym>  (. is_sym = true;  .)
+      { ident<name_span>  (. name = name_span.to_string(); .)
+        "="
+        ( integer<num_span>          (. num = std::stoll(num_span.to_string());
+                                       is_sym = false; .)
+        | qualified_ident<sym_span>  (. sym = sym_span.to_string();
+                                       is_sym = true;  .)
         )
         (. auto* t = new burg_ast::TermDecl();
            t->name = std::move(name);
@@ -86,20 +105,25 @@ TermDecl_ <. std::vector<burg_ast::TermDecl*> &terms .>
 .
 
 StartDecl <. std::string &start .>
-    = "START" ident<start>
+    (. peg::Span start_span; .)
+    = "START"
+      ident<start_span>  (. start = start_span.to_string(); .)
 .
 
 RuleDecl <. burg_ast::Rule* *result .>
-    (. std::string nt;
+    (. peg::Span nt_span; peg::Span cost_span;
+       std::string nt;
        burg_ast::TreePattern* pat;
        int64_t cost = 0;
        std::string guard;
        std::string action; .)
-    = ident<nt>             (. burg_ast::SourceLoc loc = {line(), col()}; .)
+    = ident<nt_span>  (. nt = nt_span.to_string();
+                        burg_ast::SourceLoc loc = {line(), col()}; .)
       ":"
       TreePat<&pat>
-      [ "where" "(." (. if (!scan_to("." ")", guard)) return false; .) ]
-      "=" integer<cost>
+      [ "where"
+        "(." (. if (!scan_to("." ")", guard)) return false; .) ]
+      "=" integer<cost_span>  (. cost = std::stoll(cost_span.to_string()); .)
       [ "(." (. if (!scan_to("." ")", action)) return false; .) ]
       ";"
     (. *result = new burg_ast::Rule();
@@ -112,10 +136,12 @@ RuleDecl <. burg_ast::Rule* *result .>
 .
 
 TreePat <. burg_ast::TreePattern* *result .>
-    (. std::string name;
+    (. peg::Span name_span;
+       std::string name;
        std::vector<burg_ast::TreePattern*> children;
        burg_ast::TreePattern* child; .)
-    = ident<name>           (. burg_ast::SourceLoc loc = {line(), col()}; .)
+    = ident<name_span>  (. name = name_span.to_string();
+                          burg_ast::SourceLoc loc = {line(), col()}; .)
       [ "("
         TreePat<&child>     (. children.push_back(child); .)
         { ","

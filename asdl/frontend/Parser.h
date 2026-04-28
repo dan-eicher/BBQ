@@ -6,6 +6,7 @@
 
 #include <string>
    #include <vector>
+   #include "PegRuntime.h"
 
 
 class Parser : public peg::PegCursor {
@@ -34,6 +35,8 @@ private:
     bool parse_TypId(std::string& name);
     bool parse_ConId(std::string& name);
     bool parse_AnyId(std::string& name);
+    bool ident(peg::Span& out);
+    bool string_lit(peg::Span& out);
 
 };
 

@@ -54,15 +54,15 @@ TEST(Codegen, LiteralEmission) {
     EXPECT_NE(code.find("parse_Test"), std::string::npos);
 }
 
-TEST(Codegen, KeywordEmission) {
+TEST(Codegen, BareIdentLiteralEmitsMatch) {
     auto code = generate_impl(
         "COMPILER Test\n"
         "PRODUCTIONS\n"
         "Test = \"struct\" .\n"
         "END Test.\n"
     );
-    // "struct" looks like an identifier → should use keyword()
-    EXPECT_NE(code.find("keyword(\"struct\")"), std::string::npos);
+    EXPECT_NE(code.find("match(\"struct\")"), std::string::npos);
+    EXPECT_EQ(code.find("keyword("), std::string::npos);
 }
 
 TEST(Codegen, SequenceEmission) {
@@ -168,6 +168,93 @@ TEST(Codegen, SkipSetup) {
     EXPECT_NE(code.find("//"), std::string::npos);
 }
 
+TEST(Codegen, CharsetDefsEmitted) {
+    auto code = generate_impl(
+        "COMPILER Test\n"
+        "CHARACTERS\n"
+        "  letter = 'a'..'z' + 'A'..'Z' + '_' .\n"
+        "  digit  = '0'..'9' .\n"
+        "PRODUCTIONS\n"
+        "Test = \"x\" .\n"
+        "END Test.\n"
+    );
+    // Each CharsetDef emits a static predicate function
+    EXPECT_NE(code.find("static bool is_letter(char c)"), std::string::npos);
+    EXPECT_NE(code.find("static bool is_digit(char c)"), std::string::npos);
+    // Body uses the charset predicate inlined
+    EXPECT_NE(code.find("c >= 97 && c <= 122"), std::string::npos);  // 'a'..'z'
+    EXPECT_NE(code.find("c >= 48 && c <= 57"), std::string::npos);   // '0'..'9'
+}
+
+TEST(Codegen, TokenWithCharRangeAndPlus) {
+    auto code = generate_impl(
+        "COMPILER Test\n"
+        "TOKENS\n"
+        "  digits = '0'..'9' { '0'..'9' } .\n"
+        "PRODUCTIONS\n"
+        "Test = digits<x> .\n"
+        "END Test.\n"
+    );
+    // Token body emits CharRange checks (peek() comparison)
+    EXPECT_NE(code.find("peek() < 48 || peek() > 57"), std::string::npos);
+    // Token body has no skip() — count
+    auto token_pos = code.find("bool Parser::digits");
+    ASSERT_NE(token_pos, std::string::npos);
+    auto token_end = code.find("\n}\n", token_pos);
+    ASSERT_NE(token_end, std::string::npos);
+    auto token_body = code.substr(token_pos, token_end - token_pos);
+    EXPECT_EQ(token_body.find("skip()"), std::string::npos);
+}
+
+TEST(Codegen, TokenEmittedAsLexMode) {
+    auto code = generate_impl(
+        "COMPILER Test\n"
+        "CHARACTERS\n"
+        "  letter = 'a'..'z' + 'A'..'Z' + '_' .\n"
+        "  digit  = '0'..'9' .\n"
+        "TOKENS\n"
+        "  ident = letter { letter | digit } .\n"
+        "PRODUCTIONS\n"
+        "Test = ident<x> .\n"
+        "END Test.\n"
+    );
+    // Token method emitted with span signature
+    EXPECT_NE(code.find("bool Parser::ident(peg::Span& out)"), std::string::npos);
+    // Token captures from start position
+    EXPECT_NE(code.find("const char* _start = pos();"), std::string::npos);
+    EXPECT_NE(code.find("out.ptr = _start"), std::string::npos);
+    // Production calling ident emits skip() before call (production-mode)
+    auto prod_pos = code.find("bool Parser::parse_Test()");
+    ASSERT_NE(prod_pos, std::string::npos);
+    auto skip_in_prod = code.find("skip()", prod_pos);
+    auto ident_call = code.find("ident(x)", prod_pos);
+    EXPECT_LT(skip_in_prod, ident_call);
+    // Token body itself does NOT emit skip() — count skip() before vs inside
+    auto token_pos = code.find("bool Parser::ident(peg::Span& out)");
+    ASSERT_NE(token_pos, std::string::npos);
+    auto token_end = code.find("\n}\n", token_pos);
+    ASSERT_NE(token_end, std::string::npos);
+    auto token_body = code.substr(token_pos, token_end - token_pos);
+    EXPECT_EQ(token_body.find("skip()"), std::string::npos)
+        << "Token body should not contain skip() calls";
+}
+
+TEST(Codegen, IgnoreReferencesNamedCharset) {
+    auto code = generate_impl(
+        "COMPILER Test\n"
+        "CHARACTERS\n"
+        "  ws = ' ' + '\\t' + '\\n' .\n"
+        "IGNORE ws\n"
+        "PRODUCTIONS\n"
+        "Test = \"x\" .\n"
+        "END Test.\n"
+    );
+    // Charset predicate is generated
+    EXPECT_NE(code.find("static bool is_ws(char c)"), std::string::npos);
+    // IGNORE clause's lambda body calls is_ws(c), not inline predicate
+    EXPECT_NE(code.find("is_ws(c)"), std::string::npos);
+}
+
 TEST(Codegen, RuleCallEmission) {
     auto code = generate_impl(
         "COMPILER Test\n"
@@ -237,22 +324,18 @@ TEST(Codegen, PlusEmission) {
         "Test = { \"x\" }+ .\n"
         "END Test.\n"
     );
-    // Plus = first occurrence (no lambda) + star loop (with lambda)
     EXPECT_NE(code.find("for (;;)"), std::string::npos);
-    // First occurrence uses keyword directly
-    EXPECT_NE(code.find("keyword(\"x\")"), std::string::npos);
+    EXPECT_NE(code.find("match(\"x\")"), std::string::npos);
 }
 
-TEST(Codegen, ChoiceKeywordHeadFail) {
-    // Keyword-like literals use peek_keyword for head-fail
+TEST(Codegen, ChoiceKeywordUsesGeneralChoice) {
     auto code = generate_impl(
         "COMPILER Test\n"
         "PRODUCTIONS\n"
         "Test = \"struct\" | \"union\" | \"enum\" .\n"
         "END Test.\n"
     );
-    EXPECT_NE(code.find("peek_keyword(\"struct\")"), std::string::npos);
-    EXPECT_NE(code.find("peek_keyword(\"union\")"), std::string::npos);
-    // Last alternative has no peek guard (else branch)
-    EXPECT_EQ(count_occurrences(code, "peek_keyword"), 2);
+    EXPECT_EQ(code.find("peek_keyword"), std::string::npos);
+    EXPECT_EQ(code.find("peek_at(\"struct\")"), std::string::npos);
+    EXPECT_NE(code.find("save()"), std::string::npos);
 }

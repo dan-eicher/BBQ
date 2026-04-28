@@ -26,7 +26,6 @@ struct Header;
 struct CharsetDef;
 struct CharsetExpr;
 struct TokenDef;
-struct TokenExpr;
 struct CommentDef;
 struct Production;
 struct Param;
@@ -41,18 +40,11 @@ struct Diff;
 struct NameRef;
 struct Any;
 struct TokenDef;
-struct TLiteral;
-struct TCharset;
-struct TSequence;
-struct TAlternation;
-struct TStar;
-struct TPlus;
-struct TOptional;
-struct TRange;
 struct CommentDef;
 struct Production;
 struct Param;
 struct Literal;
+struct CharRange;
 struct CharsetRef;
 struct TokenRef;
 struct RuleCall;
@@ -148,18 +140,11 @@ struct ASTVisitor {
     virtual void visit(NameRef* node) {}
     virtual void visit(Any* node) {}
     virtual void visit(TokenDef* node) {}
-    virtual void visit(TLiteral* node) {}
-    virtual void visit(TCharset* node) {}
-    virtual void visit(TSequence* node) {}
-    virtual void visit(TAlternation* node) {}
-    virtual void visit(TStar* node) {}
-    virtual void visit(TPlus* node) {}
-    virtual void visit(TOptional* node) {}
-    virtual void visit(TRange* node) {}
     virtual void visit(CommentDef* node) {}
     virtual void visit(Production* node) {}
     virtual void visit(Param* node) {}
     virtual void visit(Literal* node) {}
+    virtual void visit(CharRange* node) {}
     virtual void visit(CharsetRef* node) {}
     virtual void visit(TokenRef* node) {}
     virtual void visit(RuleCall* node) {}
@@ -321,109 +306,14 @@ struct Any : public CharsetExpr {
 struct TokenDef : public ASTNode {
     TokenDef(
         std::string name,
-        TokenExpr* pattern
+        PegExpr* body
     )
-        : name(name), pattern(pattern){}
+        : name(name), body(body){}
 
     void accept(ASTVisitor& visitor) override { visitor.visit(this); }
 
     std::string name;
-    TokenExpr* pattern;
-};
-
-// token_expr
-struct TokenExpr : public ASTNode {
-    virtual ~TokenExpr() = default;
-};
-
-struct TLiteral : public TokenExpr {
-    TLiteral(
-        std::string value
-    )
-        : value(value){}
-
-    void accept(ASTVisitor& visitor) override { visitor.visit(this); }
-
-    std::string value;
-};
-
-struct TCharset : public TokenExpr {
-    TCharset(
-        std::string name
-    )
-        : name(name){}
-
-    void accept(ASTVisitor& visitor) override { visitor.visit(this); }
-
-    std::string name;
-};
-
-struct TSequence : public TokenExpr {
-    TSequence(
-        std::vector<TokenExpr*> elements
-    )
-        : elements(std::move(elements)){}
-
-    void accept(ASTVisitor& visitor) override { visitor.visit(this); }
-
-    std::vector<TokenExpr*> elements;
-};
-
-struct TAlternation : public TokenExpr {
-    TAlternation(
-        std::vector<TokenExpr*> alternatives
-    )
-        : alternatives(std::move(alternatives)){}
-
-    void accept(ASTVisitor& visitor) override { visitor.visit(this); }
-
-    std::vector<TokenExpr*> alternatives;
-};
-
-struct TStar : public TokenExpr {
-    TStar(
-        TokenExpr* body
-    )
-        : body(body){}
-
-    void accept(ASTVisitor& visitor) override { visitor.visit(this); }
-
-    TokenExpr* body;
-};
-
-struct TPlus : public TokenExpr {
-    TPlus(
-        TokenExpr* body
-    )
-        : body(body){}
-
-    void accept(ASTVisitor& visitor) override { visitor.visit(this); }
-
-    TokenExpr* body;
-};
-
-struct TOptional : public TokenExpr {
-    TOptional(
-        TokenExpr* body
-    )
-        : body(body){}
-
-    void accept(ASTVisitor& visitor) override { visitor.visit(this); }
-
-    TokenExpr* body;
-};
-
-struct TRange : public TokenExpr {
-    TRange(
-        int from,
-        int to
-    )
-        : from(from), to(to){}
-
-    void accept(ASTVisitor& visitor) override { visitor.visit(this); }
-
-    int from;
-    int to;
+    PegExpr* body;
 };
 
 struct CommentDef : public ASTNode {
@@ -487,6 +377,19 @@ struct Literal : public PegExpr {
     void accept(ASTVisitor& visitor) override { visitor.visit(this); }
 
     std::string value;
+};
+
+struct CharRange : public PegExpr {
+    CharRange(
+        int from,
+        int to
+    )
+        : from(from), to(to){}
+
+    void accept(ASTVisitor& visitor) override { visitor.visit(this); }
+
+    int from;
+    int to;
 };
 
 struct CharsetRef : public PegExpr {

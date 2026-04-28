@@ -12,12 +12,32 @@ bool Parser::parse() {
     return parse_Calc();
 }
 
+static bool is_digit(char c) {
+    return (c >= 48 && c <= 57);
+}
+
 void Parser::setup_skip() {
     set_whitespace([](char c) -> bool {
         return ((((c == 13) || (c == 10)) || (c == 9)) || (c == 32));
     });
 }
 
+
+bool Parser::integer(peg::Span& out) {
+    const char* _start = pos();
+    if (at_end() || !is_digit(peek())) return false;
+    advance();
+    for (;;) {
+        auto _m0 = save();
+        if (![&]() -> bool {
+            if (at_end() || !is_digit(peek())) return false;
+            advance();
+            return true;
+        }()) { restore(_m0); break; }
+    }
+    out.ptr = _start; out.len = static_cast<int>(pos() - _start);
+    return true;
+}
 
 bool Parser::parse_Calc() {
     calc::Expr* e;
@@ -99,22 +119,24 @@ bool Parser::parse_UnaryExpr(calc::Expr* * result) {
 }
 
 bool Parser::parse_Atom(calc::Expr* * result) {
-    int64_t n;
+    peg::Span n_span; int64_t n;
     {
         auto _m0 = save();
         if ([&]() -> bool {
             skip();
             if (!match("$")) return false;
             skip();
-            if (!integer(n)) return false;
-            *result = new calc::SlotRef(n);
+            if (!integer(n_span)) return false;
+            n = std::stoll(n_span.to_string());
+                             *result = new calc::SlotRef(n);
             return true;
         }()) {} else {
         restore(_m0);
         if ([&]() -> bool {
             skip();
-            if (!integer(n)) return false;
-            *result = new calc::IntLit(n);
+            if (!integer(n_span)) return false;
+            n = std::stoll(n_span.to_string());
+                             *result = new calc::IntLit(n);
             return true;
         }()) {} else {
         restore(_m0);

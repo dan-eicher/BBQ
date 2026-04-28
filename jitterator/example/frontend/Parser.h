@@ -6,6 +6,7 @@
 
 #include <string>
    #include <cstdint>
+   #include "PegRuntime.h"
 
 
 class Parser : public peg::PegCursor {
@@ -28,6 +29,7 @@ private:
     bool parse_MulExpr(calc::Expr* * result);
     bool parse_UnaryExpr(calc::Expr* * result);
     bool parse_Atom(calc::Expr* * result);
+    bool integer(peg::Span& out);
 
 };
 

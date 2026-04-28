@@ -41,6 +41,10 @@ bool CParserEmitter::emit_header_to_frame(Grammar* grammar,
 
     for (auto* p : grammar->productions)
         production_names_.insert(p->name);
+    for (auto* t : grammar->tokens)
+        token_names_.insert(t->name);
+    for (auto* c : grammar->charsets)
+        charset_names_.insert(c->name);
 
     // Compute guard name from prefix + grammar name
     std::string guard = prefix_;
@@ -80,12 +84,20 @@ bool CParserEmitter::emit_impl_to_frame(Grammar* grammar,
 
     for (auto* p : grammar->productions)
         production_names_.insert(p->name);
+    for (auto* t : grammar->tokens)
+        token_names_.insert(t->name);
+    for (auto* c : grammar->charsets)
+        charset_names_.insert(c->name);
 
     fp.CopyFramePart("parser_include");
     out << "#include \"" << header_include << "\"\n\n";
 
+    fp.CopyFramePart("runtime");
+
     fp.CopyFramePart("skip_setup");
+    emit_charset_defs(grammar, out);
     emit_skip_setup(grammar, out);
+    emit_token_forward_decls(grammar, out);
 
     // Forward declarations for all parse functions (before init/parse use them)
     for (auto* prod : grammar->productions) {
@@ -130,6 +142,7 @@ bool CParserEmitter::emit_impl_to_frame(Grammar* grammar,
     out << "}\n\n";
 
     fp.CopyFramePart("parse_implementations");
+    emit_token_method_impls(grammar, out);
     emit_parse_method_impls(grammar, out);
 
     return true;
@@ -169,6 +182,53 @@ void CParserEmitter::emit_production_decl(Production* prod, std::ostream& out) {
 // ═══════════════════════════════════════════════════════════════
 // Implementation emission
 // ═══════════════════════════════════════════════════════════════
+
+void CParserEmitter::emit_charset_defs(Grammar* grammar, std::ostream& out) {
+    for (auto* cd : grammar->charsets) {
+        out << "static bool is_" << cd->name << "(char c) {\n";
+        out << "    return ";
+        emit_charset_predicate(cd->body, out);
+        out << ";\n";
+        out << "}\n\n";
+    }
+}
+
+// ── Token emission ────────────────────────────────────────────
+// Tokens use the same peg_expr AST as productions; the only difference
+// is emission mode (no auto-skip between atoms in lex mode).
+
+void CParserEmitter::emit_token_forward_decls(Grammar* grammar, std::ostream& out) {
+    for (auto* t : grammar->tokens) {
+        emit_token_forward_decl(t, out);
+    }
+}
+
+void CParserEmitter::emit_token_forward_decl(TokenDef* tok, std::ostream& out) {
+    out << "static bool " << prefix_ << tok->name
+        << "(peg_state* p, peg_span* out);\n";
+}
+
+void CParserEmitter::emit_token_method_impls(Grammar* grammar, std::ostream& out) {
+    for (auto* t : grammar->tokens) {
+        emit_token_impl(t, out);
+    }
+}
+
+void CParserEmitter::emit_token_impl(TokenDef* tok, std::ostream& out) {
+    var_counter_ = 0;
+
+    out << "static bool " << prefix_ << tok->name
+        << "(peg_state* p, peg_span* out) {\n";
+    out << "    const char* _start = peg_pos(p);\n";
+
+    in_lex_mode_ = true;
+    emit_expr(tok->body, out, 1);
+    in_lex_mode_ = false;
+
+    out << "    out->ptr = _start; out->len = (int)(peg_pos(p) - _start);\n";
+    out << "    return true;\n";
+    out << "}\n\n";
+}
 
 void CParserEmitter::emit_skip_setup(Grammar* grammar, std::ostream& out) {
     // Whitespace predicate as a named function
@@ -256,6 +316,15 @@ void CParserEmitter::emit_expr(PegExpr* expr, std::ostream& out, int indent) {
     } else if (dynamic_cast<AnyExpr*>(expr)) {
         out << indent_str(indent) << "if (peg_at_end(p)) " << fail_ << ";\n";
         out << indent_str(indent) << "peg_advance(p);\n";
+    } else if (auto* cr = dynamic_cast<CharRange*>(expr)) {
+        out << indent_str(indent) << "if (peg_at_end(p) || peg_peek_char(p) < "
+            << cr->from << " || peg_peek_char(p) > " << cr->to << ") "
+            << fail_ << ";\n";
+        out << indent_str(indent) << "peg_advance(p);\n";
+    } else if (auto* csr = dynamic_cast<CharsetRef*>(expr)) {
+        out << indent_str(indent) << "if (peg_at_end(p) || !is_" << csr->name
+            << "(peg_peek_char(p))) " << fail_ << ";\n";
+        out << indent_str(indent) << "peg_advance(p);\n";
     }
 }
 
@@ -296,25 +365,26 @@ void CParserEmitter::emit_choice(Choice* ch, std::ostream& out, int indent) {
     // Check for head-fail optimization
     bool all_literal_starts = true;
     for (auto* alt : ch->alternatives) {
-        if (!first_literal(alt)) {
+        auto* lit = first_literal(alt);
+        if (!lit) {
+            all_literal_starts = false;
+            break;
+        }
+        if (!in_lex_mode_ && is_keyword_literal(lit)) {
             all_literal_starts = false;
             break;
         }
     }
 
     if (all_literal_starts && n <= 8) {
-        out << ind << "peg_skip(p);\n";
+        if (!in_lex_mode_) out << ind << "peg_skip(p);\n";
         for (int i = 0; i < n; i++) {
             auto* alt = ch->alternatives[i];
             auto* lit = first_literal(alt);
             bool is_last = (i == n - 1);
 
             if (!is_last) {
-                if (is_keyword_literal(lit)) {
-                    out << ind << "if (peg_peek_keyword(p, \"" << escape_string(lit->value) << "\")) {\n";
-                } else {
-                    out << ind << "if (peg_peek_at(p, \"" << escape_string(lit->value) << "\")) {\n";
-                }
+                out << ind << "if (peg_peek_at(p, \"" << escape_string(lit->value) << "\")) {\n";
                 emit_expr(alt, out, indent + 1);
                 out << ind << "} else ";
             } else {
@@ -361,6 +431,17 @@ void CParserEmitter::emit_choice(Choice* ch, std::ostream& out, int indent) {
 // ── Star: e* ───────────────────────────────────────────────
 void CParserEmitter::emit_star(Star* star, std::ostream& out, int indent) {
     std::string ind = indent_str(indent);
+
+    // Charset predicate tests don't consume on fail, so the save/restore
+    // around them is dead work — collapse to a tight while loop.
+    if (auto* csr = dynamic_cast<CharsetRef*>(star->body)) {
+        if (charset_names_.count(csr->name)) {
+            out << ind << "while (!peg_at_end(p) && is_" << csr->name
+                << "(peg_peek_char(p))) peg_advance(p);\n";
+            return;
+        }
+    }
+
     int vid = next_var_id();
     out << ind << "for (;;) {\n";
     out << ind << "    peg_mark _m" << vid << " = peg_save(p);\n";
@@ -438,12 +519,8 @@ void CParserEmitter::emit_not(Not* n, std::ostream& out, int indent) {
 // ── Literal: "foo" ─────────────────────────────────────────
 void CParserEmitter::emit_literal(Literal* lit, std::ostream& out, int indent) {
     std::string ind = indent_str(indent);
-    out << ind << "peg_skip(p);\n";
-    if (is_keyword_literal(lit)) {
-        out << ind << "if (!peg_keyword(p, \"" << escape_string(lit->value) << "\")) " << fail_ << ";\n";
-    } else {
-        out << ind << "if (!peg_match(p, \"" << escape_string(lit->value) << "\")) " << fail_ << ";\n";
-    }
+    if (!in_lex_mode_) out << ind << "peg_skip(p);\n";
+    out << ind << "if (!peg_match(p, \"" << escape_string(lit->value) << "\")) " << fail_ << ";\n";
 }
 
 // ── Rule call: parse_Foo(p, args) ──────────────────────────
@@ -455,11 +532,28 @@ void CParserEmitter::emit_literal(Literal* lit, std::ostream& out, int indent) {
 // `peg_ident`); pegc no longer auto-prefixes.
 void CParserEmitter::emit_rule_call(RuleCall* rc, std::ostream& out, int indent) {
     std::string ind = indent_str(indent);
-    std::string fn_name = production_names_.count(rc->name)
-        ? prefix_ + "parse_" + to_snake_case(rc->name)
-        : "peg_" + rc->name;
 
-    out << ind << "peg_skip(p);\n";
+    // Charset reference: predicate-test-and-consume-one-char. Charsets
+    // are single-char (lex-level) predicates — never auto-skip, even in
+    // production mode. Required so `!ident_continue` and similar
+    // boundary checks operate at the current position.
+    if (charset_names_.count(rc->name)) {
+        out << ind << "if (peg_at_end(p) || !is_" << rc->name
+            << "(peg_peek_char(p))) " << fail_ << ";\n";
+        out << ind << "peg_advance(p);\n";
+        return;
+    }
+
+    std::string fn_name;
+    if (production_names_.count(rc->name)) {
+        fn_name = prefix_ + "parse_" + to_snake_case(rc->name);
+    } else if (token_names_.count(rc->name)) {
+        fn_name = prefix_ + rc->name;
+    } else {
+        fn_name = "peg_" + rc->name;
+    }
+
+    if (!in_lex_mode_) out << ind << "peg_skip(p);\n";
     out << ind << "if (!" << fn_name << "(p";
     if (!rc->args.empty()) out << ", " << rc->args;
     out << ")) " << fail_ << ";\n";

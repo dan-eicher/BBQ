@@ -7,6 +7,7 @@
 #include <string>
    #include <vector>
    #include <cstdint>
+   #include "PegRuntime.h"
 
 
 class Parser : public peg::PegCursor {
@@ -33,6 +34,9 @@ private:
     bool parse_StartDecl(std::string& start);
     bool parse_RuleDecl(burg_ast::Rule* * result);
     bool parse_TreePat(burg_ast::TreePattern* * result);
+    bool ident(peg::Span& out);
+    bool integer(peg::Span& out);
+    bool qualified_ident(peg::Span& out);
 
 };
 

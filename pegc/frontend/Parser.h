@@ -8,6 +8,7 @@
 #include <vector>
 #include <optional>
 #include <cstdlib>
+#include "PegRuntime.h"
 
 using namespace PegGrammar;
 
@@ -88,16 +89,15 @@ private:
     bool parse_CharsetDiff(CharsetExpr*& result);
     bool parse_CharsetPrimary(CharsetExpr*& result);
     bool parse_TokenDecl(std::vector<TokenDef*>& defs);
-    bool parse_TokenExpr_(TokenExpr*& result);
-    bool parse_TokenSeq(TokenExpr*& result);
-    bool parse_TokenFactor(TokenExpr*& result);
-    bool parse_TokenAtom(TokenExpr*& result);
     bool parse_CommentDecl(std::vector<CommentDef*>& defs);
     bool parse_ProductionDecl(std::vector<Production*>& prods);
     bool parse_PegBody(PegExpr*& result);
     bool parse_PegSeq(PegExpr*& result);
     bool parse_PegFactor(PegExpr*& result);
     bool parse_PegAtom(PegExpr*& result);
+    bool ident(peg::Span& out);
+    bool char_lit(peg::Span& out);
+    bool string_lit(peg::Span& out);
 
 };
 

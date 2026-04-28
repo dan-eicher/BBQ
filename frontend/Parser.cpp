@@ -14,6 +14,22 @@ bool Parser::parse() {
     return parse_BBQ();
 }
 
+static bool is_letter(char c) {
+    return (((c >= 97 && c <= 122) || (c >= 65 && c <= 90)) || (c == 95));
+}
+
+static bool is_digit(char c) {
+    return (c >= 48 && c <= 57);
+}
+
+static bool is_hex_digit(char c) {
+    return ((is_digit(c) || (c >= 97 && c <= 102)) || (c >= 65 && c <= 70));
+}
+
+static bool is_ident_continue(char c) {
+    return (is_letter(c) || is_digit(c));
+}
+
 void Parser::setup_skip() {
     set_whitespace([](char c) -> bool {
         return ((((c == 13) || (c == 10)) || (c == 9)) || (c == 32));
@@ -21,6 +37,138 @@ void Parser::setup_skip() {
     set_comments({{"#", "\n", false}, {"//", "\n", false}});
 }
 
+
+bool Parser::ident(peg::Span& out) {
+    const char* _start = pos();
+    if (at_end() || !is_letter(peek())) return false;
+    advance();
+    for (;;) {
+        auto _m0 = save();
+        if (![&]() -> bool {
+            if (at_end() || !is_ident_continue(peek())) return false;
+            advance();
+            return true;
+        }()) { restore(_m0); break; }
+    }
+    out.ptr = _start; out.len = static_cast<int>(pos() - _start);
+    return true;
+}
+
+bool Parser::integer(peg::Span& out) {
+    const char* _start = pos();
+    {
+        auto _m0 = save();
+        if ([&]() -> bool {
+            if (!match("0")) return false;
+            if (!match("x")) return false;
+            if (at_end() || !is_hex_digit(peek())) return false;
+            advance();
+            for (;;) {
+                auto _m1 = save();
+                if (![&]() -> bool {
+                    if (at_end() || !is_hex_digit(peek())) return false;
+                    advance();
+                    return true;
+                }()) { restore(_m1); break; }
+            }
+            return true;
+        }()) {} else {
+        restore(_m0);
+        if ([&]() -> bool {
+            if (!match("0")) return false;
+            if (!match("X")) return false;
+            if (at_end() || !is_hex_digit(peek())) return false;
+            advance();
+            for (;;) {
+                auto _m2 = save();
+                if (![&]() -> bool {
+                    if (at_end() || !is_hex_digit(peek())) return false;
+                    advance();
+                    return true;
+                }()) { restore(_m2); break; }
+            }
+            return true;
+        }()) {} else {
+        restore(_m0);
+        if (at_end() || !is_digit(peek())) return false;
+        advance();
+        for (;;) {
+            auto _m3 = save();
+            if (![&]() -> bool {
+                if (at_end() || !is_digit(peek())) return false;
+                advance();
+                return true;
+            }()) { restore(_m3); break; }
+        }
+        }
+        }
+    }
+    out.ptr = _start; out.len = static_cast<int>(pos() - _start);
+    return true;
+}
+
+bool Parser::floating(peg::Span& out) {
+    const char* _start = pos();
+    if (at_end() || !is_digit(peek())) return false;
+    advance();
+    for (;;) {
+        auto _m0 = save();
+        if (![&]() -> bool {
+            if (at_end() || !is_digit(peek())) return false;
+            advance();
+            return true;
+        }()) { restore(_m0); break; }
+    }
+    if (!match(".")) return false;
+    if (at_end() || !is_digit(peek())) return false;
+    advance();
+    for (;;) {
+        auto _m1 = save();
+        if (![&]() -> bool {
+            if (at_end() || !is_digit(peek())) return false;
+            advance();
+            return true;
+        }()) { restore(_m1); break; }
+    }
+    out.ptr = _start; out.len = static_cast<int>(pos() - _start);
+    return true;
+}
+
+bool Parser::string_lit(peg::Span& out) {
+    const char* _start = pos();
+    if (!match("\"")) return false;
+    for (;;) {
+        auto _m0 = save();
+        if (![&]() -> bool {
+            {
+                auto _m1 = save();
+                if ([&]() -> bool {
+                    if (!match("\\")) return false;
+                    if (at_end()) return false;
+                    advance();
+                    return true;
+                }()) {} else {
+                restore(_m1);
+                {
+                    auto _m2 = save();
+                    bool _ok2 = [&]() -> bool {
+                        if (!match("\"")) return false;
+                        return true;
+                    }();
+                    restore(_m2);
+                    if (_ok2) return false;
+                }
+                if (at_end()) return false;
+                advance();
+                }
+            }
+            return true;
+        }()) { restore(_m0); break; }
+    }
+    if (!match("\"")) return false;
+    out.ptr = _start; out.len = static_cast<int>(pos() - _start);
+    return true;
+}
 
 bool Parser::parse_BBQ() {
     std::vector<EndianDirective*> dirs;
@@ -53,15 +201,19 @@ bool Parser::parse_Directive(std::vector<EndianDirective*> * dirs) {
     Endianness e;
     skip();
     if (!match("@endian")) return false;
-    skip();
-    if (peek_keyword("big")) {
+    {
+        auto _m0 = save();
+        if ([&]() -> bool {
+            skip();
+            if (!match("big")) return false;
+            e = Endianness::Big;
+            return true;
+        }()) {} else {
+        restore(_m0);
         skip();
-        if (!keyword("big")) return false;
-        e = Endianness::Big;
-    } else {
-        skip();
-        if (!keyword("little")) return false;
+        if (!match("little")) return false;
         e = Endianness::Little;
+        }
     }
     auto* d = new EndianDirective(e);
        d->loc = Loc();
@@ -70,10 +222,10 @@ bool Parser::parse_Directive(std::vector<EndianDirective*> * dirs) {
 }
 
 bool Parser::parse_Rule_(std::vector<Rule*> * rules) {
-    std::string name; TypeExpr* body;
+    peg::Span name_span; std::string name; TypeExpr* body;
     skip();
-    if (!ident(name)) return false;
-    SourceLoc loc = Loc();
+    if (!ident(name_span)) return false;
+    name = name_span.to_string(); SourceLoc loc = Loc();
     skip();
     if (!match("=")) return false;
     skip();
@@ -140,7 +292,7 @@ bool Parser::parse_TypePrimary(TypeExpr* * result) {
         auto _m0 = save();
         if ([&]() -> bool {
             skip();
-            if (!keyword("struct")) return false;
+            if (!match("struct")) return false;
             skip();
             if (!parse_StructBody(result)) return false;
             return true;
@@ -148,7 +300,7 @@ bool Parser::parse_TypePrimary(TypeExpr* * result) {
         restore(_m0);
         if ([&]() -> bool {
             skip();
-            if (!keyword("union")) return false;
+            if (!match("union")) return false;
             skip();
             if (!parse_UnionBody(result)) return false;
             return true;
@@ -156,7 +308,7 @@ bool Parser::parse_TypePrimary(TypeExpr* * result) {
         restore(_m0);
         if ([&]() -> bool {
             skip();
-            if (!keyword("array")) return false;
+            if (!match("array")) return false;
             skip();
             if (!parse_ArrayBody(result)) return false;
             return true;
@@ -164,7 +316,7 @@ bool Parser::parse_TypePrimary(TypeExpr* * result) {
         restore(_m0);
         if ([&]() -> bool {
             skip();
-            if (!keyword("optional")) return false;
+            if (!match("optional")) return false;
             skip();
             if (!parse_OptionalBody(result)) return false;
             return true;
@@ -172,7 +324,7 @@ bool Parser::parse_TypePrimary(TypeExpr* * result) {
         restore(_m0);
         if ([&]() -> bool {
             skip();
-            if (!keyword("switch")) return false;
+            if (!match("switch")) return false;
             skip();
             if (!parse_SwitchBody(result)) return false;
             return true;
@@ -180,7 +332,7 @@ bool Parser::parse_TypePrimary(TypeExpr* * result) {
         restore(_m0);
         if ([&]() -> bool {
             skip();
-            if (!keyword("compute")) return false;
+            if (!match("compute")) return false;
             skip();
             if (!parse_ComputeBody(result)) return false;
             return true;
@@ -188,7 +340,7 @@ bool Parser::parse_TypePrimary(TypeExpr* * result) {
         restore(_m0);
         if ([&]() -> bool {
             skip();
-            if (!keyword("extern")) return false;
+            if (!match("extern")) return false;
             skip();
             if (!parse_ExternBody(result)) return false;
             return true;
@@ -196,7 +348,7 @@ bool Parser::parse_TypePrimary(TypeExpr* * result) {
         restore(_m0);
         if ([&]() -> bool {
             skip();
-            if (!keyword("bitfield")) return false;
+            if (!match("bitfield")) return false;
             skip();
             if (!parse_BitfieldBody(result)) return false;
             return true;
@@ -305,14 +457,15 @@ bool Parser::parse_EndianDirectiveField(std::vector<Field*> * fields) {
 }
 
 bool Parser::parse_FieldDecl(std::vector<Field*> * fields) {
-    std::string name;
+    peg::Span name_span;
+       std::string name;
        TypeExpr* body;
        Expr* constr = nullptr;
        Interval* iv = nullptr;
        bool scopes_rest = false;
     skip();
-    if (!ident(name)) return false;
-    SourceLoc loc = Loc();
+    if (!ident(name_span)) return false;
+    name = name_span.to_string(); SourceLoc loc = Loc();
     skip();
     if (!match(":")) return false;
     skip();
@@ -339,7 +492,7 @@ bool Parser::parse_FieldDecl(std::vector<Field*> * fields) {
             skip();
             if (!match("@")) return false;
             skip();
-            if (!keyword("rest")) return false;
+            if (!match("rest")) return false;
             scopes_rest = true;
             return true;
         }()) restore(_m2);
@@ -392,13 +545,14 @@ bool Parser::parse_UnionBody(TypeExpr* * result) {
 }
 
 bool Parser::parse_VariantDecl(std::vector<Variant*> * variants) {
-    std::string name;
+    peg::Span name_span;
+       std::string name;
        TypeExpr* body;
        Expr* constr = nullptr;
        Interval* iv = nullptr;
     skip();
-    if (!ident(name)) return false;
-    SourceLoc loc = Loc();
+    if (!ident(name_span)) return false;
+    name = name_span.to_string(); SourceLoc loc = Loc();
     skip();
     if (!match(":")) return false;
     skip();
@@ -511,7 +665,7 @@ bool Parser::parse_SepSpec(Separator* * result) {
         auto _m0 = save();
         if ([&]() -> bool {
             skip();
-            if (!keyword("none")) return false;
+            if (!match("none")) return false;
             *result = new NoneSep(); (*result)->loc = Loc();
             return true;
         }()) {} else {
@@ -530,14 +684,14 @@ bool Parser::parse_TermSpec(Terminator* * result) {
         auto _m0 = save();
         if ([&]() -> bool {
             skip();
-            if (!keyword("eof")) return false;
+            if (!match("eof")) return false;
             *result = new EofTerm(); (*result)->loc = Loc();
             return true;
         }()) {} else {
         restore(_m0);
         if ([&]() -> bool {
             skip();
-            if (!keyword("count")) return false;
+            if (!match("count")) return false;
             skip();
             if (!match("(")) return false;
             skip();
@@ -550,7 +704,7 @@ bool Parser::parse_TermSpec(Terminator* * result) {
         restore(_m0);
         if ([&]() -> bool {
             skip();
-            if (!keyword("until")) return false;
+            if (!match("until")) return false;
             skip();
             if (!match("(")) return false;
             skip();
@@ -673,7 +827,7 @@ bool Parser::parse_DefaultCaseRule(SwitchDefault* * result) {
     TypeExpr* target;
        Interval* iv = nullptr;
     skip();
-    if (!keyword("default")) return false;
+    if (!match("default")) return false;
     SourceLoc loc = Loc();
     skip();
     if (!match(":")) return false;
@@ -696,7 +850,8 @@ bool Parser::parse_DefaultCaseRule(SwitchDefault* * result) {
 }
 
 bool Parser::parse_CaseValueRule(CaseValue* * result) {
-    std::vector<std::string> path;
+    peg::Span span;
+       std::vector<std::string> path;
        std::string s;
        int64_t ival;
     {
@@ -709,15 +864,17 @@ bool Parser::parse_CaseValueRule(CaseValue* * result) {
         restore(_m0);
         if ([&]() -> bool {
             skip();
-            if (!integer(ival)) return false;
-            *result = new IntValue(ival); (*result)->loc = Loc();
+            if (!integer(span)) return false;
+            ival = std::stoll(span.to_string(), nullptr, 0);
+                                *result = new IntValue(ival); (*result)->loc = Loc();
             return true;
         }()) {} else {
         restore(_m0);
         if ([&]() -> bool {
             skip();
-            if (!string_lit(s)) return false;
-            *result = new StrValue(std::move(s)); (*result)->loc = Loc();
+            if (!string_lit(span)) return false;
+            s = peg::unescape_string_lit(span);
+                                *result = new StrValue(std::move(s)); (*result)->loc = Loc();
             return true;
         }()) {} else {
         restore(_m0);
@@ -725,15 +882,16 @@ bool Parser::parse_CaseValueRule(CaseValue* * result) {
             auto _m1 = save();
             bool _ok1 = [&]() -> bool {
                 skip();
-                if (!keyword("default")) return false;
+                if (!match("default")) return false;
                 return true;
             }();
             restore(_m1);
             if (_ok1) return false;
         }
         skip();
-        if (!ident(s)) return false;
-        *result = new IdentValue(std::move(s)); (*result)->loc = Loc();
+        if (!ident(span)) return false;
+        s = span.to_string();
+                                *result = new IdentValue(std::move(s)); (*result)->loc = Loc();
         }
         }
         }
@@ -742,24 +900,24 @@ bool Parser::parse_CaseValueRule(CaseValue* * result) {
 }
 
 bool Parser::parse_DottedRef(CaseValue* * result) {
-    std::vector<std::string> path;
-       std::string s;
+    peg::Span span;
+       std::vector<std::string> path;
     skip();
-    if (!ident(s)) return false;
-    path.push_back(std::move(s));
+    if (!ident(span)) return false;
+    path.push_back(span.to_string());
     skip();
     if (!match(".")) return false;
     skip();
-    if (!ident(s)) return false;
-    path.push_back(std::move(s));
+    if (!ident(span)) return false;
+    path.push_back(span.to_string());
     for (;;) {
         auto _m0 = save();
         if (![&]() -> bool {
             skip();
             if (!match(".")) return false;
             skip();
-            if (!ident(s)) return false;
-            path.push_back(std::move(s));
+            if (!ident(span)) return false;
+            path.push_back(span.to_string());
             return true;
         }()) { restore(_m0); break; }
     }
@@ -787,17 +945,20 @@ bool Parser::parse_ComputeBody(TypeExpr* * result) {
 }
 
 bool Parser::parse_ExternBody(TypeExpr* * result) {
-    std::string func; std::string ctype;
+    peg::Span func_span; peg::Span ctype_span;
+       std::string func; std::string ctype;
        Expr* constr = nullptr; Interval* iv = nullptr;
        SourceLoc loc = Loc();
     skip();
     if (!match("(")) return false;
     skip();
-    if (!string_lit(func)) return false;
+    if (!string_lit(func_span)) return false;
+    func = peg::unescape_string_lit(func_span);
     skip();
     if (!match(",")) return false;
     skip();
-    if (!string_lit(ctype)) return false;
+    if (!string_lit(ctype_span)) return false;
+    ctype = peg::unescape_string_lit(ctype_span);
     skip();
     if (!match(")")) return false;
     {
@@ -869,15 +1030,17 @@ bool Parser::parse_BitfieldBody(TypeExpr* * result) {
 }
 
 bool Parser::parse_BitfieldEntryRule(std::vector<BitfieldEntry*> * entries) {
-    std::string name; int64_t width;
+    peg::Span name_span; peg::Span width_span;
+       std::string name; int64_t width;
        Expr* constr = nullptr;
     skip();
-    if (!ident(name)) return false;
-    SourceLoc loc = Loc();
+    if (!ident(name_span)) return false;
+    name = name_span.to_string(); SourceLoc loc = Loc();
     skip();
     if (!match(":")) return false;
     skip();
-    if (!integer(width)) return false;
+    if (!integer(width_span)) return false;
+    width = std::stoll(width_span.to_string(), nullptr, 0);
     {
         auto _m0 = save();
         if (![&]() -> bool {
@@ -924,21 +1087,23 @@ bool Parser::parse_PrimitiveType(TypeExpr* * result) {
 }
 
 bool Parser::parse_PrimKeyword(PrimitiveKind* * result) {
-    std::string s;
+    peg::Span span; std::string s;
     skip();
-    if (!ident(s)) return false;
-    *result = DecodePrimitive(s, Loc());
+    if (!ident(span)) return false;
+    s = span.to_string();
+         *result = DecodePrimitive(s, Loc());
          if (!*result) return false;
     return true;
 }
 
 bool Parser::parse_RuleRefType(TypeExpr* * result) {
-    std::string name;
+    peg::Span name_span;
+       std::string name;
        Expr* constr = nullptr;
        Interval* iv = nullptr;
     skip();
-    if (!ident(name)) return false;
-    SourceLoc loc = Loc();
+    if (!ident(name_span)) return false;
+    name = name_span.to_string(); SourceLoc loc = Loc();
     {
         auto _m0 = save();
         if (![&]() -> bool {
@@ -964,7 +1129,7 @@ bool Parser::parse_RuleRefType(TypeExpr* * result) {
 
 bool Parser::parse_ConstraintBlock(Expr* * result) {
     skip();
-    if (!keyword("where")) return false;
+    if (!match("where")) return false;
     skip();
     if (!parse_Expr_(result)) return false;
     return true;
@@ -1326,23 +1491,35 @@ bool Parser::parse_Unary(Expr* * result) {
     {
         auto _m0 = save();
         if ([&]() -> bool {
-            skip();
-            if (peek_at("-")) {
+            {
+                auto _m1 = save();
+                if ([&]() -> bool {
+                    skip();
+                    if (!match("-")) return false;
+                    op = Unaryop::Neg;
+                    return true;
+                }()) {} else {
+                restore(_m1);
+                if ([&]() -> bool {
+                    skip();
+                    if (!match("~")) return false;
+                    op = Unaryop::BitNot;
+                    return true;
+                }()) {} else {
+                restore(_m1);
+                if ([&]() -> bool {
+                    skip();
+                    if (!match("!")) return false;
+                    op = Unaryop::Not;
+                    return true;
+                }()) {} else {
+                restore(_m1);
                 skip();
-                if (!match("-")) return false;
-                op = Unaryop::Neg;
-            } else             if (peek_at("~")) {
-                skip();
-                if (!match("~")) return false;
-                op = Unaryop::BitNot;
-            } else             if (peek_at("!")) {
-                skip();
-                if (!match("!")) return false;
-                op = Unaryop::Not;
-            } else {
-                skip();
-                if (!keyword("abs")) return false;
+                if (!match("abs")) return false;
                 op = Unaryop::Abs;
+                }
+                }
+                }
             }
             skip();
             if (!parse_Postfix(&operand)) return false;
@@ -1359,7 +1536,7 @@ bool Parser::parse_Unary(Expr* * result) {
 }
 
 bool Parser::parse_Postfix(Expr* * result) {
-    Expr* idx; std::string fname;
+    peg::Span fname_span; Expr* idx; std::string fname;
     skip();
     if (!parse_PrimaryExpr(result)) return false;
     for (;;) {
@@ -1383,8 +1560,9 @@ bool Parser::parse_Postfix(Expr* * result) {
                 skip();
                 if (!match(".")) return false;
                 skip();
-                if (!ident(fname)) return false;
-                auto* ref = dynamic_cast<Ref*>(*result);
+                if (!ident(fname_span)) return false;
+                fname = fname_span.to_string();
+           auto* ref = dynamic_cast<Ref*>(*result);
            if (ref) {
                auto* fa = new FieldAcc(ref->path, std::move(fname));
                fa->loc = ref->loc;
@@ -1398,7 +1576,8 @@ bool Parser::parse_Postfix(Expr* * result) {
 }
 
 bool Parser::parse_PrimaryExpr(Expr* * result) {
-    std::string name;
+    peg::Span span;
+       std::string name;
        std::vector<Expr*> args;
        Expr* arg;
        int64_t ival;
@@ -1414,23 +1593,25 @@ bool Parser::parse_PrimaryExpr(Expr* * result) {
         restore(_m0);
         if ([&]() -> bool {
             skip();
-            if (!integer(ival)) return false;
-            *result = new IntLit(ival);
+            if (!integer(span)) return false;
+            ival = std::stoll(span.to_string(), nullptr, 0);
+         *result = new IntLit(ival);
          (*result)->loc = Loc();
             return true;
         }()) {} else {
         restore(_m0);
         if ([&]() -> bool {
             skip();
-            if (!string_lit(sval)) return false;
-            *result = new StrLit(std::move(sval));
+            if (!string_lit(span)) return false;
+            sval = peg::unescape_string_lit(span);
+         *result = new StrLit(std::move(sval));
          (*result)->loc = Loc();
             return true;
         }()) {} else {
         restore(_m0);
         if ([&]() -> bool {
             skip();
-            if (!keyword("true")) return false;
+            if (!match("true")) return false;
             *result = new BoolLit(true);
          (*result)->loc = Loc();
             return true;
@@ -1438,7 +1619,7 @@ bool Parser::parse_PrimaryExpr(Expr* * result) {
         restore(_m0);
         if ([&]() -> bool {
             skip();
-            if (!keyword("false")) return false;
+            if (!match("false")) return false;
             *result = new BoolLit(false);
          (*result)->loc = Loc();
             return true;
@@ -1446,7 +1627,7 @@ bool Parser::parse_PrimaryExpr(Expr* * result) {
         restore(_m0);
         if ([&]() -> bool {
             skip();
-            if (!keyword("little")) return false;
+            if (!match("little")) return false;
             *result = new EndianLit(Endianness::Little);
          (*result)->loc = Loc();
             return true;
@@ -1454,7 +1635,7 @@ bool Parser::parse_PrimaryExpr(Expr* * result) {
         restore(_m0);
         if ([&]() -> bool {
             skip();
-            if (!keyword("big")) return false;
+            if (!match("big")) return false;
             *result = new EndianLit(Endianness::Big);
          (*result)->loc = Loc();
             return true;
@@ -1462,7 +1643,7 @@ bool Parser::parse_PrimaryExpr(Expr* * result) {
         restore(_m0);
         if ([&]() -> bool {
             skip();
-            if (!keyword("EOI")) return false;
+            if (!match("EOI")) return false;
             *result = new EOI();
          (*result)->loc = Loc();
             return true;
@@ -1476,8 +1657,9 @@ bool Parser::parse_PrimaryExpr(Expr* * result) {
         restore(_m0);
         if ([&]() -> bool {
             skip();
-            if (!ident(name)) return false;
-            auto* s = new Simple(std::move(name), std::nullopt, std::nullopt, 0);
+            if (!ident(span)) return false;
+            name = span.to_string();
+         auto* s = new Simple(std::move(name), std::nullopt, std::nullopt, 0);
          s->loc = Loc();
          *result = new Ref(s);
          (*result)->loc = Loc();
@@ -1505,21 +1687,23 @@ bool Parser::parse_PrimaryExpr(Expr* * result) {
 }
 
 bool Parser::parse_FloatLitExpr(Expr* * result) {
-    double fval;
+    peg::Span span; double fval;
     skip();
-    if (!floating(fval)) return false;
-    *result = new FloatLit(static_cast<float>(fval));
+    if (!floating(span)) return false;
+    fval = std::stod(span.to_string());
+         *result = new FloatLit(static_cast<float>(fval));
          (*result)->loc = Loc();
     return true;
 }
 
 bool Parser::parse_CallExpr(Expr* * result) {
-    std::string name;
+    peg::Span name_span;
+       std::string name;
        std::vector<Expr*> args;
        Expr* arg;
     skip();
-    if (!ident(name)) return false;
-    SourceLoc loc = Loc();
+    if (!ident(name_span)) return false;
+    name = name_span.to_string(); SourceLoc loc = Loc();
     skip();
     if (!match("(")) return false;
     {

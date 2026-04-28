@@ -1,5 +1,200 @@
 -->parser_include
 
+-->runtime
+
+/* ── Init ────────────────────────────────────────────────── */
+
+static void peg_init(peg_state* p, const char* input, int length) {
+    memset(p, 0, sizeof(*p));
+    p->input = input;
+    p->pos = input;
+    p->end = input + length;
+    p->line = 1;
+    p->col = 1;
+}
+
+/* ── Position ────────────────────────────────────────────── */
+
+static int peg_line(const peg_state* p) { return p->line; }
+static int peg_col(const peg_state* p) { return p->col; }
+static bool peg_at_end(const peg_state* p) { return p->pos >= p->end; }
+static const char* peg_pos(const peg_state* p) { return p->pos; }
+static int peg_remaining(const peg_state* p) { return (int)(p->end - p->pos); }
+static char peg_peek_char(const peg_state* p) { return p->pos < p->end ? *p->pos : '\0'; }
+
+/* ── Advance ─────────────────────────────────────────────── */
+
+static void peg_advance(peg_state* p) {
+    if (p->pos >= p->end) return;
+    if (*p->pos == '\n') { p->line++; p->col = 1; }
+    else { p->col++; }
+    p->pos++;
+    if (p->pos > p->furthest.pos) {
+        p->furthest.pos = p->pos;
+        p->furthest.line = p->line;
+        p->furthest.col = p->col;
+    }
+}
+
+/* ── Save / Restore ──────────────────────────────────────── */
+
+static peg_mark peg_save(const peg_state* p) {
+    peg_mark m = { p->pos, p->line, p->col };
+    return m;
+}
+
+static void peg_restore(peg_state* p, peg_mark m) {
+    p->pos = m.pos;
+    p->line = m.line;
+    p->col = m.col;
+}
+
+/* ── Character matching ──────────────────────────────────── */
+
+static bool peg_match_char(peg_state* p, char c) {
+    if (p->pos < p->end && *p->pos == c) {
+        peg_advance(p);
+        return true;
+    }
+    return false;
+}
+
+static bool peg_match(peg_state* p, const char* str) {
+    int len = (int)strlen(str);
+    if (p->pos + len > p->end) return false;
+    if (memcmp(p->pos, str, (size_t)len) != 0) return false;
+    for (int i = 0; i < len; i++) peg_advance(p);
+    return true;
+}
+
+static bool peg_match_charset(peg_state* p, bool (*fn)(char)) {
+    if (p->pos < p->end && fn(*p->pos)) {
+        peg_advance(p);
+        return true;
+    }
+    return false;
+}
+
+/* ── Lookahead (no consume) ──────────────────────────────── */
+
+static bool peg_peek_at(const peg_state* p, const char* str) {
+    int len = (int)strlen(str);
+    if (p->pos + len > p->end) return false;
+    return memcmp(p->pos, str, (size_t)len) == 0;
+}
+
+static bool peg_peek_at_char(const peg_state* p, char c) {
+    return p->pos < p->end && *p->pos == c;
+}
+
+static bool peg_peek_charset(const peg_state* p, bool (*fn)(char)) {
+    return p->pos < p->end && fn(*p->pos);
+}
+
+/* ── Span (consume while charset matches) ────────────────── */
+
+static void peg_span_chars(peg_state* p, bool (*fn)(char)) {
+    while (p->pos < p->end && fn(*p->pos))
+        peg_advance(p);
+}
+
+/* Scan forward to delimiter, capturing raw content as span. */
+static bool peg_scan_to(peg_state* p, const char* delim, peg_span* out) {
+    int dlen = (int)strlen(delim);
+    const char* start = p->pos;
+    while (p->pos + dlen <= p->end) {
+        if (memcmp(p->pos, delim, (size_t)dlen) == 0) {
+            out->ptr = start;
+            out->len = (int)(p->pos - start);
+            for (int i = 0; i < dlen; i++) peg_advance(p);
+            return true;
+        }
+        peg_advance(p);
+    }
+    return false;
+}
+
+/* ── Whitespace + comment skipping ───────────────────────── */
+
+static void peg_set_whitespace(peg_state* p, bool (*fn)(char)) {
+    p->ws_fn = fn;
+}
+
+static void peg_add_comment(peg_state* p, const char* open,
+                            const char* close, bool nested) {
+    if (p->comment_count < PEG_MAX_COMMENTS) {
+        p->comments[p->comment_count].open = open;
+        p->comments[p->comment_count].close = close;
+        p->comments[p->comment_count].nested = nested;
+        p->comment_count++;
+    }
+}
+
+static bool peg_skip_comment(peg_state* p, const peg_comment_spec* spec) {
+    int open_len = (int)strlen(spec->open);
+    if (p->pos + open_len > p->end) return false;
+    if (memcmp(p->pos, spec->open, (size_t)open_len) != 0) return false;
+    for (int i = 0; i < open_len; i++) peg_advance(p);
+    int close_len = (int)strlen(spec->close);
+    int depth = 1;
+    while (p->pos < p->end && depth > 0) {
+        if (spec->nested && p->pos + open_len <= p->end &&
+            memcmp(p->pos, spec->open, (size_t)open_len) == 0) {
+            for (int i = 0; i < open_len; i++) peg_advance(p);
+            depth++;
+        } else if (p->pos + close_len <= p->end &&
+                   memcmp(p->pos, spec->close, (size_t)close_len) == 0) {
+            for (int i = 0; i < close_len; i++) peg_advance(p);
+            depth--;
+        } else {
+            peg_advance(p);
+        }
+    }
+    return true;
+}
+
+static void peg_skip(peg_state* p) {
+    for (;;) {
+        bool skipped = false;
+        while (p->pos < p->end && p->ws_fn && p->ws_fn(*p->pos)) {
+            peg_advance(p);
+            skipped = true;
+        }
+        bool found_comment = false;
+        for (int i = 0; i < p->comment_count; i++) {
+            if (peg_skip_comment(p, &p->comments[i])) {
+                found_comment = true;
+                break;
+            }
+        }
+        if (!found_comment && !skipped) break;
+    }
+}
+
+/* ── Error reporting ─────────────────────────────────────── */
+
+static void peg_expected(peg_state* p, const char* what) {
+    if (p->error_count < PEG_MAX_ERRORS) {
+        peg_error* e = &p->errors[p->error_count++];
+        e->line = p->line;
+        e->col = p->col;
+        snprintf(e->message, PEG_ERROR_LEN, "expected %s", what);
+    }
+}
+
+static void peg_error_msg(peg_state* p, const char* msg) {
+    if (p->error_count < PEG_MAX_ERRORS) {
+        peg_error* e = &p->errors[p->error_count++];
+        e->line = p->line;
+        e->col = p->col;
+        snprintf(e->message, PEG_ERROR_LEN, "%s", msg);
+    }
+}
+
+static bool peg_has_errors(const peg_state* p) {
+    return p->error_count > 0;
+}
+
 -->skip_setup
 
 -->init_impl

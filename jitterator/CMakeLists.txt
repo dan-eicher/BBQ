@@ -46,6 +46,22 @@ add_custom_target(calc_burg_check
     VERBATIM
 )
 
+# --- Auto-regenerate Parser.h/.cpp from calc.peg ---
+add_custom_command(
+    OUTPUT ${CMAKE_CURRENT_SOURCE_DIR}/example/frontend/Parser.h
+           ${CMAKE_CURRENT_SOURCE_DIR}/example/frontend/Parser.cpp
+    COMMAND pegc ${CMAKE_CURRENT_SOURCE_DIR}/example/grammar/calc.peg
+                 -frames ${CMAKE_CURRENT_SOURCE_DIR}/example/grammar/frames/
+                 -o ${CMAKE_CURRENT_SOURCE_DIR}/example/frontend/
+                 -prefix ""
+    DEPENDS pegc
+            ${CMAKE_CURRENT_SOURCE_DIR}/example/grammar/calc.peg
+            ${CMAKE_CURRENT_SOURCE_DIR}/example/grammar/frames/Parser.frame
+            ${CMAKE_CURRENT_SOURCE_DIR}/example/grammar/frames/ParserImpl.frame
+    COMMENT "Generating calc Parser.h/.cpp from calc.peg"
+    VERBATIM
+)
+
 add_executable(calc_jit
     example/calc_jit.cpp
     example/frontend/Parser.cpp

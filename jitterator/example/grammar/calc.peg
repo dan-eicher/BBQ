@@ -2,7 +2,14 @@ COMPILER Calc
 
 (. #include <string>
    #include <cstdint>
+   #include "PegRuntime.h"
 .)
+
+CHARACTERS
+  digit = '0'..'9' .
+
+TOKENS
+  integer = digit { digit } .
 
 IGNORE '\r' + '\n' + '\t' + ' '
 
@@ -38,9 +45,11 @@ UnaryExpr <. calc::Expr* *result .>
 .
 
 Atom <. calc::Expr* *result .>
-    (. int64_t n; .)
-    = "$" integer<n>  (. *result = new calc::SlotRef(n); .)
-    | integer<n>      (. *result = new calc::IntLit(n); .)
+    (. peg::Span n_span; int64_t n; .)
+    = "$" integer<n_span>  (. n = std::stoll(n_span.to_string());
+                             *result = new calc::SlotRef(n); .)
+    | integer<n_span>      (. n = std::stoll(n_span.to_string());
+                             *result = new calc::IntLit(n); .)
     | "(" Expr<result> ")"
 .
 

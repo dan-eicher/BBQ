@@ -18,9 +18,13 @@ bool ParserEmitter::emit_header_to_frame(Grammar* grammar,
     bbqgen::FrameProcessor fp(frame_path, out);
     if (!fp.ok()) return false;
 
-    // Collect production names
+    // Collect production and token names
     for (auto* p : grammar->productions)
         production_names_.insert(p->name);
+    for (auto* t : grammar->tokens)
+        token_names_.insert(t->name);
+    for (auto* c : grammar->charsets)
+        charset_names_.insert(c->name);
 
     fp.CopyFramePart("headers");
     emit_headers(grammar, out);
@@ -36,6 +40,7 @@ bool ParserEmitter::emit_header_to_frame(Grammar* grammar,
 
     fp.CopyFramePart("parse_methods");
     emit_parse_method_decls(grammar, out);
+    emit_token_method_decls(grammar, out);
 
     fp.CopyFramePart("namespace_close");
     if (!ns_.empty()) out << "} // namespace " << ns_ << "\n";
@@ -52,6 +57,10 @@ bool ParserEmitter::emit_impl_to_frame(Grammar* grammar,
 
     for (auto* p : grammar->productions)
         production_names_.insert(p->name);
+    for (auto* t : grammar->tokens)
+        token_names_.insert(t->name);
+    for (auto* c : grammar->charsets)
+        charset_names_.insert(c->name);
 
     fp.CopyFramePart("parser_include");
     out << "#include \"" << header_include << "\"\n\n";
@@ -81,9 +90,11 @@ bool ParserEmitter::emit_impl_to_frame(Grammar* grammar,
     }
 
     fp.CopyFramePart("skip_setup");
+    emit_charset_defs(grammar, out);
     emit_skip_setup(grammar, out);
 
     fp.CopyFramePart("parse_implementations");
+    emit_token_method_impls(grammar, out);
     emit_parse_method_impls(grammar, out);
 
     fp.CopyFramePart("namespace_close");
@@ -100,10 +111,15 @@ std::string ParserEmitter::emit_header(Grammar* grammar) {
     std::ostringstream ss;
     for (auto* p : grammar->productions)
         production_names_.insert(p->name);
+    for (auto* t : grammar->tokens)
+        token_names_.insert(t->name);
+    for (auto* c : grammar->charsets)
+        charset_names_.insert(c->name);
     emit_headers(grammar, ss);
     emit_public_decls(grammar, ss);
     emit_private_decls(grammar, ss);
     emit_parse_method_decls(grammar, ss);
+    emit_token_method_decls(grammar, ss);
     return ss.str();
 }
 
@@ -111,7 +127,13 @@ std::string ParserEmitter::emit_impl(Grammar* grammar) {
     std::ostringstream ss;
     for (auto* p : grammar->productions)
         production_names_.insert(p->name);
+    for (auto* t : grammar->tokens)
+        token_names_.insert(t->name);
+    for (auto* c : grammar->charsets)
+        charset_names_.insert(c->name);
+    emit_charset_defs(grammar, ss);
     emit_skip_setup(grammar, ss);
+    emit_token_method_impls(grammar, ss);
     emit_parse_method_impls(grammar, ss);
     return ss.str();
 }
@@ -154,6 +176,51 @@ void ParserEmitter::emit_production_decl(Production* prod, std::ostream& out) {
 // ═══════════════════════════════════════════════════════════════
 // Implementation emission
 // ═══════════════════════════════════════════════════════════════
+
+void ParserEmitter::emit_charset_defs(Grammar* grammar, std::ostream& out) {
+    for (auto* cd : grammar->charsets) {
+        out << "static bool is_" << cd->name << "(char c) {\n";
+        out << "    return ";
+        emit_charset_predicate(cd->body, out);
+        out << ";\n";
+        out << "}\n\n";
+    }
+}
+
+// ── Token emission ────────────────────────────────────────────
+// Tokens use the same peg_expr AST as productions; the only difference
+// is emission mode (no auto-skip between atoms in lex mode).
+
+void ParserEmitter::emit_token_method_decls(Grammar* grammar, std::ostream& out) {
+    for (auto* t : grammar->tokens) {
+        emit_token_decl(t, out);
+    }
+}
+
+void ParserEmitter::emit_token_decl(TokenDef* tok, std::ostream& out) {
+    out << "    bool " << tok->name << "(peg::Span& out);\n";
+}
+
+void ParserEmitter::emit_token_method_impls(Grammar* grammar, std::ostream& out) {
+    for (auto* t : grammar->tokens) {
+        emit_token_impl(t, out);
+    }
+}
+
+void ParserEmitter::emit_token_impl(TokenDef* tok, std::ostream& out) {
+    var_counter_ = 0;
+
+    out << "bool Parser::" << tok->name << "(peg::Span& out) {\n";
+    out << "    const char* _start = pos();\n";
+
+    in_lex_mode_ = true;
+    emit_expr(tok->body, out, 1);
+    in_lex_mode_ = false;
+
+    out << "    out.ptr = _start; out.len = static_cast<int>(pos() - _start);\n";
+    out << "    return true;\n";
+    out << "}\n\n";
+}
 
 void ParserEmitter::emit_skip_setup(Grammar* grammar, std::ostream& out) {
     out << "void Parser::setup_skip() {\n";
@@ -250,6 +317,14 @@ void ParserEmitter::emit_expr(PegExpr* expr, std::ostream& out, int indent) {
     } else if (dynamic_cast<AnyExpr*>(expr)) {
         out << indent_str(indent) << "if (at_end()) return false;\n";
         out << indent_str(indent) << "advance();\n";
+    } else if (auto* cr = dynamic_cast<CharRange*>(expr)) {
+        out << indent_str(indent) << "if (at_end() || peek() < " << cr->from
+            << " || peek() > " << cr->to << ") return false;\n";
+        out << indent_str(indent) << "advance();\n";
+    } else if (auto* csr = dynamic_cast<CharsetRef*>(expr)) {
+        out << indent_str(indent) << "if (at_end() || !is_" << csr->name
+            << "(peek())) return false;\n";
+        out << indent_str(indent) << "advance();\n";
     }
 }
 
@@ -299,7 +374,15 @@ void ParserEmitter::emit_choice(Choice* ch, std::ostream& out, int indent) {
     // Check for head-fail optimization: all alternatives start with a literal
     bool all_literal_starts = true;
     for (auto* alt : ch->alternatives) {
-        if (!first_literal(alt)) {
+        auto* lit = first_literal(alt);
+        if (!lit) {
+            all_literal_starts = false;
+            break;
+        }
+        // Keyword-shaped literals require ident-continue boundary checks
+        // that head-fail's peek_at can't express; fall back to general
+        // choice in that case.
+        if (!in_lex_mode_ && is_keyword_literal(lit)) {
             all_literal_starts = false;
             break;
         }
@@ -309,18 +392,14 @@ void ParserEmitter::emit_choice(Choice* ch, std::ostream& out, int indent) {
         // Head-fail optimization: peek tests determine which alternative
         // to commit to. No save/restore needed.
         // Skip whitespace before peeking so we test the actual next token.
-        out << ind << "skip();\n";
+        if (!in_lex_mode_) out << ind << "skip();\n";
         for (int i = 0; i < n; i++) {
             auto* alt = ch->alternatives[i];
             auto* lit = first_literal(alt);
             bool is_last = (i == n - 1);
 
             if (!is_last) {
-                if (is_keyword_literal(lit)) {
-                    out << ind << "if (peek_keyword(\"" << escape_string(lit->value) << "\")) {\n";
-                } else {
-                    out << ind << "if (peek_at(\"" << escape_string(lit->value) << "\")) {\n";
-                }
+                out << ind << "if (peek_at(\"" << escape_string(lit->value) << "\")) {\n";
                 emit_expr(alt, out, indent + 1);
                 out << ind << "} else ";
             } else {
@@ -375,6 +454,17 @@ void ParserEmitter::emit_choice(Choice* ch, std::ostream& out, int indent) {
 //
 void ParserEmitter::emit_star(Star* star, std::ostream& out, int indent) {
     std::string ind = indent_str(indent);
+
+    // Charset predicate tests don't consume on fail, so the save/restore
+    // around them is dead work — collapse to a tight while loop.
+    if (auto* csr = dynamic_cast<CharsetRef*>(star->body)) {
+        if (charset_names_.count(csr->name)) {
+            out << ind << "while (!at_end() && is_" << csr->name
+                << "(peek())) advance();\n";
+            return;
+        }
+    }
+
     int vid = next_var_id();
     out << ind << "for (;;) {\n";
     out << ind << "    auto _m" << vid << " = save();\n";
@@ -463,15 +553,10 @@ void ParserEmitter::emit_not(Not* n, std::ostream& out, int indent) {
 // ── Literal (DDCG §2): "foo" ───────────────────────────────
 // OP_STRING "foo"  /  OP_TESTSTRING "foo" Lfalse
 // → skip(); if(!match("foo")) return false;
-// Identifier-like literals use keyword() to prevent prefix matching.
 void ParserEmitter::emit_literal(Literal* lit, std::ostream& out, int indent) {
     std::string ind = indent_str(indent);
-    out << ind << "skip();\n";
-    if (is_keyword_literal(lit)) {
-        out << ind << "if (!keyword(\"" << escape_string(lit->value) << "\")) return false;\n";
-    } else {
-        out << ind << "if (!match(\"" << escape_string(lit->value) << "\")) return false;\n";
-    }
+    if (!in_lex_mode_) out << ind << "skip();\n";
+    out << ind << "if (!match(\"" << escape_string(lit->value) << "\")) return false;\n";
 }
 
 // ── RuleCall (DDCG §16): parse_Foo(args) ────────────────────
@@ -484,9 +569,20 @@ void ParserEmitter::emit_literal(Literal* lit, std::ostream& out, int indent) {
 // as a C++ compile error instead.
 void ParserEmitter::emit_rule_call(RuleCall* rc, std::ostream& out, int indent) {
     std::string ind = indent_str(indent);
+
+    // Charset reference: predicate-test-and-consume-one-char. Charsets
+    // are single-char (lex-level) predicates — never auto-skip, even in
+    // production mode. Required so `!ident_continue` and similar
+    // boundary checks operate at the current position.
+    if (charset_names_.count(rc->name)) {
+        out << ind << "if (at_end() || !is_" << rc->name << "(peek())) return false;\n";
+        out << ind << "advance();\n";
+        return;
+    }
+
     const char* fn_prefix = production_names_.count(rc->name) ? "parse_" : "";
 
-    out << ind << "skip();\n";
+    if (!in_lex_mode_) out << ind << "skip();\n";
     out << ind << "if (!" << fn_prefix << rc->name << "(" << rc->args << ")) return false;\n";
 }
 

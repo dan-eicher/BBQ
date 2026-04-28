@@ -12,7 +12,17 @@ COMPILER Asdl
 
 (. #include <string>
    #include <vector>
+   #include "PegRuntime.h"
 .)
+
+CHARACTERS
+  letter         = 'a'..'z' + 'A'..'Z' + '_' .
+  digit          = '0'..'9' .
+  ident_continue = letter + digit .
+
+TOKENS
+  ident      = letter { ident_continue } .
+  string_lit = '"' { '\\' ANY | !'"' ANY } '"' .
 
 COMMENTS FROM "//" TO "\n"
 COMMENTS FROM "/*" TO "*/"
@@ -22,11 +32,12 @@ IGNORE '\r' + '\n' + '\t' + ' '
 PRODUCTIONS
 
 Asdl
-    (. std::string name;
+    (. peg::Span name_span;
+       std::string name;
        std::vector<asdl_ast::TypeAlias*> aliases;
        std::vector<asdl_ast::Definition*> definitions; .)
     = "module"
-      ident<name>
+      ident<name_span>      (. name = name_span.to_string(); .)
       "{"
       { TypeAliasDecl<aliases>
       | DefinitionDecl<definitions>
@@ -37,11 +48,11 @@ Asdl
 .
 
 TypeAliasDecl <. std::vector<asdl_ast::TypeAlias*> &aliases .>
-    (. std::string name; std::string ctype; .)
+    (. peg::Span ctype_span; std::string name; std::string ctype; .)
     = "type"
       TypId<name>
       "="
-      string_lit<ctype>
+      string_lit<ctype_span>  (. ctype = peg::unescape_string_lit(ctype_span); .)
     (. aliases.push_back(new asdl_ast::TypeAlias(std::move(name), std::move(ctype))); .)
 .
 
@@ -70,7 +81,7 @@ SumBody <. asdl_ast::TypeBody* &result .>
        asdl_ast::Constructor* ctor; .)
     = ConstructorDecl<ctor>  (. types.push_back(ctor); .)
       { "|" ConstructorDecl<ctor>  (. types.push_back(ctor); .) }
-      [ "attributes" FieldList<attributes> ]
+      [ "attributes" !ident_continue FieldList<attributes> ]
     (. result = new asdl_ast::Sum(std::move(types), std::move(attributes)); .)
 .
 
@@ -102,17 +113,23 @@ FieldDecl <. asdl_ast::Field* &result .>
 // --- Identifier helpers ---
 
 TypId <. std::string &name .>
+    (. peg::Span span; .)
     = (. if (!std::islower(peek())) return false; .)
-      ident<name>
+      ident<span>
+      (. name = span.to_string(); .)
 .
 
 ConId <. std::string &name .>
+    (. peg::Span span; .)
     = (. if (!std::isupper(peek())) return false; .)
-      ident<name>
+      ident<span>
+      (. name = span.to_string(); .)
 .
 
 AnyId <. std::string &name .>
-    = ident<name>
+    (. peg::Span span; .)
+    = ident<span>
+      (. name = span.to_string(); .)
 .
 
 END Asdl.

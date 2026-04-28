@@ -14,7 +14,18 @@ COMPILER Peg
 #include <vector>
 #include <optional>
 #include <cstdlib>
+#include "PegRuntime.h"
 .)
+
+CHARACTERS
+  letter         = 'a'..'z' + 'A'..'Z' + '_' .
+  digit          = '0'..'9' .
+  ident_continue = letter + digit .
+
+TOKENS
+  ident      = letter { ident_continue } .
+  char_lit   = '\'' ( '\\' ANY | !'\'' ANY ) '\'' .
+  string_lit = '"' { '\\' ANY | !'"' ANY } '"' .
 
 COMMENTS FROM "//" TO "\n"
 COMMENTS FROM "/*" TO "*/"
@@ -28,7 +39,9 @@ PRODUCTIONS
 // ═══════════════════════════════════════════════════════════════
 
 Peg
-    (. std::string name;
+    (. peg::Span name_span;
+       peg::Span endname_span;
+       std::string name;
        std::string endname;
        std::vector<Header*> headers;
        std::vector<CharsetDef*> charsets;
@@ -38,7 +51,7 @@ Peg
        CharsetExpr* ignore_expr = nullptr;
        std::vector<Production*> productions; .)
     = "COMPILER"
-      ident<name>
+      ident<name_span>      (. name = name_span.to_string(); .)
       { SemAction_<headers> }
       [ "CHARACTERS"
         { CharsetDecl<charsets> }
@@ -54,7 +67,7 @@ Peg
       "PRODUCTIONS"
       { ProductionDecl<productions> }
       "END"
-      ident<endname>
+      ident<endname_span>   (. endname = endname_span.to_string(); .)
       "."
     (. ast = new Grammar(std::move(name), std::move(headers),
            std::move(charsets), std::move(tokens), std::move(comments),
@@ -79,8 +92,8 @@ SemAction_ <. std::vector<Header*> &headers .>
 // ═══════════════════════════════════════════════════════════════
 
 CharsetDecl <. std::vector<CharsetDef*> &defs .>
-    (. std::string csname; CharsetExpr* body; .)
-    = ident<csname>       (. SourceLoc loc = Loc(); .)
+    (. peg::Span csname_span; std::string csname; CharsetExpr* body; .)
+    = ident<csname_span>  (. csname = csname_span.to_string(); SourceLoc loc = Loc(); .)
       "="
       CharsetExpr_<body>
       "."
@@ -108,82 +121,37 @@ CharsetDiff <. CharsetExpr* &result .>
 .
 
 CharsetPrimary <. CharsetExpr* &result .>
-    (. char ch1, ch2; std::string csname; .)
-    = char_lit<ch1>  (. result = new Single(static_cast<int>(ch1)); result->loc = Loc(); .)
+    (. peg::Span ch_span; peg::Span csname_span;
+       char ch1 = 0, ch2 = 0; std::string csname; .)
+    = char_lit<ch_span>  (. ch1 = peg::unescape_char_lit(ch_span);
+                           result = new Single(static_cast<int>(ch1));
+                           result->loc = Loc(); .)
       [ ".."
-        char_lit<ch2>  (. result = new Range(static_cast<int>(ch1), static_cast<int>(ch2)); result->loc = Loc(); .)
+        char_lit<ch_span>  (. ch2 = peg::unescape_char_lit(ch_span);
+                             result = new Range(static_cast<int>(ch1), static_cast<int>(ch2));
+                             result->loc = Loc(); .)
       ]
     | "ANY"   (. result = new Any(); result->loc = Loc(); .)
-    | ident<csname>  (. result = new NameRef(std::move(csname)); result->loc = Loc(); .)
+    | ident<csname_span>  (. csname = csname_span.to_string();
+                            result = new NameRef(std::move(csname));
+                            result->loc = Loc(); .)
 .
 
 // ═══════════════════════════════════════════════════════════════
 // TOKENS Section
 // ═══════════════════════════════════════════════════════════════
 
+// Token bodies use the same PegExpr AST as productions; tokens differ
+// only in emission mode (no auto-skip between atoms).
 TokenDecl <. std::vector<TokenDef*> &defs .>
-    (. std::string tname; TokenExpr* pat; .)
-    = ident<tname>        (. SourceLoc loc = Loc(); .)
+    (. peg::Span tname_span; std::string tname; PegExpr* body; .)
+    = ident<tname_span>   (. tname = tname_span.to_string(); SourceLoc loc = Loc(); .)
       "="
-      TokenExpr_<pat>
+      PegBody<body>
       "."
-    (. auto* d = new TokenDef(std::move(tname), pat);
+    (. auto* d = new TokenDef(std::move(tname), body);
        d->loc = loc;
        defs.push_back(d); .)
-.
-
-TokenExpr_ <. TokenExpr* &result .>
-    (. TokenExpr* alt;
-       std::vector<TokenExpr*> alts; .)
-    = TokenSeq<result>    (. alts.push_back(result); .)
-      { "|"
-        TokenSeq<alt>     (. alts.push_back(alt); .)
-      }
-    (. if (alts.size() > 1) {
-           auto loc = result->loc;
-           result = new TAlternation(std::move(alts));
-           result->loc = loc;
-       } .)
-.
-
-TokenSeq <. TokenExpr* &result .>
-    (. TokenExpr* elem;
-       std::vector<TokenExpr*> elems; .)
-    = TokenFactor<elem>   (. elems.push_back(elem); .)
-      { TokenFactor<elem>  (. elems.push_back(elem); .)
-      }
-    (. if (elems.size() == 1)
-           result = elems[0];
-       else {
-           auto loc = elems[0]->loc;
-           result = new TSequence(std::move(elems));
-           result->loc = loc;
-       } .)
-.
-
-TokenFactor <. TokenExpr* &result .>
-    (. TokenExpr* inner; .)
-    = TokenAtom<result>
-    | "{"
-      TokenExpr_<inner>
-      "}"
-      (. result = new TStar(inner); result->loc = inner->loc; .)
-    | "["
-      TokenExpr_<inner>
-      "]"
-      (. result = new TOptional(inner); result->loc = inner->loc; .)
-.
-
-TokenAtom <. TokenExpr* &result .>
-    (. std::string s; char ch1, ch2; TokenExpr* inner; .)
-    = string_lit<s>     (. result = new TLiteral(std::move(s)); result->loc = Loc(); .)
-    | char_lit<ch1>     (. result = new TLiteral(std::string(1, ch1));
-                           result->loc = Loc(); .)
-      [ ".."
-        char_lit<ch2>   (. result = new TRange(static_cast<int>(ch1), static_cast<int>(ch2)); result->loc = Loc(); .)
-      ]
-    | ident<s>          (. result = new TCharset(std::move(s)); result->loc = Loc(); .)
-    | "(" TokenExpr_<inner> ")"   (. result = inner; .)
 .
 
 // ═══════════════════════════════════════════════════════════════
@@ -191,13 +159,15 @@ TokenAtom <. TokenExpr* &result .>
 // ═══════════════════════════════════════════════════════════════
 
 CommentDecl <. std::vector<CommentDef*> &defs .>
-    (. bool nested = false; std::string open; std::string close_str; std::string tname; .)
+    (. peg::Span open_span; peg::Span close_span; peg::Span tname_span;
+       bool nested = false; std::string open; std::string close_str; std::string tname; .)
     = "COMMENTS"
       "FROM"
-      string_lit<open>    (. SourceLoc loc = Loc(); .)
+      string_lit<open_span> (. open = peg::unescape_string_lit(open_span);
+                              SourceLoc loc = Loc(); .)
       "TO"
-      ( string_lit<close_str>
-      | ident<tname>      (. close_str = std::move(tname); .)
+      ( string_lit<close_span> (. close_str = peg::unescape_string_lit(close_span); .)
+      | ident<tname_span>      (. close_str = tname_span.to_string(); .)
       )
       [ "NESTED"          (. nested = true; .) ]
     (. auto* c = new CommentDef(std::move(open), std::move(close_str), nested);
@@ -210,13 +180,14 @@ CommentDecl <. std::vector<CommentDef*> &defs .>
 // ═══════════════════════════════════════════════════════════════
 
 ProductionDecl <. std::vector<Production*> &prods .>
-    (. std::string pname;
+    (. peg::Span pname_span;
+       std::string pname;
        std::vector<Param*> params;
        std::string locals;
        std::string raw;
        bool has_locals = false;
        PegExpr* body; .)
-    = ident<pname>        (. SourceLoc loc = Loc(); .)
+    = ident<pname_span>   (. pname = pname_span.to_string(); SourceLoc loc = Loc(); .)
       [ "<." (. if (!scan_to("." ">", raw)) return false; .)
              (. ParseParams(raw, params); .)
       ]
@@ -288,18 +259,27 @@ PegFactor <. PegExpr* &result .>
 .
 
 PegAtom <. PegExpr* &result .>
-    (. PegExpr* inner; std::string s; char ch; .)
-    = string_lit<s>
-      (. result = new Literal(std::move(s));
+    (. peg::Span s_span; peg::Span ch_span; peg::Span name_span;
+       PegExpr* inner; std::string s; char ch1 = 0, ch2 = 0; .)
+    = string_lit<s_span>
+      (. s = peg::unescape_string_lit(s_span);
+         result = new Literal(std::move(s));
          result->loc = Loc(); .)
-    | char_lit<ch>
-      (. result = new Literal(std::string(1, ch));
+    | char_lit<ch_span>
+      (. ch1 = peg::unescape_char_lit(ch_span);
+         result = new Literal(std::string(1, ch1));
          result->loc = Loc(); .)
+      [ ".."
+        char_lit<ch_span>
+        (. ch2 = peg::unescape_char_lit(ch_span);
+           result = new CharRange(static_cast<int>(ch1), static_cast<int>(ch2));
+           result->loc = Loc(); .)
+      ]
     | "ANY"
       (. result = new AnyExpr();
          result->loc = Loc(); .)
-    | ident<s>
-      (. std::string rname = std::move(s); SourceLoc loc = Loc();
+    | ident<name_span>
+      (. std::string rname = name_span.to_string(); SourceLoc loc = Loc();
          std::string args; .)
       [ "<."
         (. if (!scan_to("." ">", args)) return false;

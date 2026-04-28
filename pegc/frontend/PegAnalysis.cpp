@@ -888,28 +888,34 @@ void PegAnalysis::detect_unused_terminals(Grammar* grammar) {
     for (auto* p : grammar->productions)
         collect_all_refs(p->body, used_tokens, used_charsets, used_rules);
 
-    // Tokens reference charsets internally — collect those too.
+    // Token bodies are PegExpr (same AST as productions). Reuse the
+    // production-side walker to collect charset/token/rule refs.
     for (auto* tk : grammar->tokens)
-        // Token bodies use TokenExpr, not PegExpr; charset names appear
-        // in TCharset nodes. We do a lightweight traversal here.
-        (void)tk;  // skipped: token-internal charset references aren't
-                    // tracked yet; this avoids false positives on
-                    // charsets used only by tokens. (See below.)
+        collect_all_refs(tk->body, used_tokens, used_charsets, used_rules);
 
-    // Walk token bodies to find charset references.
-    std::function<void(TokenExpr*)> walk_tk = [&](TokenExpr* te) {
-        if (!te) return;
-        if (auto* tc = dynamic_cast<TCharset*>(te)) {
-            used_charsets.insert(tc->name);
-        } else if (auto* ts = dynamic_cast<TSequence*>(te)) {
-            for (auto* e : ts->elements) walk_tk(e);
-        } else if (auto* ta = dynamic_cast<TAlternation*>(te)) {
-            for (auto* e : ta->alternatives) walk_tk(e);
-        } else if (auto* st = dynamic_cast<TStar*>(te)) walk_tk(st->body);
-        else if (auto* pl = dynamic_cast<TPlus*>(te)) walk_tk(pl->body);
-        else if (auto* op = dynamic_cast<TOptional*>(te)) walk_tk(op->body);
+    // Charsets compose transitively (e.g. ident_continue = letter + digit
+    // references `letter` and `digit`). Fixpoint over charset bodies so a
+    // charset used by another used charset doesn't get flagged as unused.
+    std::function<void(CharsetExpr*)> walk_cs = [&](CharsetExpr* ce) {
+        if (!ce) return;
+        if (auto* nr = dynamic_cast<NameRef*>(ce)) {
+            used_charsets.insert(nr->name);
+        } else if (auto* u = dynamic_cast<Union*>(ce)) {
+            walk_cs(u->left); walk_cs(u->right);
+        } else if (auto* d = dynamic_cast<Diff*>(ce)) {
+            walk_cs(d->base); walk_cs(d->minus);
+        }
     };
-    for (auto* tk : grammar->tokens) walk_tk(tk->pattern);
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        for (auto* cs : grammar->charsets) {
+            if (!used_charsets.count(cs->name)) continue;
+            size_t before = used_charsets.size();
+            walk_cs(cs->body);
+            if (used_charsets.size() != before) changed = true;
+        }
+    }
 
     for (auto* tk : grammar->tokens)
         if (!used_tokens.count(tk->name))

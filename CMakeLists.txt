@@ -82,12 +82,12 @@ add_executable(bbq_tests
 target_link_libraries(bbq_tests PRIVATE bbq_cpp_backend bbq_c_backend bbq_cek_backend bbq_crt GTest::GTest GTest::Main)
 target_compile_definitions(bbq_tests PRIVATE
     SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
-gtest_discover_tests(bbq_tests)
+add_test(NAME bbq_tests COMMAND bbq_tests)
 
 add_executable(lib_tests lib/tests/test_worklist.cpp)
 target_include_directories(lib_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/lib)
 target_link_libraries(lib_tests PRIVATE GTest::GTest GTest::Main)
-gtest_discover_tests(lib_tests)
+add_test(NAME lib_tests COMMAND lib_tests)
 
 # --- Python extension module (optional) ---
 find_package(Python3 COMPONENTS Development)
@@ -115,6 +115,9 @@ add_subdirectory(burgc)
 
 # --- jitterator subproject ---
 add_subdirectory(jitterator)
+
+# --- ddcgc subproject ---
+add_subdirectory(tools/ddcgc)
 
 # --- Auto-regenerate BBQ_AST.h from BBQ.asdl ---
 add_custom_command(

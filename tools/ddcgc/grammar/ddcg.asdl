@@ -1,0 +1,110 @@
+// =============================================================
+// ddcgc — DDCG compiler-compiler — DSL AST schema
+//
+// Defines the AST produced by parsing .ddcg files. Auto-generated
+// to tools/ddcgc/frontend/ddcg_ast.h via the asdl tool.
+//
+// Mirrors the on-paper DSL grammar from the plan
+// (~/.claude/plans/maybe-update-the-plan-breezy-cascade.md, §
+// "ddcgc DSL grammar shape" + "Expression language").
+//
+// Sections of a .ddcg file:
+//   COMPILER name
+//   (. headers .)            -- zero or more verbatim code blocks
+//   IMPORTS                  -- name = "path/to/schema.json"
+//   DESTINATIONS             -- data_dest, ctrl_dest declarations + ir_root
+//   AUXILIARIES              -- cg_* runtime function signatures
+//   PREDICATES (optional)    -- bool-returning user functions for `where` guards
+//   RULES                    -- rule decls: pattern + optional guard + body
+// =============================================================
+
+module DdcgAst {
+
+    // Root: a complete .ddcg file
+    file = File(identifier compiler_name,
+                header* headers,
+                import* imports,
+                dest_decl* destinations,
+                type_ref ir_root,
+                aux_decl* auxiliaries,
+                pred_decl* predicates,
+                string members,
+                identifier* desugared_by_normalization,
+                rule* rules)
+
+    // Headers: code blocks copied verbatim into generated dispatcher
+    header = Header(string code)
+
+    // Imports: schema bindings — `source = "..."`, `target = "..."`
+    import = Import(identifier name, string path)
+
+    // Destinations: tagged-union declarations the consumer's runtime
+    // implements. Each variant is either discriminant-only (`fail`) or
+    // discriminant + payload fields (`break_loop(save: ident)`).
+    dest_decl = DataDest(identifier name, dest_variant* variants)
+              | CtrlDest(identifier name, dest_variant* variants)
+
+    dest_variant = DestVariant(identifier name, dest_field* fields)
+    dest_field   = DestField(identifier name, type_ref ty)
+
+    // Auxiliaries: runtime function signatures the rules call into.
+    // Each takes a typed parameter tuple and returns a typed result.
+    aux_decl = Aux(identifier name, type_ref* param_types, type_ref return_ty)
+
+    // Predicates: bool-returning auxiliaries usable in `where` guards.
+    // No side effects allowed; the type system enforces this by signature.
+    pred_decl = Pred(identifier name, type_ref* param_types)
+
+    // Type references — used in destination fields, auxiliary signatures,
+    // ir_root declaration, and pattern-binding annotations.
+    type_ref = TypeName(identifier name, bool is_pointer)        // ident or ident*
+             | TypeList(type_ref elem)                           // list<T>
+             | TypeTuple(type_ref* elems)                        // tuple<T1, T2, ...>
+
+    // Rule: one or more head patterns sharing a body, optional guard.
+    rule = Rule(pattern* heads, expr? guard, stmt* body)
+
+    // Patterns: match against the source AST schema's constructors,
+    // bind variables, or test literal/nil values.
+    pattern = ConstructorPat(identifier module,
+                             identifier ctor,
+                             field_pat* fields)
+            | BindPat(identifier name)
+            | WildcardPat
+            | NilPat
+            | IntPat(int value)
+            | StringPat(string value)
+
+    field_pat = NamedFieldPat(identifier name, pattern pat)      // name: pat
+              | RestFieldPat(identifier name)                    // ...name
+
+    // Statements inside a rule body
+    stmt = LetStmt(bind* binds, expr value)                      // let x = ... | let (a, b) = ...
+         | MutAssign(identifier name, expr value)                // v := expr (rebind)
+         | ForStmt(bind iter, expr seq, stmt* body)              // for v in xs: ...
+         | LabelStmt(identifier name)                            // label L
+         | ExprStmt(expr value)                                  // tail or discarded expression
+
+    bind = SimpleBind(identifier name, type_ref? ty)             // x or x: T
+         | WildcardBind                                          // _
+
+    // Expression grammar — flat, opcode-tagged BinOp/UnaryOp.
+    // Operator precedence is enforced by the parser; the AST stores
+    // a string tag per operator (==, !=, <, +, &&, ||, etc.).
+    expr = TernaryExpr(expr cond, expr then_, expr else_)        // a ? b : c
+         | BinOp(string op, expr left, expr right)               // a OP b
+         | UnaryOp(string op, expr operand)                      // OP a
+         | CallExpr(expr fn, expr* args)                         // fn(args...)
+         | FieldAccExpr(expr base, identifier field)             // x.y
+         | IndexAccExpr(expr base, expr index)                   // x[i]
+         | IdentExpr(identifier name)
+         | IntLit(int value)
+         | StringLit(string value)
+         | BoolLit(bool value)
+         | NilLit
+         | ListLit(expr* elems)                                  // [a, b, c]
+         | TupleLit(expr* elems)                                 // (a, b, c)
+         | DestPattern(identifier name, expr* args)              // δ/γ value: pair(L1, L2) or `effect`
+         | GenCall(expr subject, expr data_dest, expr ctrl_dest, expr? lnext)
+                                                                 // gen e δ γ [Lnext] — recursive cg per Dybvig 1990
+}

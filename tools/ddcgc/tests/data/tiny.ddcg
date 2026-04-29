@@ -1,0 +1,44 @@
+COMPILER tiny
+
+(. #include "tiny_runtime.h" .)
+
+IMPORTS
+  ast    = "tiny_ast.json"
+  target = "tiny_target.json"
+
+DESTINATIONS
+  data_dest delta { effect | ac | stack(slot: int) }
+  ctrl_dest gamma { fail  | restore(save: int) }
+  ir_root int
+
+AUXILIARIES
+  cg_lit : (int, int) -> int
+  cg_add : (int, int) -> int
+
+MEMBERS (.
+    // Per-compile state and the aux/pred bodies live here, inline.
+    // The generated dispatch methods read `current_loc` directly and
+    // call cg_lit / cg_add as bare member calls on `this`.
+    SourceLoc current_loc;
+    int aux_calls = 0;
+
+    int cg_lit(int /*x*/, int n) { aux_calls++; return n; }
+    int cg_add(int l, int r)     { aux_calls++; return l + r; }
+.)
+
+RULES
+
+// Lit is a leaf: deliver `x` to wherever δ says, then transfer per γ.
+rule lit : ast.Lit(n: x) {
+    cg_lit(x, x);
+}
+
+// Add evaluates l with δ=ac (paper figure 8: simple sub-expression spilled
+// into the accumulator), then r with the outer δ unchanged. Using `ac` for
+// both keeps the test small and still proves δ varies between recursive
+// calls.
+rule add : ast.Add(left: l, right: r) {
+    let lk = gen(l, ac, restore(0));
+    let rk = gen(r, ac, restore(0));
+    cg_add(lk, rk);
+}

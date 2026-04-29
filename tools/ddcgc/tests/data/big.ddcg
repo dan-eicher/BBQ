@@ -1,0 +1,140 @@
+COMPILER big
+
+(. #include "big_runtime.h" .)
+
+IMPORTS
+  ast    = "big_ast.json"
+  target = "big_target.json"
+
+DESTINATIONS
+  data_dest delta { effect | ac | spill(slot: int) }
+  ctrl_dest gamma { fail | jump(target: label) }
+  ir_root int
+
+AUXILIARIES
+  cg_lit     : (int) -> int
+  cg_seq     : (list<int>) -> int
+  cg_pick    : (int, int) -> int
+  cg_str     : (string) -> int
+  cg_split   : (int) -> tuple<int, int>
+  place      : (label) -> int
+  trace_fire : (string) -> int
+
+PREDICATES
+  is_zero       : (int) -> bool
+  is_short_name : (string) -> bool
+
+MEMBERS (.
+    using label_t = int;
+    SourceLoc current_loc;
+    int next_label = 0;
+    std::vector<std::string> trace;
+
+    label_t fresh_label() { return next_label++; }
+    int place(label_t L) {
+        trace.push_back("place:L" + std::to_string(L));
+        return 0;
+    }
+
+    int trace_fire(const std::string& name) {
+        trace.push_back("rule:" + name);
+        return 0;
+    }
+    int cg_lit(int n) {
+        trace.push_back("cg_lit:" + std::to_string(n));
+        return n;
+    }
+    int cg_seq(std::vector<int> xs) {
+        trace.push_back("cg_seq:" + std::to_string(xs.size()));
+        int s = 0; for (int x : xs) s += x; return s;
+    }
+    int cg_pick(int a, int b) {
+        trace.push_back("cg_pick");
+        return a + b;
+    }
+    int cg_str(std::string s) {
+        trace.push_back("cg_str:" + s);
+        return static_cast<int>(s.size());
+    }
+    std::tuple<int, int> cg_split(int x) {
+        trace.push_back("cg_split:" + std::to_string(x));
+        return {x / 2, x - x / 2};
+    }
+
+    bool is_zero(int n)              { return n == 0; }
+    bool is_short_name(std::string s) { return s.size() < 4; }
+.)
+
+RULES
+
+// ── Nested ConstructorPat: zero-left optimisation fires before general Add
+rule add_zero_l : ast.Add(left: ast.Lit(n: 0), right: r) {
+    trace_fire("add_zero_l");
+    cg_pick(0, gen(r, ac, fail));
+}
+
+// ── Where-guarded specialisation (predicate over int)
+rule lit_zero : ast.Lit(n: x) where is_zero(x) {
+    trace_fire("lit_zero");
+    cg_lit(0);
+}
+
+// ── Tuple-destructuring let + ternary + tuple-returning aux
+rule lit : ast.Lit(n: x) {
+    trace_fire("lit");
+    let (lo, hi) = cg_split(x > 100 ? 100 : x);
+    cg_pick(lo, hi);
+}
+
+// ── General Add (fallback after the nested-pat specialisation)
+rule add : ast.Add(left: l, right: r) {
+    trace_fire("add");
+    cg_pick(gen(l, ac, fail), gen(r, ac, fail));
+}
+
+// ── For-loop accumulator + list concat + Sequence-typed field
+rule seq : ast.Seq(items: es) {
+    trace_fire("seq");
+    let acc: list<int> = [];
+    for e in es {
+        acc := acc + [gen(e, ac, fail)];
+    }
+    cg_seq(acc);
+}
+
+// ── Label statement + label-payload γ variant
+rule pair : ast.Pair(first: e1, second: e2) {
+    trace_fire("pair");
+    label L;
+    gen(e1, effect, jump(L));
+    place(L);
+    cg_pick(gen(e2, effect, fail), 0);
+}
+
+// ── StringPat: literal string match in a field
+rule tag_x : ast.Tag(name: "x") {
+    trace_fire("tag_x");
+    cg_str("x-special");
+}
+
+// ── String predicate guard
+rule tag_short : ast.Tag(name: n) where is_short_name(n) {
+    trace_fire("tag_short");
+    cg_str(n);
+}
+
+rule tag : ast.Tag(name: n) {
+    trace_fire("tag");
+    cg_str(n);
+}
+
+// ── NilPat: optional field with nullptr
+rule maybe_none : ast.Maybe(sub: nil) {
+    trace_fire("maybe_none");
+    cg_lit(-1);
+}
+
+rule maybe_some : ast.Maybe(sub: s) {
+    trace_fire("maybe_some");
+    gen(s, ac, fail);
+}

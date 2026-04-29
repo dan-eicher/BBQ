@@ -52,4 +52,4 @@ add_executable(burgc_tests
 target_link_libraries(burgc_tests PRIVATE burgc_lib GTest::GTest GTest::Main)
 target_compile_definitions(burgc_tests PRIVATE
     SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
-gtest_discover_tests(burgc_tests)
+add_test(NAME burgc_tests COMMAND burgc_tests)

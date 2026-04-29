@@ -48,4 +48,4 @@ add_executable(asdl_tests
 target_link_libraries(asdl_tests PRIVATE asdl_lib GTest::GTest GTest::Main)
 target_compile_definitions(asdl_tests PRIVATE
     SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
-gtest_discover_tests(asdl_tests)
+add_test(NAME asdl_tests COMMAND asdl_tests)

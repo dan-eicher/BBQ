@@ -1,0 +1,792 @@
+{
+  "aliases": {},
+  "bases": [
+    "File",
+    "Header",
+    "Import",
+    "DestDecl",
+    "DestVariant",
+    "DestField",
+    "Aux",
+    "Pred",
+    "TypeRef",
+    "Rule",
+    "Pattern",
+    "FieldPat",
+    "Stmt",
+    "Bind",
+    "Expr"
+  ],
+  "definitions": [
+    {
+      "attributes": [],
+      "is_enum": false,
+      "name": "file",
+      "type": "sum",
+      "types": [
+        {
+          "base": "ASTNode",
+          "fields": [
+            {
+              "flag": "none",
+              "name": "compiler_name",
+              "type": "identifier"
+            },
+            {
+              "flag": "sequence",
+              "name": "headers",
+              "type": "header"
+            },
+            {
+              "flag": "sequence",
+              "name": "imports",
+              "type": "import"
+            },
+            {
+              "flag": "sequence",
+              "name": "destinations",
+              "type": "dest_decl"
+            },
+            {
+              "flag": "none",
+              "name": "ir_root",
+              "type": "type_ref"
+            },
+            {
+              "flag": "sequence",
+              "name": "auxiliaries",
+              "type": "aux_decl"
+            },
+            {
+              "flag": "sequence",
+              "name": "predicates",
+              "type": "pred_decl"
+            },
+            {
+              "flag": "none",
+              "name": "members",
+              "type": "string"
+            },
+            {
+              "flag": "sequence",
+              "name": "desugared_by_normalization",
+              "type": "identifier"
+            },
+            {
+              "flag": "sequence",
+              "name": "rules",
+              "type": "rule"
+            }
+          ],
+          "name": "File"
+        }
+      ]
+    },
+    {
+      "attributes": [],
+      "is_enum": false,
+      "name": "header",
+      "type": "sum",
+      "types": [
+        {
+          "base": "ASTNode",
+          "fields": [
+            {
+              "flag": "none",
+              "name": "code",
+              "type": "string"
+            }
+          ],
+          "name": "Header"
+        }
+      ]
+    },
+    {
+      "attributes": [],
+      "is_enum": false,
+      "name": "import",
+      "type": "sum",
+      "types": [
+        {
+          "base": "ASTNode",
+          "fields": [
+            {
+              "flag": "none",
+              "name": "name",
+              "type": "identifier"
+            },
+            {
+              "flag": "none",
+              "name": "path",
+              "type": "string"
+            }
+          ],
+          "name": "Import"
+        }
+      ]
+    },
+    {
+      "attributes": [],
+      "is_enum": false,
+      "name": "dest_decl",
+      "type": "sum",
+      "types": [
+        {
+          "base": "DestDecl",
+          "fields": [
+            {
+              "flag": "none",
+              "name": "name",
+              "type": "identifier"
+            },
+            {
+              "flag": "sequence",
+              "name": "variants",
+              "type": "dest_variant"
+            }
+          ],
+          "name": "DataDest"
+        },
+        {
+          "base": "DestDecl",
+          "fields": [
+            {
+              "flag": "none",
+              "name": "name",
+              "type": "identifier"
+            },
+            {
+              "flag": "sequence",
+              "name": "variants",
+              "type": "dest_variant"
+            }
+          ],
+          "name": "CtrlDest"
+        }
+      ]
+    },
+    {
+      "attributes": [],
+      "is_enum": false,
+      "name": "dest_variant",
+      "type": "sum",
+      "types": [
+        {
+          "base": "ASTNode",
+          "fields": [
+            {
+              "flag": "none",
+              "name": "name",
+              "type": "identifier"
+            },
+            {
+              "flag": "sequence",
+              "name": "fields",
+              "type": "dest_field"
+            }
+          ],
+          "name": "DestVariant"
+        }
+      ]
+    },
+    {
+      "attributes": [],
+      "is_enum": false,
+      "name": "dest_field",
+      "type": "sum",
+      "types": [
+        {
+          "base": "ASTNode",
+          "fields": [
+            {
+              "flag": "none",
+              "name": "name",
+              "type": "identifier"
+            },
+            {
+              "flag": "none",
+              "name": "ty",
+              "type": "type_ref"
+            }
+          ],
+          "name": "DestField"
+        }
+      ]
+    },
+    {
+      "attributes": [],
+      "is_enum": false,
+      "name": "aux_decl",
+      "type": "sum",
+      "types": [
+        {
+          "base": "ASTNode",
+          "fields": [
+            {
+              "flag": "none",
+              "name": "name",
+              "type": "identifier"
+            },
+            {
+              "flag": "sequence",
+              "name": "param_types",
+              "type": "type_ref"
+            },
+            {
+              "flag": "none",
+              "name": "return_ty",
+              "type": "type_ref"
+            }
+          ],
+          "name": "Aux"
+        }
+      ]
+    },
+    {
+      "attributes": [],
+      "is_enum": false,
+      "name": "pred_decl",
+      "type": "sum",
+      "types": [
+        {
+          "base": "ASTNode",
+          "fields": [
+            {
+              "flag": "none",
+              "name": "name",
+              "type": "identifier"
+            },
+            {
+              "flag": "sequence",
+              "name": "param_types",
+              "type": "type_ref"
+            }
+          ],
+          "name": "Pred"
+        }
+      ]
+    },
+    {
+      "attributes": [],
+      "is_enum": false,
+      "name": "type_ref",
+      "type": "sum",
+      "types": [
+        {
+          "base": "TypeRef",
+          "fields": [
+            {
+              "flag": "none",
+              "name": "name",
+              "type": "identifier"
+            },
+            {
+              "flag": "none",
+              "name": "is_pointer",
+              "type": "bool"
+            }
+          ],
+          "name": "TypeName"
+        },
+        {
+          "base": "TypeRef",
+          "fields": [
+            {
+              "flag": "none",
+              "name": "elem",
+              "type": "type_ref"
+            }
+          ],
+          "name": "TypeList"
+        },
+        {
+          "base": "TypeRef",
+          "fields": [
+            {
+              "flag": "sequence",
+              "name": "elems",
+              "type": "type_ref"
+            }
+          ],
+          "name": "TypeTuple"
+        }
+      ]
+    },
+    {
+      "attributes": [],
+      "is_enum": false,
+      "name": "rule",
+      "type": "sum",
+      "types": [
+        {
+          "base": "ASTNode",
+          "fields": [
+            {
+              "flag": "sequence",
+              "name": "heads",
+              "type": "pattern"
+            },
+            {
+              "flag": "optional",
+              "name": "guard",
+              "type": "expr"
+            },
+            {
+              "flag": "sequence",
+              "name": "body",
+              "type": "stmt"
+            }
+          ],
+          "name": "Rule"
+        }
+      ]
+    },
+    {
+      "attributes": [],
+      "is_enum": false,
+      "name": "pattern",
+      "type": "sum",
+      "types": [
+        {
+          "base": "Pattern",
+          "fields": [
+            {
+              "flag": "none",
+              "name": "module",
+              "type": "identifier"
+            },
+            {
+              "flag": "none",
+              "name": "ctor",
+              "type": "identifier"
+            },
+            {
+              "flag": "sequence",
+              "name": "fields",
+              "type": "field_pat"
+            }
+          ],
+          "name": "ConstructorPat"
+        },
+        {
+          "base": "Pattern",
+          "fields": [
+            {
+              "flag": "none",
+              "name": "name",
+              "type": "identifier"
+            }
+          ],
+          "name": "BindPat"
+        },
+        {
+          "base": "Pattern",
+          "fields": [],
+          "name": "WildcardPat"
+        },
+        {
+          "base": "Pattern",
+          "fields": [],
+          "name": "NilPat"
+        },
+        {
+          "base": "Pattern",
+          "fields": [
+            {
+              "flag": "none",
+              "name": "value",
+              "type": "int"
+            }
+          ],
+          "name": "IntPat"
+        },
+        {
+          "base": "Pattern",
+          "fields": [
+            {
+              "flag": "none",
+              "name": "value",
+              "type": "string"
+            }
+          ],
+          "name": "StringPat"
+        }
+      ]
+    },
+    {
+      "attributes": [],
+      "is_enum": false,
+      "name": "field_pat",
+      "type": "sum",
+      "types": [
+        {
+          "base": "FieldPat",
+          "fields": [
+            {
+              "flag": "none",
+              "name": "name",
+              "type": "identifier"
+            },
+            {
+              "flag": "none",
+              "name": "pat",
+              "type": "pattern"
+            }
+          ],
+          "name": "NamedFieldPat"
+        },
+        {
+          "base": "FieldPat",
+          "fields": [
+            {
+              "flag": "none",
+              "name": "name",
+              "type": "identifier"
+            }
+          ],
+          "name": "RestFieldPat"
+        }
+      ]
+    },
+    {
+      "attributes": [],
+      "is_enum": false,
+      "name": "stmt",
+      "type": "sum",
+      "types": [
+        {
+          "base": "Stmt",
+          "fields": [
+            {
+              "flag": "sequence",
+              "name": "binds",
+              "type": "bind"
+            },
+            {
+              "flag": "none",
+              "name": "value",
+              "type": "expr"
+            }
+          ],
+          "name": "LetStmt"
+        },
+        {
+          "base": "Stmt",
+          "fields": [
+            {
+              "flag": "none",
+              "name": "name",
+              "type": "identifier"
+            },
+            {
+              "flag": "none",
+              "name": "value",
+              "type": "expr"
+            }
+          ],
+          "name": "MutAssign"
+        },
+        {
+          "base": "Stmt",
+          "fields": [
+            {
+              "flag": "none",
+              "name": "iter",
+              "type": "bind"
+            },
+            {
+              "flag": "none",
+              "name": "seq",
+              "type": "expr"
+            },
+            {
+              "flag": "sequence",
+              "name": "body",
+              "type": "stmt"
+            }
+          ],
+          "name": "ForStmt"
+        },
+        {
+          "base": "Stmt",
+          "fields": [
+            {
+              "flag": "none",
+              "name": "name",
+              "type": "identifier"
+            }
+          ],
+          "name": "LabelStmt"
+        },
+        {
+          "base": "Stmt",
+          "fields": [
+            {
+              "flag": "none",
+              "name": "value",
+              "type": "expr"
+            }
+          ],
+          "name": "ExprStmt"
+        }
+      ]
+    },
+    {
+      "attributes": [],
+      "is_enum": false,
+      "name": "bind",
+      "type": "sum",
+      "types": [
+        {
+          "base": "Bind",
+          "fields": [
+            {
+              "flag": "none",
+              "name": "name",
+              "type": "identifier"
+            },
+            {
+              "flag": "optional",
+              "name": "ty",
+              "type": "type_ref"
+            }
+          ],
+          "name": "SimpleBind"
+        },
+        {
+          "base": "Bind",
+          "fields": [],
+          "name": "WildcardBind"
+        }
+      ]
+    },
+    {
+      "attributes": [],
+      "is_enum": false,
+      "name": "expr",
+      "type": "sum",
+      "types": [
+        {
+          "base": "Expr",
+          "fields": [
+            {
+              "flag": "none",
+              "name": "cond",
+              "type": "expr"
+            },
+            {
+              "flag": "none",
+              "name": "then_",
+              "type": "expr"
+            },
+            {
+              "flag": "none",
+              "name": "else_",
+              "type": "expr"
+            }
+          ],
+          "name": "TernaryExpr"
+        },
+        {
+          "base": "Expr",
+          "fields": [
+            {
+              "flag": "none",
+              "name": "op",
+              "type": "string"
+            },
+            {
+              "flag": "none",
+              "name": "left",
+              "type": "expr"
+            },
+            {
+              "flag": "none",
+              "name": "right",
+              "type": "expr"
+            }
+          ],
+          "name": "BinOp"
+        },
+        {
+          "base": "Expr",
+          "fields": [
+            {
+              "flag": "none",
+              "name": "op",
+              "type": "string"
+            },
+            {
+              "flag": "none",
+              "name": "operand",
+              "type": "expr"
+            }
+          ],
+          "name": "UnaryOp"
+        },
+        {
+          "base": "Expr",
+          "fields": [
+            {
+              "flag": "none",
+              "name": "fn",
+              "type": "expr"
+            },
+            {
+              "flag": "sequence",
+              "name": "args",
+              "type": "expr"
+            }
+          ],
+          "name": "CallExpr"
+        },
+        {
+          "base": "Expr",
+          "fields": [
+            {
+              "flag": "none",
+              "name": "base",
+              "type": "expr"
+            },
+            {
+              "flag": "none",
+              "name": "field",
+              "type": "identifier"
+            }
+          ],
+          "name": "FieldAccExpr"
+        },
+        {
+          "base": "Expr",
+          "fields": [
+            {
+              "flag": "none",
+              "name": "base",
+              "type": "expr"
+            },
+            {
+              "flag": "none",
+              "name": "index",
+              "type": "expr"
+            }
+          ],
+          "name": "IndexAccExpr"
+        },
+        {
+          "base": "Expr",
+          "fields": [
+            {
+              "flag": "none",
+              "name": "name",
+              "type": "identifier"
+            }
+          ],
+          "name": "IdentExpr"
+        },
+        {
+          "base": "Expr",
+          "fields": [
+            {
+              "flag": "none",
+              "name": "value",
+              "type": "int"
+            }
+          ],
+          "name": "IntLit"
+        },
+        {
+          "base": "Expr",
+          "fields": [
+            {
+              "flag": "none",
+              "name": "value",
+              "type": "string"
+            }
+          ],
+          "name": "StringLit"
+        },
+        {
+          "base": "Expr",
+          "fields": [
+            {
+              "flag": "none",
+              "name": "value",
+              "type": "bool"
+            }
+          ],
+          "name": "BoolLit"
+        },
+        {
+          "base": "Expr",
+          "fields": [],
+          "name": "NilLit"
+        },
+        {
+          "base": "Expr",
+          "fields": [
+            {
+              "flag": "sequence",
+              "name": "elems",
+              "type": "expr"
+            }
+          ],
+          "name": "ListLit"
+        },
+        {
+          "base": "Expr",
+          "fields": [
+            {
+              "flag": "sequence",
+              "name": "elems",
+              "type": "expr"
+            }
+          ],
+          "name": "TupleLit"
+        },
+        {
+          "base": "Expr",
+          "fields": [
+            {
+              "flag": "none",
+              "name": "name",
+              "type": "identifier"
+            },
+            {
+              "flag": "sequence",
+              "name": "args",
+              "type": "expr"
+            }
+          ],
+          "name": "DestPattern"
+        },
+        {
+          "base": "Expr",
+          "fields": [
+            {
+              "flag": "none",
+              "name": "subject",
+              "type": "expr"
+            },
+            {
+              "flag": "none",
+              "name": "data_dest",
+              "type": "expr"
+            },
+            {
+              "flag": "none",
+              "name": "ctrl_dest",
+              "type": "expr"
+            },
+            {
+              "flag": "optional",
+              "name": "lnext",
+              "type": "expr"
+            }
+          ],
+          "name": "GenCall"
+        }
+      ]
+    }
+  ],
+  "name": "DdcgAst"
+}

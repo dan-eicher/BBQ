@@ -1,0 +1,5 @@
+module tiny_target {
+    // Empty target schema; the test's ir_root is plain `int` (a built-in
+    // type), not a schema-defined sum, so nothing needs to live here.
+    placeholder = Placeholder(int x)
+}

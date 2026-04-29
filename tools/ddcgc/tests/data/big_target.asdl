@@ -1,0 +1,3 @@
+module target {
+    placeholder = Placeholder(int x)
+}

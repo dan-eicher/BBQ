@@ -1,0 +1,8 @@
+module ast {
+    expr = Lit(int n)
+         | Add(expr left, expr right)
+         | Seq(expr* items)
+         | Pair(expr first, expr second)
+         | Tag(string name)
+         | Maybe(expr? sub)
+}

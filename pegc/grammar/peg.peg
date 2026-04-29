@@ -47,12 +47,20 @@ Peg
        std::vector<CharsetDef*> charsets;
        std::vector<TokenDef*> tokens;
        std::vector<CommentDef*> comments;
+       std::string members;
+       std::string priv;
        bool has_ignore = false;
        CharsetExpr* ignore_expr = nullptr;
        std::vector<Production*> productions; .)
     = "COMPILER"
       ident<name_span>      (. name = name_span.to_string(); .)
       { SemAction_<headers> }
+      [ "MEMBERS"
+        "(."                (. if (!scan_to("." ")", members)) return false; .)
+      ]
+      [ "PRIVATE"
+        "(."                (. if (!scan_to("." ")", priv)) return false; .)
+      ]
       [ "CHARACTERS"
         { CharsetDecl<charsets> }
       ]
@@ -71,6 +79,7 @@ Peg
       "."
     (. ast = new Grammar(std::move(name), std::move(headers),
            std::move(charsets), std::move(tokens), std::move(comments),
+           std::move(members), std::move(priv),
            has_ignore,
            ignore_expr ? std::optional<CharsetExpr*>(ignore_expr) : std::nullopt,
            std::move(productions));

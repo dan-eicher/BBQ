@@ -189,11 +189,13 @@ struct Grammar : public ASTNode {
         std::vector<CharsetDef*> charsets,
         std::vector<TokenDef*> tokens,
         std::vector<CommentDef*> comments,
+        std::string members,
+        std::string private_helpers,
         bool has_ignore,
         std::optional<CharsetExpr*> ignore,
         std::vector<Production*> productions
     )
-        : name(name), headers(std::move(headers)), charsets(std::move(charsets)), tokens(std::move(tokens)), comments(std::move(comments)), has_ignore(has_ignore), ignore(std::move(ignore)), productions(std::move(productions)){}
+        : name(name), headers(std::move(headers)), charsets(std::move(charsets)), tokens(std::move(tokens)), comments(std::move(comments)), members(members), private_helpers(private_helpers), has_ignore(has_ignore), ignore(std::move(ignore)), productions(std::move(productions)){}
 
     void accept(ASTVisitor& visitor) override { visitor.visit(this); }
 
@@ -202,6 +204,8 @@ struct Grammar : public ASTNode {
     std::vector<CharsetDef*> charsets;
     std::vector<TokenDef*> tokens;
     std::vector<CommentDef*> comments;
+    std::string members;
+    std::string private_helpers;
     bool has_ignore;
     std::optional<CharsetExpr*> ignore;
     std::vector<Production*> productions;

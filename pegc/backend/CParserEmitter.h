@@ -2,11 +2,10 @@
 
 #include <string>
 #include <ostream>
-#include <sstream>
-#include <set>
 
 #include "GrammarAST.h"
 #include "PegAnalysis.h"
+#include "c_emit.h"
 
 namespace pegc {
 
@@ -38,44 +37,20 @@ private:
     void emit_token_method_impls(PegGrammar::Grammar* grammar, std::ostream& out);
     void emit_token_forward_decls(PegGrammar::Grammar* grammar, std::ostream& out);
 
-    // Per-production
+    // Per-production / per-token (orchestrators that reset gensym + lex mode
+    // and dispatch into the cg_* free functions for the body)
     void emit_production_decl(PegGrammar::Production* prod, std::ostream& out);
     void emit_production_impl(PegGrammar::Production* prod, std::ostream& out);
     void emit_token_forward_decl(PegGrammar::TokenDef* tok, std::ostream& out);
     void emit_token_impl(PegGrammar::TokenDef* tok, std::ostream& out);
 
-    // PEG expression code generation (DDCG → C)
-    void emit_expr(PegGrammar::PegExpr* expr, std::ostream& out, int indent);
-    void emit_sequence(PegGrammar::Sequence* seq, std::ostream& out, int indent);
-    void emit_choice(PegGrammar::Choice* ch, std::ostream& out, int indent);
-    void emit_star(PegGrammar::Star* star, std::ostream& out, int indent);
-    void emit_plus(PegGrammar::Plus* plus, std::ostream& out, int indent);
-    void emit_optional(PegGrammar::Optional* opt, std::ostream& out, int indent);
-    void emit_and(PegGrammar::And* a, std::ostream& out, int indent);
-    void emit_not(PegGrammar::Not* n, std::ostream& out, int indent);
-    void emit_literal(PegGrammar::Literal* lit, std::ostream& out, int indent);
-    void emit_rule_call(PegGrammar::RuleCall* rc, std::ostream& out, int indent);
-    void emit_action(PegGrammar::Action* act, std::ostream& out, int indent);
-    void emit_resolver(PegGrammar::Resolver* res, std::ostream& out, int indent);
-
-    // Helpers
-    std::string indent_str(int indent);
-    std::string escape_string(const std::string& s);
-    bool is_keyword_literal(PegGrammar::Literal* lit);
-    void emit_charset_predicate(PegGrammar::CharsetExpr* expr, std::ostream& out);
-    int next_var_id();
+    // Per-PEG-expression code generation lives in pegc/runtime/c_emit.{h,cpp}
+    // as `pegc::c_emit::cg_*` free functions, threaded through `ctx_`.
+    // Phase 6 will replace this class's switch dispatch with ddcgc-generated
+    // code that calls the same `cg_*` functions.
 
     const AnalysisResult& analysis_;
-    std::string prefix_;
-    int var_counter_ = 0;
-    std::set<std::string> production_names_;
-    std::set<std::string> token_names_;
-    std::set<std::string> charset_names_;
-    bool in_lex_mode_ = false;
-
-    // Tracks failure action: "return false" at production level,
-    // "break" inside do { } while(0) backtracking blocks.
-    std::string fail_ = "return false";
+    c_emit::Ctx ctx_;
 };
 
 } // namespace pegc

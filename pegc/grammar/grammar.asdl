@@ -11,7 +11,9 @@ module PegGrammar {
 
     // Root
     grammar = Grammar(identifier name, header* headers, charset_def* charsets,
-                      token_def* tokens, comment_def* comments, bool has_ignore,
+                      token_def* tokens, comment_def* comments,
+                      string members, string private_helpers,
+                      bool has_ignore,
                       charset_expr? ignore, production* productions)
 
     // Preamble (code blocks between COMPILER and first section)

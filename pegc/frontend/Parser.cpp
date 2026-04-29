@@ -126,6 +126,8 @@ bool Parser::parse_Peg() {
        std::vector<CharsetDef*> charsets;
        std::vector<TokenDef*> tokens;
        std::vector<CommentDef*> comments;
+       std::string members;
+       std::string priv;
        bool has_ignore = false;
        CharsetExpr* ignore_expr = nullptr;
        std::vector<Production*> productions;
@@ -146,44 +148,66 @@ bool Parser::parse_Peg() {
         auto _m1 = save();
         if (![&]() -> bool {
             skip();
-            if (!match("CHARACTERS")) return false;
-            for (;;) {
-                auto _m2 = save();
-                if (![&]() -> bool {
-                    skip();
-                    if (!parse_CharsetDecl(charsets)) return false;
-                    return true;
-                }()) { restore(_m2); break; }
-            }
+            if (!match("MEMBERS")) return false;
+            skip();
+            if (!match("(.")) return false;
+            if (!scan_to("." ")", members)) return false;
             return true;
         }()) restore(_m1);
+    }
+    {
+        auto _m2 = save();
+        if (![&]() -> bool {
+            skip();
+            if (!match("PRIVATE")) return false;
+            skip();
+            if (!match("(.")) return false;
+            if (!scan_to("." ")", priv)) return false;
+            return true;
+        }()) restore(_m2);
     }
     {
         auto _m3 = save();
         if (![&]() -> bool {
             skip();
-            if (!match("TOKENS")) return false;
+            if (!match("CHARACTERS")) return false;
             for (;;) {
                 auto _m4 = save();
                 if (![&]() -> bool {
                     skip();
-                    if (!parse_TokenDecl(tokens)) return false;
+                    if (!parse_CharsetDecl(charsets)) return false;
                     return true;
                 }()) { restore(_m4); break; }
             }
             return true;
         }()) restore(_m3);
     }
-    for (;;) {
+    {
         auto _m5 = save();
+        if (![&]() -> bool {
+            skip();
+            if (!match("TOKENS")) return false;
+            for (;;) {
+                auto _m6 = save();
+                if (![&]() -> bool {
+                    skip();
+                    if (!parse_TokenDecl(tokens)) return false;
+                    return true;
+                }()) { restore(_m6); break; }
+            }
+            return true;
+        }()) restore(_m5);
+    }
+    for (;;) {
+        auto _m7 = save();
         if (![&]() -> bool {
             skip();
             if (!parse_CommentDecl(comments)) return false;
             return true;
-        }()) { restore(_m5); break; }
+        }()) { restore(_m7); break; }
     }
     {
-        auto _m6 = save();
+        auto _m8 = save();
         if (![&]() -> bool {
             skip();
             if (!match("IGNORE")) return false;
@@ -191,17 +215,17 @@ bool Parser::parse_Peg() {
             if (!parse_CharsetExpr_(ignore_expr)) return false;
             has_ignore = true;
             return true;
-        }()) restore(_m6);
+        }()) restore(_m8);
     }
     skip();
     if (!match("PRODUCTIONS")) return false;
     for (;;) {
-        auto _m7 = save();
+        auto _m9 = save();
         if (![&]() -> bool {
             skip();
             if (!parse_ProductionDecl(productions)) return false;
             return true;
-        }()) { restore(_m7); break; }
+        }()) { restore(_m9); break; }
     }
     skip();
     if (!match("END")) return false;
@@ -212,6 +236,7 @@ bool Parser::parse_Peg() {
     if (!match(".")) return false;
     ast = new Grammar(std::move(name), std::move(headers),
            std::move(charsets), std::move(tokens), std::move(comments),
+           std::move(members), std::move(priv),
            has_ignore,
            ignore_expr ? std::optional<CharsetExpr*>(ignore_expr) : std::nullopt,
            std::move(productions));

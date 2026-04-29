@@ -1,0 +1,212 @@
+{
+  "aliases": {},
+  "bases": [
+    "Kont"
+  ],
+  "definitions": [
+    {
+      "attributes": [],
+      "is_enum": false,
+      "name": "kont",
+      "type": "sum",
+      "types": [
+        {
+          "base": "Kont",
+          "fields": [
+            {
+              "flag": "sequence",
+              "name": "elems",
+              "type": "kont"
+            }
+          ],
+          "name": "KSeq"
+        },
+        {
+          "base": "Kont",
+          "fields": [
+            {
+              "flag": "sequence",
+              "name": "alts",
+              "type": "kont"
+            }
+          ],
+          "name": "KChoice"
+        },
+        {
+          "base": "Kont",
+          "fields": [
+            {
+              "flag": "none",
+              "name": "body",
+              "type": "kont"
+            }
+          ],
+          "name": "KStar"
+        },
+        {
+          "base": "Kont",
+          "fields": [
+            {
+              "flag": "none",
+              "name": "body",
+              "type": "kont"
+            }
+          ],
+          "name": "KPlus"
+        },
+        {
+          "base": "Kont",
+          "fields": [
+            {
+              "flag": "none",
+              "name": "body",
+              "type": "kont"
+            }
+          ],
+          "name": "KOptional"
+        },
+        {
+          "base": "Kont",
+          "fields": [
+            {
+              "flag": "none",
+              "name": "body",
+              "type": "kont"
+            }
+          ],
+          "name": "KAnd"
+        },
+        {
+          "base": "Kont",
+          "fields": [
+            {
+              "flag": "none",
+              "name": "body",
+              "type": "kont"
+            }
+          ],
+          "name": "KNot"
+        },
+        {
+          "base": "Kont",
+          "fields": [
+            {
+              "flag": "none",
+              "name": "value",
+              "type": "string"
+            }
+          ],
+          "name": "KMatchString"
+        },
+        {
+          "base": "Kont",
+          "fields": [],
+          "name": "KMatchAny"
+        },
+        {
+          "base": "Kont",
+          "fields": [
+            {
+              "flag": "none",
+              "name": "from",
+              "type": "int"
+            },
+            {
+              "flag": "none",
+              "name": "to",
+              "type": "int"
+            }
+          ],
+          "name": "KMatchCharRange"
+        },
+        {
+          "base": "Kont",
+          "fields": [
+            {
+              "flag": "none",
+              "name": "name",
+              "type": "identifier"
+            }
+          ],
+          "name": "KMatchCharset"
+        },
+        {
+          "base": "Kont",
+          "fields": [
+            {
+              "flag": "none",
+              "name": "name",
+              "type": "identifier"
+            },
+            {
+              "flag": "none",
+              "name": "args",
+              "type": "string"
+            }
+          ],
+          "name": "KCallProduction"
+        },
+        {
+          "base": "Kont",
+          "fields": [
+            {
+              "flag": "none",
+              "name": "name",
+              "type": "identifier"
+            },
+            {
+              "flag": "none",
+              "name": "args",
+              "type": "string"
+            }
+          ],
+          "name": "KCallToken"
+        },
+        {
+          "base": "Kont",
+          "fields": [
+            {
+              "flag": "none",
+              "name": "name",
+              "type": "identifier"
+            },
+            {
+              "flag": "none",
+              "name": "args",
+              "type": "string"
+            }
+          ],
+          "name": "KCallExtern"
+        },
+        {
+          "base": "Kont",
+          "fields": [
+            {
+              "flag": "none",
+              "name": "code",
+              "type": "string"
+            }
+          ],
+          "name": "KAction"
+        },
+        {
+          "base": "Kont",
+          "fields": [
+            {
+              "flag": "none",
+              "name": "cond",
+              "type": "string"
+            },
+            {
+              "flag": "none",
+              "name": "body",
+              "type": "kont"
+            }
+          ],
+          "name": "KResolver"
+        }
+      ]
+    }
+  ],
+  "name": "ParserKont"
+}

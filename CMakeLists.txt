@@ -117,7 +117,7 @@ add_subdirectory(burgc)
 add_subdirectory(jitterator)
 
 # --- ddcgc subproject ---
-add_subdirectory(tools/ddcgc)
+add_subdirectory(ddcgc)
 
 # --- Auto-regenerate BBQ_AST.h from BBQ.asdl ---
 add_custom_command(

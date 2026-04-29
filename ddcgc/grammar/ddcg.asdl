@@ -2,7 +2,7 @@
 // ddcgc — DDCG compiler-compiler — DSL AST schema
 //
 // Defines the AST produced by parsing .ddcg files. Auto-generated
-// to tools/ddcgc/frontend/ddcg_ast.h via the asdl tool.
+// to ddcgc/frontend/ddcg_ast.h via the asdl tool.
 //
 // Mirrors the on-paper DSL grammar from the plan
 // (~/.claude/plans/maybe-update-the-plan-breezy-cascade.md, §

@@ -234,7 +234,7 @@ auto result = compiler.compile_expr(&root, mylang::ac(), mylang::fail());
 ## FILES
 
 ```
-tools/ddcgc/
+ddcgc/
   grammar/
     ddcg.peg                  Self-hosted grammar (authoritative)
     ddcg.asdl                 DSL AST schema

@@ -68,6 +68,11 @@
               "type": "string"
             },
             {
+              "flag": "none",
+              "name": "private_helpers",
+              "type": "string"
+            },
+            {
               "flag": "sequence",
               "name": "desugared_by_normalization",
               "type": "identifier"

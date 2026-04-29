@@ -779,16 +779,25 @@ bool emit_cpp(const DdcgAst::File* file,
     }
 
     out << "class Compiler {\n";
-    out << "public:\n";
     c.em.indent_depth = 1;
 
     if (!file->members.empty()) {
+        out << "public:\n";
         c.em.indent() << "// ─── MEMBERS (verbatim) ─────────────────────\n";
         out << file->members;
-        if (!file->members.empty() && file->members.back() != '\n') out << "\n";
+        if (file->members.back() != '\n') out << "\n";
         c.em.indent() << "// ─── End MEMBERS ────────────────────────────\n";
     }
 
+    if (!file->private_helpers.empty()) {
+        out << "private:\n";
+        c.em.indent() << "// ─── PRIVATE (verbatim) ─────────────────────\n";
+        out << file->private_helpers;
+        if (file->private_helpers.back() != '\n') out << "\n";
+        c.em.indent() << "// ─── End PRIVATE ────────────────────────────\n";
+    }
+
+    out << "public:\n";
     for (const auto& s : sums) {
         emit_dispatcher(c, s);
     }

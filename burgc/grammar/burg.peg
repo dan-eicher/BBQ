@@ -58,7 +58,7 @@ Decl <. std::vector<burg_ast::TermDecl*> &terms, std::string &start, std::string
 
 NamespaceDecl <. std::string &ns .>
     (. peg::Span ns_span; .)
-    = "NAMESPACE"
+    = "COMPILER"
       ident<ns_span>  (. ns = ns_span.to_string(); .)
 .
 

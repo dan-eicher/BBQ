@@ -758,7 +758,7 @@ void check_coverage(Ctx& c, const HeadIndex& idx) {
     auto sit = c.schemas->find(mod);
     if (sit == c.schemas->end()) return;
 
-    // The DSL's `DESUGARED_BY_NORMALIZATION` block lets the .ddcg
+    // The DSL's `DESUGARED` block lets the .ddcg
     // author exempt constructors that the consumer's earlier
     // normalization pass has already eliminated. Validate every name
     // refers to a real constructor in the source schema, then skip
@@ -788,17 +788,64 @@ void check_coverage(Ctx& c, const HeadIndex& idx) {
     }
 }
 
+void serialize_pattern(const DdcgAst::Pattern* p, std::ostringstream& os);
+
+// Compute a structural-shape signature for a head, ignoring bind-variable
+// names. Two heads with the same signature are interchangeable — only
+// guards or rule order can distinguish them. Differing signatures mean
+// one rule is a specialisation of the other (nested ConstructorPats,
+// IntPat / StringPat / NilPat value checks) — PEG ordered choice
+// handles the disambiguation, no warning warranted.
+std::string head_shape_signature(const DdcgAst::Pattern* p) {
+    std::ostringstream os;
+    serialize_pattern(p, os);
+    return os.str();
+}
+
 void check_overlap(Ctx& c, const HeadIndex& idx) {
     for (const auto& [k, rules] : idx) {
         if (rules.size() <= 1) continue;
-        bool any_unguarded = false;
-        for (auto* r : rules) if (!r->guard.has_value()) any_unguarded = true;
-        if (!any_unguarded) continue;
-        std::ostringstream msg;
-        msg << "multiple rules share head '" << k.first << "." << k.second
-            << "' — ensure their `where` guards are disjoint";
-        for (size_t i = 1; i < rules.size(); ++i) {
-            warn(c, rules[i]->loc, msg.str());
+
+        // Group by head-shape signature. Within each group, every rule's
+        // pattern is structurally equivalent (modulo bind names) so the
+        // disambiguation is purely on guards and order.
+        std::map<std::string, std::vector<const DdcgAst::Rule*>> by_shape;
+        for (auto* r : rules) {
+            for (auto* h : r->heads) {
+                if (auto* cp = dynamic_cast<DdcgAst::ConstructorPat*>(h)) {
+                    if (cp->module == k.first && cp->ctor == k.second) {
+                        by_shape[head_shape_signature(h)].push_back(r);
+                        break;
+                    }
+                }
+            }
+        }
+
+        for (const auto& [shape, group] : by_shape) {
+            (void)shape;
+            if (group.size() <= 1) continue;
+
+            // The only statically-decidable bad case: an unguarded rule
+            // appears before any other rule with the same shape. Under
+            // PEG ordered choice the unguarded rule fires first and the
+            // others can never run.
+            //
+            // All-guarded with same shape is unknowable — the predicates
+            // could be disjoint, overlapping, or never both true. We
+            // can't tell, so we don't warn; that'd just be a "please
+            // check" note.
+            //
+            // Multiple unguarded with same shape is duplicate territory
+            // and is reported by check_duplicates as an error.
+            for (size_t i = 0; i + 1 < group.size(); ++i) {
+                if (group[i]->guard.has_value()) continue;
+                std::ostringstream msg;
+                msg << "rule for head '" << k.first << "." << k.second
+                    << "' is unguarded and precedes other rules with the "
+                       "same shape — those later rules are unreachable";
+                warn(c, group[i]->loc, msg.str());
+                break;
+            }
         }
     }
 }

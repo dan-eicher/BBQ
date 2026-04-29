@@ -106,7 +106,7 @@ MEMBERS (.
     bool is_zero(int n) { return n == 0; }
 .)
 
-DESUGARED_BY_NORMALIZATION                      // optional; exempts source
+DESUGARED                      // optional; exempts source
   CtorA, CtorB                                  //   constructors from the
                                                 //   coverage check
 
@@ -179,7 +179,7 @@ up the annotation's element type.
 
 Every constructor in the source-AST schema (the .ddcg's first
 IMPORTS entry) must be the head of at least one rule, unless listed
-in `DESUGARED_BY_NORMALIZATION`. Missing constructors are errors.
+in `DESUGARED`. Missing constructors are errors.
 
 ### Multi-pattern uniformity (always)
 

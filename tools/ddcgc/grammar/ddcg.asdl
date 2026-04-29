@@ -29,6 +29,7 @@ module DdcgAst {
                 aux_decl* auxiliaries,
                 pred_decl* predicates,
                 string members,
+                string private_helpers,
                 identifier* desugared_by_normalization,
                 rule* rules)
 

@@ -55,6 +55,7 @@ Ddcg
        std::vector<DdcgAst::Aux*> auxiliaries;
        std::vector<DdcgAst::Pred*> predicates;
        std::string members;
+       std::string priv;
        std::vector<std::string> desugared;
        std::vector<DdcgAst::Rule*> rules; .)
     = "COMPILER"
@@ -72,7 +73,10 @@ Ddcg
       [ "MEMBERS"
         "(."                        (. if (!scan_to("." ")", members)) return false; .)
       ]
-      [ "DESUGARED_BY_NORMALIZATION"
+      [ "PRIVATE"
+        "(."                        (. if (!scan_to("." ")", priv)) return false; .)
+      ]
+      [ "DESUGARED"
         ident<name_span>            (. desugared.push_back(name_span.to_string()); .)
         { "," ident<name_span>      (. desugared.push_back(name_span.to_string()); .) }
       ]
@@ -82,7 +86,8 @@ Ddcg
            std::move(headers), std::move(imports),
            std::move(destinations), ir_root,
            std::move(auxiliaries), std::move(predicates),
-           std::move(members), std::move(desugared), std::move(rules));
+           std::move(members), std::move(priv),
+           std::move(desugared), std::move(rules));
        ast->loc = DdcgAst::SourceLoc{nullptr, 1, 1}; .)
 .
 

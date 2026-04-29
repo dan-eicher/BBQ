@@ -186,7 +186,7 @@ bool Parser::parse_Decl(std::vector<burg_ast::TermDecl*>& terms, std::string& st
 bool Parser::parse_NamespaceDecl(std::string& ns) {
     peg::Span ns_span;
     skip();
-    if (!match("NAMESPACE")) return false;
+    if (!match("COMPILER")) return false;
     skip();
     if (!ident(ns_span)) return false;
     ns = ns_span.to_string();

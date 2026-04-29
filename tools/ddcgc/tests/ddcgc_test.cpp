@@ -409,8 +409,73 @@ rule add      : ast.Add(left: l, right: r) {
     ASSERT_NE(file, nullptr);
     std::map<std::string, Schema> schemas{{"ast", make_tiny_schema()}};
     auto r = check_file(file, schemas);
-    EXPECT_TRUE(r.ok());  // overlap is a warning, not an error
-    EXPECT_TRUE(has_warn_substring(r, "share head 'ast.Lit'"));
+    EXPECT_TRUE(r.ok());
+    // Canonical guarded-specialisation + unguarded-fallback. The
+    // disambiguation is unambiguous (PEG order: guard first, fallback
+    // second), so the overlap check should NOT warn.
+    EXPECT_FALSE(has_warn_substring(r, "share head 'ast.Lit'"))
+        << "guarded specialisation + unguarded fallback should be silent";
+}
+
+TEST(TypeCheck, OverlapWarnsWhenUnguardedNotLast) {
+    // Unguarded rule before a guarded rule with the same shape — the
+    // guarded one is unreachable.
+    static const char* src = R"(
+COMPILER hello
+IMPORTS
+  ast = "ast.json"
+DESTINATIONS
+  data_dest delta { effect }
+  ctrl_dest gamma { fail }
+  ir_root int
+AUXILIARIES
+  cg_x : (int) -> int
+PREDICATES
+  is_zero : (int) -> bool
+RULES
+rule lit      : ast.Lit(n: x) { cg_x(x); }
+rule lit_zero : ast.Lit(n: x) where is_zero(x) { cg_x(0); }
+rule add      : ast.Add(left: l, right: r) {
+    let lk = gen(l, effect, fail); cg_x(lk);
+}
+)";
+    auto* file = parse_ddcg(src);
+    ASSERT_NE(file, nullptr);
+    std::map<std::string, Schema> schemas{{"ast", make_tiny_schema()}};
+    auto r = check_file(file, schemas);
+    EXPECT_TRUE(r.ok());
+    EXPECT_TRUE(has_warn_substring(r, "unreachable"));
+}
+
+TEST(TypeCheck, NestedPatternSpecialisationIsNotOverlap) {
+    // `Add(left: ast.Lit(n: 0), right: r)` vs `Add(left: l, right: r)`
+    // — different shapes, PEG ordered choice handles them. No warning.
+    static const char* src = R"(
+COMPILER hello
+IMPORTS
+  ast = "ast.json"
+DESTINATIONS
+  data_dest delta { effect }
+  ctrl_dest gamma { fail }
+  ir_root int
+AUXILIARIES
+  cg_x : (int) -> int
+RULES
+rule add_zero : ast.Add(left: ast.Lit(n: 0), right: r) {
+    let rk = gen(r, effect, fail); cg_x(rk);
+}
+rule add : ast.Add(left: l, right: r) {
+    let lk = gen(l, effect, fail); cg_x(lk);
+}
+rule lit : ast.Lit(n: x) { cg_x(x); }
+)";
+    auto* file = parse_ddcg(src);
+    ASSERT_NE(file, nullptr);
+    std::map<std::string, Schema> schemas{{"ast", make_tiny_schema()}};
+    auto r = check_file(file, schemas);
+    EXPECT_TRUE(r.ok());
+    EXPECT_FALSE(has_warn_substring(r, "share head"))
+        << "structural specialisation must not warn";
 }
 
 TEST(TypeCheck, DuplicateRuleIsError) {
@@ -472,10 +537,9 @@ rule add      : ast.Add(left: l, right: r) where same_node(l, r) {
     std::map<std::string, Schema> schemas{{"ast", make_tiny_schema()}};
     auto r = check_file(file, schemas);
     EXPECT_TRUE(r.ok());
-    // Two rules share head ast.Lit but lit_zero has a guard, so the
-    // overlap warning still fires on the unguarded `lit` rule. That's
-    // exactly the case the warning is supposed to catch — confirm.
-    EXPECT_TRUE(has_warn_substring(r, "share head 'ast.Lit'"));
+    // lit_zero (guarded) + lit (unguarded fallback) is the canonical
+    // disambiguation pattern; no overlap warning expected.
+    EXPECT_FALSE(has_warn_substring(r, "share head"));
 }
 
 // ─── Destinations tests ─────────────────────────────────────────
@@ -1705,7 +1769,7 @@ rule add : ast.Add(left: l, right: r) {
 }
 
 TEST(TypeCheck, DesugaredByNormalizationExemptsFromCoverage) {
-    // `Add` has no rule, but DESUGARED_BY_NORMALIZATION lists it as
+    // `Add` has no rule, but DESUGARED lists it as
     // exempt — coverage should still pass.
     static const char* src = R"(
 COMPILER hello
@@ -1717,7 +1781,7 @@ DESTINATIONS
   ir_root int
 AUXILIARIES
   cg_x : (int) -> int
-DESUGARED_BY_NORMALIZATION
+DESUGARED
   Add
 RULES
 rule lit : ast.Lit(n: x) { cg_x(x); }
@@ -1743,7 +1807,7 @@ DESTINATIONS
   ir_root int
 AUXILIARIES
   cg_x : (int) -> int
-DESUGARED_BY_NORMALIZATION
+DESUGARED
   NotARealCtor
 RULES
 rule lit : ast.Lit(n: x) { cg_x(x); }

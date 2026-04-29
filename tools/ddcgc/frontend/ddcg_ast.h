@@ -226,10 +226,11 @@ struct File : public ASTNode {
         std::vector<Aux*> auxiliaries,
         std::vector<Pred*> predicates,
         std::string members,
+        std::string private_helpers,
         std::vector<std::string> desugared_by_normalization,
         std::vector<Rule*> rules
     )
-        : compiler_name(compiler_name), headers(std::move(headers)), imports(std::move(imports)), destinations(std::move(destinations)), ir_root(ir_root), auxiliaries(std::move(auxiliaries)), predicates(std::move(predicates)), members(members), desugared_by_normalization(std::move(desugared_by_normalization)), rules(std::move(rules)){}
+        : compiler_name(compiler_name), headers(std::move(headers)), imports(std::move(imports)), destinations(std::move(destinations)), ir_root(ir_root), auxiliaries(std::move(auxiliaries)), predicates(std::move(predicates)), members(members), private_helpers(private_helpers), desugared_by_normalization(std::move(desugared_by_normalization)), rules(std::move(rules)){}
 
     void accept(ASTVisitor& visitor) override { visitor.visit(this); }
 
@@ -241,6 +242,7 @@ struct File : public ASTNode {
     std::vector<Aux*> auxiliaries;
     std::vector<Pred*> predicates;
     std::string members;
+    std::string private_helpers;
     std::vector<std::string> desugared_by_normalization;
     std::vector<Rule*> rules;
 };

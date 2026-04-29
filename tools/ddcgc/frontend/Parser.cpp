@@ -109,6 +109,7 @@ bool Parser::parse_Ddcg() {
        std::vector<DdcgAst::Aux*> auxiliaries;
        std::vector<DdcgAst::Pred*> predicates;
        std::string members;
+       std::string priv;
        std::vector<std::string> desugared;
        std::vector<DdcgAst::Rule*> rules;
     skip();
@@ -185,12 +186,23 @@ bool Parser::parse_Ddcg() {
         auto _m7 = save();
         if (![&]() -> bool {
             skip();
-            if (!match("DESUGARED_BY_NORMALIZATION")) return false;
+            if (!match("PRIVATE")) return false;
+            skip();
+            if (!match("(.")) return false;
+            if (!scan_to("." ")", priv)) return false;
+            return true;
+        }()) restore(_m7);
+    }
+    {
+        auto _m8 = save();
+        if (![&]() -> bool {
+            skip();
+            if (!match("DESUGARED")) return false;
             skip();
             if (!ident(name_span)) return false;
             desugared.push_back(name_span.to_string());
             for (;;) {
-                auto _m8 = save();
+                auto _m9 = save();
                 if (![&]() -> bool {
                     skip();
                     if (!match(",")) return false;
@@ -198,26 +210,27 @@ bool Parser::parse_Ddcg() {
                     if (!ident(name_span)) return false;
                     desugared.push_back(name_span.to_string());
                     return true;
-                }()) { restore(_m8); break; }
+                }()) { restore(_m9); break; }
             }
             return true;
-        }()) restore(_m7);
+        }()) restore(_m8);
     }
     skip();
     if (!match("RULES")) return false;
     for (;;) {
-        auto _m9 = save();
+        auto _m10 = save();
         if (![&]() -> bool {
             skip();
             if (!parse_RuleDecl(rules)) return false;
             return true;
-        }()) { restore(_m9); break; }
+        }()) { restore(_m10); break; }
     }
     ast = new DdcgAst::File(std::move(name),
            std::move(headers), std::move(imports),
            std::move(destinations), ir_root,
            std::move(auxiliaries), std::move(predicates),
-           std::move(members), std::move(desugared), std::move(rules));
+           std::move(members), std::move(priv),
+           std::move(desugared), std::move(rules));
        ast->loc = DdcgAst::SourceLoc{nullptr, 1, 1};
     return true;
 }

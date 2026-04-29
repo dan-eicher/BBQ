@@ -80,7 +80,9 @@ burgc additionally runs a unified semantic analysis over each grammar:
 TERM Name = N             // numeric ID
 TERM Name = NS::CONST     // qualified symbolic ID
 
-NAMESPACE my_ns           // optional: wrap C++ output in namespace
+COMPILER my_ns            // optional: wrap C++ output in namespace
+                          //   (C backend: prefixes user-facing symbols
+                          //   with `my_ns_`)
 
 (. #include "..." .)      // optional: header injection
 

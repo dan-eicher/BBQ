@@ -36,7 +36,9 @@ private:
     bool parse_ConId(std::string& name);
     bool parse_AnyId(std::string& name);
     bool ident(peg::Span& out);
+    bool ident() { peg::Span _d; return ident(_d); }
     bool string_lit(peg::Span& out);
+    bool string_lit() { peg::Span _d; return string_lit(_d); }
 
 };
 

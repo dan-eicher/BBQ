@@ -337,3 +337,30 @@ TEST(CodegenCompile, RuntimeEndianSwitch) {
         "    offset: uint32\n"
         "}"));
 }
+
+// `default: reject` — explicit unreachable-fail marker. Emits the
+// same fail behavior as a missing default, but the rejection is
+// audit-visible in the spec (and silences the no-default warning).
+TEST(CodegenCompile, SwitchDefaultReject) {
+    EXPECT_TRUE(compiles(
+        "Text = struct { data: uint8 }\n"
+        "Bin = struct { data: uint16le }\n"
+        "P = switch(t) {\n"
+        "    1: Text;\n"
+        "    2: Bin;\n"
+        "    default: reject;\n"
+        "}"));
+}
+
+// Inline reject in a struct field's switch — same shape, exercised
+// at the inline-switch emit path which is structurally distinct.
+TEST(CodegenCompile, InlineSwitchDefaultReject) {
+    EXPECT_TRUE(compiles(
+        "@endian little\n"
+        "TextData = struct { data: uint8 }\n"
+        "BinData = struct { data: uint16 }\n"
+        "Entry = struct {\n"
+        "    type: uint8,\n"
+        "    value: switch(type) { 1: TextData; 2: BinData; default: reject; }\n"
+        "}"));
+}

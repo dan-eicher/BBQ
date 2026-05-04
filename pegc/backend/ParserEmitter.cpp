@@ -194,7 +194,14 @@ void ParserEmitter::emit_token_method_decls(Grammar* grammar, std::ostream& out)
 }
 
 void ParserEmitter::emit_token_decl(TokenDef* tok, std::ostream& out) {
+    // Capturing version + no-arg discard overload so call sites that
+    // don't care about the matched span (pure-recognizer use, e.g.
+    // keywords) can write `tok()` instead of constructing a throwaway.
+    // The no-arg overload is defined in-class so it's implicitly inline
+    // and the body is visible to call sites at any -O level.
     out << "    bool " << tok->name << "(peg::Span& out);\n";
+    out << "    bool " << tok->name << "() { peg::Span _d; return "
+        << tok->name << "(_d); }\n";
 }
 
 void ParserEmitter::emit_token_method_impls(Grammar* grammar, std::ostream& out) {

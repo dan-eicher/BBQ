@@ -37,7 +37,9 @@ private:
     bool parse_UnaryExpr(calc::Expr* * result);
     bool parse_Atom(calc::Expr* * result);
     bool integer(peg::Span& out);
+    bool integer() { peg::Span _d; return integer(_d); }
     bool ident(peg::Span& out);
+    bool ident() { peg::Span _d; return ident(_d); }
 
 };
 

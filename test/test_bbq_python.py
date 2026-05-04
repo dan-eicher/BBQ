@@ -147,6 +147,40 @@ class TestParse:
         result = spec.parse(b"\x89PNG")
         assert result.error_message is None
 
+    def test_switch_default_reject(self):
+        # `default: reject;` — author-visible explicit-fail. A tag
+        # value not in the case list must fail the parse with a
+        # meaningful error message. Uses peek() as the discriminator
+        # (read tag without consuming, then dispatch — the canonical
+        # tag-prefixed-union shape used by cap.bbq's CpInfo etc.).
+        spec = bbq.compile_string(
+            "Doc = switch(peek()) {\n"
+            "    1: Body;\n"
+            "    2: Body;\n"
+            "    default: reject;\n"
+            "}\n"
+            "Body = struct { tag: uint8, payload: uint8 }"
+        )
+        # Tag 1 — accepted.
+        ok = spec.parse(b"\x01\x42")
+        assert ok.success
+        # Tag 99 — rejected at parse time. The exact error message
+        # is backend-specific (C backend says "rejected", CEK says
+        # "switch: no matching case"); the test asserts only the
+        # core guarantee — the parse fails.
+        fail = spec.parse(b"\x63\x42")
+        assert not fail.success
+
+    def test_reject_is_not_a_reserved_identifier(self):
+        # `reject` is a contextual keyword — only meaningful as the
+        # body of a `default:` clause. As a struct field name it
+        # must remain a valid identifier.
+        spec = bbq.compile_string(
+            "Flags = struct { reject: uint8, accept: uint8 }"
+        )
+        result = spec.parse(b"\x01\x02")
+        assert result.success
+
 
 # ── Node attribute access ────────────────────────────────────────────────────
 

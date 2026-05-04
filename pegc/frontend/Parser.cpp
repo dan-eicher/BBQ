@@ -23,6 +23,10 @@ static bool is_digit(char c) {
     return (c >= 48 && c <= 57);
 }
 
+static bool is_hex_digit(char c) {
+    return ((is_digit(c) || (c >= 97 && c <= 102)) || (c >= 65 && c <= 70));
+}
+
 static bool is_ident_continue(char c) {
     return (is_letter(c) || is_digit(c));
 }
@@ -58,6 +62,16 @@ bool Parser::char_lit(peg::Span& out) {
         auto _m0 = save();
         if ([&]() -> bool {
             if (!match("\\")) return false;
+            if (!match("x")) return false;
+            if (at_end() || !is_hex_digit(peek())) return false;
+            advance();
+            if (at_end() || !is_hex_digit(peek())) return false;
+            advance();
+            return true;
+        }()) {} else {
+        restore(_m0);
+        if ([&]() -> bool {
+            if (!match("\\")) return false;
             if (at_end()) return false;
             advance();
             return true;
@@ -74,6 +88,7 @@ bool Parser::char_lit(peg::Span& out) {
         }
         if (at_end()) return false;
         advance();
+        }
         }
     }
     if (!match("'")) return false;

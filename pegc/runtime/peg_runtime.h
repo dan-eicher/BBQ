@@ -19,6 +19,22 @@
 extern "C" {
 #endif
 
+/* ── Internal linkage for generated runtime helpers ──────────
+ * Generated parsers paste a fixed pool of helpers (file-scope static).
+ * Any given grammar exercises only a subset, so we mark them as
+ * possibly-unused for compilers that flag dead static functions.
+ * Combine `static` + maybe-unused into one macro so frames stay clean
+ * and adding/removing attributes touches only this header. */
+#if defined(__cplusplus) && __cplusplus >= 201703L
+#  define PEG_INTERNAL [[maybe_unused]] static
+#elif defined(__STDC_VERSION__) && __STDC_VERSION__ >= 202311L
+#  define PEG_INTERNAL [[maybe_unused]] static
+#elif defined(__GNUC__) || defined(__clang__)
+#  define PEG_INTERNAL static __attribute__((unused))
+#else
+#  define PEG_INTERNAL static
+#endif
+
 /* ── Position mark for backtracking ──────────────────────── */
 
 typedef struct {

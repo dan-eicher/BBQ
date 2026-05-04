@@ -96,8 +96,11 @@ private:
     bool parse_PegFactor(PegExpr*& result);
     bool parse_PegAtom(PegExpr*& result);
     bool ident(peg::Span& out);
+    bool ident() { peg::Span _d; return ident(_d); }
     bool char_lit(peg::Span& out);
+    bool char_lit() { peg::Span _d; return char_lit(_d); }
     bool string_lit(peg::Span& out);
+    bool string_lit() { peg::Span _d; return string_lit(_d); }
 
 };
 

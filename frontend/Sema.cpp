@@ -165,8 +165,8 @@ void Sema::validate_type(TypeExpr* type, const std::string& ctx, bool guarded) {
         for (auto* c : sw->cases) {
             validate_type(c->target, ctx, guarded);
         }
-        if (sw->default_)
-            validate_type((*sw->default_)->target, ctx, guarded);
+        if (sw->default_ && (*sw->default_)->target.has_value())
+            validate_type(*(*sw->default_)->target, ctx, guarded);
         validate_switch(sw, ctx);
     } else if (auto* comp = dynamic_cast<Compute*>(type)) {
         validate_expr(comp->expression, ctx);
@@ -579,8 +579,62 @@ void Sema::validate_switch(Switch* sw, const std::string& ctx) {
     }
 
     if (!sw->default_.has_value()) {
-        errors_.warning(sw->loc, "switch in %s has no default case", ctx.c_str());
+        // Skip the warning when the discriminator's value range is
+        // provably covered by the explicit case values. The warning's
+        // job is to catch forgotten ranges; if everything possible is
+        // already handled, there's nothing to remind the author about.
+        auto range = compute_value_range(sw->discriminator);
+        bool exhaustive = false;
+        if (range && range->second - range->first <= 256) {
+            std::unordered_set<int64_t> covered;
+            for (auto* c : sw->cases) {
+                if (auto* iv = dynamic_cast<IntValue*>(c->value))
+                    covered.insert(iv->value);
+            }
+            exhaustive = true;
+            for (int64_t v = range->first; v <= range->second; v++) {
+                if (!covered.count(v)) { exhaustive = false; break; }
+            }
+        }
+        if (!exhaustive)
+            errors_.warning(sw->loc, "switch in %s has no default case", ctx.c_str());
     }
+}
+
+// Compute a discriminator's possible value range, when narrow enough
+// to verify case-exhaustiveness. Returns nullopt for expressions whose
+// range we don't track. Currently handles: integer literals, peek(),
+// constant-amount right-shift, bitwise-and against a constant.
+std::optional<std::pair<int64_t, int64_t>>
+Sema::compute_value_range(Expr* e) {
+    if (auto* lit = dynamic_cast<IntLit*>(e)) {
+        return std::make_pair(lit->value, lit->value);
+    }
+    if (auto* call = dynamic_cast<Call*>(e)) {
+        if (call->func == "peek" && call->args.empty())
+            return std::make_pair<int64_t, int64_t>(0, 255);
+        return std::nullopt;
+    }
+    if (auto* bo = dynamic_cast<BinOp*>(e)) {
+        auto lr = compute_value_range(bo->left);
+        auto rr = compute_value_range(bo->right);
+        if (!lr || !rr) return std::nullopt;
+        if (bo->op == Binop::Shr) {
+            // Need a constant RHS shift amount.
+            if (rr->first != rr->second) return std::nullopt;
+            int64_t shift = rr->first;
+            if (shift < 0 || shift >= 63) return std::nullopt;
+            return std::make_pair(lr->first >> shift, lr->second >> shift);
+        }
+        if (bo->op == Binop::BitAnd) {
+            // Conservative: result ⊆ [0, min(l_hi, r_hi)].
+            int64_t hi = std::min(lr->second, rr->second);
+            if (hi < 0) return std::nullopt;
+            return std::make_pair<int64_t, int64_t>(0, std::move(hi));
+        }
+        return std::nullopt;
+    }
+    return std::nullopt;
 }
 
 // --- Phase 7: expression type checking ---

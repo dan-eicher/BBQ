@@ -2,9 +2,11 @@
 
 #include "BBQ_AST.h"
 #include "Errors.h"
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 namespace bbqgen {
@@ -80,6 +82,11 @@ private:
 
     // Phase 6: switch validation
     void validate_switch(BBQ::Switch* sw, const std::string& ctx);
+
+    // Discriminator range analysis — used by validate_switch to skip
+    // the no-default warning when cases provably cover the full range.
+    std::optional<std::pair<int64_t, int64_t>>
+        compute_value_range(BBQ::Expr* e);
 
     // Phase 7: expression type checking
     void check_types(BBQ::Rule* rule);

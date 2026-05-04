@@ -20,11 +20,19 @@ COMPILER Peg
 CHARACTERS
   letter         = 'a'..'z' + 'A'..'Z' + '_' .
   digit          = '0'..'9' .
+  hex_digit      = digit + 'a'..'f' + 'A'..'F' .
   ident_continue = letter + digit .
 
 TOKENS
   ident      = letter { ident_continue } .
-  char_lit   = '\'' ( '\\' ANY | !'\'' ANY ) '\'' .
+  // \xNN is a hex byte escape — needed for charset ranges that
+  // can't be expressed via printable ASCII (e.g. C0 control chars
+  // in TOML's basic-string body restriction).
+  char_lit   = '\''
+               ( '\\' 'x' hex_digit hex_digit
+               | '\\' ANY
+               | !'\'' ANY )
+               '\'' .
   string_lit = '"' { '\\' ANY | !'"' ANY } '"' .
 
 COMMENTS FROM "//" TO "\n"

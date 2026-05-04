@@ -1378,6 +1378,7 @@ static PyObject* do_parse(PyBBQSpec* self, Py_buffer* view, const char* rule_nam
     ParseArena* arena = new ParseArena();
     CEKMachine machine;
     machine.arena = arena;
+    machine.builtins = &self->grammar->builtins;
     if (self->ext_count > 0)
         machine.ext_parsers = &self->ext_table;
 

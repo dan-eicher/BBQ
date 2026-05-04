@@ -92,6 +92,21 @@ inline char unescape_char_lit(Span s) {
             case '\'': return '\'';
             case '"': return '"';
             case '0': return '\0';
+            case 'x': {
+                // \xNN — exactly two hex digits. The grammar (char_lit
+                // rule in peg.peg) enforces the digit count; here we
+                // just decode the captured bytes.
+                if (p + 4 > end) return p[1];
+                auto hex = [](char c) -> int {
+                    if (c >= '0' && c <= '9') return c - '0';
+                    if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
+                    if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
+                    return -1;
+                };
+                int hi = hex(p[2]), lo = hex(p[3]);
+                if (hi < 0 || lo < 0) return p[1];
+                return static_cast<char>((hi << 4) | lo);
+            }
             default: return p[1];
         }
     }

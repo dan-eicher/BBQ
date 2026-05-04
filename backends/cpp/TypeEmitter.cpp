@@ -164,8 +164,11 @@ void TypeEmitter::emit_switch_type(const std::string& name, Switch* sw, std::ost
     for (auto* c : sw->cases) {
         types.push_back(cpp_type(c->target));
     }
-    if (sw->default_) {
-        types.push_back(cpp_type((*sw->default_)->target));
+    if (sw->default_ && !(*sw->default_)->is_reject) {
+        // `default: reject` is unreachable — no payload type, no
+        // variant slot needed. The parser emits a fail at this
+        // position; the variant simply doesn't grow.
+        types.push_back(cpp_type(*(*sw->default_)->target));
     }
     out << "    std::variant<" << variant_type_list(types) << "> data;\n";
     out << "};\n";
@@ -250,9 +253,9 @@ std::string TypeEmitter::cpp_type(TypeExpr* type) {
             first = false;
             result += cpp_type(c->target);
         }
-        if (sw->default_) {
+        if (sw->default_ && !(*sw->default_)->is_reject) {
             if (!first) result += ", ";
-            result += cpp_type((*sw->default_)->target);
+            result += cpp_type(*(*sw->default_)->target);
         }
         result += ">";
         return result;

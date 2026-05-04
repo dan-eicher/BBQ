@@ -43,6 +43,30 @@ struct ExternalParserTable {
     }
 };
 
+// --- Built-in function registry ---
+// Linear-scan lookup by interned pointer equality (same idiom as
+// ExternalParserTable). Populated at grammar compile time by interning
+// each built-in's name into the grammar's StringPool, so the call
+// site's func_name (also interned in that pool) matches by pointer.
+struct BuiltinFnTable {
+    using Handler = void (*)(CEKMachine*, struct Value**);
+    struct Entry {
+        const char* name;       // Interned in the owning grammar's pool
+        int arity;
+        Handler fn;
+    };
+    Entry* entries = nullptr;
+    int count = 0;
+
+    const Entry* lookup(const char* name, int arity) const {
+        for (int i = 0; i < count; i++) {
+            if (entries[i].name == name && entries[i].arity == arity)
+                return &entries[i];
+        }
+        return nullptr;
+    }
+};
+
 // --- User expression function signature ---
 // Called during expression evaluation (e.g., custom functions in where/compute).
 using ExprFunction = int64_t (*)(const int64_t* args, int arg_count,
@@ -95,6 +119,12 @@ struct CEKMachine {
     // ── Extensibility ──────────────────────────────────────
     ExternalParserTable* ext_parsers = nullptr;
     FunctionTable* func_table = nullptr;
+    // Built-in function dispatch — populated at grammar compile time.
+    // CallApplyKont uses this for builtins (peek/abs/min/max/clamp);
+    // matching is by interned pointer equality (entries[i].name ==
+    // call_site_name), so this must point at the table from the same
+    // CompiledGrammar whose StringPool the call sites came from.
+    BuiltinFnTable* builtins = nullptr;
 
     // ── Error state ─────────────────────────────────────────
     bool failed = false;
@@ -150,5 +180,19 @@ private:
 int64_t read_primitive(const uint8_t* data, size_t pos, PrimitiveInfo prim,
                        bool little_endian);
 CaptureType primitive_capture_type(PrimitiveInfo prim, bool little_endian);
+
+// Populate a BuiltinFnTable with handlers for the standard built-in
+// functions (peek/abs/min/max/clamp). Names are interned into `pool`
+// so call-site func_name pointers (interned in the same pool) match
+// by pointer-equality during dispatch. Entries are arena-allocated.
+struct StringPool;
+void populate_builtins_into(BuiltinFnTable& out, ParseArena& arena,
+                            StringPool& pool);
+
+// Convenience for the production path: pre-populate g.builtins from
+// g.arena/g.strings. Call once at grammar compile time, before any
+// parse uses `m.builtins = &g.builtins`.
+struct CompiledGrammar;  // forward
+void populate_builtins(CompiledGrammar& g);
 
 } // namespace bbq::cek

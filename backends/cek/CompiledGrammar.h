@@ -3,6 +3,7 @@
 #include <cstring>
 #include <string>
 
+#include "Machine.h"
 #include "ParseArena.h"
 #include "StringPool.h"
 #include "KontNode.h"
@@ -24,6 +25,12 @@ struct CompiledGrammar {
 
     ParseArena arena;
     StringPool strings;
+
+    // Built-in function dispatch table — populated at compile time
+    // with each built-in's name interned into `strings` so call-site
+    // func_name pointers (also interned in the same pool) match by
+    // pointer equality. Pre-populate via populate_builtins(*this).
+    BuiltinFnTable builtins;
 
     KontNode* lookup(const char* name) const {
         for (int i = 0; i < rule_count; i++) {

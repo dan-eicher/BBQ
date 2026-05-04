@@ -64,8 +64,11 @@ private:
     bool parse_Postfix(DdcgAst::Expr* * result);
     bool parse_Primary(DdcgAst::Expr* * result);
     bool ident(peg::Span& out);
+    bool ident() { peg::Span _d; return ident(_d); }
     bool integer(peg::Span& out);
+    bool integer() { peg::Span _d; return integer(_d); }
     bool string_lit(peg::Span& out);
+    bool string_lit() { peg::Span _d; return string_lit(_d); }
 
 };
 

@@ -162,9 +162,16 @@ void CWriterEmitter::emit_impl(Rule* rule, std::ostream& out) {
             emit_write_call("in->u." + case_name, sw->cases[i]->target, rule->name, out, 2);
             out << ind(2) << "return true;\n";
         }
-        if (sw->default_) {
+        if (sw->default_ && (*sw->default_)->is_reject) {
+            // Reject default: writer should never see this tag (the
+            // reader would have rejected it). Return false so a buggy
+            // AST fails the write rather than silently producing
+            // garbage bytes. Writer ctx has no message channel.
             out << ind(1) << "default:\n";
-            emit_write_call("in->u.default_val", (*sw->default_)->target, rule->name, out, 2);
+            out << ind(2) << "return false;\n";
+        } else if (sw->default_) {
+            out << ind(1) << "default:\n";
+            emit_write_call("in->u.default_val", *(*sw->default_)->target, rule->name, out, 2);
             out << ind(2) << "return true;\n";
         }
         out << ind(1) << "}\n";
@@ -301,9 +308,12 @@ void CWriterEmitter::emit_write_call(const std::string& src, TypeExpr* type,
             emit_write_call(src + ".u." + case_name, sw->cases[i]->target, ctx, out, indent + 1);
             out << ind(indent + 1) << "break;\n";
         }
-        if (sw->default_) {
+        if (sw->default_ && (*sw->default_)->is_reject) {
             out << ind(indent) << "default:\n";
-            emit_write_call(src + ".u.default_val", (*sw->default_)->target, ctx, out, indent + 1);
+            out << ind(indent + 1) << "return false;\n";
+        } else if (sw->default_) {
+            out << ind(indent) << "default:\n";
+            emit_write_call(src + ".u.default_val", *(*sw->default_)->target, ctx, out, indent + 1);
             out << ind(indent + 1) << "break;\n";
         }
         out << ind(indent) << "}\n";

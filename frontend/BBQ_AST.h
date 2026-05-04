@@ -655,15 +655,17 @@ struct SwitchCase : public ASTNode {
 
 struct SwitchDefault : public ASTNode {
     SwitchDefault(
-        TypeExpr* target,
-        std::optional<Interval*> interval
+        std::optional<TypeExpr*> target,
+        std::optional<Interval*> interval,
+        bool is_reject
     )
-        : target(target), interval(std::move(interval)) {}
+        : target(std::move(target)), interval(std::move(interval)), is_reject(is_reject) {}
 
     void accept(ASTVisitor& visitor) override { visitor.visit(this); }
 
-    TypeExpr* target;
+    std::optional<TypeExpr*> target;
     std::optional<Interval*> interval;
+    bool is_reject;
 };
 
 // case_value

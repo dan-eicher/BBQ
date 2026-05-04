@@ -210,7 +210,9 @@ void CParserEmitter::emit_token_impl(TokenDef* tok, std::ostream& out) {
     c_emit::cg_expr(&ctx_, tok->body, out, 1);
     ctx_.in_lex_mode = false;
 
-    out << "    out->ptr = _start; out->len = (int)(peg_pos(p) - _start);\n";
+    // out is optional — pure-recognizer tokens (keywords, punctuation)
+    // don't need the captured span at the call site.
+    out << "    if (out) { out->ptr = _start; out->len = (int)(peg_pos(p) - _start); }\n";
     out << "    return true;\n";
     out << "}\n\n";
 }

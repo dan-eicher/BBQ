@@ -419,10 +419,15 @@ void CReaderEmitter::emit_switch_body(const std::string& rule_name, Switch* sw,
             first = false;
             variant_idx++;
         }
-        if (sw->default_) {
+        if (sw->default_ && (*sw->default_)->is_reject) {
+            // Explicit reject — same fail behavior as no-default, but
+            // the author wrote it intentionally (audit-visible).
+            out << ind(indent) << "}\n";
+            out << ind(indent) << "return bbq_fail(ctx, \"" << rule_name << ": rejected\");\n";
+        } else if (sw->default_) {
             out << ind(indent) << "} else {\n";
             out << ind(indent + 1) << target << "->tag = " << variant_idx << ";\n";
-            emit_read_call(target + "->u.default_val", (*sw->default_)->target, rule_name, out, indent + 1);
+            emit_read_call(target + "->u.default_val", *(*sw->default_)->target, rule_name, out, indent + 1);
             out << ind(indent + 1) << exit_stmt << ";\n";
             out << ind(indent) << "}\n";
         } else {
@@ -459,14 +464,16 @@ void CReaderEmitter::emit_switch_body(const std::string& rule_name, Switch* sw,
         out << ind(indent) << "}\n";
         variant_idx++;
     }
-    if (sw->default_) {
+    if (sw->default_ && (*sw->default_)->is_reject) {
+        out << ind(indent) << "default:\n";
+        out << ind(indent + 1) << "return bbq_fail(ctx, \"" << rule_name << ": rejected\");\n";
+    } else if (sw->default_) {
         out << ind(indent) << "default: {\n";
         out << ind(indent + 1) << target << "->tag = -1;\n";
-        emit_read_call(target + "->u.default_val", (*sw->default_)->target, rule_name, out, indent + 1);
+        emit_read_call(target + "->u.default_val", *(*sw->default_)->target, rule_name, out, indent + 1);
         out << ind(indent + 1) << exit_stmt << ";\n";
         out << ind(indent) << "}\n";
-    }
-    if (!sw->default_) {
+    } else {
         out << ind(indent) << "default:\n";
         out << ind(indent + 1) << "return bbq_fail(ctx, \"" << rule_name << ": unhandled case\");\n";
     }

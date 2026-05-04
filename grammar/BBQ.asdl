@@ -74,7 +74,12 @@ module BBQ {
     // Switch
     switch_case    = SwitchCase(case_value value, type_expr target,
                                 interval? interval)
-    switch_default = SwitchDefault(type_expr target, interval? interval)
+    // SwitchDefault: target is the type to parse on default. Setting
+    // is_reject = true makes the default an explicit unreachable-fail
+    // marker — emits `bbq_fail` in the reader (and a write-side fail).
+    // When is_reject is true, target is unused (None).
+    switch_default = SwitchDefault(type_expr? target, interval? interval,
+                                   bool is_reject)
 
     case_value    = IntValue(int64 value)
                   | StrValue(string value)

@@ -161,6 +161,11 @@ public:
             }
         }
 
+        // Pre-intern built-in function names into result->strings so
+        // CallApplyKont's dispatch can use pointer-equality against
+        // call-site func_name pointers (also interned in this pool).
+        bbq::cek::populate_builtins(*result);
+
         return result;
     }
     // ─── End MEMBERS ────────────────────────────
@@ -714,7 +719,12 @@ private:
     compile_switch_default(std::optional<BBQ::SwitchDefault*> dflt, ::bbq::rho_t r,
                            bbq::cek::StaticKont* Lnext) {
         if (!dflt.has_value() || !dflt.value()) return nullptr;
-        return compile_type_expr(dflt.value()->target, r, ::bbq::effect(),
+        // `default: reject` has no target — caller (compile_switch)
+        // emits a fail node directly. Returning nullptr here triggers
+        // that path uniformly with the no-default case.
+        if (dflt.value()->is_reject || !dflt.value()->target.has_value())
+            return nullptr;
+        return compile_type_expr(*dflt.value()->target, r, ::bbq::effect(),
                                  ::bbq::jump(Lnext), Lnext);
     }
 

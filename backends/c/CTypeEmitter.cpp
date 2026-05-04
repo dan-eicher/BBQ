@@ -286,8 +286,11 @@ void CTypeEmitter::emit_switch_type(const std::string& name, Switch* sw, std::os
             values.push_back(std::to_string(i));
         }
     }
-    if (sw->default_) {
-        types.push_back(c_type((*sw->default_)->target));
+    if (sw->default_ && !(*sw->default_)->is_reject) {
+        // `default: reject` is an unreachable explicit-fail marker —
+        // no payload type, no union slot needed. The reader emits a
+        // bbq_fail at this position; the union just doesn't grow.
+        types.push_back(c_type(*(*sw->default_)->target));
         names.push_back("default_val");
         values.push_back("-1");
     }
@@ -356,8 +359,8 @@ std::string CTypeEmitter::c_type(TypeExpr* type) {
         std::string result = "struct { int tag; union { ";
         for (size_t i = 0; i < sw->cases.size(); i++)
             result += c_type(sw->cases[i]->target) + " case_" + std::to_string(i) + "; ";
-        if (sw->default_)
-            result += c_type((*sw->default_)->target) + " default_val; ";
+        if (sw->default_ && !(*sw->default_)->is_reject)
+            result += c_type(*(*sw->default_)->target) + " default_val; ";
         result += "} u; }";
         return result;
     } else if (auto* ext = dynamic_cast<Extern*>(type)) {
@@ -497,6 +500,15 @@ void CTypeEmitter::emit_free_funcs(std::ostream& out) {
 
     out << "// ── Free functions ──\n\n";
     out << "#include <stdlib.h>\n\n";
+
+    // Forward-declare all _free functions so emission order doesn't matter
+    // when one free body calls another (e.g. parent struct frees child struct).
+    for (auto* rule : sema_.sorted_rules()) {
+        if (!type_needs_free(rule->body)) continue;
+        out << "static inline void " << prefixed_name(rule->name) << "_free("
+            << type_name(rule->name) << "* p);\n";
+    }
+    out << "\n";
 
     for (auto* rule : sema_.sorted_rules())
         emit_free_func(rule, out);

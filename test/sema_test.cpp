@@ -159,6 +159,65 @@ TEST(Sema, SwitchNoDefaultWarning) {
     EXPECT_TRUE(found);
 }
 
+// Range-narrow discriminators (peek() >> N, peek() & N) — when the
+// case values exhaustively cover the computed range, the no-default
+// warning is suppressed because the author can't reach the unhandled
+// path.
+
+TEST(Sema, SwitchExhaustiveShiftRecognized) {
+    auto* g = parse(
+        "P = switch(peek() >> 7) {\n"
+        "    0: FooType;\n"
+        "    1: BarType;\n"
+        "}");
+    ASSERT_NE(g, nullptr);
+    ErrorReporter errors;
+    Sema sema(errors);
+    sema.analyze(g);
+    for (auto& e : errors.errors()) {
+        EXPECT_FALSE(e.is_warning && e.message.find("no default") != std::string::npos)
+            << "false-positive no-default warning on exhaustive shift";
+    }
+}
+
+TEST(Sema, SwitchExhaustiveAndRecognized) {
+    auto* g = parse(
+        "P = switch(peek() & 3) {\n"
+        "    0: FooType;\n"
+        "    1: BarType;\n"
+        "    2: FooType;\n"
+        "    3: BarType;\n"
+        "}");
+    ASSERT_NE(g, nullptr);
+    ErrorReporter errors;
+    Sema sema(errors);
+    sema.analyze(g);
+    for (auto& e : errors.errors()) {
+        EXPECT_FALSE(e.is_warning && e.message.find("no default") != std::string::npos)
+            << "false-positive no-default warning on exhaustive mask";
+    }
+}
+
+// Reject as default — explicit "this case is unreachable, fail
+// the parse" marker. Suppresses the no-default warning while
+// keeping the rejection visible in the spec.
+TEST(Sema, SwitchDefaultRejectSuppressesWarning) {
+    auto* g = parse(
+        "P = switch(t) {\n"
+        "    1: FooType;\n"
+        "    2: BarType;\n"
+        "    default: reject;\n"
+        "}");
+    ASSERT_NE(g, nullptr);
+    ErrorReporter errors;
+    Sema sema(errors);
+    sema.analyze(g);
+    for (auto& e : errors.errors()) {
+        EXPECT_FALSE(e.is_warning && e.message.find("no default") != std::string::npos)
+            << "no-default warning fired despite explicit `default: reject;`";
+    }
+}
+
 TEST(Sema, ValidDependencyOrdering) {
     auto* g = parse(
         "Header = struct { magic: uint32be }\n"

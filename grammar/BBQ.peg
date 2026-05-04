@@ -306,15 +306,25 @@ SwitchCaseRule <. std::vector<SwitchCase*> *cases .>
 .
 
 DefaultCaseRule <. SwitchDefault* *result .>
-    (. TypeExpr* target;
-       Interval* iv = nullptr; .)
+    (. TypeExpr* target = nullptr;
+       Interval* iv = nullptr;
+       bool is_reject = false; .)
     = "default"    (. SourceLoc loc = Loc(); .)
       ":"
-      TypeBody<&target>
+      // `reject` is a contextual keyword — only meaningful here.
+      // !ident_continue enforces the word boundary so a struct field
+      // or rule name like `reject_id` doesn't get misparsed as the
+      // keyword followed by garbage. Outside this context, `reject`
+      // is a normal identifier.
+      ( "reject" !ident_continue   (. is_reject = true; .)
+      | TypeBody<&target>
+      )
       [ IntervalSpec<&iv> ]
       ";"
-    (. *result = new SwitchDefault(target,
-           iv ? std::optional<Interval*>(iv) : std::nullopt);
+    (. *result = new SwitchDefault(
+           target ? std::optional<TypeExpr*>(target) : std::nullopt,
+           iv ? std::optional<Interval*>(iv) : std::nullopt,
+           is_reject);
        (*result)->loc = loc; .)
 .
 

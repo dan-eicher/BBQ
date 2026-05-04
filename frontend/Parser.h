@@ -123,9 +123,13 @@ private:
     bool parse_FloatLitExpr(Expr* * result);
     bool parse_CallExpr(Expr* * result);
     bool ident(peg::Span& out);
+    bool ident() { peg::Span _d; return ident(_d); }
     bool integer(peg::Span& out);
+    bool integer() { peg::Span _d; return integer(_d); }
     bool floating(peg::Span& out);
+    bool floating() { peg::Span _d; return floating(_d); }
     bool string_lit(peg::Span& out);
+    bool string_lit() { peg::Span _d; return string_lit(_d); }
 
 };
 

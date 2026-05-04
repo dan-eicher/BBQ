@@ -8,6 +8,7 @@
 // place — Layer 2 uses them from the new structural invokes.
 
 #include "Machine.h"
+#include "CompiledGrammar.h"
 
 #include <algorithm>
 #include <cstdlib>
@@ -696,87 +697,143 @@ void ArgStoreKont::invoke(CEKMachine* m) const {
     this->args_buf[this->slot] = m->result;
 }
 
+// ── Built-in expression functions ──────────────────────────
+//
+// Each built-in is a named static handler; the dispatch table below
+// maps (name, arity) to the handler. Each handler validates argument
+// types, allocates its result via the per-parse arena, and writes
+// m->result. On error it calls m->fail(...) and returns.
+
+namespace {
+
+void builtin_abs(CEKMachine* m, Value** args) {
+    Value* v = args[0];
+    if (v && v->tag == ValueTag::IntValue) {
+        auto* r = m->arena->alloc<IntValue>();
+        int64_t x = static_cast<IntValue*>(v)->v;
+        r->v = x < 0 ? -x : x;
+        m->result = r;
+        return;
+    }
+    if (v && v->tag == ValueTag::FloatValue) {
+        auto* r = m->arena->alloc<FloatValue>();
+        double x = static_cast<FloatValue*>(v)->v;
+        r->v = x < 0 ? -x : x;
+        m->result = r;
+        return;
+    }
+    m->fail("abs: type mismatch");
+}
+
+void builtin_minmax(CEKMachine* m, Value** args, bool is_max) {
+    Value* a = args[0]; Value* b = args[1];
+    if (!a || !b || a->tag != b->tag) { m->fail("min/max: type mismatch"); return; }
+    if (a->tag == ValueTag::IntValue) {
+        auto* r = m->arena->alloc<IntValue>();
+        int64_t x = static_cast<IntValue*>(a)->v;
+        int64_t y = static_cast<IntValue*>(b)->v;
+        r->v = is_max ? (x > y ? x : y) : (x < y ? x : y);
+        m->result = r;
+        return;
+    }
+    if (a->tag == ValueTag::FloatValue) {
+        auto* r = m->arena->alloc<FloatValue>();
+        double x = static_cast<FloatValue*>(a)->v;
+        double y = static_cast<FloatValue*>(b)->v;
+        r->v = is_max ? (x > y ? x : y) : (x < y ? x : y);
+        m->result = r;
+        return;
+    }
+    m->fail("min/max: type mismatch");
+}
+
+void builtin_min(CEKMachine* m, Value** args) { builtin_minmax(m, args, false); }
+void builtin_max(CEKMachine* m, Value** args) { builtin_minmax(m, args, true);  }
+
+void builtin_clamp(CEKMachine* m, Value** args) {
+    Value* x = args[0]; Value* lo = args[1]; Value* hi = args[2];
+    if (!x || !lo || !hi || x->tag != lo->tag || x->tag != hi->tag) {
+        m->fail("clamp: type mismatch"); return;
+    }
+    if (x->tag == ValueTag::IntValue) {
+        int64_t xv = static_cast<IntValue*>(x)->v;
+        int64_t lov = static_cast<IntValue*>(lo)->v;
+        int64_t hiv = static_cast<IntValue*>(hi)->v;
+        auto* rv = m->arena->alloc<IntValue>();
+        rv->v = xv < lov ? lov : (xv > hiv ? hiv : xv);
+        m->result = rv;
+        return;
+    }
+    if (x->tag == ValueTag::FloatValue) {
+        double xv = static_cast<FloatValue*>(x)->v;
+        double lov = static_cast<FloatValue*>(lo)->v;
+        double hiv = static_cast<FloatValue*>(hi)->v;
+        auto* rv = m->arena->alloc<FloatValue>();
+        rv->v = xv < lov ? lov : (xv > hiv ? hiv : xv);
+        m->result = rv;
+        return;
+    }
+    m->fail("clamp: type mismatch");
+}
+
+// peek() — read the next byte without consuming. Mirrors the C
+// backend's bbq_peek built-in. Used as a switch discriminator for
+// tag-prefixed unions where the discriminating byte is also the
+// first byte of each case body (see e.g. cap.bbq's CpInfo).
+void builtin_peek(CEKMachine* m, Value** /*args*/) {
+    if (m->pos >= m->input_length) { m->fail("peek: end of input"); return; }
+    auto* r = m->arena->alloc<IntValue>();
+    r->v = static_cast<int64_t>(m->input[m->pos]);
+    m->result = r;
+}
+
+// Master registration list — literal name + arity + handler. Pre-
+// populated into each CompiledGrammar's BuiltinFnTable at compile
+// time, with the names interned in that grammar's StringPool so the
+// CallApplyKont dispatch can use pointer-equality.
+struct BuiltinRegistration {
+    const char* name;
+    int arity;
+    BuiltinFnTable::Handler fn;
+};
+
+constexpr BuiltinRegistration BUILTIN_REGISTRATIONS[] = {
+    { "abs",   1, builtin_abs   },
+    { "min",   2, builtin_min   },
+    { "max",   2, builtin_max   },
+    { "clamp", 3, builtin_clamp },
+    { "peek",  0, builtin_peek  },
+};
+
+constexpr size_t BUILTIN_COUNT =
+    sizeof(BUILTIN_REGISTRATIONS) / sizeof(BUILTIN_REGISTRATIONS[0]);
+
+} // namespace
+
+void populate_builtins_into(BuiltinFnTable& out, ParseArena& arena,
+                            StringPool& pool) {
+    auto* entries = static_cast<BuiltinFnTable::Entry*>(
+        arena.allocate(BUILTIN_COUNT * sizeof(BuiltinFnTable::Entry),
+                       alignof(BuiltinFnTable::Entry)));
+    for (size_t i = 0; i < BUILTIN_COUNT; i++) {
+        entries[i].name = pool.intern(BUILTIN_REGISTRATIONS[i].name);
+        entries[i].arity = BUILTIN_REGISTRATIONS[i].arity;
+        entries[i].fn = BUILTIN_REGISTRATIONS[i].fn;
+    }
+    out.entries = entries;
+    out.count = static_cast<int>(BUILTIN_COUNT);
+}
+
+void populate_builtins(CompiledGrammar& g) {
+    populate_builtins_into(g.builtins, g.arena, g.strings);
+}
+
 void CallApplyKont::invoke(CEKMachine* m) const {
-    // Function table lookup is only used by user functions; built-ins
-    // (abs/min/max/clamp) aren't hooked up yet at this layer. For now,
-    // dispatch to a minimal built-in set inline.
-    const char* name = this->func_name;
-    Value** args = this->args_buf;
-    int n = this->arg_count;
-
-    auto fail_and_return = [m, name]() { m->fail(name); };
-
-    // abs(x) — int or float
-    if (name && std::strcmp(name, "abs") == 0 && n == 1) {
-        Value* v = args[0];
-        if (!v) { fail_and_return(); return; }
-        if (v->tag == ValueTag::IntValue) {
-            auto* r = m->arena->alloc<IntValue>();
-            int64_t x = static_cast<IntValue*>(v)->v;
-            r->v = x < 0 ? -x : x;
-            m->result = r;
+    if (m->builtins) {
+        if (auto* e = m->builtins->lookup(this->func_name, this->arg_count)) {
+            e->fn(m, this->args_buf);
             return;
         }
-        if (v->tag == ValueTag::FloatValue) {
-            auto* r = m->arena->alloc<FloatValue>();
-            double x = static_cast<FloatValue*>(v)->v;
-            r->v = x < 0 ? -x : x;
-            m->result = r;
-            return;
-        }
-        fail_and_return();
-        return;
-    }
-    // min / max — int or float, two args
-    if (name && (std::strcmp(name, "min") == 0 || std::strcmp(name, "max") == 0) && n == 2) {
-        bool is_max = std::strcmp(name, "max") == 0;
-        Value* a = args[0]; Value* b = args[1];
-        if (!a || !b || a->tag != b->tag) { fail_and_return(); return; }
-        if (a->tag == ValueTag::IntValue) {
-            auto* r = m->arena->alloc<IntValue>();
-            int64_t x = static_cast<IntValue*>(a)->v;
-            int64_t y = static_cast<IntValue*>(b)->v;
-            r->v = is_max ? (x > y ? x : y) : (x < y ? x : y);
-            m->result = r;
-            return;
-        }
-        if (a->tag == ValueTag::FloatValue) {
-            auto* r = m->arena->alloc<FloatValue>();
-            double x = static_cast<FloatValue*>(a)->v;
-            double y = static_cast<FloatValue*>(b)->v;
-            r->v = is_max ? (x > y ? x : y) : (x < y ? x : y);
-            m->result = r;
-            return;
-        }
-        fail_and_return();
-        return;
-    }
-    // clamp(x, lo, hi)
-    if (name && std::strcmp(name, "clamp") == 0 && n == 3) {
-        Value* x = args[0]; Value* lo = args[1]; Value* hi = args[2];
-        if (!x || !lo || !hi || x->tag != lo->tag || x->tag != hi->tag) { fail_and_return(); return; }
-        if (x->tag == ValueTag::IntValue) {
-            int64_t xv = static_cast<IntValue*>(x)->v;
-            int64_t lov = static_cast<IntValue*>(lo)->v;
-            int64_t hiv = static_cast<IntValue*>(hi)->v;
-            int64_t r = xv < lov ? lov : (xv > hiv ? hiv : xv);
-            auto* rv = m->arena->alloc<IntValue>();
-            rv->v = r;
-            m->result = rv;
-            return;
-        }
-        if (x->tag == ValueTag::FloatValue) {
-            double xv = static_cast<FloatValue*>(x)->v;
-            double lov = static_cast<FloatValue*>(lo)->v;
-            double hiv = static_cast<FloatValue*>(hi)->v;
-            double r = xv < lov ? lov : (xv > hiv ? hiv : xv);
-            auto* rv = m->arena->alloc<FloatValue>();
-            rv->v = r;
-            m->result = rv;
-            return;
-        }
-        fail_and_return();
-        return;
     }
     m->fail("unknown function");
 }

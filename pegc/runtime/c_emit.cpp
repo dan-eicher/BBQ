@@ -280,7 +280,14 @@ void cg_rule_call(Ctx* ctx, RuleCall* rc, std::ostream& out, int indent) {
 
     if (!ctx->in_lex_mode) out << ind << "peg_skip(p);\n";
     out << ind << "if (!" << fn_name << "(p";
-    if (!rc->args.empty()) out << ", " << rc->args;
+    if (!rc->args.empty()) {
+        out << ", " << rc->args;
+    } else if (ctx->token_names.count(rc->name)) {
+        // Tokens always take a peg_span* out param; auto-pass NULL when
+        // the call site doesn't care about the captured span (pure-
+        // recognizer use, e.g. keywords).
+        out << ", NULL";
+    }
     out << ")) " << ctx->fail << ";\n";
 }
 

@@ -451,10 +451,14 @@ void ParserEmitter::emit_switch_body(const std::string& rule_name, Switch* sw, c
             first = false;
             variant_idx++;
         }
-        if (sw->default_) {
+        if (sw->default_ && (*sw->default_)->is_reject) {
+            // Explicit reject — same fail behavior as no default.
+            out << ind(indent) << "}\n";
+            out << ind(indent) << "return ctx.fail(\"" << rule_name << ": rejected\");\n";
+        } else if (sw->default_) {
             out << ind(indent) << "} else {\n";
             out << ind(indent + 1) << "auto& val = " << target << ".emplace<" << variant_idx << ">();\n";
-            emit_read_call("val", (*sw->default_)->target, rule_name, out, indent + 1);
+            emit_read_call("val", *(*sw->default_)->target, rule_name, out, indent + 1);
             out << ind(indent + 1) << exit_stmt << ";\n";
             out << ind(indent) << "}\n";
         } else {
@@ -486,14 +490,16 @@ void ParserEmitter::emit_switch_body(const std::string& rule_name, Switch* sw, c
         out << ind(indent) << "}\n";
         variant_idx++;
     }
-    if (sw->default_) {
+    if (sw->default_ && (*sw->default_)->is_reject) {
+        out << ind(indent) << "default:\n";
+        out << ind(indent + 1) << "return ctx.fail(\"" << rule_name << ": rejected\");\n";
+    } else if (sw->default_) {
         out << ind(indent) << "default: {\n";
         out << ind(indent + 1) << "auto& val = " << target << ".emplace<" << variant_idx << ">();\n";
-        emit_read_call("val", (*sw->default_)->target, rule_name, out, indent + 1);
+        emit_read_call("val", *(*sw->default_)->target, rule_name, out, indent + 1);
         out << ind(indent + 1) << exit_stmt << ";\n";
         out << ind(indent) << "}\n";
-    }
-    if (!sw->default_) {
+    } else {
         out << ind(indent) << "default:\n";
         out << ind(indent + 1) << "return ctx.fail(\"" << rule_name << ": unhandled case\");\n";
     }

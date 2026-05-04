@@ -824,27 +824,51 @@ bool Parser::parse_SwitchCaseRule(std::vector<SwitchCase*> * cases) {
 }
 
 bool Parser::parse_DefaultCaseRule(SwitchDefault* * result) {
-    TypeExpr* target;
+    TypeExpr* target = nullptr;
        Interval* iv = nullptr;
+       bool is_reject = false;
     skip();
     if (!match("default")) return false;
     SourceLoc loc = Loc();
     skip();
     if (!match(":")) return false;
-    skip();
-    if (!parse_TypeBody(&target)) return false;
     {
         auto _m0 = save();
+        if ([&]() -> bool {
+            skip();
+            if (!match("reject")) return false;
+            {
+                auto _m1 = save();
+                bool _ok1 = [&]() -> bool {
+                    if (at_end() || !is_ident_continue(peek())) return false;
+                    advance();
+                    return true;
+                }();
+                restore(_m1);
+                if (_ok1) return false;
+            }
+            is_reject = true;
+            return true;
+        }()) {} else {
+        restore(_m0);
+        skip();
+        if (!parse_TypeBody(&target)) return false;
+        }
+    }
+    {
+        auto _m2 = save();
         if (![&]() -> bool {
             skip();
             if (!parse_IntervalSpec(&iv)) return false;
             return true;
-        }()) restore(_m0);
+        }()) restore(_m2);
     }
     skip();
     if (!match(";")) return false;
-    *result = new SwitchDefault(target,
-           iv ? std::optional<Interval*>(iv) : std::nullopt);
+    *result = new SwitchDefault(
+           target ? std::optional<TypeExpr*>(target) : std::nullopt,
+           iv ? std::optional<Interval*>(iv) : std::nullopt,
+           is_reject);
        (*result)->loc = loc;
     return true;
 }

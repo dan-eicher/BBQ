@@ -35,8 +35,11 @@ private:
     bool parse_RuleDecl(burg_ast::Rule* * result);
     bool parse_TreePat(burg_ast::TreePattern* * result);
     bool ident(peg::Span& out);
+    bool ident() { peg::Span _d; return ident(_d); }
     bool integer(peg::Span& out);
+    bool integer() { peg::Span _d; return integer(_d); }
     bool qualified_ident(peg::Span& out);
+    bool qualified_ident() { peg::Span _d; return qualified_ident(_d); }
 
 };
 

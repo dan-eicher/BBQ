@@ -713,6 +713,24 @@ ExprResult run_expr(KontNode* expr_root, ParseArena& arena, Environment* env = n
     return {m.result, m.failed, m.best_error_msg};
 }
 
+// Variant for tests that exercise built-in function calls (abs/min/...).
+// Built-in dispatch is by interned-pointer equality, so the test's
+// StringPool — the one used to intern the call's func_name — must also
+// be where the BuiltinFnTable's names are interned.
+ExprResult run_expr_with_builtins(KontNode* expr_root, ParseArena& arena,
+                                   StringPool& pool, Environment* env = nullptr) {
+    BuiltinFnTable table;
+    populate_builtins_into(table, arena, pool);
+
+    CEKMachine m;
+    m.arena = &arena;
+    m.env = env;
+    m.builtins = &table;
+    auto meta = m.execute_from(expr_root, nullptr, 0, true);
+    (void)meta;
+    return {m.result, m.failed, m.best_error_msg};
+}
+
 IntLitKont* int_lit(ParseArena& a, int64_t v) {
     auto* k = a.alloc<IntLitKont>();
     k->v = v;
@@ -914,7 +932,7 @@ TEST(CEKLayer2Call, AbsInt) {
     args[0] = int_lit(arena, -7);
     call->args = args;
     call->args_count = 1;
-    auto r = run_expr(call, arena);
+    auto r = run_expr_with_builtins(call, arena, pool);
     ASSERT_FALSE(r.failed) << (r.error_msg ? r.error_msg : "");
     EXPECT_EQ(static_cast<IntValue*>(r.result)->v, 7);
 }
@@ -929,7 +947,7 @@ TEST(CEKLayer2Call, MinTwoInts) {
     args[1] = int_lit(arena, 3);
     call->args = args;
     call->args_count = 2;
-    auto r = run_expr(call, arena);
+    auto r = run_expr_with_builtins(call, arena, pool);
     EXPECT_EQ(static_cast<IntValue*>(r.result)->v, 3);
 }
 

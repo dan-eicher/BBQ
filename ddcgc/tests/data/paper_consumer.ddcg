@@ -1,0 +1,99 @@
+// Paper-direct consumer of dybvig.ddcg. Demonstrates that a real
+// consumer needs only:
+//   1. its own AST schema (paper_consumer_ast.json)
+//   2. point -ir at dybvig_ir.json (the lib's IR shape)
+//   3. `import "dybvig.ddcg"` — δ/γ/ρ + cg_*/make_* come along
+//   4. RULES that drop straight to the lib's helpers
+//
+// No MEMBERS that re-implement paper logic; no consumer-side cg_store
+// matrix; no IR-layout-pass workaround for fall-through.
+
+COMPILER paper_consumer
+
+(. #include "paper_consumer_runtime.h" .)
+
+IMPORTS
+  ast = "paper_consumer_ast.json"
+  ir  = "dybvig_ir.json"
+
+// Consumers using `import "dybvig.ddcg"` get δ/γ/ρ shapes spliced in;
+// what they have to declare themselves is the root IR type (the lib
+// has no way to know which import name on the consumer side aliases
+// the IR), and any consumer-specific destinations beyond the paper
+// shapes (none here).
+DESTINATIONS
+  ir_root ir.expr
+
+// All paper-direct auxiliaries come from dybvig.ddcg via the splice;
+// the consumer adds nothing here because the test rules don't need
+// any consumer-specific helpers.
+AUXILIARIES
+
+MEMBERS (.
+    // Per-compile state. The dispatcher writes current_loc on every
+    // node; the make_X allocators leak into a per-compile pool we
+    // walk for verification in main.
+    SourceLoc current_loc;
+    std::vector<std::unique_ptr<ir::Expr>> pool;
+
+    template <typename T, typename... Args>
+    T* alloc(Args&&... a) {
+        // Trailing space before `)` is intentional — without it the
+        // pack expansion ends in dot-dot-paren which the MEMBERS
+        // scanner's terminator search would false-trigger on.
+        auto p = std::make_unique<T>(std::forward<Args>(a)... );
+        T* raw = p.get();
+        pool.push_back(std::move(p));
+        return raw;
+    }
+
+    // Paper-direct allocator implementations — CEK-tree shape (Phase
+    // 9R): producers carry sub-tree operands and have no `next`;
+    // consumers thread the spine via `next` and take a value sub-tree
+    // where they need one.
+    ir::Expr* make_load_const(int v)                              { return alloc<ir::LoadConst>(v); }
+    ir::Expr* make_load_local(int s)                              { return alloc<ir::LoadLocal>(s); }
+    ir::Expr* make_add(ir::Expr* l, ir::Expr* r)                  { return alloc<ir::Add>(l, r); }
+    ir::Expr* make_store_local(int d, ir::Expr* v, ir::Expr* n)   { return alloc<ir::StoreLocal>(d, v, n); }
+    ir::Expr* make_expr_effect(ir::Expr* v, ir::Expr* n)          { return alloc<ir::ExprEffect>(v, n); }
+    ir::Expr* make_branch(ir::Expr* t, ir::Expr* th, ir::Expr* el){ return alloc<ir::Branch>(t, th, el); }
+    ir::Expr* make_goto(ir::Expr* t)                              { return alloc<ir::Goto>(t); }
+    ir::Expr* make_leave(ir::Expr* v)                             { return alloc<ir::Leave>(v); }
+    ir::Expr* make_halt(ir::Expr* v)                              { return alloc<ir::Halt>(v); }
+    // Stub allocator for the lib's call AUX. paper_consumer doesn't
+    // use Call, so the stub aborts if reached.
+    ir::Expr* make_call(ir::Expr*, std::vector<ir::Expr*>, int)   { std::abort(); }
+
+    // Required hook from dybvig.ddcg lib — paper-undefined γ contexts
+    // call into here. paper_consumer's only rule (add) doesn't invoke
+    // any helper that reaches a panic arm, so the stub aborts.
+    [[noreturn]] ir::Expr* panic_unreachable() {
+        std::fprintf(stderr, "paper_consumer: panic_unreachable\n");
+        std::abort();
+    }
+.)
+
+import "dybvig.ddcg"
+
+RULES
+
+// Paper page 13: CG[int n] ρ δ γ ⇒ CG_store n δ γ.
+// In tree shape: build a LoadConst leaf, then deliver per (δ, γ).
+rule lit : ast.Lit(n: x) {
+    cg_deliver(make_load_const(x), delta, gamma, Lnext);
+}
+
+// Paper figure 8 case 4 (both operands complex): in CEK-tree shape
+// this collapses to "build the value sub-tree directly":
+//   CG[binop op E1 E2] ρ δ γ ⇒
+//     gen E1 with δ=ac → value_l (sub-tree)
+//     gen E2 with δ=ac → value_r (sub-tree)
+//     deliver make_add(value_l, value_r) per (δ, γ)
+// No spilling at the IR level — operand-shape selection is the BURG
+// matcher's job at lowering time. With the L==Lnext peephole, gen
+// with δ=ac and γ=jump(Lnext) returns the value sub-tree alone.
+rule add : ast.Add(left: l, right: r) {
+    let lv = gen(l, rho, ac, jump(Lnext), Lnext);
+    let rv = gen(r, rho, ac, jump(Lnext), Lnext);
+    cg_deliver(make_add(lv, rv), delta, gamma, Lnext);
+}

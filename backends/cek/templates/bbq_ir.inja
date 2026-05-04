@@ -1,0 +1,181 @@
+// ============================================================
+// BBQ CEK IR — auto-generated from bbq_ir.asdl
+// Do not edit by hand. Regenerate via the asdl tool.
+// ============================================================
+#pragma once
+
+#include <cstddef>
+#include <cstdint>
+
+namespace bbq::cek {
+
+// Forward declaration for the runtime that consumes nodes.
+struct CEKMachine;
+
+// FieldCapture lives in Capture.h. Forward-declare so FieldCaptureValue
+// can reference it without a header dependency.
+struct FieldCapture;
+
+// ── Primitive type descriptor ───────────────────────────────
+
+enum class PrimWidth : uint8_t { W8, W16, W32, W64 };
+enum class PrimSign  : uint8_t { Unsigned, Signed };
+enum class PrimEndian : uint8_t { Little, Big, Native };
+enum class PrimKind : uint8_t { Integer, Float, Bool };
+
+struct PrimitiveInfo {
+    PrimKind kind = PrimKind::Integer;
+    PrimWidth width = PrimWidth::W8;
+    PrimSign sign = PrimSign::Unsigned;
+    PrimEndian endian = PrimEndian::Native;
+
+    size_t byte_count() const {
+        if (kind == PrimKind::Bool) return 1;
+        if (kind == PrimKind::Float) {
+            return (width == PrimWidth::W64) ? 8 : 4;
+        }
+        switch (width) {
+            case PrimWidth::W8:  return 1;
+            case PrimWidth::W16: return 2;
+            case PrimWidth::W32: return 4;
+            case PrimWidth::W64: return 8;
+        }
+        return 0;
+    }
+};
+
+// ── Generated enums ─────────────────────────────────────────
+
+{% for def in definitions %}
+{% if existsIn(def, "is_enum") and def.is_enum %}
+enum class {{camelcase(def.name)}} : uint8_t {
+{% for type in def.types %}
+    {{type.name}}{% if not loop.is_last %},{% endif %}
+
+{% endfor %}
+};
+
+{% endif %}
+{% endfor %}
+// ── Forward declarations ────────────────────────────────────
+
+struct KontNode;
+{% for base in bases %}
+struct {{base}};
+{% endfor %}
+{% for def in definitions %}
+{% if def.type == "sum" and not (existsIn(def, "is_enum") and def.is_enum) %}
+{% for type in def.types %}
+struct {{type.name}};
+{% endfor %}
+{% endif %}
+{% if def.type == "product" %}
+struct {{def.name}};
+{% endif %}
+{% endfor %}
+
+// ── KontNode root ───────────────────────────────────────────
+//
+// The shared root for static_kont and dynamic_kont variants.
+// `invoke()` is private with `friend class CEKMachine` so the
+// trampoline (`CEKMachine::execute_from()`) is the only legal
+// call site. Any kont's invoke body that tries to call another
+// kont's invoke directly is a compile error — schedule via
+// `m->push_kont(other)` instead.
+
+struct KontNode {
+    virtual ~KontNode() = default;
+
+private:
+    friend struct CEKMachine;
+    virtual void invoke(CEKMachine* m) const = 0;
+};
+
+// ── Product types (inline structs nested in node fields) ────
+
+{% for def in definitions %}
+{% if def.type == "product" %}
+struct {{def.name}} {
+{% for field in def.fields %}
+{% if field.flag == "sequence" %}
+    {{get_type(field.type)}}* {{safe_name(field.name)}} = nullptr;
+    int {{safe_name(field.name)}}_count = 0;
+{% else %}
+    {{get_type(field.type)}} {{safe_name(field.name)}}{};
+{% endif %}
+{% endfor %}
+};
+
+{% endif %}
+{% endfor %}
+// ── Sum types ───────────────────────────────────────────────
+//
+// `value` is a sum of plain data records — no virtual methods,
+// tag-based dispatch via `kind` constants (consumed by `expect<T>`
+// in Machine.cpp).
+//
+// `static_kont` and `dynamic_kont` are sums of kont variants —
+// each inherits from its sum base, which inherits from `KontNode`.
+// Variants override the private `invoke()` declared on KontNode.
+
+{% for def in definitions %}
+{% if def.type == "sum" and not (existsIn(def, "is_enum") and def.is_enum) %}
+{% if length(def.types) > 1 %}
+{% if def.name == "value" %}
+// Value sum — typed accumulator values + binding values + computed_value.
+enum class {{camelcase(def.name)}}Tag : int {
+{% for type in def.types %}
+    {{type.name}}{% if not loop.is_last %},{% endif %}
+
+{% endfor %}
+};
+
+struct {{camelcase(def.name)}} {
+    {{camelcase(def.name)}}Tag tag;
+    explicit {{camelcase(def.name)}}({{camelcase(def.name)}}Tag t) : tag(t) {}
+
+protected:
+    ~{{camelcase(def.name)}}() = default;  // arena-allocated, never delete'd
+};
+
+{% else %}
+// {{camelcase(def.name)}} — sum base inheriting from the shared `KontNode` root.
+struct {{camelcase(def.name)}} : public KontNode {
+};
+
+{% endif %}
+{% endif %}
+{% for type in def.types %}
+struct {{type.name}} : public {{type.base}} {
+{% if def.name == "value" %}
+    static constexpr {{camelcase(def.name)}}Tag kind = {{camelcase(def.name)}}Tag::{{type.name}};
+
+    {{type.name}}() : {{type.base}}(kind) {}
+
+{% for field in type.fields %}
+{% if field.flag == "sequence" %}
+    {{get_type(field.type)}}* {{safe_name(field.name)}} = nullptr;
+    int {{safe_name(field.name)}}_count = 0;
+{% else %}
+    {{get_type(field.type)}} {{safe_name(field.name)}}{};
+{% endif %}
+{% endfor %}
+{% else %}
+{% for field in type.fields %}
+{% if field.flag == "sequence" %}
+    {{get_type(field.type)}}* {{safe_name(field.name)}} = nullptr;
+    int {{safe_name(field.name)}}_count = 0;
+{% else %}
+    {{get_type(field.type)}} {{safe_name(field.name)}}{};
+{% endif %}
+{% endfor %}
+
+private:
+    void invoke(CEKMachine* m) const override;
+{% endif %}
+};
+
+{% endfor %}
+{% endif %}
+{% endfor %}
+} // namespace bbq::cek

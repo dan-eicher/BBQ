@@ -6,6 +6,7 @@
 
 #include <string>
    #include <cstdint>
+   #include <vector>
    #include "PegRuntime.h"
 
 
@@ -24,12 +25,19 @@ private:
 
 
     bool parse_Calc();
+    bool parse_FunctionDecl(std::vector<calc::Function*>* fns);
+    bool parse_Param(std::vector<std::string>* params);
     bool parse_Expr(calc::Expr* * result);
+    bool parse_SeqExpr(calc::Expr* * result);
+    bool parse_OrExpr(calc::Expr* * result);
+    bool parse_AndExpr(calc::Expr* * result);
+    bool parse_CmpExpr(calc::Expr* * result);
     bool parse_AddExpr(calc::Expr* * result);
     bool parse_MulExpr(calc::Expr* * result);
     bool parse_UnaryExpr(calc::Expr* * result);
     bool parse_Atom(calc::Expr* * result);
     bool integer(peg::Span& out);
+    bool ident(peg::Span& out);
 
 };
 

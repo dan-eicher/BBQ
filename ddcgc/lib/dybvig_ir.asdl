@@ -1,0 +1,23 @@
+// Reference IR shape for paper-direct DDCG consumers using dybvig.ddcg.
+//
+// CEK kont shape: every node is one continuation that does ONE thing —
+// produces a value in ctx.ac, places ctx.ac elsewhere, or transfers
+// control. ctx.ac is the implicit "current value" register passed
+// between konts (paper's r0 / AiPL Machine::result). Producer konts
+// have NO dest field; placement is the separate StoreSlot kont.
+//
+// Consumers DON'T have to use this schema — dybvig.ddcg's auxiliaries
+// reference `ir.expr` opaquely, so any consumer-supplied schema with
+// matching constructor / field names is fine. This file ships in the
+// lib for consumers without an IR who want to copy it wholesale.
+
+module ir {
+
+    expr = Halt
+         | Goto(expr target)
+         | LoadConst(int value, expr next)
+         | LoadSlot(int src, expr next)
+         | StoreSlot(int dest, expr next)
+         | Add(int lhs, expr next)
+         | Branch(expr then_, expr else_)
+}

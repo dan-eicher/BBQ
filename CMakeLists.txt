@@ -52,7 +52,8 @@ target_link_libraries(bbq_c_backend PUBLIC bbq_frontend)
 # --- CEK backend library ---
 add_library(bbq_cek_backend STATIC
     backends/cek/Machine.cpp
-    backends/cek/Compiler.cpp
+    backends/cek/KontNode.h
+    backends/cek/bbq_compile.h
 )
 target_include_directories(bbq_cek_backend PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/backends/cek)
@@ -102,6 +103,17 @@ if(Python3_FOUND)
         PREFIX ""
         OUTPUT_NAME "bbq"
     )
+
+    find_package(Python3 COMPONENTS Interpreter)
+    if(Python3_Interpreter_FOUND)
+        add_test(NAME bbq_python_tests
+            COMMAND ${Python3_EXECUTABLE} -m pytest
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/test_bbq_python.py
+                --tb=short
+            WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
+        set_tests_properties(bbq_python_tests PROPERTIES
+            ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_BINARY_DIR}")
+    endif()
 endif()
 
 # --- pegc subproject ---
@@ -129,6 +141,53 @@ add_custom_command(
             ${CMAKE_CURRENT_SOURCE_DIR}/grammar/BBQ.asdl
             ${CMAKE_CURRENT_SOURCE_DIR}/grammar/templates/bbq_ast.inja
     COMMENT "Generating BBQ_AST.h from BBQ.asdl"
+)
+
+# --- Auto-regenerate KontNode.h + bbq_ir.json from bbq_ir.asdl ---
+# bbq_ir.json is a JSON sidecar consumed by ddcgc when generating
+# bbq_compile.h from bbq.ddcg.
+add_custom_command(
+    OUTPUT ${CMAKE_CURRENT_SOURCE_DIR}/backends/cek/KontNode.h
+           ${CMAKE_CURRENT_BINARY_DIR}/bbq_ir.json
+    COMMAND asdl -i ${CMAKE_CURRENT_SOURCE_DIR}/backends/cek/bbq_ir.asdl
+                 -t ${CMAKE_CURRENT_SOURCE_DIR}/backends/cek/templates/bbq_ir.inja
+                 -o ${CMAKE_CURRENT_SOURCE_DIR}/backends/cek/KontNode.h
+                 --json ${CMAKE_CURRENT_BINARY_DIR}/bbq_ir.json
+    DEPENDS asdl
+            ${CMAKE_CURRENT_SOURCE_DIR}/backends/cek/bbq_ir.asdl
+            ${CMAKE_CURRENT_SOURCE_DIR}/backends/cek/templates/bbq_ir.inja
+    COMMENT "Generating KontNode.h + bbq_ir.json from bbq_ir.asdl"
+)
+
+# --- Auto-regenerate bbq.json (AST schema sidecar for ddcgc) ---
+# ddcgc consumes this JSON when compiling bbq.ddcg → bbq_compile.h.
+# It mirrors what bbq_ast.inja generates as C++, but in JSON form so
+# ddcgc can introspect AST shapes at compile-time.
+add_custom_command(
+    OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/bbq.json
+    COMMAND asdl -i ${CMAKE_CURRENT_SOURCE_DIR}/grammar/BBQ.asdl
+                 --json ${CMAKE_CURRENT_BINARY_DIR}/bbq.json
+    DEPENDS asdl
+            ${CMAKE_CURRENT_SOURCE_DIR}/grammar/BBQ.asdl
+    COMMENT "Generating bbq.json from BBQ.asdl"
+)
+
+# --- Auto-regenerate bbq_compile.h from bbq.ddcg ---
+# ddcgc compiles the BBQ.asdl → kont-IR translation rule set into a
+# `class Compiler` C++ header. Driver (bbq_runner.cpp) consumes this.
+add_custom_command(
+    OUTPUT ${CMAKE_CURRENT_SOURCE_DIR}/backends/cek/bbq_compile.h
+    COMMAND ddcgc -i ${CMAKE_CURRENT_SOURCE_DIR}/backends/cek/bbq.ddcg
+                  -ast ${CMAKE_CURRENT_BINARY_DIR}/bbq.json
+                  -ir  ${CMAKE_CURRENT_BINARY_DIR}/bbq_ir.json
+                  -L   ${CMAKE_CURRENT_SOURCE_DIR}/ddcgc/lib
+                  -o   ${CMAKE_CURRENT_SOURCE_DIR}/backends/cek/bbq_compile.h
+    DEPENDS ddcgc
+            ${CMAKE_CURRENT_SOURCE_DIR}/backends/cek/bbq.ddcg
+            ${CMAKE_CURRENT_BINARY_DIR}/bbq.json
+            ${CMAKE_CURRENT_BINARY_DIR}/bbq_ir.json
+            ${CMAKE_CURRENT_SOURCE_DIR}/ddcgc/lib/dybvig.ddcg
+    COMMENT "Generating bbq_compile.h from bbq.ddcg"
 )
 
 # --- Auto-regenerate Parser.h/.cpp from BBQ.peg ---

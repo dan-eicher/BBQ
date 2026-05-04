@@ -1,13 +1,65 @@
 // calc.asdl — AST for the calculator expression language
+//
+// Locals are positional `$N` slots — no name binding, no scope. The
+// parser maps each `$N` to the slot index directly; `$a = e; rest` is
+// `Sequence(Assign(slot, e), rest)`. This matches the paper's
+// flat-scope-no-functions DDCG subset (paper §2.1: locals are renamed
+// into positions upstream of DDCG; calc just makes the parser do that).
 
 module calc {
 
-    program = Program(expr body)
+    program = Program(function* functions, expr body)
+
+    function = Function(identifier name, identifier* params, expr body)
 
     op = Add | Sub | Mul
 
+    // Each comparison kind is its own continuation in the CEK model;
+    // the AST mirrors that — no enum-tagged Cmp constructor.
     expr = IntLit(int64 value)
-         | SlotRef(int64 slot)
          | BinOp(op op, expr left, expr right)
          | NegOp(expr operand)
+         | CmpEq(expr left, expr right)
+         | CmpNeq(expr left, expr right)
+         | CmpLt(expr left, expr right)
+         | CmpLe(expr left, expr right)
+         | CmpGt(expr left, expr right)
+         | CmpGe(expr left, expr right)
+         | Sequence(expr first, expr rest)
+         // Paper Figure 5 — `if test then [else]`. Optional `else_`
+         // distinguishes one-arm (nil) from two-arm (non-nil); DDCG
+         // rules dispatch via NilPat.
+         | If(expr test, expr then_, expr? else_)
+         // Paper Figure 5 `while E_test E_body`. Calc's normalizer
+         // rewrites this to the page-10 generic Loop form below before
+         // DDCG sees it; While stays in the AST as a parser surface.
+         | While(expr test, expr body)
+         // Paper page 10 generic loop. Normalizer emits
+         //   While(t, b)  ⇒  Loop(If(t, b, Break))
+         // making the page-10 CG_loop rule the only loop construct
+         // DDCG has to handle.
+         | Loop(expr body)
+         // Paper Figure 5 `break` and `return E`.
+         | Break
+         | Return(expr value)
+         // Boolean ops — paper Figure 7 in test contexts; page 12
+         // rewrites in non-test contexts (handled by the normalizer
+         // pass before DDCG sees them).
+         | And(expr left, expr right)
+         | Or(expr left, expr right)
+         | Not(expr operand)
+         // Phase 9 — surface forms for the named-variable / function
+         // model. The normalizer's scope chain resolves Var / VarAssign
+         // / LetDecl into LocalRef / LocalAssign (frame-relative). Call
+         // resolves the function name into the function's IR entry node.
+         // Until Phase 9c lands, all of these are DESUGARED placeholders
+         // (calc.ddcg has no rules for them yet) and the normalizer
+         // leaves them untouched — programs using the new syntax don't
+         // compile through DDCG yet.
+         | Var(identifier name)
+         | VarAssign(identifier name, expr value)
+         | LetDecl(identifier name, expr value)
+         | Call(identifier name, expr* args)
+         | LocalRef(int64 index)
+         | LocalAssign(int64 index, expr value)
 }

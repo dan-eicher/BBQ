@@ -28,10 +28,13 @@ module DdcgAst {
                 type_ref ir_root,
                 aux_decl* auxiliaries,
                 pred_decl* predicates,
+                fun_decl* funs,
+                library_decl* libraries,
                 string members,
                 string private_helpers,
                 identifier* desugared_by_normalization,
-                rule* rules)
+                rule* rules,
+                bool internal_dispatchers)
 
     // Headers: code blocks copied verbatim into generated dispatcher
     header = Header(string code)
@@ -39,11 +42,13 @@ module DdcgAst {
     // Imports: schema bindings — `source = "..."`, `target = "..."`
     import = Import(identifier name, string path)
 
-    // Destinations: tagged-union declarations the consumer's runtime
-    // implements. Each variant is either discriminant-only (`fail`) or
-    // discriminant + payload fields (`break_loop(save: ident)`).
+    // Destinations: tagged-union declarations (data_dest, ctrl_dest)
+    // or flat record (env_dest, paper's ρ — no variants, just fields
+    // accessed directly). The consumer's runtime implements each as
+    // a `<name>_t` C++ type.
     dest_decl = DataDest(identifier name, dest_variant* variants)
               | CtrlDest(identifier name, dest_variant* variants)
+              | EnvDest(identifier name, dest_field* fields)
 
     dest_variant = DestVariant(identifier name, dest_field* fields)
     dest_field   = DestField(identifier name, type_ref ty)
@@ -56,9 +61,24 @@ module DdcgAst {
     // No side effects allowed; the type system enforces this by signature.
     pred_decl = Pred(identifier name, type_ref* param_types)
 
+    // Funs: action-language function definitions. Unlike Aux (signature
+    // only, body in MEMBERS), a Fun's body is a stmt block in the action
+    // sub-language, type-checked and translated to target code by the
+    // ddcgc backend. The trailing ExprStmt produces the return value.
+    fun_decl  = Fun(identifier name, fun_param* params, type_ref ret_ty, stmt* body)
+    fun_param = FunParam(identifier name, type_ref ty)
+
+    // Library imports: `import "path.ddcg"` references another .ddcg
+    // whose `fun` declarations get spliced into this file's funs at
+    // load time. No binding name (unlike asdl-JSON `Import`); resolution
+    // is by file path, relative to the importing file's directory.
+    library_decl = LibraryImport(string path)
+
     // Type references — used in destination fields, auxiliary signatures,
     // ir_root declaration, and pattern-binding annotations.
-    type_ref = TypeName(identifier name, bool is_pointer)        // ident or ident*
+    // `module` is empty for unqualified types (`int`, `delta`, `gamma`),
+    // and the schema name for module-qualified schema refs (`ast.Lit`).
+    type_ref = TypeName(identifier module, identifier name, bool is_pointer)
              | TypeList(type_ref elem)                           // list<T>
              | TypeTuple(type_ref* elems)                        // tuple<T1, T2, ...>
 
@@ -106,6 +126,16 @@ module DdcgAst {
          | ListLit(expr* elems)                                  // [a, b, c]
          | TupleLit(expr* elems)                                 // (a, b, c)
          | DestPattern(identifier name, expr* args)              // δ/γ value: pair(L1, L2) or `effect`
-         | GenCall(expr subject, expr data_dest, expr ctrl_dest, expr? lnext)
-                                                                 // gen e δ γ [Lnext] — recursive cg per Dybvig 1990
+         | GenCall(expr subject, expr* args)
+                                                                 // gen e [ρ] δ γ [Lnext] — recursive cg per Dybvig 1990.
+                                                                 // The args list is `[δ, γ, Lnext?]` when no env_dest is
+                                                                 // declared, or `[ρ, δ, γ, Lnext?]` when one is. Typecheck
+                                                                 // disambiguates by file's destinations + args.size().
+         | MatchExpr(expr subject, match_arm* arms)              // match v { pat => body | ... }
+         | BuildExpr(identifier schema, identifier ctor, expr* args)
+                                                                 // build Schema.Ctor(args) — construct an asdl-schema value
+         | WithExpr(expr base, identifier field, expr value)
+                                                                 // base with field := value — functional record update
+
+    match_arm = MatchArm(pattern pat, stmt* body)
 }

@@ -153,13 +153,36 @@ struct ASTNode {
 {% if def.type == "sum" and not (existsIn(def, "is_enum") and def.is_enum) %}
 {% if length(def.types) > 1 %}
 // {{def.name}}
+//
+// Per-sum Tag enum + non-virtual `tag` field on the base class give
+// O(1) dispatch via `switch (node->tag)` and let callers `static_cast`
+// instead of `dynamic_cast` once the tag is matched. Each derived
+// stamps a `static constexpr {{camelcase(def.name)}}Tag kind` (the
+// canonical value for that subclass, used to initialise the base's
+// tag) and a `static constexpr int kind_value` (plain-int form for
+// burgc TERM declarations and any other place that wants the
+// discriminator as an integer literal).
+enum class {{camelcase(def.name)}}Tag : int {
+{% for type in def.types %}
+    {{type.name}}{% if not loop.is_last %},{% endif %}
+
+{% endfor %}
+};
+
 struct {{camelcase(def.name)}} : public ASTNode {
+    {{camelcase(def.name)}}Tag tag;
+    explicit {{camelcase(def.name)}}({{camelcase(def.name)}}Tag t) : tag(t) {}
     virtual ~{{camelcase(def.name)}}() = default;
 };
 
 {% endif %}
 {% for type in def.types %}
 struct {{type.name}} : public {{type.base}} {
+{% if length(def.types) > 1 %}
+    static constexpr {{camelcase(def.name)}}Tag kind = {{camelcase(def.name)}}Tag::{{type.name}};
+    static constexpr int kind_value = static_cast<int>({{camelcase(def.name)}}Tag::{{type.name}});
+
+{% endif %}
 {% if length(type.fields) > 0 %}
     {{type.name}}(
 {% for field in type.fields %}
@@ -175,7 +198,9 @@ struct {{type.name}} : public {{type.base}} {
 {% endif %}
 {% endfor %}
     )
-        : {% for field in type.fields %}{{safe_name(field.name)}}{% if field.flag == "none" %}({{safe_name(field.name)}}){% else %}(std::move({{safe_name(field.name)}})){% endif %}{% if not loop.is_last %}, {% endif %}{% endfor %}{{ " {}" }}
+        : {% if length(def.types) > 1 %}{{type.base}}(kind), {% endif %}{% for field in type.fields %}{{safe_name(field.name)}}{% if field.flag == "none" %}({{safe_name(field.name)}}){% else %}(std::move({{safe_name(field.name)}})){% endif %}{% if not loop.is_last %}, {% endif %}{% endfor %}{{ " {}" }}
+{% else if length(def.types) > 1 %}
+    {{type.name}}() : {{type.base}}(kind) {}
 {% endif %}
 
     void accept(ASTVisitor& visitor) override { visitor.visit(this); }

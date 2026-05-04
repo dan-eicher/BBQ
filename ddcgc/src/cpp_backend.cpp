@@ -19,25 +19,73 @@ struct Emit {
 };
 
 // Translate an asdl schema type name to its C++ form.
-// Sums and constructors become `<Name>*`; primitives map to canonical
-// C++ types; aliases (e.g. `identifier` → `std::string`) pass through.
+// Sums and constructors become `<module>::<Name>*` (always namespace-
+// qualified, so the generated dispatcher works regardless of which
+// `namespace` it ends up living in — and so AST and IR types from
+// different schemas can't collide on bare names like `SlotRef`).
+// Primitives map to canonical C++ types; aliases (e.g. `identifier`
+// → `std::string`) pass through.
+// asdl emitters escape C++ reserved-word field names by appending '_'
+// (e.g. `default` → `default_`). ddcgc's generated field accesses must
+// match the asdl-emitted AST class layout, so apply the same escaping
+// when emitting `node->fieldname`. Keep this list in sync with
+// asdl/src/string_utils.cpp's reserved_keywords.
+static bool is_cpp_keyword(const std::string& s) {
+    static const std::set<std::string> kw = {
+        "alignas","alignof","and","and_eq","asm","auto","bitand","bitor",
+        "bool","break","case","catch","char","char8_t","char16_t","char32_t",
+        "class","compl","concept","const","consteval","constexpr","const_cast",
+        "continue","co_await","co_return","co_yield","decltype","default",
+        "delete","do","double","dynamic_cast","else","enum","explicit","export",
+        "extern","false","float","for","friend","goto","if","inline","int",
+        "long","mutable","namespace","new","noexcept","not","not_eq","nullptr",
+        "operator","or","or_eq","private","protected","public","register",
+        "reinterpret_cast","requires","return","short","signed","sizeof",
+        "static","static_assert","static_cast","struct","switch","template",
+        "this","thread_local","throw","true","try","typedef","typeid",
+        "typename","union","unsigned","using","virtual","void","volatile",
+        "wchar_t","while","xor","xor_eq"
+    };
+    return kw.count(s) > 0;
+}
+
+static std::string safe_field_name(const std::string& name) {
+    return is_cpp_keyword(name) ? name + "_" : name;
+}
+
 std::string cpp_type_for(const Schema& schema, const std::string& schema_type) {
     if (auto a = schema.aliases.find(schema_type); a != schema.aliases.end()) {
         return a->second;
     }
     if (schema.sum_names.count(schema_type) ||
         schema.constructors.count(schema_type)) {
+        // Products keep their snake_case type names — asdl emits them
+        // as `struct switch_case { ... }` not `struct SwitchCase`.
+        // Sums and their constructors are camelcased per asdl convention.
         std::string r;
-        bool upper = true;
-        for (char c : schema_type) {
-            if (c == '_') { upper = true; continue; }
-            r += upper ? (char)std::toupper(c) : c;
-            upper = false;
+        if (schema.product_names.count(schema_type)) {
+            r = schema_type;
+        } else {
+            bool upper = true;
+            for (char c : schema_type) {
+                if (c == '_') { upper = true; continue; }
+                r += upper ? (char)std::toupper(c) : c;
+                upper = false;
+            }
         }
+        if (!schema.module_name.empty()) {
+            r = schema.module_name + "::" + r;
+        }
+        // asdl enum sums are emitted as `enum class` values, not pointers.
+        if (schema.enum_sums.count(schema_type)) return r;
+        // Products are by-value structs in BBQ's asdl conventions; sum
+        // constructors are heap-allocated, so they keep the trailing '*'.
+        if (schema.product_names.count(schema_type)) return r;
         return r + "*";
     }
     if (schema_type == "string")     return "std::string";
     if (schema_type == "int")        return "int";
+    if (schema_type == "int64")      return "int64_t";
     if (schema_type == "bool")       return "bool";
     if (schema_type == "identifier") return "std::string";
     return schema_type;
@@ -45,6 +93,7 @@ std::string cpp_type_for(const Schema& schema, const std::string& schema_type) {
 
 // Same as cpp_type_for but always returns the bare class name (drops
 // the trailing '*' if present). Used for `<Name>* node` parameter forms.
+// The result is still namespace-qualified for schema types.
 std::string cpp_class_name(const Schema& schema, const std::string& sum_or_ctor) {
     std::string t = cpp_type_for(schema, sum_or_ctor);
     if (!t.empty() && t.back() == '*') t.pop_back();
@@ -68,6 +117,17 @@ struct Ctx {
     // exactly: `<data_dest_name>_t` and `<ctrl_dest_name>_t`.
     std::string data_dest_cpp_type;
     std::string ctrl_dest_cpp_type;
+    // The DSL-level names (without the _t suffix) the user chose in
+    // the .ddcg's `data_dest <name>` / `ctrl_dest <name>` declarations.
+    // The dispatcher parameter names are exactly these — so a rule body
+    // that writes `gen(e, delta, gamma)` references the dispatcher's
+    // own incoming destinations by their declared names.
+    std::string data_dest_name;
+    std::string ctrl_dest_name;
+    // Empty when no env_dest declared — dispatcher and gen-call stay
+    // 4-arg (without ρ).
+    std::string env_dest_cpp_type;
+    std::string env_dest_name;
 
     // ir_root C++ type — the return type of every dispatcher.
     std::string ir_root_cpp_type;
@@ -130,9 +190,84 @@ std::string cpp_for_type(const Ctx& c, const Type& t) {
     return "auto";
 }
 
+// Lower a .ddcg TypeRef (parsed surface syntax) to a C++ type string.
+// Mirrors typecheck.cpp's `type_from_dsl_typeref` but emits text.
+// Used for fun parameters and return types.
+std::string cpp_for_typeref(Ctx& c, DdcgAst::TypeRef* tr) {
+    if (auto* tn = dynamic_cast<DdcgAst::TypeName*>(tr)) {
+        const std::string& n = tn->name;
+
+        // Module-qualified schema reference.
+        if (!tn->module.empty()) {
+            auto sit = c.schemas->find(tn->module);
+            if (sit != c.schemas->end()) return cpp_type_for(sit->second, n);
+            return tn->module + "::" + n;
+        }
+
+        // `ir_root` placeholder — resolves to whatever the importing
+        // file declared as its ir_root. Shared libraries (dybvig.ddcg)
+        // use this so they don't have to know the consumer's IR's
+        // module name or root sum name.
+        if (n == "ir_root") {
+            if (!c.ir_root_cpp_type.empty()) return c.ir_root_cpp_type;
+            return "/*BUG: ir_root used before resolution*/auto";
+        }
+
+        if (n == "int")                          return "int";
+        if (n == "int64")                        return "int64_t";
+        if (n == "string")                       return "std::string";
+        if (n == "bool")                         return "bool";
+        if (n == "ident" || n == "identifier")   return "std::string";
+        if (n == "label")                        return "label_t";
+        if (n == "void")                         return "void";
+        // Destination type → <name>_t (data_dest, ctrl_dest, or env_dest)
+        for (auto* d : c.file->destinations) {
+            if (auto* dd = dynamic_cast<DdcgAst::DataDest*>(d)) {
+                if (dd->name == n) return n + "_t";
+            } else if (auto* cd = dynamic_cast<DdcgAst::CtrlDest*>(d)) {
+                if (cd->name == n) return n + "_t";
+            } else if (auto* ed = dynamic_cast<DdcgAst::EnvDest*>(d)) {
+                if (ed->name == n) return n + "_t";
+            }
+        }
+        // Schema sum/ctor — search loaded schemas. Multiple schemas
+        // matching is ambiguous; emit a sentinel that surfaces as a
+        // C++ compile error (better than silent first-wins).
+        const Schema* hit = nullptr;
+        std::string hit_imp;
+        for (const auto& [imp, schema] : *c.schemas) {
+            if (schema.sum_names.count(n) || schema.constructors.count(n)) {
+                if (hit) {
+                    c.errors->push_back("typeref '" + n +
+                        "' is ambiguous (defined in '" + hit_imp +
+                        "' and '" + imp + "') — qualify as <module>." + n);
+                    return "/*AMBIGUOUS*/" + n;
+                }
+                hit = &schema; hit_imp = imp;
+            }
+        }
+        if (hit) return cpp_type_for(*hit, n);
+        return n;  // opaque runtime-supplied
+    }
+    if (auto* tl = dynamic_cast<DdcgAst::TypeList*>(tr)) {
+        return "std::vector<" + cpp_for_typeref(c, tl->elem) + ">";
+    }
+    if (auto* tt = dynamic_cast<DdcgAst::TypeTuple*>(tr)) {
+        std::string r = "std::tuple<";
+        for (size_t i = 0; i < tt->elems.size(); ++i) {
+            if (i) r += ", ";
+            r += cpp_for_typeref(c, tt->elems[i]);
+        }
+        return r + ">";
+    }
+    return "auto";
+}
+
 // ── Expression translation ────────────────────────────────────
 
 void emit_expr(Ctx& c, DdcgAst::Expr* e);
+// Forward decl so MatchExpr's per-arm body emission can call it.
+void emit_stmt(Ctx& c, DdcgAst::Stmt* s, bool is_tail);
 
 bool is_aux(Ctx& c, const std::string& name) {
     for (auto* a : c.file->auxiliaries) if (a->name == name) return true;
@@ -274,7 +409,26 @@ void emit_expr(Ctx& c, DdcgAst::Expr* e) {
     }
     if (auto* fa = dynamic_cast<DdcgAst::FieldAccExpr*>(e)) {
         emit_expr(c, fa->base);
-        c.em.out << "->" << fa->field;
+        // Schema sums/ctors emit as pointer types (`<Name>*`); accessing
+        // their fields uses `->`. Dest tagged unions and primitive value
+        // types use `.`. Default to `->` when type info is missing.
+        const char* sep = "->";
+        auto it = c.check->expr_types.find(fa->base);
+        if (it != c.check->expr_types.end()) {
+            switch (it->second.kind) {
+                case TypeKind::Dest:
+                case TypeKind::Int:
+                case TypeKind::String:
+                case TypeKind::Bool:
+                case TypeKind::Ident:
+                case TypeKind::Label:
+                case TypeKind::Tuple:
+                    sep = ".";
+                    break;
+                default: break;
+            }
+        }
+        c.em.out << sep << fa->field;
         return;
     }
     if (auto* ix = dynamic_cast<DdcgAst::IndexAccExpr*>(e)) {
@@ -322,6 +476,179 @@ void emit_expr(Ctx& c, DdcgAst::Expr* e) {
         emit_call_args(c, dp->args);
         return;
     }
+    if (auto* w = dynamic_cast<DdcgAst::WithExpr*>(e)) {
+        // Functional record-update via GNU statement-expression: copy
+        // the base, mutate the named field on the copy, return it.
+        c.em.out << "({ auto _w = (";
+        emit_expr(c, w->base);
+        c.em.out << "); _w." << w->field << " = (";
+        emit_expr(c, w->value);
+        c.em.out << "); _w; })";
+        return;
+    }
+    if (auto* b = dynamic_cast<DdcgAst::BuildExpr*>(e)) {
+        // Lower `build Schema.Ctor(args)` to `new Namespace::Ctor(args)`.
+        // cpp_class_name handles snake_case → PascalCase + namespace.
+        auto sit = c.schemas->find(b->schema);
+        if (sit == c.schemas->end()) {
+            c.errors->push_back("build: unknown schema '" + b->schema +
+                                "' (typecheck should have caught this)");
+            c.em.out << "/*BUG: unknown schema*/(void)0";
+            return;
+        }
+        c.em.out << "new " << cpp_class_name(sit->second, b->ctor) << "(";
+        for (size_t i = 0; i < b->args.size(); ++i) {
+            if (i) c.em.out << ", ";
+            emit_expr(c, b->args[i]);
+        }
+        c.em.out << ")";
+        return;
+    }
+    if (auto* m = dynamic_cast<DdcgAst::MatchExpr*>(e)) {
+        // CamelCase the dest name → its tag enum (e.g. "gamma" → "GammaTag").
+        // Per BBQ runtime convention; matches what tiny_runtime.h /
+        // calc.ddcg expose.
+        auto camel = [](const std::string& s) {
+            std::string r; bool up = true;
+            for (char ch : s) {
+                if (ch == '_') { up = true; continue; }
+                r += up ? (char)std::toupper(ch) : ch;
+                up = false;
+            }
+            return r;
+        };
+
+        // Determine the subject's static type. Two supported shapes:
+        //   1. Dest tagged-union  → switch on `_m.tag` against `<Dest>Tag::X`
+        //   2. asdl enum sum      → switch on `_m` directly against
+        //                            `<module>::<Enum>::X`
+        std::string dest_name;
+        std::string enum_cpp;     // namespace-qualified class name when subj is enum
+        const Schema* enum_schema = nullptr;
+        std::string enum_sum_name;
+        auto it = c.check->expr_types.find(m->subject);
+        if (it != c.check->expr_types.end()) {
+            const Type& st = it->second;
+            if (st.kind == TypeKind::Dest) {
+                dest_name = st.name;
+            } else if (st.kind == TypeKind::Schema) {
+                auto sit = c.schemas->find(st.schema_import);
+                if (sit != c.schemas->end() &&
+                    sit->second.enum_sums.count(st.name)) {
+                    enum_schema = &sit->second;
+                    enum_sum_name = st.name;
+                    enum_cpp = cpp_class_name(*enum_schema, st.name);
+                }
+            }
+        }
+        if (dest_name.empty() && enum_cpp.empty()) {
+            c.errors->push_back("match: subject is not a dest tagged union "
+                                "or asdl enum");
+            c.em.out << "({})";
+            return;
+        }
+        std::string tag_class = camel(dest_name) + "Tag";
+
+        // IIFE wrapping the switch — match-as-expression. Capture-by-ref.
+        // Pull the recorded result type to give the lambda an explicit
+        // return so arms with related-but-different constructor types
+        // don't trip auto-deduction.
+        std::string match_ret = "auto";
+        auto rti = c.check->expr_types.find(e);
+        if (rti != c.check->expr_types.end()) {
+            match_ret = cpp_for_type(c, rti->second);
+        }
+        c.em.out << "([&]() -> " << match_ret << " {\n";
+        c.em.indent_depth++;
+        c.em.indent() << "auto _m = ";
+        emit_expr(c, m->subject);
+        c.em.out << ";\n";
+        if (!enum_cpp.empty()) {
+            c.em.indent() << "switch (_m) {\n";
+        } else {
+            c.em.indent() << "switch (_m.tag) {\n";
+        }
+        // Helper: BindPat with a name matching a zero-arg variant of
+        // this dest is treated as a variant match (`case Tag::X:`).
+        auto is_zero_arg_variant_name = [&](const std::string& nm) {
+            for (auto* d : c.file->destinations) {
+                std::string dn;
+                std::vector<DdcgAst::DestVariant*> vs;
+                if (auto* dd = dynamic_cast<DdcgAst::DataDest*>(d)) {
+                    dn = dd->name; vs = dd->variants;
+                } else if (auto* cd = dynamic_cast<DdcgAst::CtrlDest*>(d)) {
+                    dn = cd->name; vs = cd->variants;
+                }
+                if (dn != dest_name) continue;
+                for (auto* v : vs) {
+                    if (v->name == nm && v->fields.empty()) return true;
+                }
+            }
+            return false;
+        };
+        // Helper: BindPat name matching one of the enum sum's
+        // constructors → emit `case Module::Enum::X:`.
+        auto is_enum_value_name = [&](const std::string& nm) {
+            if (!enum_schema) return false;
+            auto eit = enum_schema->sum_constructors.find(enum_sum_name);
+            if (eit == enum_schema->sum_constructors.end()) return false;
+            for (const auto& cn : eit->second) {
+                if (cn == nm) return true;
+            }
+            return false;
+        };
+
+        for (auto* arm : m->arms) {
+            c.em.indent();
+            if (auto* cp = dynamic_cast<DdcgAst::ConstructorPat*>(arm->pat);
+                cp && cp->module.empty()) {
+                c.em.out << "case " << tag_class << "::" << camel(cp->ctor) << ": {\n";
+                c.em.indent_depth++;
+                // Bind each NamedFieldPat to the subject's field.
+                for (auto* fp : cp->fields) {
+                    if (auto* nf = dynamic_cast<DdcgAst::NamedFieldPat*>(fp)) {
+                        if (auto* bp = dynamic_cast<DdcgAst::BindPat*>(nf->pat)) {
+                            c.em.indent() << "auto " << bp->name
+                                          << " = _m." << nf->name << ";\n";
+                        } else if (dynamic_cast<DdcgAst::WildcardPat*>(nf->pat)) {
+                            // No binding for wildcard.
+                        }
+                    }
+                }
+            } else if (dynamic_cast<DdcgAst::WildcardPat*>(arm->pat)) {
+                c.em.out << "default: {\n";
+                c.em.indent_depth++;
+            } else if (auto* bp = dynamic_cast<DdcgAst::BindPat*>(arm->pat);
+                       bp && !enum_cpp.empty() && is_enum_value_name(bp->name)) {
+                c.em.out << "case " << enum_cpp << "::" << bp->name << ": {\n";
+                c.em.indent_depth++;
+            } else if (auto* bp = dynamic_cast<DdcgAst::BindPat*>(arm->pat);
+                       bp && is_zero_arg_variant_name(bp->name)) {
+                c.em.out << "case " << tag_class << "::" << camel(bp->name) << ": {\n";
+                c.em.indent_depth++;
+            } else if (auto* bp = dynamic_cast<DdcgAst::BindPat*>(arm->pat)) {
+                c.em.out << "default: {\n";
+                c.em.indent_depth++;
+                c.em.indent() << "auto " << bp->name << " = _m;\n";
+            } else {
+                c.errors->push_back("match: unsupported arm pattern shape");
+                c.em.out << "default: {\n";
+                c.em.indent_depth++;
+            }
+            for (size_t i = 0; i < arm->body.size(); ++i) {
+                bool is_last = (i + 1 == arm->body.size());
+                emit_stmt(c, arm->body[i], is_last);
+            }
+            c.em.indent_depth--;
+            c.em.indent() << "}\n";
+        }
+        c.em.indent() << "}\n";
+        // Unreachable for exhaustive matches; keeps the compiler happy.
+        c.em.indent() << "return {};\n";
+        c.em.indent_depth--;
+        c.em.indent() << "})()";
+        return;
+    }
     if (auto* g = dynamic_cast<DdcgAst::GenCall*>(e)) {
         std::string sum = sum_for_subject(c, g->subject);
         if (sum.empty()) {
@@ -339,13 +666,9 @@ void emit_expr(Ctx& c, DdcgAst::Expr* e) {
         }
         c.em.out << "compile_" << sum << "(";
         emit_expr(c, g->subject);
-        c.em.out << ", ";
-        emit_expr(c, g->data_dest);
-        c.em.out << ", ";
-        emit_expr(c, g->ctrl_dest);
-        if (g->lnext.has_value()) {
+        for (auto* a : g->args) {
             c.em.out << ", ";
-            emit_expr(c, *g->lnext);
+            emit_expr(c, a);
         }
         c.em.out << ")";
         return;
@@ -447,8 +770,16 @@ void emit_stmt(Ctx& c, DdcgAst::Stmt* s, bool is_tail) {
 // the leaf sub-pattern `sub`. For BindPat / WildcardPat / RestFieldPat
 // / nested ConstructorPat there is no leaf-level check — those produce
 // either binds or sub-blocks; both are handled outside this function.
+//
+// `field` describes the asdl-level cardinality of the field. Optional
+// schema-pointer fields lower to `std::optional<Foo*>`, which doesn't
+// compare against `nullptr`; NilPat against such fields emits
+// `!field.has_value()`.
 std::string field_check_expr(DdcgAst::Pattern* sub,
-                              const std::string& field_expr) {
+                              const std::string& field_expr,
+                              const Field* field) {
+    bool is_optional_schema = field && field->is_schema &&
+                              field->flag == FieldFlag::Optional;
     if (auto* il = dynamic_cast<DdcgAst::IntPat*>(sub)) {
         return field_expr + " == " + std::to_string(il->value);
     }
@@ -467,6 +798,7 @@ std::string field_check_expr(DdcgAst::Pattern* sub,
         return field_expr + " == \"" + lit + "\"";
     }
     if (dynamic_cast<DdcgAst::NilPat*>(sub)) {
+        if (is_optional_schema) return "!" + field_expr + ".has_value()";
         return field_expr + " == nullptr";
     }
     return {};
@@ -484,12 +816,16 @@ int emit_match(Ctx& c, const Schema& schema,
                 int& name_ctr) {
     int blocks_open = 0;
 
-    // 1. dynamic_cast the value to the constructor type.
+    // 1. dynamic_cast the value to the constructor type. Always use
+    //    the namespace-qualified form (cpp_class_name handles
+    //    `<module>::<PascalName>`) so two schemas can't collide on a
+    //    bare ctor name like `Add`.
     auto ci = schema.constructors.find(cp->ctor);
     if (ci == schema.constructors.end()) return blocks_open;
     std::string nv = "_n" + std::to_string(name_ctr++);
     c.em.indent() << "if (auto* " << nv << " = dynamic_cast<"
-                  << ci->second.name << "*>(" << value_expr << ")) {\n";
+                  << cpp_class_name(schema, ci->second.name) << "*>("
+                  << value_expr << ")) {\n";
     c.em.indent_depth++;
     blocks_open++;
 
@@ -502,15 +838,62 @@ int emit_match(Ctx& c, const Schema& schema,
 
     for (auto* fp : cp->fields) {
         if (auto* nf = dynamic_cast<DdcgAst::NamedFieldPat*>(fp)) {
-            std::string field_expr = nv + "->" + nf->name;
+            std::string field_expr = nv + "->" + safe_field_name(nf->name);
+            const Field* matched = nullptr;
+            for (const auto& f : ci->second.fields) {
+                if (f.name == nf->name) { matched = &f; break; }
+            }
+            bool is_optional_schema = matched && matched->is_schema &&
+                                      matched->flag == FieldFlag::Optional;
             if (auto* bp = dynamic_cast<DdcgAst::BindPat*>(nf->pat)) {
-                c.em.indent() << "auto " << bp->name << " = "
-                              << field_expr << ";\n";
+                // Enum-value disambiguation: if the field's asdl type is
+                // an enum sum and the bind name matches one of its
+                // constructors, emit a `field == Module::Type::Value`
+                // leaf check rather than binding the field to a name.
+                bool is_enum_value = false;
+                if (matched && schema.enum_sums.count(matched->type_name)) {
+                    auto eit = schema.sum_constructors.find(matched->type_name);
+                    if (eit != schema.sum_constructors.end()) {
+                        for (const auto& cn : eit->second) {
+                            if (cn == bp->name) {
+                                std::string enum_cpp =
+                                    cpp_class_name(schema, matched->type_name);
+                                leaf_checks.push_back(
+                                    field_expr + " == " + enum_cpp +
+                                    "::" + bp->name);
+                                is_enum_value = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if (!is_enum_value) {
+                    if (is_optional_schema) {
+                        // Unwrap std::optional<T*> into a bare nullable T*
+                        // so subsequent rule-body uses see a pointer.
+                        c.em.indent() << "auto " << bp->name << " = "
+                                      << field_expr
+                                      << ".has_value() ? *" << field_expr
+                                      << " : nullptr;\n";
+                    } else {
+                        c.em.indent() << "auto " << bp->name << " = "
+                                      << field_expr << ";\n";
+                    }
+                }
             } else if (auto* sub_cp =
                            dynamic_cast<DdcgAst::ConstructorPat*>(nf->pat)) {
-                nested.emplace_back(sub_cp, field_expr);
+                if (is_optional_schema) {
+                    // Optional schema field: must have a value before we
+                    // can dereference for dynamic_cast. Add a has_value
+                    // leaf check evaluated in the combined-if block, then
+                    // recurse against `(*field)`.
+                    leaf_checks.push_back(field_expr + ".has_value()");
+                    nested.emplace_back(sub_cp, "(*" + field_expr + ")");
+                } else {
+                    nested.emplace_back(sub_cp, field_expr);
+                }
             } else {
-                std::string ck = field_check_expr(nf->pat, field_expr);
+                std::string ck = field_check_expr(nf->pat, field_expr, matched);
                 if (!ck.empty()) leaf_checks.push_back(std::move(ck));
                 // WildcardPat: no check, no bind.
             }
@@ -635,12 +1018,38 @@ std::vector<std::string> source_sums_with_rules(const Ctx& c) {
 // consumer needs — arena, gensym counters, diagnostics, source-loc
 // tracking. Aux/pred bodies live in MEMBERS too, called as bare
 // methods on `this`.
+// Emit one action-language `fun` as a C++ method on the dispatcher
+// class. Body is the same stmt-block grammar as a rule body — last
+// ExprStmt becomes a `return …;` via emit_stmt's is_tail flag.
+void emit_fun(Ctx& c, DdcgAst::Fun* f) {
+    c.em.out << "\n";
+    c.em.indent() << "// fun " << f->name << "\n";
+    c.em.indent() << cpp_for_typeref(c, f->ret_ty) << " " << f->name << "(";
+    for (size_t i = 0; i < f->params.size(); ++i) {
+        if (i) c.em.out << ", ";
+        c.em.out << cpp_for_typeref(c, f->params[i]->ty)
+                 << " " << f->params[i]->name;
+    }
+    c.em.out << ") {\n";
+    c.em.indent_depth++;
+    for (size_t i = 0; i < f->body.size(); ++i) {
+        bool is_last = (i + 1 == f->body.size());
+        emit_stmt(c, f->body[i], is_last);
+    }
+    c.em.indent_depth--;
+    c.em.indent() << "}\n";
+}
+
 void emit_dispatcher_signature(Ctx& c, const std::string& sum_name) {
     std::string sum_cpp = cpp_class_name(*c.source_schema, sum_name);
     c.em.out << c.ir_root_cpp_type << " compile_" << sum_name
-             << "(" << sum_cpp << "* node, "
-             << c.data_dest_cpp_type << " d, "
-             << c.ctrl_dest_cpp_type << " g)";
+             << "(" << sum_cpp << "* node, ";
+    if (!c.env_dest_name.empty()) {
+        c.em.out << c.env_dest_cpp_type << " " << c.env_dest_name << ", ";
+    }
+    c.em.out << c.data_dest_cpp_type << " " << c.data_dest_name << ", "
+             << c.ctrl_dest_cpp_type << " " << c.ctrl_dest_name << ", "
+             << c.ir_root_cpp_type << " Lnext = {})";
 }
 
 void emit_dispatcher(Ctx& c, const std::string& sum_name) {
@@ -654,7 +1063,12 @@ void emit_dispatcher(Ctx& c, const std::string& sum_name) {
     emit_dispatcher_signature(c, sum_name);
     c.em.out << " {\n";
     c.em.indent_depth++;
-    c.em.indent() << "(void)d; (void)g;\n";
+    c.em.indent() << "(void)" << c.data_dest_name << "; "
+                  << "(void)" << c.ctrl_dest_name << "; "
+                  << "(void)Lnext;\n";
+    if (!c.env_dest_name.empty()) {
+        c.em.indent() << "(void)" << c.env_dest_name << ";\n";
+    }
     c.em.indent() << "current_loc = node->loc;\n";
 
     for (auto* r : rules) {
@@ -674,29 +1088,45 @@ void emit_dispatcher(Ctx& c, const std::string& sum_name) {
     c.em.indent() << "}\n";
 }
 
-// Resolve the data_dest and ctrl_dest C++ type names from the .ddcg's
+// Resolve the data_dest and ctrl_dest names from the .ddcg's
 // DESTINATIONS block. Both are mandatory — the paper's CG signature
 // has no degenerate forms. The runtime author must provide types
-// named exactly `<dest>_t` for each.
-struct DestNames { std::string data, ctrl; };
+// named exactly `<dest>_t` for each, and the dispatcher binds the
+// declared name itself (e.g. `delta`, `gamma`) as the parameter
+// identifier so rule bodies can reference them.
+struct DestNames {
+    std::string data_name, data_type;
+    std::string ctrl_name, ctrl_type;
+    // env_dest is optional: empty names mean "no ρ" — dispatcher
+    // signature stays 4-arg, gen-call layout stays (δ, γ, [Lnext]).
+    std::string env_name, env_type;
+};
 DestNames dest_type_names(const DdcgAst::File* file,
                             std::vector<std::string>& errors) {
     DestNames out;
     for (auto* d : file->destinations) {
         if (auto* dd = dynamic_cast<DdcgAst::DataDest*>(d)) {
-            if (!out.data.empty()) {
+            if (!out.data_type.empty()) {
                 errors.push_back("multiple data_dest declarations");
             }
-            out.data = dd->name + "_t";
+            out.data_name = dd->name;
+            out.data_type = dd->name + "_t";
         } else if (auto* cd = dynamic_cast<DdcgAst::CtrlDest*>(d)) {
-            if (!out.ctrl.empty()) {
+            if (!out.ctrl_type.empty()) {
                 errors.push_back("multiple ctrl_dest declarations");
             }
-            out.ctrl = cd->name + "_t";
+            out.ctrl_name = cd->name;
+            out.ctrl_type = cd->name + "_t";
+        } else if (auto* ed = dynamic_cast<DdcgAst::EnvDest*>(d)) {
+            if (!out.env_type.empty()) {
+                errors.push_back("multiple env_dest declarations");
+            }
+            out.env_name = ed->name;
+            out.env_type = ed->name + "_t";
         }
     }
-    if (out.data.empty()) errors.push_back("no data_dest declared (the paper's δ)");
-    if (out.ctrl.empty()) errors.push_back("no ctrl_dest declared (the paper's γ)");
+    if (out.data_type.empty()) errors.push_back("no data_dest declared (the paper's δ)");
+    if (out.ctrl_type.empty()) errors.push_back("no ctrl_dest declared (the paper's γ)");
     return out;
 }
 } // namespace
@@ -713,8 +1143,46 @@ bool emit_cpp(const DdcgAst::File* file,
     c.errors = &errors;
 
     if (auto* tn = dynamic_cast<DdcgAst::TypeName*>(file->ir_root)) {
-        c.ir_root_cpp_type = tn->name;
-        if (tn->is_pointer) c.ir_root_cpp_type += "*";
+        // Module-qualified (`ir.expr`) lookups MUST go through the
+        // named schema only — picking the first schema that happens
+        // to have a sum named `expr` would silently mis-resolve when
+        // multiple imports share a constructor name.
+        bool resolved = false;
+        if (!tn->module.empty()) {
+            auto sit = schemas.find(tn->module);
+            if (sit == schemas.end()) {
+                errors.push_back("ir_root references unknown schema '" +
+                                 tn->module + "'");
+                return false;
+            }
+            const Schema& sch = sit->second;
+            if (sch.sum_names.count(tn->name) ||
+                sch.constructors.count(tn->name)) {
+                c.ir_root_cpp_type = cpp_type_for(sch, tn->name);
+                resolved = true;
+            } else {
+                errors.push_back("ir_root '" + tn->module + "." + tn->name +
+                                 "' not found in schema '" + tn->module + "'");
+                return false;
+            }
+        } else {
+            // Unqualified — fall back to "any schema that has it" only
+            // when the user opted out of module qualification. Primitive
+            // types (`int`) and runtime-supplied names land here too.
+            for (const auto& [imp, sch] : schemas) {
+                (void)imp;
+                if (sch.sum_names.count(tn->name) ||
+                    sch.constructors.count(tn->name)) {
+                    c.ir_root_cpp_type = cpp_type_for(sch, tn->name);
+                    resolved = true;
+                    break;
+                }
+            }
+        }
+        if (!resolved) {
+            c.ir_root_cpp_type = tn->name;
+            if (tn->is_pointer) c.ir_root_cpp_type += "*";
+        }
     } else {
         errors.push_back("ir_root must be a simple TypeName (list/tuple roots not supported)");
         return false;
@@ -734,9 +1202,13 @@ bool emit_cpp(const DdcgAst::File* file,
     c.source_schema = &sit->second;
 
     DestNames dn = dest_type_names(file, errors);
-    if (dn.data.empty() || dn.ctrl.empty()) return false;
-    c.data_dest_cpp_type = std::move(dn.data);
-    c.ctrl_dest_cpp_type = std::move(dn.ctrl);
+    if (dn.data_type.empty() || dn.ctrl_type.empty()) return false;
+    c.data_dest_cpp_type = std::move(dn.data_type);
+    c.ctrl_dest_cpp_type = std::move(dn.ctrl_type);
+    c.data_dest_name = std::move(dn.data_name);
+    c.ctrl_dest_name = std::move(dn.ctrl_name);
+    c.env_dest_cpp_type = std::move(dn.env_type);
+    c.env_dest_name = std::move(dn.env_name);
 
     out << "// Generated by ddcgc — do not edit\n";
     out << "#pragma once\n";
@@ -797,7 +1269,20 @@ bool emit_cpp(const DdcgAst::File* file,
         c.em.indent() << "// ─── End PRIVATE ────────────────────────────\n";
     }
 
-    out << "public:\n";
+    if (!file->funs.empty()) {
+        out << "protected:\n";
+        c.em.indent() << "// ─── action-language funs ───────────────────\n";
+        c.em.indent() << "// Internal helpers; consumer (subclass) calls\n";
+        c.em.indent() << "// these from rule bodies and other funs, not\n";
+        c.em.indent() << "// from external code.\n";
+        for (auto* f : file->funs) emit_fun(c, f);
+    }
+
+    // When INTERNAL_DISPATCHERS is set, the per-sum dispatch methods are
+    // implementation details — callable only from within the class
+    // (e.g. by a public entry method in MEMBERS). Otherwise dispatchers
+    // are the public API and consumers call them directly.
+    out << (file->internal_dispatchers ? "private:\n" : "public:\n");
     for (const auto& s : sums) {
         emit_dispatcher(c, s);
     }

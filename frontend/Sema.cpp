@@ -97,32 +97,34 @@ void Sema::validate_rule(Rule* rule) {
     validate_type(rule->body, rule->name);
 }
 
-void Sema::validate_type(TypeExpr* type, const std::string& ctx) {
+void Sema::validate_type(TypeExpr* type, const std::string& ctx, bool guarded) {
     if (auto* st = dynamic_cast<Struct*>(type)) {
         for (auto* field : st->fields) {
-            validate_type(field->body, ctx);
+            validate_type(field->body, ctx, guarded);
             if (field->constraint)
                 validate_expr(*field->constraint, ctx);
         }
     } else if (auto* u = dynamic_cast<Union*>(type)) {
         for (auto* variant : u->variants) {
-            validate_type(variant->body, ctx);
+            validate_type(variant->body, ctx, guarded);
             if (variant->constraint)
                 validate_expr(*variant->constraint, ctx);
         }
     } else if (auto* arr = dynamic_cast<Array*>(type)) {
-        validate_type(arr->element, ctx);
+        // Array element is guarded — count=0 (or until-condition matching
+        // immediately) terminates the recursion at runtime.
+        validate_type(arr->element, ctx, true);
         if (auto* fc = dynamic_cast<FixedCount*>(arr->spec)) {
             validate_expr(fc->count, ctx);
         } else if (auto* st = dynamic_cast<SepTerm*>(arr->spec)) {
             if (auto* ts = dynamic_cast<TypeSep*>(st->sep))
-                validate_type(ts->sep_type, ctx);
+                validate_type(ts->sep_type, ctx, guarded);
             if (auto* ct = dynamic_cast<CountTerm*>(st->term))
                 validate_expr(ct->count, ctx);
             else if (auto* ut = dynamic_cast<UntilTerm*>(st->term))
                 validate_expr(ut->condition, ctx);
             else if (auto* tt = dynamic_cast<BBQ::TypeTerm*>(st->term))
-                validate_type(tt->term_type, ctx);
+                validate_type(tt->term_type, ctx, guarded);
         }
         if (arr->constraint)
             validate_expr(*arr->constraint, ctx);
@@ -154,16 +156,17 @@ void Sema::validate_type(TypeExpr* type, const std::string& ctx) {
             }
         }
     } else if (auto* opt = dynamic_cast<Optional*>(type)) {
-        validate_type(opt->element, ctx);
+        // Optional element is guarded — the value may be absent at runtime.
+        validate_type(opt->element, ctx, true);
         if (opt->constraint)
             validate_expr(*opt->constraint, ctx);
     } else if (auto* sw = dynamic_cast<Switch*>(type)) {
         validate_expr(sw->discriminator, ctx);
         for (auto* c : sw->cases) {
-            validate_type(c->target, ctx);
+            validate_type(c->target, ctx, guarded);
         }
         if (sw->default_)
-            validate_type((*sw->default_)->target, ctx);
+            validate_type((*sw->default_)->target, ctx, guarded);
         validate_switch(sw, ctx);
     } else if (auto* comp = dynamic_cast<Compute*>(type)) {
         validate_expr(comp->expression, ctx);
@@ -175,14 +178,17 @@ void Sema::validate_type(TypeExpr* type, const std::string& ctx) {
                               rr->name.c_str(), suggestion.c_str());
             else
                 errors_.error(rr->loc, "undefined rule '%s'", rr->name.c_str());
-        } else {
+        } else if (!guarded) {
+            // Only unguarded refs count as topo-sort dependencies. Guarded
+            // refs (under Array/Optional) form legal recursive cycles
+            // resolved at compile time by patch_kont.
             deps_[ctx].insert(rr->name);
         }
         if (rr->constraint)
             validate_expr(*rr->constraint, ctx);
     } else if (auto* alts = dynamic_cast<Alternatives*>(type)) {
         for (auto* alt : alts->alts) {
-            validate_type(alt, ctx);
+            validate_type(alt, ctx, guarded);
         }
     } else if (auto* prim = dynamic_cast<Primitive*>(type)) {
         if (prim->constraint)

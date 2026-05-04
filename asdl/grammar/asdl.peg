@@ -93,10 +93,14 @@ ConstructorDecl <. asdl_ast::Constructor* &result .>
     (. result = new asdl_ast::Constructor(std::move(name), std::move(fields)); .)
 .
 
+// `()` is a valid (zero-field) constructor argument list — semantically
+// identical to omitting the parens entirely.
 FieldList <. std::vector<asdl_ast::Field*> &fields .>
     (. asdl_ast::Field* f; .)
-    = "(" FieldDecl<f>  (. fields.push_back(f); .)
-          { "," FieldDecl<f>  (. fields.push_back(f); .) }
+    = "("
+      [ FieldDecl<f>  (. fields.push_back(f); .)
+        { "," FieldDecl<f>  (. fields.push_back(f); .) }
+      ]
       ")"
 .
 

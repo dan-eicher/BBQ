@@ -9,6 +9,10 @@ IMPORTS
 DESTINATIONS
   data_dest delta { effect | ac | stack(slot: int) }
   ctrl_dest gamma { fail  | restore(save: int) }
+  // ρ: paper's environment. depth tracks recursion depth (used here
+  // only to prove typed ρ threads through the dispatcher signature
+  // and recursive gen() calls; rule bodies pass it unchanged).
+  env_dest  rho   { depth: int }
   ir_root int
 
 AUXILIARIES
@@ -38,7 +42,7 @@ rule lit : ast.Lit(n: x) {
 // both keeps the test small and still proves δ varies between recursive
 // calls.
 rule add : ast.Add(left: l, right: r) {
-    let lk = gen(l, ac, restore(0));
-    let rk = gen(r, ac, restore(0));
+    let lk = gen(l, rho, ac, restore(0));
+    let rk = gen(r, rho, ac, restore(0));
     cg_add(lk, rk);
 }

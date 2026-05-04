@@ -235,19 +235,25 @@ bool Parser::parse_FieldList(std::vector<asdl_ast::Field*>& fields) {
     asdl_ast::Field* f;
     skip();
     if (!match("(")) return false;
-    skip();
-    if (!parse_FieldDecl(f)) return false;
-    fields.push_back(f);
-    for (;;) {
+    {
         auto _m0 = save();
         if (![&]() -> bool {
             skip();
-            if (!match(",")) return false;
-            skip();
             if (!parse_FieldDecl(f)) return false;
             fields.push_back(f);
+            for (;;) {
+                auto _m1 = save();
+                if (![&]() -> bool {
+                    skip();
+                    if (!match(",")) return false;
+                    skip();
+                    if (!parse_FieldDecl(f)) return false;
+                    fields.push_back(f);
+                    return true;
+                }()) { restore(_m1); break; }
+            }
             return true;
-        }()) { restore(_m0); break; }
+        }()) restore(_m0);
     }
     skip();
     if (!match(")")) return false;

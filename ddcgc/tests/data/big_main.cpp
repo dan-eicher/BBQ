@@ -28,6 +28,19 @@ const std::vector<std::pair<const char*, const char*>> kFeatures = {
     {"tag",         "Generic string-field fallback"},
     {"maybe_none",  "NilPat against optional field"},
     {"maybe_some",  "BindPat against optional field carrying a value"},
+    {"binop_add",   "Enum-value field-pat (OpAdd constant match)"},
+    {"binop_sub",   "Enum-value field-pat (OpSub constant match)"},
+    {"binop_mul",   "Enum-value field-pat (OpMul constant match)"},
+    {"sel",         "match over asdl-enum subject (op_to_int fun)"},
+};
+
+// Action-language markers logged by the dest_to_value fun (match → build),
+// invoked from the `pair` rule body. Each entry: (trace marker, what the
+// arm exercised).
+const std::vector<std::pair<const char*, const char*>> kActionMarkers = {
+    {"log_value:imm:99", "fun + match `ac` arm + build target.Imm"},
+    {"log_value:slot:7", "fun + match `spill(slot)` arm + build target.Slot"},
+    {"rule:import_demo", "fun imported from big_imports.ddcg via `import` directive"},
 };
 
 bool trace_contains(const std::vector<std::string>& trace,
@@ -66,9 +79,15 @@ int main() {
     Tag tag_short_node("ab");                // → tag_short (predicate)
     Tag tag_long_node("longname");           // → tag       (fallback)
 
-    Maybe maybe_none_node(nullptr);          // → maybe_none
+    Maybe maybe_none_node(std::nullopt);     // → maybe_none
     Lit l5(5);
-    Maybe maybe_some_node(&l5);              // → maybe_some
+    Maybe maybe_some_node(std::optional<Expr*>{&l5});  // → maybe_some
+
+    Lit l4(4), l6(6), l8(8), l9(9);
+    BinOp binop_add_node(Op::OpAdd, &l4, &l6);  // → binop_add (4+6=10)
+    BinOp binop_sub_node(Op::OpSub, &l8, &l9);  // → binop_sub (8+9=17, cg_pick is sum)
+    BinOp binop_mul_node(Op::OpMul, &l2, &l3);  // → binop_mul (2+3=5)
+    Sel sel_node(Op::OpMul);                    // → sel (op_to_int(OpMul)=3)
 
     Seq root({
         &add_zero_left,
@@ -81,10 +100,15 @@ int main() {
         &tag_long_node,
         &maybe_none_node,
         &maybe_some_node,
+        &binop_add_node,
+        &binop_sub_node,
+        &binop_mul_node,
+        &sel_node,
     });
 
     Compiler compiler;
-    int result = compiler.compile_expr(&root, ac(), fail());
+    rho_t rho{0};
+    int result = compiler.compile_expr(&root, rho, ac(), fail());
 
     // Verify every catalogued feature fired.
     bool ok = true;
@@ -93,6 +117,13 @@ int main() {
         if (!trace_contains(compiler.trace, marker)) {
             std::fprintf(stderr, "FAIL: rule '%s' (%s) never fired\n",
                          name, descr);
+            ok = false;
+        }
+    }
+    for (const auto& [marker, descr] : kActionMarkers) {
+        if (!trace_contains(compiler.trace, marker)) {
+            std::fprintf(stderr, "FAIL: action-language marker '%s' (%s) never logged\n",
+                         marker, descr);
             ok = false;
         }
     }
@@ -111,8 +142,12 @@ int main() {
     //   tag("longname")            → len("longname")           = 8
     //   maybe_none                 → -1
     //   maybe_some(Lit(5))         → lit(5)                    = 5
-    //                                                  Σ items = 105
-    constexpr int kExpected = 105;
+    //   binop_add(Lit(4), Lit(6))  → cg_pick(lit(4) , lit(6))  = 4 + 6   = 10
+    //   binop_sub(Lit(8), Lit(9))  → cg_pick(lit(8) , lit(9))  = 8 + 9   = 17
+    //   binop_mul(Lit(2), Lit(3))  → cg_pick(lit(2) , lit(3))  = 2 + 3   = 5
+    //   sel(OpMul)                 → cg_lit(op_to_int(OpMul))   = 3
+    //                                                  Σ items = 140
+    constexpr int kExpected = 140;
     if (result != kExpected) {
         std::fprintf(stderr, "FAIL: expected result=%d, got %d\n",
                      kExpected, result);
@@ -124,11 +159,13 @@ int main() {
         return 1;
     }
 
-    // Success: print the catalogue so the test log says which features
-    // were exercised. (The trace itself is verbose; this is the summary.)
-    std::printf("ddcgc big.ddcg — %zu features exercised:\n", kFeatures.size());
+    std::printf("ddcgc big.ddcg — %zu features + %zu action-lang markers:\n",
+                kFeatures.size(), kActionMarkers.size());
     for (const auto& [name, descr] : kFeatures) {
-        std::printf("  ✓ %-12s  %s\n", name, descr);
+        std::printf("  ✓ %-16s  %s\n", name, descr);
+    }
+    for (const auto& [marker, descr] : kActionMarkers) {
+        std::printf("  ✓ %-16s  %s\n", marker, descr);
     }
     std::printf("result=%d, trace=%zu entries\n",
                 result, compiler.trace.size());

@@ -7,10 +7,15 @@ IMPORTS
   target = "big_target.json"
 
 DESTINATIONS
-  data_dest delta { effect | ac | spill(slot: int) }
-  ctrl_dest gamma { fail | jump(target: label) }
+  // ρ tracks recursion depth — threaded through every gen() call.
+  // big_imports.ddcg supplies delta + gamma; ρ is local to big.ddcg
+  // because big_imports.ddcg's funs are pure (don't touch ρ).
+  env_dest rho { depth: int }
   ir_root int
 
+// big_imports.ddcg supplies `delta`, `gamma`, and `trace_fire` —
+// merged in via the import below. Demonstrates that a library's
+// AUXILIARIES + DESTINATIONS reach the importer without redeclaration.
 AUXILIARIES
   cg_lit     : (int) -> int
   cg_seq     : (list<int>) -> int
@@ -18,7 +23,7 @@ AUXILIARIES
   cg_str     : (string) -> int
   cg_split   : (int) -> tuple<int, int>
   place      : (label) -> int
-  trace_fire : (string) -> int
+  log_value  : (target.value) -> int
 
 PREDICATES
   is_zero       : (int) -> bool
@@ -63,14 +68,43 @@ MEMBERS (.
 
     bool is_zero(int n)              { return n == 0; }
     bool is_short_name(std::string s) { return s.size() < 4; }
+
+    int log_value(target::Value* v) {
+        // 0=Imm, 1=Slot — see target::Value::kind_tag().
+        const char* kind = v->kind_tag() == 0 ? "imm" : "slot";
+        trace.push_back(std::string("log_value:") + kind +
+                        ":" + std::to_string(v->payload()));
+        return v->payload();
+    }
 .)
+
+// Action-language helper: dispatches on δ via `match` and constructs a
+// target::Value via `build`. Exercises fun + match + build together.
+fun dest_to_value(d : delta) -> target.value {
+    match (d) {
+        effect      => build target.Imm(0)
+      | ac          => build target.Imm(99)
+      | spill(slot) => build target.Slot(slot)
+    };
+}
+
+// `match` over an asdl-enum subject lowers to `switch` on the enum value.
+fun op_to_int(o : ast.op) -> int {
+    match (o) {
+        OpAdd => 1
+      | OpSub => 2
+      | OpMul => 3
+    };
+}
+
+import "big_imports.ddcg"
 
 RULES
 
 // ── Nested ConstructorPat: zero-left optimisation fires before general Add
 rule add_zero_l : ast.Add(left: ast.Lit(n: 0), right: r) {
     trace_fire("add_zero_l");
-    cg_pick(0, gen(r, ac, fail));
+    cg_pick(0, gen(r, rho, ac, fail));
 }
 
 // ── Where-guarded specialisation (predicate over int)
@@ -89,26 +123,33 @@ rule lit : ast.Lit(n: x) {
 // ── General Add (fallback after the nested-pat specialisation)
 rule add : ast.Add(left: l, right: r) {
     trace_fire("add");
-    cg_pick(gen(l, ac, fail), gen(r, ac, fail));
+    cg_pick(gen(l, rho, ac, fail), gen(r, rho, ac, fail));
 }
 
 // ── For-loop accumulator + list concat + Sequence-typed field
+//   Also calls a fun imported from `big_imports.ddcg` to validate
+//   cross-file fun resolution.
 rule seq : ast.Seq(items: es) {
     trace_fire("seq");
+    let _ = import_demo(0);
     let acc: list<int> = [];
     for e in es {
-        acc := acc + [gen(e, ac, fail)];
+        acc := acc + [gen(e, rho, ac, fail)];
     }
     cg_seq(acc);
 }
 
 // ── Label statement + label-payload γ variant
+//   Also drives the action-language fun (match + build) from this
+//   rule's body, side-effecting the trace before the main pair logic.
 rule pair : ast.Pair(first: e1, second: e2) {
     trace_fire("pair");
+    let _ = log_value(dest_to_value(ac));
+    let _ = log_value(dest_to_value(spill(7)));
     label L;
-    gen(e1, effect, jump(L));
+    gen(e1, rho, effect, jump(L));
     place(L);
-    cg_pick(gen(e2, effect, fail), 0);
+    cg_pick(gen(e2, rho, effect, fail), 0);
 }
 
 // ── StringPat: literal string match in a field
@@ -136,5 +177,28 @@ rule maybe_none : ast.Maybe(sub: nil) {
 
 rule maybe_some : ast.Maybe(sub: s) {
     trace_fire("maybe_some");
-    gen(s, ac, fail);
+    gen(s, rho, ac, fail);
+}
+
+// ── Per-op rules dispatch on the `op` enum constructor as a field-pat
+//   constant — bare `OpAdd` (etc.) is the enum value, not a value-bind.
+rule binop_add : ast.BinOp(op: OpAdd, left: l, right: r) {
+    trace_fire("binop_add");
+    cg_pick(gen(l, rho, ac, fail), gen(r, rho, ac, fail));
+}
+
+rule binop_sub : ast.BinOp(op: OpSub, left: l, right: r) {
+    trace_fire("binop_sub");
+    cg_pick(gen(l, rho, ac, fail), gen(r, rho, ac, fail));
+}
+
+rule binop_mul : ast.BinOp(op: OpMul, left: l, right: r) {
+    trace_fire("binop_mul");
+    cg_pick(gen(l, rho, ac, fail), gen(r, rho, ac, fail));
+}
+
+// ── Enum-typed field bound by name, then matched on by the op_to_int fun.
+rule sel : ast.Sel(which: w) {
+    trace_fire("sel");
+    cg_lit(op_to_int(w));
 }

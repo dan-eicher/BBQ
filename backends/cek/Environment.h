@@ -9,7 +9,7 @@ namespace bbq::cek {
 
 struct Binding {
     const char* name = nullptr;     // Interned string
-    int64_t value = 0;              // Scalar value for expressions
+    Value* value = nullptr;         // Typed value for expressions
     size_t start_offset = 0;        // Capture interval start
     size_t end_offset = 0;          // Capture interval end
     CaptureType type = CaptureType::UInt8;

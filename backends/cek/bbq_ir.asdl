@@ -1,0 +1,204 @@
+// BBQ CEK continuation-graph IR.
+//
+// Three flat top-level sums under a shared KontNode root that the
+// template (bbq_ir.inja) injects:
+//
+//   static_kont   — variants the compiler emits at compile time.
+//                   Live in the grammar arena, immutable across parses.
+//                   Spine variants carry `next`; expression variants
+//                   hold operand sub-trees by pointer.
+//
+//   dynamic_kont  — variants the interpreter allocates at runtime.
+//                   Live in the per-parse arena, freed at parse end.
+//                   Apply / eval-left / check / dispatch / consumer
+//                   sequencing frames.
+//
+//   value         — typed values flowing through ac, env bindings,
+//                   and FieldCapture::computed_value. Plain data
+//                   records, no virtual methods, no kont relationship.
+//
+// asdl declares all three as flat top-level sums. The template injects
+// the KontNode shared root with private virtual `invoke()` and
+// `friend class CEKMachine` so the trampoline is the only legal call
+// site for invoke. Value variants get plain tag+payload structs.
+
+module bbq_ir {
+
+    type interned       = "const char*"
+    type primitive_info = "PrimitiveInfo"
+    type field_capture  = "FieldCapture*"
+    type value_slot     = "Value**"
+    type value_buf      = "Value**"
+    // f64 — 64-bit IEEE float. asdl's built-in `float` resolves to C++
+    // `float` (32-bit); we want full f64 precision in FloatValue so
+    // f32 and f64 BBQ fields both round-trip cleanly.
+    type f64            = "double"
+
+    // KontNode is the template-injected shared root over both kont
+    // sums. Asdl doesn't know about it (no `kont_node` sum is
+    // declared), so we declare it as a type alias resolving to
+    // `KontNode*`. Spine `next` fields and operator sub-tree fields
+    // use this alias to point at either a static_kont or dynamic_kont
+    // variant uniformly.
+    type kont_node      = "KontNode*"
+
+    // ── Enums ────────────────────────────────────────────────
+
+    // EOF_ not EOF — EOF is a <cstdio> macro.
+    array_mode = FixedCount | EOF_ | Count | Until
+
+    // ── Sub-products (inline structs nested inside KontNodes) ──
+
+    // Switch case: typed match value (Int or String) + branch target.
+    switch_case   = (value match_value, kont_node target)
+    bitfield_entry = (interned name, int width_bits)
+
+    // ── Value sum (typed accumulator + binding + capture values) ──
+
+    value = IntValue(int64 v)
+          | FloatValue(f64 v)
+          | StringValue(interned v)
+          | BoolValue(bool v)
+          | FieldCaptureValue(field_capture capture)
+
+    // ── Static konts (compiler-emitted; live in grammar arena) ──
+
+    static_kont
+        // Spine / structural — `next` field threads the spine.
+        = MatchPrimitiveNode(interned field_name, primitive_info prim, kont_node next)
+        | BeginStructNode(interned struct_name, kont_node next)
+        | EndStructNode(kont_node next)
+        | EvalConstraintNode(kont_node constraint_expr, kont_node on_false, kont_node next)
+        | BindComputeNode(interned field_name, kont_node compute_expr, kont_node next)
+        | InvokeRuleNode(interned rule_name, kont_node entry, kont_node next)
+        | ReturnRuleNode(kont_node next)
+        | BeginChoiceNode(kont_node* alternatives, kont_node next)
+        | CommitChoiceNode(kont_node next)
+        | BeginOptionalNode(kont_node inner, kont_node next)
+        | EndOptionalNode(kont_node next)
+        | BeginArrayNode(interned array_name, array_mode mode, kont_node count_expr, kont_node end_node, kont_node next)
+        | ArrayNextNode(array_mode mode, kont_node count_expr, kont_node until_expr, kont_node end_node, kont_node body_entry)
+        | EndArrayNode(kont_node next)
+        | SwitchDispatchNode(kont_node discriminator_expr, switch_case* cases, kont_node default_target)
+        | BitfieldReadNode(primitive_info container, bitfield_entry* entries, kont_node next)
+        | SetEndianNode(kont_node endian_expr, kont_node next)
+        | ExternalCallNode(interned func_name, interned field_name, kont_node next)
+        | MatchBytesNode(interned field_name, kont_node length_expr, bool is_string, kont_node next)
+        | HaltNode
+
+        // Expression leaves — write a Value to ac, push nothing.
+        | IntLitKont(int64 v)
+        | BoolLitKont(bool v)
+        | FloatLitKont(float v)
+        | StrLitKont(interned v)
+        | RefKont(interned name)
+        | PosKont
+        | RemainingKont
+        | AtEndKont
+        | EOIKont
+        | LoopVarKont
+
+        // Unary operators — operand sub-tree.
+        | NegKont(kont_node operand)
+        | BitNotKont(kont_node operand)
+        | NotKont(kont_node operand)
+
+        // Binary arithmetic operators — left and right sub-trees.
+        | AddKont(kont_node left, kont_node right)
+        | SubKont(kont_node left, kont_node right)
+        | MulKont(kont_node left, kont_node right)
+        | DivKont(kont_node left, kont_node right)
+        | ModKont(kont_node left, kont_node right)
+
+        // Binary bitwise operators.
+        | BitAndKont(kont_node left, kont_node right)
+        | BitOrKont(kont_node left, kont_node right)
+        | BitXorKont(kont_node left, kont_node right)
+        | ShlKont(kont_node left, kont_node right)
+        | ShrKont(kont_node left, kont_node right)
+
+        // Binary comparison operators.
+        | EqKont(kont_node left, kont_node right)
+        | NeKont(kont_node left, kont_node right)
+        | LtKont(kont_node left, kont_node right)
+        | LeKont(kont_node left, kont_node right)
+        | GtKont(kont_node left, kont_node right)
+        | GeKont(kont_node left, kont_node right)
+
+        // Logical short-circuit operators.
+        | LogicalAndKont(kont_node left, kont_node right)
+        | LogicalOrKont(kont_node left, kont_node right)
+
+        // Ternary.
+        | TernaryKont(kont_node cond, kont_node then_, kont_node else_)
+
+        // Function call.
+        | CallKont(interned func_name, kont_node* args)
+
+        // Path navigation.
+        | PathStartKont(interned name)
+        | FieldAccessKont(interned field, kont_node base)
+        | IndexAccessKont(kont_node index_expr, kont_node base)
+        | CaptureValueKont(kont_node path)
+
+    // ── Dynamic konts (runtime-allocated; live in per-parse arena) ──
+
+    dynamic_kont
+        // Apply variants for binary operators — saved_right slot
+        // populated by EvalLeftKont before the apply runs.
+        = ApplyAddKont(value saved_right)
+        | ApplySubKont(value saved_right)
+        | ApplyMulKont(value saved_right)
+        | ApplyDivKont(value saved_right)
+        | ApplyModKont(value saved_right)
+        | ApplyBitAndKont(value saved_right)
+        | ApplyBitOrKont(value saved_right)
+        | ApplyBitXorKont(value saved_right)
+        | ApplyShlKont(value saved_right)
+        | ApplyShrKont(value saved_right)
+        | ApplyEqKont(value saved_right)
+        | ApplyNeKont(value saved_right)
+        | ApplyLtKont(value saved_right)
+        | ApplyLeKont(value saved_right)
+        | ApplyGtKont(value saved_right)
+        | ApplyGeKont(value saved_right)
+
+        // Apply variants for unary operators — read ac, write ac.
+        | ApplyNegKont
+        | ApplyBitNotKont
+        | ApplyNotKont
+
+        // Shared eval-left: writes ac into a `Value**` slot on an
+        // apply kont, then pushes the left-operand kont onto K.
+        | EvalLeftKont(value_slot saved_right_slot, kont_node left_kont)
+
+        // Logical short-circuit: read ac (boolean), decide whether
+        // to push the right operand or short-circuit.
+        | LogicalAndCheckKont(kont_node right)
+        | LogicalOrCheckKont(kont_node right)
+        | NormalizeKont
+
+        // Ternary dispatch: read ac (boolean), push the chosen branch.
+        | TernaryDispatchKont(kont_node then_, kont_node else_)
+
+        // Function call sequencing: store an arg into a buffer slot,
+        // and apply the function once all args have evaluated.
+        | ArgStoreKont(value_buf args_buf, int slot)
+        | CallApplyKont(interned func_name, value_buf args_buf, int arg_count)
+
+        // Path navigation apply variants.
+        | FieldAccessApplyKont(interned field)
+        | IndexAccessApplyKont(value saved_index)
+        | CaptureValueApplyKont
+
+        // Site consumers — read ac after the site's expression
+        // evaluates and act accordingly.
+        | EvalConstraintCheckKont(kont_node on_false, kont_node next)
+        | SwitchSelectKont(switch_case* cases, kont_node default_target)
+        | BindComputeStoreKont(interned field_name, kont_node next)
+        | BeginArrayWithLimitKont(interned array_name, array_mode mode, kont_node end_node, kont_node next)
+        | ArrayCountCheckKont(kont_node end_node, kont_node body_entry)
+        | ArrayUntilCheckKont(kont_node end_node, kont_node body_entry)
+        | MatchBytesApplyKont(interned field_name, bool is_string, kont_node next)
+        | SetEndianApplyKont(kont_node next)
+}

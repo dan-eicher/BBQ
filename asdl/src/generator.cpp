@@ -162,6 +162,25 @@ void Generator::process(json& module) {
         defined_types.insert(def["name"].get<std::string>());
     }
 
+    // Tag each field with is_schema = whether its type is a sum/product
+    // defined in this module (vs primitive or alias). Lets the template
+    // emit generic arity/child accessors without a sidecar dispatch.
+    auto tag_fields = [&](json& fields) {
+        for (json& f : fields) {
+            std::string t = f["type"].get<std::string>();
+            f["is_schema"] = defined_types.count(t) > 0;
+        }
+    };
+    for (json& def : module["definitions"]) {
+        if (def["type"] == "sum" && def.contains("types")) {
+            for (json& ctor : def["types"]) {
+                if (ctor.contains("fields")) tag_fields(ctor["fields"]);
+            }
+        } else if (def["type"] == "product" && def.contains("fields")) {
+            tag_fields(def["fields"]);
+        }
+    }
+
     std::string mod = module["name"].get<std::string>();
 
     for (json& def : module["definitions"]) {

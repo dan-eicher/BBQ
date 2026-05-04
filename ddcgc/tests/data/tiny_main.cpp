@@ -17,7 +17,8 @@ int main() {
     Add add_expr(&two, &three);
 
     Compiler compiler;
-    int result = compiler.compile_expr(&add_expr, ac(), fail());
+    rho_t rho{0};
+    int result = compiler.compile_expr(&add_expr, rho, ac(), fail());
 
     if (result != 5) {
         std::fprintf(stderr, "expected 5, got %d\n", result);

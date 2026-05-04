@@ -10,21 +10,13 @@ set(DDCG_AST_H   ${CMAKE_CURRENT_SOURCE_DIR}/frontend/ddcg_ast.h)
 set(DDCG_JSON    ${CMAKE_CURRENT_SOURCE_DIR}/grammar/ddcg.json)
 
 add_custom_command(
-    OUTPUT ${DDCG_AST_H}
+    OUTPUT ${DDCG_AST_H} ${DDCG_JSON}
     COMMAND asdl -i ${DDCG_ASDL}
                  -t ${DDCG_TPL}
                  -o ${DDCG_AST_H}
-    DEPENDS asdl ${DDCG_ASDL} ${DDCG_TPL}
-    COMMENT "Generating ddcg_ast.h from ddcg.asdl"
-    VERBATIM
-)
-
-add_custom_command(
-    OUTPUT ${DDCG_JSON}
-    COMMAND asdl -i ${DDCG_ASDL}
                  --json ${DDCG_JSON}
-    DEPENDS asdl ${DDCG_ASDL}
-    COMMENT "Generating ddcg.json schema sidecar from ddcg.asdl"
+    DEPENDS asdl ${DDCG_ASDL} ${DDCG_TPL}
+    COMMENT "Generating ddcg_ast.h + ddcg.json from ddcg.asdl"
     VERBATIM
 )
 
@@ -155,6 +147,7 @@ add_custom_command(
                   -o   ${DDCG_TEST_OUT}/big_compile.h
     DEPENDS ddcgc
             ${DDCG_TEST_DATA}/big.ddcg
+            ${DDCG_TEST_DATA}/big_imports.ddcg
             ${DDCG_TEST_OUT}/big_ast.json
             ${DDCG_TEST_OUT}/big_target.json
     COMMENT "Running ddcgc on tests/data/big.ddcg"
@@ -167,3 +160,53 @@ target_include_directories(ddcgc_big_e2e PRIVATE
     ${DDCG_TEST_DATA}
     ${DDCG_TEST_OUT})
 add_test(NAME ddcgc_big_e2e COMMAND ddcgc_big_e2e)
+
+# ── "paper_consumer" e2e — exercises the shipped dybvig.ddcg library ──
+# ── via -L search path. Verifies paper-direct cg_helpers (Lnext, ρ).  ──
+set(DDCG_LIB_DIR ${CMAKE_CURRENT_SOURCE_DIR}/lib)
+
+# Generate the reference IR schema's JSON (lib ships the asdl, build
+# emits the JSON the consumer points -ir at).
+add_custom_command(
+    OUTPUT ${DDCG_TEST_OUT}/dybvig_ir.json
+    COMMAND asdl -i ${DDCG_LIB_DIR}/dybvig_ir.asdl
+                 --json ${DDCG_TEST_OUT}/dybvig_ir.json
+    DEPENDS asdl ${DDCG_LIB_DIR}/dybvig_ir.asdl
+    COMMENT "Generating dybvig_ir.json from lib/dybvig_ir.asdl"
+    VERBATIM
+)
+
+# Per-consumer AST schema.
+add_custom_command(
+    OUTPUT ${DDCG_TEST_OUT}/paper_consumer_ast.json
+    COMMAND asdl -i ${DDCG_TEST_DATA}/paper_consumer_ast.asdl
+                 --json ${DDCG_TEST_OUT}/paper_consumer_ast.json
+    DEPENDS asdl ${DDCG_TEST_DATA}/paper_consumer_ast.asdl
+    COMMENT "Generating paper_consumer_ast.json"
+    VERBATIM
+)
+
+# ddcgc invocation: `-L lib/` lets `import "dybvig.ddcg"` resolve
+# without copying the file or relative-pathing it.
+add_custom_command(
+    OUTPUT ${DDCG_TEST_OUT}/paper_consumer_compile.h
+    COMMAND ddcgc -i ${DDCG_TEST_DATA}/paper_consumer.ddcg
+                  -ast ${DDCG_TEST_OUT}/paper_consumer_ast.json
+                  -ir  ${DDCG_TEST_OUT}/dybvig_ir.json
+                  -L   ${DDCG_LIB_DIR}
+                  -o   ${DDCG_TEST_OUT}/paper_consumer_compile.h
+    DEPENDS ddcgc
+            ${DDCG_TEST_DATA}/paper_consumer.ddcg
+            ${DDCG_LIB_DIR}/dybvig.ddcg
+            ${DDCG_TEST_OUT}/paper_consumer_ast.json
+            ${DDCG_TEST_OUT}/dybvig_ir.json
+    COMMENT "Running ddcgc on paper_consumer.ddcg with lib/dybvig.ddcg"
+    VERBATIM
+)
+add_executable(ddcgc_paper_e2e
+    ${DDCG_TEST_DATA}/paper_consumer_main.cpp
+    ${DDCG_TEST_OUT}/paper_consumer_compile.h)
+target_include_directories(ddcgc_paper_e2e PRIVATE
+    ${DDCG_TEST_DATA}
+    ${DDCG_TEST_OUT})
+add_test(NAME ddcgc_paper_e2e COMMAND ddcgc_paper_e2e)

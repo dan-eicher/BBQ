@@ -38,6 +38,7 @@ struct AlternativeFrame : Frame {
     Environment* saved_env = nullptr;
     size_t saved_pos = 0;
     bool saved_endian = true;
+    size_t saved_kont_size = 0;         // Truncate kont_stack to this on restore
     CaptureBuilder::Mark capture_mark{};
 
     AlternativeFrame() { type = FrameType::Alternative; }

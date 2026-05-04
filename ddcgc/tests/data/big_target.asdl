@@ -1,3 +1,4 @@
 module target {
     placeholder = Placeholder(int x)
+    value = Imm(int v) | Slot(int s)
 }

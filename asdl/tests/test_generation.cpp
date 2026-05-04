@@ -4,6 +4,7 @@
 #include "generator.h"
 #include "type_registry.h"
 #include "exceptions.h"
+#include "Parser.h"
 
 #ifndef SOURCE_DIR
 #define SOURCE_DIR "."
@@ -54,6 +55,40 @@ TEST(TypeRegistry, ThrowsOnUnknownType) {
 }
 
 // --- Parser tests ---
+
+// `Ctor` (no parens) and `Ctor()` (empty parens) are both valid
+// zero-field constructor syntaxes and produce structurally identical
+// ASTs.
+TEST(Parser, EmptyParensZeroFieldEquivalentToBareName) {
+    auto parse_one = [](const char* src) -> asdl_ast::Module* {
+        Parser p;
+        p.init(src, static_cast<int>(std::strlen(src)));
+        return p.parse() ? p.ast : nullptr;
+    };
+
+    const char* bare    = "module m { foo = Ctor }";
+    const char* parens  = "module m { foo = Ctor() }";
+
+    auto* m_bare   = parse_one(bare);
+    auto* m_parens = parse_one(parens);
+    ASSERT_NE(m_bare,   nullptr);
+    ASSERT_NE(m_parens, nullptr) << "empty-parens form failed to parse";
+
+    ASSERT_EQ(m_bare->definitions.size(),   1u);
+    ASSERT_EQ(m_parens->definitions.size(), 1u);
+
+    auto* sum_bare   = dynamic_cast<asdl_ast::Sum*>(m_bare  ->definitions[0]->body);
+    auto* sum_parens = dynamic_cast<asdl_ast::Sum*>(m_parens->definitions[0]->body);
+    ASSERT_NE(sum_bare,   nullptr);
+    ASSERT_NE(sum_parens, nullptr);
+
+    ASSERT_EQ(sum_bare  ->types.size(), 1u);
+    ASSERT_EQ(sum_parens->types.size(), 1u);
+    EXPECT_EQ(sum_bare  ->types[0]->name, "Ctor");
+    EXPECT_EQ(sum_parens->types[0]->name, "Ctor");
+    EXPECT_TRUE(sum_bare  ->types[0]->fields.empty());
+    EXPECT_TRUE(sum_parens->types[0]->fields.empty());
+}
 
 TEST(Generator, ParsesExampleASDL) {
     Generator gen;

@@ -1,31 +1,33 @@
 # CEK Machine Design for BBQ
 
 An interpretive backend for BBQ that compiles format specifications into
-continuation graphs and executes them against byte buffers, producing zero-copy
-capture metadata.
+typed continuation graphs and executes them against byte buffers, producing
+zero-copy capture metadata.
 
-The CEK machine was always part of the BBQ design — the original design docs
-(in `/home/dan/Source/IPG/`) spec out the full VM architecture, DDCG
-compilation rules, capture metadata, operational semantics, and implementation
-plan. The static C++ code generator (`bbqc`) was built first to nail down the
-frontend (grammar, AST, Sema) before tackling the VM. This document covers
-the VM design as adapted for the actual BBQ AST and Sema output.
+The architecture is the canonical CEK machine of Felleisen & Friedman 1987 —
+state transitions `(C, E, K) → (C', E', K')` driven by syntactic
+decomposition of the current continuation, plus a typed accumulator register
+holding values in flight. Expression evaluation is defunctionalized per
+Reynolds 1972 and Ager-Biernacki-Danvy-Midtgaard 2003: every continuation
+that would sit on the host stack in a recursive interpreter becomes an
+explicit data constructor on the runtime K stack.
 
-All 13 implementation phases are complete. The CEK backend is fully operational
-and powers the Python extension module (`bindings/python/bbq_python.cpp`).
+The design draws on three working implementations: AiPL's 70-continuation
+production VM, the calc compiler in `jitterator/example/`, and the original
+IPG design docs in `/home/dan/Source/IPG/`.
 
 ---
 
 ## 1. Architecture Overview
 
 The CEK machine is the second BBQ backend — an interpreter that complements
-the static C++ code generator. Both backends share the same frontend (Scanner,
-Parser, Sema); the split happens at the validated AST.
+the static C++ code generator. Both backends share the same frontend
+(Scanner, Parser, Sema); the split happens at the validated AST.
 
 ```
                         ┌─────────────────┐
   format.bbq ──────────▶│  BBQ Frontend    │
-                        │  Scanner + Parser│
+                        │  Parser          │
                         └────────┬─────────┘
                                  │ BBQ AST
                         ┌────────▼─────────┐
@@ -39,7 +41,7 @@ Parser, Sema); the split happens at the validated AST.
                    │                                │
           ┌────────▼────────┐             ┌─────────▼─────────┐
           │ Static Backend   │             │ CEK Backend        │
-          │ TypeEmitter      │             │ CEK Compiler       │
+          │ TypeEmitter      │             │ DDCG Compiler      │
           │ ParserEmitter    │             │ AST → Kont Graph   │
           │ → C++ source     │             └─────────┬──────────┘
           └──────────────────┘                       │
@@ -52,15 +54,28 @@ Parser, Sema); the split happens at the validated AST.
                                             └──────────────────┘
 ```
 
-**Input:** Validated, topologically sorted BBQ AST + byte buffer.
+**Input.** Validated, topologically sorted BBQ AST + byte buffer.
 
-**Output:** `CaptureMetadata` — a hierarchical zero-copy file index recording
-`[start, end)` offsets into the original buffer. No data is copied during
-parsing; the metadata IS the parse result.
+**Output.** `CaptureMetadata` — a hierarchical zero-copy file index recording
+`[start, end)` offsets into the original buffer plus typed computed values.
+No bytes are copied; the metadata IS the parse result.
 
-**Key principle:** continuations ARE the compiled
-representation. There is no separate IR layer between the AST and the
-executable graph — the DDCG compiler emits continuation nodes directly.
+**Toolchain at a glance.** The compiler and IR are themselves generated from
+declarative inputs:
+
+- `backends/cek/bbq_ir.asdl` declares the IR variants (typed value sum +
+  static/dynamic kont sums under a shared root). The `asdl` tool generates
+  the C++ headers via the `bbq_ir.inja` template.
+- `backends/cek/bbq.ddcg` declares the AST→IR compilation rules using
+  Destination-Driven Code Generation. The `ddcgc` tool, with the
+  `dybvig.ddcg` primitive library, generates the compiler.
+- `backends/cek/Machine.cpp` and friends are hand-written runtime: the
+  trampoline, backtracking, capture builder, error tracking, external
+  parser dispatch.
+
+The design doc names what each input file is FOR and the architectural
+discipline they collectively realize. Variant catalogs and rule bodies
+themselves live in those files.
 
 ### Why both backends?
 
@@ -68,20 +83,19 @@ The static backend generates C++ source — maximum performance, zero runtime
 dependency, but requires a C++ compiler. The CEK backend fills complementary
 roles:
 
-- **Interactive exploration** — Load a `.bbq` spec and parse files immediately,
-  without a C++ compilation step.
+- **Interactive exploration** — Load a `.bbq` spec and parse files
+  immediately, without a C++ compilation step.
 - **Hot-reload** — Recompile the continuation graph when the spec changes,
   without restarting.
-- **Embedding** — Ship a single library that accepts BBQ specs at runtime
-  (no build toolchain dependency).
-- **Round-trip testing** — Validate that both backends produce identical parse
-  results for the same input.
+- **Embedding** — Ship a single library that accepts BBQ specs at runtime.
+- **Round-trip testing** — Validate that both backends produce identical
+  parse results for the same input.
 
 ---
 
 ## 2. Memory Management
 
-Three-tier model, validated by AiPL's production experience.
+Three-tier model.
 
 ### Tier 1: Immutable Compiled Grammar (Reference-Counted)
 
@@ -92,9 +106,6 @@ struct CompiledGrammar {
     // Entry point for each rule, indexed by rule name
     std::unordered_map<std::string, KontNode*> entries;
 
-    // Compiled expression trees (shared by continuation nodes)
-    std::vector<std::unique_ptr<CompiledExpr>> expr_pool;
-
     // Interned strings (field names, rule names, error messages)
     StringPool strings;
 
@@ -102,330 +113,220 @@ struct CompiledGrammar {
     ExternalParserTable ext_parsers;
     FunctionTable ext_functions;
 
-    // Arena that owns all continuation nodes
+    // Arena owning all compile-time-emitted (static_kont) nodes
     Arena graph_arena;
 };
 ```
 
-Allocated once during compilation. Shared across concurrent parses (thread-safe
-because immutable). Reference-counted so grammars can be swapped at runtime
-without dangling pointers.
+Allocated once during compilation. Shared across concurrent parses (thread-
+safe because immutable). Reference-counted so grammars can be swapped at
+runtime without dangling pointers.
 
 ### Tier 2: Per-Parse Arena (Bump Allocator)
 
-```cpp
-class ParseArena {
-    uint8_t* memory;
-    size_t used;
-    size_t capacity;
-
-public:
-    explicit ParseArena(size_t capacity);
-    ~ParseArena();
-
-    template<typename T, typename... Args>
-    T* alloc(Args&&... args) {
-        size_t aligned = align_up(used, alignof(T));
-        if (aligned + sizeof(T) > capacity) throw std::bad_alloc();
-        T* ptr = new (memory + aligned) T(std::forward<Args>(args)...);
-        used = aligned + sizeof(T);
-        return ptr;
-    }
-
-    void reset() { used = 0; }      // O(1) — no destructors needed
-    size_t bytes_used() const { return used; }
-};
-```
-
 All mutable per-parse state lives here: environments, capture nodes, frame
-stack entries. Reset in O(1) after each parse — a single pointer assignment.
+stack entries, runtime-allocated (`dynamic_kont`) nodes, in-flight typed
+Values. Reset in O(1) after each parse — a single pointer assignment.
 No fragmentation, no GC overhead.
 
-**Sizing:** AiPL uses 64KB for ephemeral expression evaluation; binary parsing
-workloads are heavier (deeper nesting, larger capture trees). Default to
-**256KB**, growing on demand. Most binary format parses (ELF headers, PNG
-chunks, TLV streams) will fit within a single block.
+**Sizing.** AiPL uses 64KB for ephemeral expression evaluation; binary
+parsing workloads are heavier (deeper nesting, larger capture trees).
+Default to **256KB**, growing on demand.
 
-**Why no GC?** Unlike AiPL's APL interpreter, the parsing use case creates no
-long-lived closures, no user-defined functions, no cyclic structures. All
-per-parse allocations are provably short-lived — the arena reset after each
-parse is sufficient. This is a major simplification over AiPL's generational
-GC, which was necessary only because APL has persistent closures and mutable
-arrays.
+**Why no GC?** All per-parse allocations are provably short-lived — no
+long-lived closures, no user-defined functions, no cyclic structures. Arena
+reset is sufficient.
 
-### Tier 3: Expression Evaluation Stack (No Allocation)
+### Tier 3: Runtime K Stack and Typed Accumulator
 
-```cpp
-static constexpr size_t EVAL_STACK_SIZE = 256;
-
-int64_t eval_stack[EVAL_STACK_SIZE];
-size_t eval_top = 0;
-```
-
-Fixed-size stack for expression evaluation. Operations push/pop `int64_t`
-values. 256 entries is far more than any reasonable BBQ expression requires
-(the deepest expressions are `where` constraints with a few operators).
-Stack overflow during expression evaluation is a spec authoring error, not
-a runtime concern.
-
----
-
-## 3. Core Data Structures
-
-### 3.1 Machine State
+The third tier is the literal **K** of the CEK machine — the runtime
+continuation stack — paired with a single typed accumulator register.
 
 ```cpp
 struct CEKMachine {
-    // ── C: Control ──────────────────────────────────
-    // Current continuation node. nullptr means halt.
-    KontNode* control;
-
-    // ── E: Environment ──────────────────────────────
-    // Variable bindings + capture intervals. Immutable
-    // linked list — never mutated, only extended.
-    Environment* env;
-
-    // ── K: Kontinuation (frame stack) ───────────────
-    // Call/return, backtracking, loop iteration frames.
-    Frame* frame_top;
-
-    // ── Input ───────────────────────────────────────
-    const uint8_t* input;
-    size_t input_length;
-    size_t pos;
-
-    // ── Endianness ──────────────────────────────────
-    // Resolved from @endian directive or EndianSwitch.
-    // true = little-endian, false = big-endian.
-    bool little_endian;
-
-    // ── Expression evaluation ───────────────────────
-    int64_t eval_stack[EVAL_STACK_SIZE];
-    size_t eval_top;
-
-    // ── Output ──────────────────────────────────────
-    CaptureNode* capture_root;
-    CaptureBuilder builder;
-
-    // ── Memory ──────────────────────────────────────
-    ParseArena* arena;
-    const CompiledGrammar* grammar;
-
-    // ── Error state ─────────────────────────────────
-    ParseError error;
-    size_t best_error_pos;      // Furthest position reached before failure
-    const char* best_error_msg;
+    // …
+    KontNode* control;                    // C — currently dispatched kont
+    std::vector<KontNode*> kont_stack;   // K — runtime continuation stack
+    Value* result;                        // ac — typed accumulator
 };
 ```
 
-The CEK acronym maps directly:
-- **C** (Control) — `control` pointer to the current continuation node.
-- **E** (Environment) — `env` pointer to the current environment.
-- **K** (Kontinuation) — `frame_top` pointer to the frame stack.
+**The K stack** is a LIFO stack of `KontNode*` pointers. Each iteration
+the trampoline loads `control` from K's top, pops, and invokes
+`control->invoke(this)`. The kont's `invoke()` may push further konts
+(in reverse execution order — the next-to-run is last pushed). Control
+is overwritten each iteration from K; it is never advanced via
+`control->next`. The pointers live on the stack-vector spine; the konts
+they point to live in the Tier 1 grammar arena (for `static_kont`
+variants emitted at compile time) or the Tier 2 per-parse arena (for
+`dynamic_kont` variants allocated mid-parse).
 
-### 3.2 Continuation Nodes (Immutable, Compiled)
+**The accumulator `ac`** holds a `Value*` — a pointer to a typed,
+arena-allocated value. Producer konts (literals, refs, the apply variants
+of operators) allocate a fresh `Value` and write the pointer to `ac`.
+Consumer konts read `ac` and dispatch on the value's type. This is the
+typed accumulator of the canonical CEK machine; there is no separate
+evaluation stack.
 
-Each BBQ construct compiles to one or more continuation node types. Nodes are
-linked into chains via a `next` pointer. Each node carries immutable data
-(field names, type info, compiled expressions) allocated in the grammar arena.
+**Backtracking** saves the K stack size and the environment pointer.
+Restoration truncates K back to the saved size (dropping any konts pushed
+during the speculative branch) and resets the env pointer (dropping any
+bindings extended during the branch). Speculative arena allocations
+(Values, dynamic konts) are not freed — the per-parse arena is monotonic
+within a parse and reset only at parse end. This is sound because nothing
+restored points at speculative allocations.
 
-```cpp
-enum class KontType : uint8_t {
-    MatchPrimitive,
-    MatchBytes,
-    BeginStruct,
-    EndStruct,
-    InvokeRule,
-    ReturnRule,
-    EvalConstraint,
-    BindCompute,
-    BeginChoice,
-    CommitChoice,
-    Backtrack,
-    BeginArray,
-    ArrayNext,
-    ArraySeparator,
-    EndArray,
-    BeginOptional,
-    EndOptional,
-    SwitchDispatch,
-    BitfieldRead,
-    SetEndian,
-    ExternalCall,
-    Halt
-};
+---
 
-struct KontNode {
-    KontType type;
-    KontNode* next;         // Chain to next node in sequence
+## 3. State Model
 
-    void invoke(CEKMachine* m) const;
-};
-```
+### 3.1 The CEK machine
 
-**Type-specific data** is stored in substructs that extend `KontNode`:
+The state has four components — the literal C/E/K of Felleisen-Friedman
+1987 plus the typed accumulator:
 
-```cpp
-struct MatchPrimitiveNode : KontNode {
-    const char* field_name;     // Interned string
-    PrimitiveInfo prim;         // Width, signedness, endianness
-    CompiledExpr* constraint;   // nullptr if no where clause
-    IntervalInfo* interval;     // nullptr if no interval
-};
+- **C (control)** — the kont currently being dispatched. A private
+  field on the machine with `friend class CEKMachine` access only:
+  the trampoline (`execute_from()`) is the sole writer. Loaded from
+  K's top each iteration. Never assigned inside any kont's `invoke()`
+  body, never advanced via `control->next` — both are compile errors
+  by construction.
+- **E (environment)** — the binding/record channel. Immutable linked list
+  of `Binding` records. Persists for the lifetime of the parse.
+- **K (kontinuation)** — the runtime continuation stack `kont_stack`.
+  Real LIFO stack of pending konts.
+- **ac (accumulator)** — the typed register `result`. Single `Value*` slot
+  for in-flight expression values.
 
-struct InvokeRuleNode : KontNode {
-    const char* rule_name;
-    KontNode* entry;            // Entry point of target rule
-    IntervalInfo* interval;
-};
+The frame stack (`frame_top`) is a separate auxiliary structure carrying
+saved-state for call/return, alternative branches, and loop iterations. It
+is consulted by the failure path; the trampoline does not pop from it.
 
-struct BeginChoiceNode : KontNode {
-    KontNode** alternatives;    // Remaining alternatives (after the first)
-    int alt_count;
-    // First alternative is wired as `next`. On backtrack, tries alternatives[0..].
-    // Pushes AlternativeFrame with join=nullptr (exhaustion = real failure).
-};
+### 3.2 The value channel and the binding channel
 
-struct CommitChoiceNode : KontNode {
-    // Pops the AlternativeFrame after a successful choice alternative.
-    // Without this, the frame lingers and a later failure could incorrectly
-    // backtrack into the already-committed choice.
-    // Pattern (a la PEG VM's OP_COMMIT):
-    //   BeginChoice [alt2, alt3] → alt1 → Commit → join
-    //                               alt2 → Commit → join
-    //                               alt3 → join   (last alt: no commit needed)
-};
+A defunctionalized CEK machine for BBQ has two distinct channels for data:
 
-struct SwitchDispatchNode : KontNode {
-    CompiledExpr* discriminator;
-    struct Case {
-        int64_t int_val;        // For int cases
-        const char* str_val;    // For string/ident cases
-        KontNode* target;
-    };
-    Case* cases;
-    int case_count;
-    KontNode* default_target;   // nullptr if no default
-};
+- **The value channel — `ac`** is the workspace where in-flight
+  expression values live. Producer konts write a typed Value pointer to ac;
+  consumer konts read it.
+- **The binding channel — `E`** is the persistent name→value store.
+  Bindings hold typed Value pointers and capture intervals. Once written,
+  bindings are immutable — extending E creates a new head.
 
-struct BeginArrayNode : KontNode {
-    enum class Mode { FixedCount, SepTerm } mode;
-    CompiledExpr* count_expr;   // For FixedCount
-    KontNode* element_entry;    // Continuation for one element
-    KontNode* separator;        // nullptr if no separator
-    TerminatorInfo* terminator; // For SepTerm mode
-    IntervalInfo* element_interval; // Per-element interval template
-};
+The handoff between ac and E happens at exactly two kont families:
 
-struct BitfieldReadNode : KontNode {
-    PrimitiveInfo container;
-    struct Entry {
-        const char* name;       // Interned
-        int width_bits;
-    };
-    Entry* entries;
-    int entry_count;
-    bool msb_first;             // true for BE containers
-};
+- **`Ref`** reads E → copies the binding's `Value*` into ac. **`PathStart`**
+  reads the capture builder → wraps the capture pointer in a fresh
+  `FieldCaptureValue` and writes that to ac. Both are gateways from E into
+  expression evaluation.
+- **`BindComputeStore`** reads ac → extends E with a new binding holding
+  that Value pointer + records the value in the capture builder. This is
+  how a freshly-computed typed value commits to a name.
 
-struct ExternalCallNode : KontNode {
-    const char* func_name;      // Interned, looked up in registry
-    const char* field_name;
-};
-```
+Every other kont stays on one side: structural konts (`BeginStruct`,
+`BeginArray`, etc.) only touch E and the capture builder; expression konts
+only touch ac.
 
-### 3.3 Environment (Arena-Allocated, Immutable Linked List)
+This split is the canonical CEK shape. ac handles workspace; E handles
+bindings; a third channel (an evaluation stack) would be neither, which is
+why none exists.
 
-The environment serves a dual purpose:
-it holds both **variable bindings** for use in expressions AND **capture
-intervals** that form the zero-copy file index. After parsing completes, the
-final environment IS the metadata.
+### 3.3 The eval-and-apply discipline
+
+Expression evaluation is defunctionalized per Ager-Biernacki-Danvy-
+Midtgaard 2003 §3. Every recursive call in a tree-walker becomes a kont
+allocation; every "apply this operator after both operands evaluate"
+becomes an apply kont on K.
+
+For a binary operator `Add(left, right)`, the operator-shape kont
+(`AddKont`, emitted by the compiler) on invoke:
+
+1. Allocates a fresh `ApplyAddKont` (carries a slot for the saved right
+   value).
+2. Allocates a fresh `EvalLeftKont` (will fire after right evaluates,
+   moves ac into the apply's slot, then pushes left).
+3. Pushes onto K in reverse execution order: apply, eval-left, right.
+
+Right evaluates first (it sits on top), leaves its Value in ac; eval-left
+fires, copies ac into apply's saved slot, pushes left; left evaluates,
+leaves its Value in ac; apply fires, dispatches on the (left, right) type
+pair, produces the typed result Value, writes it to ac.
+
+Every binop, unary, ternary, call, and path-navigation step instantiates
+this discipline. Logical and/or short-circuit via a check kont rather than
+an apply (the right operand is conditionally pushed). The seven structural
+sites that consume an expression value (constraint, switch discriminator,
+bind compute, array count, array until, bytes length, endian switch) each
+have a dedicated runtime "consumer" kont that reads ac after the
+expression IR finishes.
+
+Apply konts are **allocated fresh per evaluation**. There is no shared
+mutable slot between evaluations of the same expression — re-evaluating
+an array's per-iteration count expression simply re-pushes the IR
+sub-tree onto K, which freshly allocates apply konts each time.
+
+### 3.4 Hand-written runtime types
+
+The IR variants are generated (§4). The remaining runtime types are
+hand-written; their C++ shape is the spec.
+
+**Environment.** Immutable linked list of bindings.
 
 ```cpp
 struct Binding {
     const char* name;       // Interned string
-    int64_t value;          // Scalar value (for expression evaluation)
+    Value* value;            // Typed value pointer
     size_t start_offset;    // Capture interval start
     size_t end_offset;      // Capture interval end
-    CaptureType type;       // How to interpret the captured bytes
+    BindingSource source;
 };
 
 struct Environment {
     Binding binding;
-    Environment* parent;    // Lexical scope chain
+    Environment* parent;
 };
 ```
 
-**Never mutated** — only extended by creating new `Environment` nodes that
-point to the previous head. This makes backtracking trivial: restoring the
-environment is a single pointer assignment back to the saved state.
+Lookup walks the parent chain via interned-pointer comparison.
 
-**Lookup** walks the parent chain:
+**Frame stack.** Three frame types cover all saved-state needs.
 
 ```cpp
-const Binding* Environment::lookup(const char* name) const {
-    // Pointer comparison — names are interned
-    for (const Environment* e = this; e; e = e->parent) {
-        if (e->binding.name == name) return &e->binding;
-    }
-    return nullptr;
-}
-```
-
-### 3.4 Frame Stack (Arena-Allocated)
-
-Frames save machine state for operations that need to restore it later.
-Three frame types cover all control flow needs:
-
-```cpp
-enum class FrameType : uint8_t {
-    Return,         // Nonterminal call — save continuation + env
-    Alternative,    // Backtracking choice — save pos + env + remaining alts
-    Loop            // Array iteration — save counter + limits
-};
-
 struct Frame {
-    FrameType type;
-    Frame* prev;            // Stack linkage
+    FrameType type;          // Return | Alternative | Loop
+    Frame* prev;
 };
 
 struct ReturnFrame : Frame {
-    KontNode* return_to;    // Where to resume after rule completes
-    Environment* saved_env; // Caller's environment
-    size_t start_pos;       // For computing capture interval [start, end)
-    CaptureBuilder::Mark capture_mark; // Capture tree insertion point
+    KontNode* return_to;
+    Environment* saved_env;
+    size_t start_pos;
+    CaptureBuilder::Mark capture_mark;
 };
 
 struct AlternativeFrame : Frame {
-    KontNode** remaining;   // Untried alternatives
+    KontNode** remaining;
     int remaining_count;
-    KontNode* join;         // Where to continue after any alternative succeeds
+    KontNode* join;          // nullptr for Choice; skip-target for Optional
     Environment* saved_env;
     size_t saved_pos;
     bool saved_endian;
+    size_t saved_kont_size;  // K-stack truncation point
     CaptureBuilder::Mark capture_mark;
 };
 
 struct LoopFrame : Frame {
-    int64_t counter;        // Current iteration index
-    int64_t limit;          // For FixedCount: total count
-    KontNode* body_entry;   // Loop body continuation
-    KontNode* separator;    // nullptr if no separator
-    KontNode* loop_end;     // Exit continuation
-    Environment* body_env;  // Environment at loop start
+    int64_t counter;
+    int64_t limit;
+    KontNode* body_entry;
+    KontNode* loop_end;
+    Environment* body_env;
     CaptureBuilder::Mark capture_mark;
-    // For SepTerm arrays:
-    TerminatorInfo* terminator;
-    // For per-element intervals:
-    IntervalInfo* element_interval;
+    // … plus terminator/separator/element-interval data per array mode
 };
 ```
 
-### 3.5 Capture Metadata (Arena-Allocated Output)
-
-The capture metadata IS the zero-copy file index — the entire point of
-parsing. It records where things are in the input buffer, not what they
-contain.
+**Capture metadata.** The output structure.
 
 ```cpp
 enum class CaptureType : uint8_t {
@@ -433,989 +334,429 @@ enum class CaptureType : uint8_t {
     Int8,  Int16LE,  Int16BE,  Int32LE,  Int32BE,  Int64LE,  Int64BE,
     Float32LE, Float32BE, Float64LE, Float64BE,
     Bool, Bytes, String,
-    Struct, Array, Bitfield, Computed, External
+    Struct, Array, Computed, External
 };
 
 struct FieldCapture {
-    const char* name;           // Interned field name
+    const char* name;           // Interned
     size_t start_offset;
     size_t end_offset;
     CaptureType type;
-
-    // For nested captures (Struct, Array):
-    FieldCapture* children;
+    FieldCapture* children;     // Nested captures (Struct, Array)
     int child_count;
-
-    // For Computed fields:
-    int64_t computed_value;
+    Value* computed_value;      // Typed value for Computed fields
 };
 
 struct CaptureMetadata {
     bool success;
     size_t bytes_consumed;
-
-    FieldCapture* root;         // Top-level rule capture
-
-    // Error info (populated on failure):
+    FieldCapture* root;
     const char* error_message;
     size_t error_offset;
 };
 ```
 
-**Usage after parsing:**
+The capture builder accumulates this tree during parsing and supports
+mark/restore for backtracking.
 
-```cpp
-CaptureMetadata result = vm.parse(grammar, "Header", input, length);
-if (result.success) {
-    FieldCapture* magic = result.root->child("magic");
-    // magic->start_offset == 0, magic->end_offset == 4
-    // magic->type == CaptureType::UInt32BE
-
-    // Read the actual value lazily from the input buffer:
-    uint32_t magic_val = read_uint32be(input + magic->start_offset);
-}
-```
-
-### 3.6 Capture Builder
-
-A helper that accumulates capture metadata during parsing, managing the
-nesting stack of struct/array scopes:
-
-```cpp
-class CaptureBuilder {
-public:
-    struct Mark { int depth; int child_index; };
-
-    void begin_struct(const char* name, size_t pos);
-    void end_struct(size_t pos);
-    void begin_array(const char* name, size_t pos);
-    void end_array(size_t pos);
-    void add_field(const char* name, size_t start, size_t end,
-                   CaptureType type);
-    void add_computed(const char* name, int64_t value);
-    void add_bitfield_entries(const char* container_name,
-                              size_t start, size_t end,
-                              const BitfieldEntry* entries, int count);
-
-    Mark mark() const;          // Snapshot for backtracking
-    void restore(Mark m);       // Discard captures added since mark
-
-    FieldCapture* finish();     // Return the root capture
-};
-```
-
-### 3.7 String Interning
-
-Following AiPL's proven pattern, all identifier strings (field names, rule
-names, error messages) are interned in the `CompiledGrammar::strings` pool.
-This enables O(1) pointer-equality comparisons during environment lookup
-instead of O(n) string comparisons.
-
-```cpp
-class StringPool {
-    std::unordered_map<std::string_view, const char*> table;
-    Arena storage;
-
-public:
-    const char* intern(std::string_view s);
-};
-```
-
-All `const char*` pointers in the system (field names in `Binding`, `KontNode`
-substructs, `FieldCapture`) are interned — pointer comparison is always
-sufficient.
+**String interning.** All identifier strings (field names, rule names) are
+interned in `CompiledGrammar::strings`. Identifier comparison is interned-
+pointer equality.
 
 ---
 
-## 4. Continuation Node Types
+## 4. The IR Layer
 
-Every BBQ construct maps to one or more continuation nodes. The table below
-shows the complete mapping:
+### 4.1 Why the IR is generated
 
-| Node Type | BBQ Construct | Behavior |
-|-----------|--------------|----------|
-| `MatchPrimitive` | Primitive fields (`uint32le`, `int16be`, `float64`, `bool`) | Read N bytes at current position (or interval), decode value, record capture, bind value in environment. Endianness from node data or machine state. |
-| `MatchBytes` | `bytes[N]`, `string[N]` | Read variable-length data (length from interval expression). Record capture. Bind length as value. |
-| `BeginStruct` | `struct { ... }` | Push a new capture scope. Subsequent field captures nest under this struct. |
-| `EndStruct` | (closing `}`) | Pop the capture scope. Record the struct's `[start, end)` interval. |
-| `InvokeRule` | Rule reference (`Header`, `Entry`, etc.) | Push a `ReturnFrame` saving current continuation, environment, and position. Jump control to the rule's entry point. Apply interval if specified. |
-| `ReturnRule` | (end of rule body) | Pop the `ReturnFrame`. Record the rule's capture interval. Restore the caller's continuation and environment (extended with the new binding). |
-| `EvalConstraint` | `where` clause | Evaluate the constraint expression using the current environment. If false, trigger failure (backtrack or error). |
-| `BindCompute` | `compute(expr : type)` | Evaluate expression, bind result in environment. No bytes consumed, no capture interval — only a computed value. |
-| `BeginChoice` | `union { ... }`, `alt1 \| alt2` | Push an `AlternativeFrame` (with `join=nullptr`) saving position, environment, endianness, and the list of remaining alternatives. Jump to the first alternative. |
-| `CommitChoice` | (successful alternative) | Pop the `AlternativeFrame` after a successful choice alternative. Prevents later failures from backtracking into the committed choice. All alternatives except the last chain through `CommitChoice` before reaching the join point. (PEG VM OP_COMMIT pattern.) |
-| `Backtrack` | (failure during alternative) | Pop the most recent `AlternativeFrame`. Restore saved state. If alternatives remain, try the next one. If none remain (and `join=nullptr`), propagate failure upward. If `join` is set (optional), skip to join. |
-| `BeginArray` | `array<T>[N]`, `array<T>(sep, term)` | Push a `LoopFrame` with counter, limit (or terminator info), and body entry. Initialize counter to 0. Begin array capture scope. |
-| `ArrayNext` | (end of array element) | Increment counter. Check termination condition (count reached, terminator matched, `until` condition true, EOF). If not done, loop back to body entry (with optional separator). If done, fall through to `EndArray`. |
-| `ArraySeparator` | `sep` in `array<T>(sep, term)` | Parse the separator type between elements. On failure in a sep/term array, treat as end-of-array. |
-| `EndArray` | (array complete) | Pop the `LoopFrame`. Close array capture scope. |
-| `BeginOptional` | `optional<T>` | Push an `AlternativeFrame` with zero remaining alternatives (so failure means "absent, not error"). Jump to the inner type. |
-| `EndOptional` | (optional element parsed) | Pop the `AlternativeFrame` (success path). Mark optional as present. |
-| `SwitchDispatch` | `switch(expr) { ... }` | Evaluate discriminator expression. Look up matching case (int, string, or ident). Jump to the matching case's continuation, or the default. No backtracking — switch is deterministic. |
-| `BitfieldRead` | `bitfield<container> { ... }` | Read the container (e.g. `uint16be`). Extract each named bit range using shift-mask. Bind each entry's value in the environment. Record captures for container and entries. |
-| `SetEndian` | `@endian` directive, `@endian: expr` | Update `machine->little_endian`. For directive: set at compile time. For EndianSwitch: evaluate expression at runtime. |
-| `ExternalCall` | `extern("func", "type")` | Look up the named function in the grammar's external parser registry. Call it with the current input position and arena. On success, record capture and advance position. |
-| `Halt` | (end of top-level rule) | Set `control = nullptr` to exit the trampoline loop. Parse succeeded. |
+`backends/cek/bbq_ir.asdl` declares the typed value sum and the kont
+variant catalog. The `asdl` tool generates the C++ headers via the
+`bbq_ir.inja` template. Single source of truth for: runtime `invoke()`
+dispatch, ddcg-generated emit functions, future tooling.
+
+The design content here is what categories of variants exist, why the
+shape is what it is, and which architectural roles each variant family
+plays. The catalog itself is in the .asdl.
+
+### 4.2 Variant categories
+
+**`static_kont`** — variants the compiler emits at compile time. Live in
+the grammar arena, immutable across parses.
+
+- **Structural** — struct/array/choice/optional/switch/bitfield/extern/
+  invoke-rule/return-rule/halt and the transition konts between them.
+- **Expression leaves** — integer/float/string/bool literals; refs;
+  position queries (`pos`, `remaining`, `at_end`, `eoi`); the loop
+  counter `i`.
+- **Expression operators** — unary, binary arithmetic/bitwise/comparison,
+  logical and/or, ternary, function call, path-nav steps (field access,
+  index access, capture-value).
+
+**`dynamic_kont`** — variants the interpreter allocates when a static
+kont's `invoke()` fires. Live in the per-parse arena, freed at parse end.
+
+- **Apply variants** paired 1:1 with operator variants. Each apply carries
+  the slot eval-left writes the saved right operand into, and dispatches
+  on the (left, right) type pair to produce the result.
+- **Site-consumer variants** for the seven structural sites that take an
+  expression: `EvalConstraintCheck`, `SwitchSelect`, `BindComputeStore`,
+  `BeginArrayWithLimit`, `ArrayCountCheck`, `ArrayUntilCheck`,
+  `MatchBytesApply`, `SetEndianApply`.
+
+### 4.3 Why two sums under shared root
+
+The split reflects a real lifetime/memory-tier distinction: static konts
+live in the grammar arena (refcounted, immutable, shared across parses);
+dynamic konts live in the per-parse arena (ephemeral, freed at parse end).
+Different lifetimes, different concerns.
+
+Both sums inherit from a shared `KontNode` root. The trampoline dispatches
+`KontNode::invoke` virtually and only sees the shared root, so the split
+costs nothing at runtime.
+
+### 4.4 The Value sum
+
+`Value` is a separate sum, not under `KontNode`. Values are not
+continuations — they don't go on K, they have no `invoke()`, they're tag-
+dispatched data records allocated from the per-parse arena.
+
+| Variant | Carries | Role |
+|---|---|---|
+| `IntValue` | `int64_t` | uN/iN fields, int literals, count/length/discriminator/index results |
+| `FloatValue` | `double` | f32/f64 fields, float literals, float arithmetic |
+| `StringValue` | interned pointer | string fields, string literals (equality via pointer) |
+| `BoolValue` | `bool` | comparison results, constraint outcomes, true/false literals |
+| `FieldCaptureValue` | `FieldCapture*` | path-nav intermediate; converted to a typed scalar by `CaptureValueApplyKont` before leaving the path sub-chain |
+
+`ac` holds `Value*`. Env bindings hold `Value*`. FieldCapture's
+`computed_value` is `Value*`. The same Value type flows everywhere typed
+data lives.
+
+### 4.5 Reference
+
+Variant catalog: `backends/cek/bbq_ir.asdl`.
 
 ---
 
-## 5. Compilation Rules (BBQ AST → Continuation Graph)
+## 5. The Compilation Pass
 
-The DDCG (Destination-Driven Code Generation) compiler transforms the validated
-BBQ AST into a linked graph of continuation nodes. Each AST node type has a
-compilation rule that emits nodes into the grammar arena.
+### 5.1 Why DDCG
 
-The compiler maintains a **continuation parameter** — the "what comes next"
-pointer that each emitted node chains to. This is the destination-driven aspect:
-the compiler knows where each subexpression's control flows to before emitting it.
+The AST→IR compiler is written as a Destination-Driven Code Generation
+rule set (Dybvig-Hieb-Butler 1990) compiled by `ddcgc`, rather than as
+hand-written C++. The discipline forces paper-strict semantics: every
+rule is a destination-driven transformation parameterized by where the
+value goes, where control goes, and what loop-break label is in scope.
+Hand-written compilers accumulate weasel structure (ad-hoc state
+threading, mid-rule program-exit invention, γ=ret/pair fallbacks);
+the .ddcg shape excludes those by construction.
 
-**Theoretical connection:** The DDCG pattern originates in PEG VM research
-(Medeiros & Ierusalimschy, "A Parsing Machine for PEGs"), where the key insight
-is that **destinations are continuations**. A DDCG compiler threads a "where to
-go next" parameter through every compilation rule — this is exactly a
-continuation. The BBQ CEK machine makes this explicit: the `next` pointer on
-every `KontNode` *is* the destination, and the compilation rules in §5.1–§5.8
-are DDCG rules that wire these destination-continuations. The `CommitChoice`
-and `AlternativeFrame` patterns also derive from the PEG VM operational
-semantics (`OP_CHOICE`/`OP_COMMIT`/`OP_PARTIAL_COMMIT`), adapted from bytecode
-offsets to linked continuation nodes.
+### 5.2 δ, γ, ρ in BBQ
 
-### 5.1 Grammar Compilation
+DDCG parameterizes each rule by three destinations:
 
-```
-compile_grammar(Grammar{directives, rules}) →
-    For each directive: record endian default
-    For each rule (in topological order):
-        entries[rule.name] = compile_rule(rule)
-```
+- **δ (delta)** — where the value goes. The full lattice is
+  `effect | ac | stack | local(i)`. BBQ uses **only `effect` and `ac`**:
+  `effect` for spine work that produces no value, `ac` for expression
+  rules whose value flows via the typed accumulator.
+- **γ (gamma)** — where control goes. The full lattice is
+  `jump(L) | pair(Lt, Lf) | ret`. BBQ uses **only `jump(L)`** at the top
+  level. `pair(Lt, Lf)` short-circuits boolean expressions in test
+  position — a worthwhile follow-up but excluded by default in favor of
+  the explicit `EvalConstraintCheck` runtime kont. `ret` is unused.
+- **ρ (rho)** — loop-break label. BBQ has no `break` in the BBQ source
+  language, so ρ is unit (an empty struct).
 
-### 5.2 Rule Compilation
+The narrow δ/γ usage is what keeps BBQ rules paper-strict. Rules pass ρ
+through unchanged. The single γ form means rules never branch on which
+γ they got.
 
-```
-compile_rule(Rule{name, body}, join) →
-    body_chain = compile_type_expr(body, ReturnRule → join)
-    return body_chain    // Entry point for this rule
-```
+### 5.3 The eval-and-apply emission pattern
 
-### 5.3 Struct
+For each binary-operator AST node, the rule:
 
-```
-compile(Struct{fields}, next) →
-    BeginStruct(name) →
-    compile_field(fields[0]) →
-    compile_field(fields[1]) →
-    ... →
-    compile_field(fields[N]) →
-    EndStruct → next
-```
+1. Generates the right operand's IR with δ=ac.
+2. Generates the left operand's IR with δ=ac.
+3. Emits an operator variant carrying both as sub-trees.
 
-Each field is compiled as:
+The runtime sequences "right evaluates first, then eval-left moves ac
+into apply's slot, then left, then apply" via K push order (§6).
 
-```
-compile_field(Field{name, body, constraint, interval}, next) →
-    body_chain = compile_type_expr(body, next)
-    if constraint:
-        body_chain = compile_type_expr(body,
-            EvalConstraint(constraint) → next)
-    if interval:
-        // Wrap in position save/restore for [start, end] intervals
-    return body_chain
-```
+For each of the seven structural sites that consume an expression
+(constraint, switch discriminator, bind-compute expression, array count,
+array until, bytes length, endian-switch expression), the structural
+kont carries the expression IR sub-tree. The runtime arranges
+"evaluate, then consume" by pushing the consumer kont onto K before the
+expression IR.
 
-Fields that are `EndianSwitch` emit a `SetEndian` node instead of a field parse.
+### 5.4 The driver owns Halt wrapping
 
-### 5.4 Union / Alternatives
+DDCG rules emit kont chains with γ=`jump(Lnext)` — they never invent
+program-exit konts. The top-level driver wraps each rule's compilation
+with γ=`jump(Halt)` by allocating a `HaltKont` and a `ReturnRuleKont`
+chain at the top, and threading those through as the rule body's Lnext.
 
-```
-compile(Union{variants: [v1, v2, ..., vN]}, next) →
-    commit = CommitChoice → next
-    alt_chains = [compile_variant(v2, commit),
-                  compile_variant(v3, commit),
-                  ...,
-                  compile_variant(v(N-1), commit),
-                  compile_variant(vN, next)]    // last alt: no commit needed
-    BeginChoice(alt_chains) →
-    compile_variant(v1, commit)
-```
+This rule is durable: any γ=`ret` or `pair` fallback inside a DDCG rule
+body is weasel structure. If a rule needs program exit, the driver
+provides it through Lnext.
 
-The first variant is tried immediately. If it succeeds, `CommitChoice` pops
-the `AlternativeFrame` so that later failures don't backtrack into the
-already-committed choice (PEG VM OP_COMMIT pattern). If the first variant
-fails, the machine backtracks to the `AlternativeFrame` and tries the next
-chain from `alt_chains`. The last alternative needs no `CommitChoice` because
-the frame was already consumed by backtracking to reach it.
+### 5.5 References
 
-Rule-level alternatives (`A = X | Y | Z`) compile identically:
-
-```
-compile(Alternatives{alts: [a1, a2, ..., aN]}, next) →
-    commit = CommitChoice → next
-    alt_chains = [compile_type_expr(a2, commit),
-                  ...,
-                  compile_type_expr(a(N-1), commit),
-                  compile_type_expr(aN, next)]
-    BeginChoice(alt_chains) →
-    compile_type_expr(a1, commit)
-```
-
-### 5.5 Array (Fixed Count)
-
-```
-compile(Array{element, FixedCount(count_expr)}, next) →
-    end = EndArray → next
-    body = compile_type_expr(element, ArrayNext → ...)
-    BeginArray(mode=FixedCount, count=count_expr, body=body, end=end) → body
-```
-
-The `BeginArray` node pushes a `LoopFrame` with counter=0 and limit=eval(count_expr).
-`ArrayNext` increments the counter; if counter < limit, it resets control to `body`.
-
-### 5.6 Array (Separator/Terminator)
-
-```
-compile(Array{element, SepTerm(sep, term)}, next) →
-    end = EndArray → next
-    sep_chain = compile_separator(sep)   // or nullptr for NoneSep
-    body = compile_type_expr(element, ArrayNext → ...)
-    BeginArray(mode=SepTerm, body=body, sep=sep_chain, term=term, end=end) → body
-```
-
-`ArrayNext` in SepTerm mode:
-1. Check terminator condition (EOF, count, until-expr, or try-parse type terminator).
-2. If terminated: jump to `EndArray`.
-3. If separator exists: parse separator; on separator failure, jump to `EndArray`.
-4. Loop back to `body`.
-
-### 5.7 Array (Per-Element Intervals)
-
-When `element_interval` is present (only on fixed-count arrays), each iteration
-evaluates the interval expressions with `i` bound to the current loop counter:
-
-```
-ArrayNext with element_interval:
-    i = frame->counter
-    start = eval(interval.start, env + {i → counter})
-    end = eval(interval.end, env + {i → counter})
-    seek to start, set scope end to end
-    jump to body
-```
-
-### 5.8 Optional
-
-```
-compile(Optional{element, constraint}, next) →
-    if constraint:
-        // Conditional presence: evaluate constraint, skip if false
-        EvalConstraint(constraint,
-            on_true:  compile_type_expr(element, next),
-            on_false: next)
-    else:
-        // Try-parse with backtracking
-        end = EndOptional → next
-        inner = compile_type_expr(element, end)
-        BeginOptional → inner
-        // BeginOptional pushes an AlternativeFrame with 0 remaining
-        // alternatives. Failure → restore pos, skip to next.
-```
-
-### 5.9 Switch
-
-```
-compile(Switch{disc, cases, default}, next) →
-    case_targets = [
-        {value: c.value, target: compile_type_expr(c.target, next)}
-        for c in cases
-    ]
-    default_target = default ? compile_type_expr(default.target, next) : nullptr
-    SwitchDispatch(disc, case_targets, default_target)
-```
-
-No backtracking — the discriminator is evaluated once and the matching case is
-selected deterministically. If no case matches and there is no default, parsing
-fails with an error.
-
-### 5.10 Primitive
-
-```
-compile(Primitive{kind, constraint, interval}, next) →
-    node = MatchPrimitive(kind, interval)
-    if constraint:
-        node.next = EvalConstraint(constraint) → next
-    else:
-        node.next = next
-    return node
-```
-
-Endianness resolution:
-- Explicit suffix (`uint32le`, `uint32be`) → baked into the node.
-- `Default` endianness → node stores `Default`, resolved at execution time
-  from `machine->little_endian`.
-
-### 5.11 Bytes / String
-
-```
-compile(Primitive{BytesKind or StringKind, constraint, interval}, next) →
-    MatchBytes(interval) → [EvalConstraint(constraint) →] next
-```
-
-The interval is required for `bytes` and `string` — Sema enforces this.
-
-### 5.12 Rule Reference
-
-```
-compile(RuleRef{name, constraint, interval}, next) →
-    InvokeRule(name, entry=grammar.entries[name], interval) →
-    [EvalConstraint(constraint) →] next
-```
-
-`InvokeRule` pushes a `ReturnFrame` and jumps to the target rule's entry point.
-When the rule completes, `ReturnRule` pops the frame and resumes at the
-continuation stored in the frame.
-
-### 5.13 Compute
-
-```
-compile_field(Field{name, body=Compute{expr, type}}, next) →
-    BindCompute(name, expr, type) → next
-```
-
-No bytes consumed. The expression is evaluated using current environment
-bindings, and the result is bound as a new environment entry (with a zero-width
-capture interval at the current position).
-
-### 5.14 Bitfield
-
-```
-compile(Bitfield{container, entries}, next) →
-    BitfieldRead(container, entries, msb_first=is_big_endian(container)) → next
-```
-
-Execution:
-1. Read the container value (e.g. 2 bytes for `uint16be`).
-2. For each entry, extract bits using shift-mask:
-   - BE (MSB-first): shift right from highest bits, first entry at top.
-   - LE (LSB-first): shift right from lowest bits, first entry at bottom.
-3. Bind each entry's value in the environment.
-4. Record a container-level capture with child entries.
-
-### 5.15 Extern
-
-```
-compile(Extern{func_name, cpp_type, constraint, interval}, next) →
-    ExternalCall(func_name) → [EvalConstraint(constraint) →] next
-```
-
-### 5.16 EndianSwitch
-
-```
-compile_field(Field{name="", body=EndianSwitch{expr}}, next) →
-    SetEndian(expr) → next
-```
+Compilation rules: `backends/cek/bbq.ddcg`. Codegen primitive library
+(`cg_deliver`, `cg_jump`, `cg_call`, etc.): `ddcgc/lib/dybvig.ddcg`.
+Calc compiler as a worked example: `jitterator/example/grammar/calc.ddcg`.
 
 ---
 
 ## 6. Expression Evaluation
 
-Expressions are compiled into `CompiledExpr` trees during grammar compilation
-and evaluated at runtime using a stack-based evaluator. No allocation occurs
-during expression evaluation — only the fixed `eval_stack` is used.
+### 6.1 The eval-and-apply mechanism
 
-### 6.1 Compiled Expression Tree
+Operator-shape konts produced by the compiler carry their operands as
+sub-tree pointers. On invoke, they allocate the corresponding apply kont
+(plus an eval-left for binops), then push onto K in reverse execution
+order.
 
-```cpp
-enum class ExprOp : uint8_t {
-    // Literals
-    IntLit, FloatLit, StrLit, BoolLit,
-    // Variable reference (interned name)
-    Ref,
-    // Binary operators
-    Add, Sub, Mul, Div, Mod,
-    BitAnd, BitOr, BitXor, Shl, Shr,
-    And, Or, Eq, Ne, Lt, Le, Gt, Ge,
-    // Unary operators
-    Neg, BitNot, Not, Abs,
-    // Ternary
-    Ternary,
-    // Function call
-    Call,
-    // Special references
-    FieldAccess,    // a.b
-    IndexAccess,    // a[i]
-    Pos,            // current byte position
-    Remaining,      // bytes remaining in scope
-    AtEnd,          // true if no bytes remain
-    EOI,            // total input length
-    LoopVar         // i (loop counter)
-};
+The runtime apply kont reads ac and the saved-right slot, dispatches on
+the type pair, allocates a fresh result Value, and writes it to ac.
 
-struct CompiledExpr {
-    ExprOp op;
-    union {
-        int64_t int_val;
-        double float_val;
-        const char* str_val;        // Interned
-        bool bool_val;
-        const char* ref_name;       // Interned variable name
-        struct { CompiledExpr* left; CompiledExpr* right; } binary;
-        struct { CompiledExpr* operand; } unary;
-        struct { CompiledExpr* cond; CompiledExpr* then_; CompiledExpr* else_; } ternary;
-        struct { const char* func_name; CompiledExpr** args; int arg_count; } call;
-        struct { CompiledExpr* base; const char* field; } field_access;
-        struct { CompiledExpr* base; CompiledExpr* index; } index_access;
-    };
-};
-```
+Re-evaluation is trivial — pushing the IR sub-tree onto K freshly
+allocates apply konts each time. Per-iteration array count expressions
+re-evaluate without compile-time chain duplication or runtime mutable
+state.
 
-### 6.2 Stack-Based Evaluator
+### 6.2 Type semantics
 
-```cpp
-int64_t eval(const CompiledExpr* expr, CEKMachine* m) {
-    switch (expr->op) {
-    case ExprOp::IntLit:
-        return expr->int_val;
-    case ExprOp::Ref: {
-        const Binding* b = m->env->lookup(expr->ref_name);
-        return b->value;
-    }
-    case ExprOp::Add:
-        return eval(expr->binary.left, m) + eval(expr->binary.right, m);
-    case ExprOp::Eq:
-        return eval(expr->binary.left, m) == eval(expr->binary.right, m) ? 1 : 0;
-    case ExprOp::Ternary:
-        return eval(expr->ternary.cond, m)
-            ? eval(expr->ternary.then_, m)
-            : eval(expr->ternary.else_, m);
-    case ExprOp::Call:
-        return eval_call(expr, m);
-    case ExprOp::Pos:
-        return (int64_t)m->pos;
-    case ExprOp::Remaining:
-        return (int64_t)(m->input_length - m->pos);
-    case ExprOp::EOI:
-        return (int64_t)m->input_length;
-    // ... remaining cases
-    }
-}
-```
+BBQ expressions are typed. The type semantics are strict-by-default:
 
-The recursive call depth is bounded by expression tree depth — BBQ expressions
-are shallow (typically 3–5 levels). No stack overflow risk. The alternative
-(iterative stack-based postorder traversal) adds complexity without benefit
-for these shallow trees.
+| Operation | Rule |
+|---|---|
+| Arithmetic (`+ - * / %`) | Same-type required; mixing Int and Float fails |
+| Comparison (`==`, `!=`) | Same-type compares as expected; cross-type → `BoolValue(false)` for `==`, `BoolValue(true)` for `!=` |
+| Ordered comparison (`< <= > >=`) | Same-type required; cross-type fails |
+| Logical (`&& || !`) | Operands must be Bool; coerce IntValue→bool (nonzero=true); other types fail |
+| Constraint check | Bool or coerce-from-int; other types fail |
+| Switch dispatch | Int discriminator → IntValue cases; string discriminator → StringValue (interned-pointer equality) |
+| Array count / length / index | IntValue required |
+| Endian switch | Bool or coerce-from-int |
 
-### 6.3 Built-in Functions
+Type errors call `m->fail("type error: …")` — fail-loud, no silent
+coercion or zero-fallback. Type checking happens at value boundaries
+(apply konts, consumer konts), not at every kont.
 
-| Function | Signature | Description |
-|----------|-----------|-------------|
-| `crc32` | `crc32(data_ref, length) → uint32` | CRC-32 over a byte range |
-| `checksum_xor` | `checksum_xor(data_ref, length) → uint8` | XOR checksum |
-| `abs` | `abs(x) → int64` | Absolute value |
-| `min` | `min(a, b) → int64` | Minimum |
-| `max` | `max(a, b) → int64` | Maximum |
+### 6.3 Path navigation
 
-### 6.4 Host-Extensible Function Table
+Dotted/indexed path expressions (`a.b[i].c`) walk the capture tree using
+the same eval-and-apply discipline. `PathStart(name)` produces a
+`FieldCaptureValue` in ac by looking up the named field in the capture
+builder. `FieldAccess(field)` and `IndexAccess(index_expr)` consume the
+current `FieldCaptureValue` in ac and produce the next one, walking one
+step deeper. `CaptureValue` at the outer wraps the final
+`FieldCaptureValue` by reading its `computed_value` (a typed Value of
+whatever type the field declares) and writing that to ac.
 
-Users can register custom functions for expression evaluation:
+`FieldCaptureValue` is a real Value variant — path navigation has the
+same typed-data discipline as everything else. There is no reinterpret-
+cast through int64.
 
-```cpp
-using ExprFunction = int64_t (*)(const int64_t* args, int arg_count,
-                                  const CEKMachine* machine);
+### 6.4 The seven structural sites
 
-struct FunctionTable {
-    std::unordered_map<const char*, ExprFunction> functions;
+Each of the following AST sites carries an expression IR sub-tree; the
+structural kont's `invoke()` pushes a runtime consumer kont onto K, then
+pushes the expression IR. The expression evaluates first and leaves a
+typed Value in ac; the consumer reads ac and acts:
 
-    void register_function(const char* name, ExprFunction fn);
-    ExprFunction lookup(const char* name) const;
-};
-```
+| Site | Consumer | Reads from ac |
+|---|---|---|
+| `where` constraint | `EvalConstraintCheck` | Bool (or coerced) |
+| `switch` discriminator | `SwitchSelect` | Int or String |
+| `compute(name : T = expr)` | `BindComputeStore` | Typed Value |
+| Array `count(N)` | `BeginArrayWithLimit` / `ArrayCountCheck` | Int |
+| Array `until(cond)` | `ArrayUntilCheck` | Bool (or coerced) |
+| `bytes[length]` / `string[length]` | `MatchBytesApply` | Int |
+| `@endian: expr` | `SetEndianApply` | Bool (or coerced) |
 
 ---
 
-## 7. Trampoline Execution Loop
+## 7. Runtime Semantics
 
-The core execution model is a trampoline — a flat loop that dispatches to
-continuation nodes without recursive function calls. This is the same pattern
-proven in AiPL's 70-continuation machine.
+### 7.1 Trampoline
 
 ```cpp
-ParseResult CEKMachine::execute(const CompiledGrammar* grammar,
-                                 const char* rule_name,
-                                 const uint8_t* input,
-                                 size_t length) {
-    // Initialize machine state
-    this->grammar = grammar;
-    this->input = input;
-    this->input_length = length;
-    this->pos = 0;
-    this->little_endian = grammar->default_little_endian;
-    this->env = nullptr;
-    this->frame_top = nullptr;
-    this->eval_top = 0;
-    this->error = {};
-    this->best_error_pos = 0;
-
-    arena->reset();
-    builder.reset();
-
-    // Set control to the rule's entry point, with Halt as the final continuation
-    KontNode halt_node{KontType::Halt, nullptr};
-    control = grammar->entries.at(rule_name);
-    // The rule's ReturnRule will chain to Halt
-
-    // ── Trampoline loop ──────────────────────────
-    while (control != nullptr) {
+void CEKMachine::execute_from(KontNode* entry) {
+    kont_stack.clear();
+    kont_stack.push_back(entry);
+    while (!kont_stack.empty() && !failed) {
+        control = kont_stack.back();
+        kont_stack.pop_back();
         control->invoke(this);
     }
-
-    // ── Build result ─────────────────────────────
-    if (error.type == ErrorType::None) {
-        return ParseResult{
-            .success = true,
-            .bytes_consumed = pos,
-            .root = builder.finish(),
-        };
-    } else {
-        return ParseResult{
-            .success = false,
-            .error_message = best_error_msg,
-            .error_offset = best_error_pos,
-        };
-    }
 }
 ```
 
-**Key properties** (from AiPL lessons):
-
-1. **No recursive calls.** Every `invoke()` method modifies machine state and
-   returns — it never calls another `invoke()`. Nonterminal calls push frames
-   and redirect `control`; they don't recurse.
-
-2. **Each `invoke()` may:** advance `control` (to `next`), redirect `control`
-   (to a different node), push/pop frames, extend `env`, update `pos`, trigger
-   backtracking.
-
-3. **Backtracking** pops `AlternativeFrame`s to restore state and try the next
-   alternative. If no alternatives remain, the parse fails.
-
-4. **No GC/cleanup during execution.** The arena handles all allocation; no
-   objects are freed until arena reset after the parse completes.
-
-### 7.1 Continuation Dispatch
-
-Each `KontNode::invoke()` is a short, focused function. Following AiPL's
-pattern, communication between continuations happens through machine state
-(not return values):
-
-```cpp
-void MatchPrimitiveNode::invoke(CEKMachine* m) const {
-    // Check bounds
-    size_t byte_count = prim_byte_count(prim);
-    if (m->pos + byte_count > m->input_length) {
-        m->fail("unexpected end of input reading %s", field_name);
-        return;
-    }
-
-    // Read and decode value
-    int64_t value = read_primitive(m->input + m->pos, prim,
-                                    m->little_endian);
-
-    // Record capture
-    size_t start = m->pos;
-    m->pos += byte_count;
-    m->builder.add_field(field_name, start, m->pos,
-                          primitive_capture_type(prim));
-
-    // Bind value in environment
-    Binding b{field_name, value, start, m->pos,
-              primitive_capture_type(prim)};
-    m->env = m->arena->alloc<Environment>(b, m->env);
-
-    // Advance control
-    m->control = next;
-}
-
-void BeginChoiceNode::invoke(CEKMachine* m) const {
-    // Push alternative frame with remaining options
-    auto* frame = m->arena->alloc<AlternativeFrame>();
-    frame->type = FrameType::Alternative;
-    frame->remaining = alternatives;
-    frame->remaining_count = alt_count;
-    frame->join = nullptr;          // Choice: exhaustion = real failure (not skip)
-    frame->saved_env = m->env;
-    frame->saved_pos = m->pos;
-    frame->saved_endian = m->little_endian;
-    frame->capture_mark = m->builder.mark();
-    frame->prev = m->frame_top;
-    m->frame_top = frame;
-
-    // Try first alternative (already wired as next in the chain)
-    m->control = next;
-}
-
-void CommitChoiceNode::invoke(CEKMachine* m) const {
-    // Pop the AlternativeFrame — this alternative succeeded.
-    // Prevents later failures from backtracking into the choice.
-    // (Equivalent to PEG VM's OP_COMMIT instruction.)
-    m->frame_top = m->frame_top->prev;
-    m->control = next;
-}
-
-void InvokeRuleNode::invoke(CEKMachine* m) const {
-    // Apply interval if present
-    if (interval) {
-        // Save/restore position handled by frame
-    }
-
-    // Push return frame
-    auto* frame = m->arena->alloc<ReturnFrame>();
-    frame->type = FrameType::Return;
-    frame->return_to = next;       // Resume here after rule completes
-    frame->saved_env = m->env;
-    frame->start_pos = m->pos;
-    frame->capture_mark = m->builder.mark();
-    frame->prev = m->frame_top;
-    m->frame_top = frame;
-
-    // Jump to rule entry
-    m->control = entry;
-}
-```
+A leaf kont writes ac and pushes nothing. A compound kont pushes its
+sub-konts in reverse execution order. Spine konts push their successor
+onto K as part of their invoke. K is a real stack, not a static graph
+traversal — `control` is loaded fresh from K each iteration and never
+advanced via `control->next`.
 
 ### 7.2 Backtracking
 
-When any continuation detects failure (bounds check, constraint violation,
-match failure), it calls `m->fail()`:
+When any kont detects failure (bounds check, constraint violation, type
+error, match failure), it calls `m->fail()`. The failure path searches
+the frame stack for an `AlternativeFrame` and restores from it.
 
-```cpp
-void CEKMachine::fail(const char* message) {
-    // Track best error position for diagnostics
-    if (pos >= best_error_pos) {
-        best_error_pos = pos;
-        best_error_msg = message;
-    }
+Restoration sets:
 
-    // Search for an AlternativeFrame to backtrack to
-    while (frame_top != nullptr) {
-        if (frame_top->type == FrameType::Alternative) {
-            auto* alt = static_cast<AlternativeFrame*>(frame_top);
-            if (alt->remaining_count > 0) {
-                // Restore state and try next alternative
-                pos = alt->saved_pos;
-                env = alt->saved_env;
-                little_endian = alt->saved_endian;
-                builder.restore(alt->capture_mark);
-                control = alt->remaining[0];
-                alt->remaining++;
-                alt->remaining_count--;
-                return;
-            }
-            // Frame with 0 remaining alternatives:
-            //   join != nullptr → optional (restore state, skip to join)
-            //   join == nullptr → choice (all alts exhausted, keep searching)
-            if (alt->join) {
-                pos = alt->saved_pos;
-                env = alt->saved_env;
-                little_endian = alt->saved_endian;
-                builder.restore(alt->capture_mark);
-                frame_top = alt->prev;
-                control = alt->join;
-                return;
-            }
-        }
-        // Pop non-alternative frames (ReturnFrame, LoopFrame)
-        // and exhausted choice frames (join == nullptr)
-        frame_top = frame_top->prev;
-    }
+- `pos` ← saved position
+- `env` ← saved environment pointer
+- `little_endian` ← saved endian flag
+- `builder` ← saved capture mark
+- `kont_stack` ← truncated to saved K size
 
-    // No alternatives remain — parse fails
-    failed = true;
-    control = nullptr;
-}
-```
+The per-parse arena is **monotonic within a parse**. Speculative
+allocations (Values, dynamic konts allocated during the failed branch)
+are not freed; they live until the arena is reset at parse end. This is
+sound because everything that survives backtracking points only at
+non-speculative allocations.
 
-**Choice vs Optional frame semantics.** Both use `AlternativeFrame`, but they
-differ in the `join` field:
+**Choice vs Optional frame semantics** are encoded in
+`AlternativeFrame::join`. Choice (`join = nullptr`) treats exhaustion as
+real failure and propagates upward. Optional (`join = skip_target`)
+treats exhaustion as "absent" and resumes at the skip target. Successful
+choice alternatives must run a `CommitChoice` kont to pop the
+`AlternativeFrame`; otherwise a later failure could backtrack into the
+already-committed choice. This is the PEG VM `OP_CHOICE`/`OP_COMMIT`
+pattern (Medeiros & Ierusalimschy).
 
-- **Choice** (`BeginChoiceNode`): `join = nullptr`. When all alternatives are
-  exhausted, `fail()` pops the frame and continues searching — there is no skip
-  point. Successful alternatives must execute a `CommitChoiceNode` to pop the
-  frame before continuing, otherwise a later failure could incorrectly backtrack
-  into the already-succeeded choice.
+### 7.3 PEG VM optimization patterns
 
-- **Optional** (`BeginOptionalNode`): `join = skip_point`. When the optional body
-  fails, `fail()` restores state and jumps to `join` (the continuation after the
-  optional). Successful bodies execute `EndOptionalNode` to pop the frame.
+Three optimizations from PEG operational semantics are applicable:
 
-This is the same pattern as PEG VM's `OP_CHOICE`/`OP_COMMIT` (see Peggy):
+- **PartialCommit** — array iteration updates the saved state in place
+  rather than push/popping `AlternativeFrame`s per element. Saves N
+  frame allocations on an N-element array.
+- **Head-fail** — when alternatives have known distinct first bytes,
+  test the discriminator before pushing an `AlternativeFrame`. Effectively
+  a switch on the first byte.
+- **Tail-call** — when the last action in a rule is `InvokeRule`, reuse
+  the current `ReturnFrame` rather than pushing a new one. Bounds the
+  frame stack for recursive grammars.
 
-```
-Choice codegen pattern for (a | b | c):
-
-  BeginChoice [alt2, alt3]
-    alt1_body → CommitChoice → join    // commit pops frame on success
-  alt2:
-    alt2_body → CommitChoice → join
-  alt3:
-    alt3_body → join                   // last alt: frame already consumed
-  join:
-    ...continuation...
-```
-
-**Zero-copy restoration:** backtracking only restores pointers (`pos`, `env`,
-`capture_mark`). No data is copied or reconstructed — the immutable
-environment chain and arena allocation model make this free.
-
-### 7.3 Optimization Patterns from PEG Operational Semantics
-
-Three additional patterns from the PEG VM operational semantics (Medeiros &
-Ierusalimschy; see also `../Peggy/Operational Semantics.txt`) are directly
-applicable to the BBQ CEK machine. These are optimization opportunities for
-future phases, not required for correctness.
-
-#### 7.3.1 PartialCommit (Arrays)
-
-PEG VM's `OP_PARTIAL_COMMIT` updates the saved position in an existing
-`AlternativeFrame` without popping and re-pushing it. This is the loop body
-pattern: instead of `Commit → BeginChoice` on every iteration (pop frame, push
-new frame), `PartialCommit` updates `saved_pos`, `saved_env`, and
-`capture_mark` in place.
-
-Applicable to BBQ arrays (Phase 7). The `ArrayNext` continuation should update
-the `LoopFrame`'s saved state rather than cycling frames:
-
-```
-Array codegen: array<T>[N]
-  BeginArray(N)
-    element_body → PartialCommit → (loop back to element_body)
-  EndArray
-```
-
-This eliminates N frame push/pop pairs per array, replacing them with N
-in-place pointer updates. For large arrays (packet payloads, table entries),
-this is a significant win.
-
-#### 7.3.2 Head-Fail Optimization (Discriminated Unions)
-
-When the first byte (or first few bytes) of each alternative is a known
-constant, the compiler can test the discriminator *before* pushing an
-`AlternativeFrame`. If it doesn't match, skip to the next alternative without
-any frame overhead.
-
-This is effectively a `switch` on the first byte, falling back to
-`BeginChoice` only when alternatives share a common prefix. The BBQ `switch`
-construct already handles explicit discrimination; this optimization would
-apply to implicit unions where alternatives start with distinct primitives.
-
-```
-Head-fail for (a | b | c) where each starts with a distinct byte:
-  if input[pos] == a_head → alt_a_body → join
-  if input[pos] == b_head → alt_b_body → join
-  if input[pos] == c_head → alt_c_body → join
-  fail()   // no match
-```
-
-No `AlternativeFrame` pushed at all — pure sequential tests with direct jumps.
-
-#### 7.3.3 Tail-Call Optimization (Rule Chaining)
-
-When the last action in a rule body is an `InvokeRule` call, the compiler can
-reuse the current `ReturnFrame` instead of pushing a new one. The callee's
-`ReturnRule` returns directly to the caller's caller.
-
-```
-Without tail-call:  push ReturnFrame → jump to callee → ... → pop → return
-With tail-call:     rewrite ReturnFrame.return_to → jump to callee → ... → pop → return
-```
-
-This bounds the frame stack depth for recursive grammars (e.g., recursive
-descent through nested TLV structures) and is a direct application of the PEG
-`OP_JUMP` instruction (call without pushing a return address).
+These are optimization opportunities, not required for correctness. They
+preserve the design invariants in §13.
 
 ---
 
 ## 8. Zero-Copy Capture Output
 
-The capture metadata IS the parse result. After a successful parse, the caller
-receives a `CaptureMetadata` tree that maps the hierarchical structure of the
-format specification onto byte ranges in the original input buffer. No bytes
-are copied during parsing or after.
-
-### 8.1 Lazy Access Pattern
+The capture metadata IS the parse result. After a successful parse, the
+caller receives a `CaptureMetadata` tree mapping the hierarchical
+structure of the format specification onto byte ranges in the original
+input buffer. No bytes are copied during or after parsing.
 
 ```cpp
-// After parsing:
 ParseResult result = vm.execute(grammar, "PNGFile", buffer, length);
 
-// Navigate the capture tree:
 FieldCapture* header = result.root->child("header");
-FieldCapture* magic = header->child("magic");
+FieldCapture* magic  = header->child("magic");
 // magic->start_offset == 0, magic->end_offset == 4
 // magic->type == CaptureType::UInt32BE
 
-// Read values lazily (only when needed):
+// Read the actual value lazily from the input buffer:
 uint32_t magic_val = read_uint32be(buffer + magic->start_offset);
 
-// Array access:
 FieldCapture* chunks = result.root->child("chunks");
 for (int i = 0; i < chunks->child_count; i++) {
     FieldCapture* chunk = &chunks->children[i];
-    FieldCapture* length = chunk->child("length");
-    uint32_t len = read_uint32be(buffer + length->start_offset);
+    // …
 }
 ```
 
-### 8.2 Capture Tree Navigation
+Computed fields (from `compute(name : T = expr)`) hold a typed `Value*`
+in `computed_value` rather than referencing buffer bytes. The user sees
+the actual typed value (Int, Float, String, Bool) directly.
 
-```cpp
-struct FieldCapture {
-    // ... (fields from §3.5)
-
-    FieldCapture* child(const char* name) const {
-        // Linear scan — struct fields are few; interned pointer comparison
-        for (int i = 0; i < child_count; i++) {
-            if (children[i].name == name) return &children[i];
-        }
-        return nullptr;
-    }
-
-    // Convenience readers (interpret bytes from original buffer):
-    uint8_t  read_uint8(const uint8_t* buf) const;
-    uint16_t read_uint16le(const uint8_t* buf) const;
-    uint32_t read_uint32be(const uint8_t* buf) const;
-    // ... etc for all primitive types, dispatching on this->type
-};
-```
-
-### 8.3 Lifetime Management
-
-The capture tree is arena-allocated. The caller must keep the `ParseArena`
-alive (or copy the data out) for as long as they access the captures. A
-typical usage pattern:
-
-```cpp
-{
-    ParseArena arena(256 * 1024);
-    CEKMachine vm(&arena);
-    ParseResult result = vm.execute(grammar, "Header", buf, len);
-    // Use result.root while arena is alive
-    process(result.root, buf);
-}   // Arena destroyed — all captures freed
-```
-
-Or for persistent access, serialize the capture tree to a flat structure
-before destroying the arena.
+The capture tree is arena-allocated; the caller must keep the
+`ParseArena` alive for as long as they access captures, or copy data out
+before releasing.
 
 ---
 
 ## 9. External Parser Interface
 
-External parsers let BBQ specs delegate to user-provided C++ functions for
-formats that can't be expressed in BBQ (compression, encryption, checksums).
+External parsers let BBQ specs delegate to user-provided functions for
+formats that can't be expressed in BBQ (compression, encryption,
+checksums).
 
 ```cpp
 using ExternalParseFn = bool (*)(
-    const uint8_t* data,    // Input at current position
-    size_t length,          // Remaining bytes
-    size_t* bytes_consumed, // Out: how many bytes were consumed
-    ParseArena* arena,      // For allocating output data
-    void* user_data         // Per-entry user context
+    const uint8_t* data,
+    size_t length,
+    size_t* bytes_consumed,
+    ParseArena* arena,
+    void* user_data
 );
 
 struct ExternalParserTable {
     struct Entry {
         const char* name;       // Interned
         ExternalParseFn fn;
-        void* user_data;        // Per-entry context
+        void* user_data;
     };
-    Entry* entries = nullptr;   // User-allocated array
-    int count = 0;
-
-    const Entry* lookup(const char* name) const;  // Linear scan, pointer equality
+    Entry* entries;
+    int count;
+    const Entry* lookup(const char* name) const;
 };
 ```
 
-Each `Entry` carries its own `user_data`, so different external parsers can
-have independent contexts (e.g., the Python bindings store the callable
+External parsers are **input verification only** — they consume bytes
+and record a zero-copy `[start, end)` capture. They do not produce
+transformed data that flows back into expression evaluation. Each entry
+carries its own `user_data`, so different external parsers can have
+independent contexts (e.g., the Python bindings store the callable
 object pointer here).
 
-**Execution in `ExternalCallNode::invoke()`:**
+User expression functions (the `FunctionTable`) follow the same pattern
+but operate on typed Values:
 
 ```cpp
-void ExternalCallNode::invoke(CEKMachine* m) {
-    if (!m->ext_parsers) {
-        m->fail("external parser table not configured");
-        return;
-    }
-
-    auto* entry = m->ext_parsers->lookup(func_name);
-    if (!entry) {
-        m->fail("external parser not registered");
-        return;
-    }
-
-    size_t remaining = m->input_length - m->pos;
-    size_t consumed = 0;
-    bool ok = entry->fn(m->input + m->pos, remaining, &consumed,
-                        m->arena, entry->user_data);
-    if (!ok) {
-        m->fail("external parser failed");
-        return;
-    }
-
-    size_t start = m->pos;
-    m->pos += consumed;
-    m->builder.add_field(field_name, start, m->pos, CaptureType::External);
-    // Bind in environment + advance control
-    ...
-}
+using ExprFunction = Value* (*)(Value** args, int arg_count,
+                                 CEKMachine* m, ParseArena* arena);
 ```
+
+Built-ins (`abs`, `min`, `max`, `clamp`) dispatch on argument types and
+produce typed results.
 
 ---
 
 ## 10. Error Handling
 
-Error handling is simplified from AiPL's completion record pattern. AiPL needs
-BREAK, CONTINUE, RETURN, and THROW completion types for a general-purpose
-language. BBQ parsing only needs two outcomes: **success** or **failure**.
+Two outcomes: success or failure. No completion-record machinery for
+break/continue/return/throw — BBQ parsing has no such concepts.
 
-### 10.1 Failure Modes
+### 10.1 Failure modes
 
 | Failure | Source | Recovery |
-|---------|--------|----------|
-| Match failure | Unexpected bytes | Backtrack to nearest `AlternativeFrame` |
-| Constraint violation | `where` clause evaluates false | Backtrack or report error |
-| End of input | Reading past buffer end | Backtrack or report error |
-| External parser failure | User function returns false | Backtrack or report error |
-| Switch miss | No case matches, no default | Fatal error (no backtracking) |
-| Expression error | Division by zero, undefined ref | Fatal error |
+|---|---|---|
+| Match failure | Unexpected bytes | Backtrack |
+| Constraint violation | `where` clause false | Backtrack or report |
+| End of input | Reading past buffer end | Backtrack or report |
+| External parser failure | User function returned false | Backtrack or report |
+| Switch miss | No case matches, no default | Fatal |
+| Type error | Value-channel type mismatch | Fatal |
+| Expression error | Division by zero, undefined ref | Fatal |
 
-### 10.2 Best-Error Tracking
+### 10.2 Best-error tracking
 
-The machine tracks the **furthest position reached** before any failure. This
-is the most useful error position for the user — it indicates where the parser
-made the most progress before giving up.
+The machine tracks the **furthest position reached** before any failure.
+This is the most useful error position for the user — it indicates
+where the parser made the most progress before giving up.
 
-```cpp
-struct ParseError {
-    ErrorType type;
-    const char* message;
-    size_t offset;              // Best error position
+### 10.3 Context stack
 
-    // Context stack for nested rule diagnostics:
-    struct Context {
-        const char* rule_name;
-        const char* field_name;
-        size_t offset;
-    };
-    Context context_stack[32];
-    int context_depth;
-};
-```
-
-### 10.3 Context Stack
-
-As the machine enters and exits rules (via `InvokeRule`/`ReturnRule`), it
-maintains a context stack showing the path of nesting. On error, this gives
+As the machine enters and exits rules, it maintains a context stack of
+(rule, field, offset) showing the path of nesting. On error, this gives
 a diagnostic like:
 
 ```
@@ -1424,393 +765,157 @@ parse error at offset 42:
     expected 4 bytes for uint32be, got 2 bytes remaining
 ```
 
-### 10.4 Constraint Error Messages
-
-When a `where` constraint fails, the error includes the constraint expression
-and the actual values:
-
-```
-constraint violation at offset 8:
-  in Header.magic:
-    where magic == 0x89504E47
-    actual value: 0x00000000
-```
-
 ---
 
-## 11. Integration with BBQ Frontend
-
-### 11.1 CLI Integration
-
-```
-bbqc -backend cpp    format.bbq    # Existing: generate C++ source
-bbqc -backend cek    format.bbq    # New: compile + run interactively
-bbqc -backend both   format.bbq    # Both backends (for round-trip testing)
-```
-
-Or as a standalone tool:
-
-```
-bbq-vm format.bbq input.bin        # Parse input.bin using format.bbq
-bbq-vm format.bbq -rule Header input.bin   # Parse only a specific rule
-bbq-vm format.bbq -hexdump input.bin       # Hex dump with field annotations
-```
-
-### 11.2 Library API
-
-```cpp
-#include "bbq/vm.h"
-
-// Compile a BBQ spec (reusable across parses)
-CompiledGrammar* grammar = bbq_compile_file("format.bbq");
-// or: bbq_compile_string(bbq_source, source_length)
-
-// Parse a buffer
-ParseArena arena(256 * 1024);
-CEKMachine vm(&arena);
-ParseResult result = vm.execute(grammar, "Header", buffer, buffer_length);
-
-if (result.success) {
-    // Walk the capture tree
-    FieldCapture* magic = result.root->child("magic");
-    uint32_t magic_val = magic->read_uint32be(buffer);
-}
-
-// Reuse for another parse (arena resets internally)
-ParseResult result2 = vm.execute(grammar, "Header", buffer2, len2);
-
-// Clean up
-bbq_grammar_release(grammar);
-```
-
-### 11.3 Frontend Sharing
-
-Both backends consume the same validated AST from the Sema phase:
-
-```cpp
-// In bbqc main():
-BBQ::Grammar* ast = parse(source);
-Sema sema;
-sema.analyze(ast);
-
-if (backend == "cpp") {
-    TypeEmitter te;
-    te.emit(ast, output_dir);
-    ParserEmitter pe;
-    pe.emit(ast, output_dir);
-} else if (backend == "cek") {
-    CEKCompiler compiler;
-    CompiledGrammar* grammar = compiler.compile(ast);
-    // ... interactive mode or parse files
-}
-```
-
-### 11.4 Round-Trip Testing
-
-With both backends available, we can verify equivalence:
-
-```cpp
-// For each test case:
-//   1. Parse with static backend (compile C++, run)
-//   2. Parse with CEK backend (interpret)
-//   3. Compare capture metadata (field names, offsets, values)
-```
-
-This is a powerful validation strategy — two independent implementations
-of the same specification should produce identical results.
-
----
-
-## 12. Thread Safety
-
-Thread-safety model:
+## 11. Thread Safety
 
 **Thread-safe (immutable, shared):**
-- `CompiledGrammar` — continuation graph, expression trees, string pool
-- All `KontNode` substructs — read-only after compilation
-- `CompiledExpr` trees — read-only after compilation
+
+- `CompiledGrammar` and the entire static-kont graph
+- The string pool
 
 **Per-thread (not shared):**
-- `CEKMachine` — all mutable state
-- `ParseArena` — allocations are thread-local
-- `CaptureBuilder` — accumulates per-parse
-- `Environment` chain — grows per-parse
 
-**Pattern:** Compile once globally, each thread parses independently with
-its own `CEKMachine` + `ParseArena`.
+- `CEKMachine` and all mutable state
+- `ParseArena` (per-parse allocations including dynamic_kont nodes)
+- `CaptureBuilder`, `Environment` chain
 
-```cpp
-// Main thread:
-auto* grammar = compiler.compile(ast);
-
-// Worker threads:
-void parse_worker(const CompiledGrammar* grammar,
-                  const uint8_t* input, size_t len) {
-    ParseArena arena(256 * 1024);   // Thread-local
-    CEKMachine vm(&arena);          // Thread-local
-    auto result = vm.execute(grammar, "Root", input, len);
-    // Process result...
-}
-```
+Pattern: compile once globally, each thread parses independently with
+its own machine + arena.
 
 ---
 
-## 13. Performance Characteristics
+## 12. Performance Characteristics
 
-| Operation | Complexity | Notes |
-|-----------|-----------|-------|
-| Arena allocation | O(1) | Bump pointer |
-| Arena reset | O(1) | Single pointer assignment |
-| Primitive match | O(1) | Fixed-size read + decode |
-| Bytes/string match | O(n) | n = byte count |
-| Environment lookup | O(d) | d = scope depth (typically 3–10) |
-| Expression evaluation | O(e) | e = expression tree size (typically 3–7 nodes) |
-| Backtracking | O(1) | Pointer restoration |
-| Frame push/pop | O(1) | Arena allocation + pointer update |
-| String comparison | O(1) | Interned pointer equality |
-| Overall parse | O(n) | n = input size, single pass (modulo backtracking) |
+| Operation | Complexity |
+|---|---|
+| Arena allocation | O(1) bump |
+| Arena reset | O(1) pointer assignment |
+| Primitive match | O(1) read + decode |
+| Bytes/string match | O(n) byte copy not performed (zero-copy) |
+| Environment lookup | O(d) where d = scope depth (typically 3–10) |
+| Expression evaluation | O(e) where e = expression tree size (typically 3–7 nodes) |
+| Backtracking | O(1) — restore three pointers + truncate K |
+| String comparison | O(1) interned pointer equality |
+| Overall parse | O(n) input size, single pass (modulo backtracking) |
 
-**Memory overhead per parse:** ~256KB arena (typical). The arena grows on
-demand for deeply nested formats but resets to zero after each parse.
-
----
-
-## 14. Implementation Phases
-
-Condensed from the original 13-phase plan, adapted for the actual BBQ AST and
-Sema output.
-
-### Phase 1: Arena + Core Types
-- `ParseArena` — bump allocator with O(1) reset
-- `KontNode` base struct + all node subtypes (§4)
-- `Environment` — immutable linked list with `Binding`
-- `Frame` hierarchy — `ReturnFrame`, `AlternativeFrame`, `LoopFrame`
-- `CaptureNode` / `FieldCapture` / `CaptureBuilder`
-- `StringPool` — interning for identifiers
-
-### Phase 2: Trampoline + Primitive Matching
-- `CEKMachine` struct with all state fields
-- Trampoline loop (`while (control) control->invoke(this)`)
-- `MatchPrimitive` — read uint8/16/32/64, int8/16/32/64, float32/64, bool
-- `Halt` — successful termination
-- Endianness-aware reads (LE/BE/Default)
-- Bounds checking
-
-### Phase 3: Struct + Field Capture
-- `BeginStruct` / `EndStruct` — push/pop capture scope
-- Field compilation chain — sequential field parsing
-- Capture recording — `add_field()` with offsets and types
-- Environment binding — each parsed field extends env
-
-### Phase 4: Environment + Expressions
-- `CompiledExpr` tree structure
-- Expression evaluator — all operators, references, special variables
-- `EvalConstraint` — evaluate where-clause, trigger failure
-- `BindCompute` — evaluate expression, bind without consuming input
-- Built-in functions (crc32, abs, min, max)
-
-### Phase 5: Nonterminal Calls
-- `InvokeRule` — push `ReturnFrame`, jump to rule entry
-- `ReturnRule` — pop frame, record interval, restore caller env
-- Interval application on rule references (`[start, end]`)
-
-### Phase 6: Backtracking
-- `fail()` — search for `AlternativeFrame`, restore state
-- `BeginChoice` / `Backtrack` — union and alternatives
-- Best-error tracking (furthest position)
-- `BeginOptional` / `EndOptional` — try-parse with restore
-
-### Phase 7: Arrays
-- `BeginArray` / `ArrayNext` / `EndArray` — loop iteration
-- `LoopFrame` — counter, limit, body entry
-- Fixed-count arrays (`array<T>[N]`)
-- Sep/term arrays (`array<T>(sep, term)`)
-- `ArraySeparator` — parse separator between elements
-- Terminator modes: EOF, count, until-expr, type-match
-- Per-element intervals with loop variable `i`
-
-### Phase 8: Switch + Optional
-- `SwitchDispatch` — evaluate discriminator, jump to case
-- Case matching: int, string, ident, dotted-ref
-- Optional with constraint (conditional presence)
-
-### Phase 9: Bitfield + Endian
-- `BitfieldRead` — read container, extract bit fields
-- MSB-first (BE) and LSB-first (LE) ordering
-- Bind each entry value in environment
-- `SetEndian` — runtime endianness switching
-
-### Phase 10: External Parsers
-- `ExternalCall` — dispatch to registered function
-- `ExternalParserTable` — name → function registry
-- `FunctionTable` — user expression functions
-
-### Phase 11: CEK Compiler
-- `CEKCompiler` class — AST visitor that emits continuation graphs
-- Compilation rules from §5, one method per AST node type
-- Expression compiler — `Expr*` AST → `CompiledExpr*` tree
-- `CompiledGrammar` construction with string interning
-
-### Phase 12: Expression Completion
-- FieldAccess/IndexAccess evaluation via CaptureBuilder navigation
-- Defensive null guards (InvokeRuleNode entry, execute_from arena)
-- Compile/execute separation: `CEKCompiler::compile()` + `CEKMachine::execute_from()`
-
-### Phase 13: Test Audit & Completion
-- Hand-built MatchBytesNode, float, signed int, bitwise expression tests
-- FieldAccess/IndexAccess tests (hand-built + compiler end-to-end)
-- Conditional optional compiler test
+For binary parsing workloads, file I/O dominates. The interpreter is not
+the bottleneck, and no JIT is in scope.
 
 ---
 
-## Appendix A: Complete BBQ AST → Continuation Node Mapping
+## 13. Design Invariants
 
-For verification that every AST construct has a compilation rule:
+These are forbidden patterns. Any code matching them indicates weasel
+structure to be removed.
 
-| BBQ AST Node | §5 Rule | Continuation Nodes |
-|-------------|---------|-------------------|
-| `Grammar` | §5.1 | (orchestrates rule compilation) |
-| `EndianDirective` | §5.1 | Sets `grammar->default_little_endian` |
-| `Rule` | §5.2 | Entry point + body chain + `ReturnRule` |
-| `Alternatives` | §5.4 | `BeginChoice` + per-alternative chains |
-| `Struct` | §5.3 | `BeginStruct` + fields + `EndStruct` |
-| `Union` | §5.4 | `BeginChoice` + per-variant chains |
-| `Array` | §5.5–§5.7 | `BeginArray` + element + `ArrayNext` + `EndArray` |
-| `Optional` | §5.8 | `BeginOptional` + inner + `EndOptional` (or conditional) |
-| `Switch` | §5.9 | `SwitchDispatch` + per-case chains |
-| `Compute` | §5.13 | `BindCompute` |
-| `Primitive` | §5.10 | `MatchPrimitive` [+ `EvalConstraint`] |
-| `RuleRef` | §5.12 | `InvokeRule` [+ `EvalConstraint`] |
-| `Extern` | §5.15 | `ExternalCall` [+ `EvalConstraint`] |
-| `Bitfield` | §5.14 | `BitfieldRead` |
-| `EndianSwitch` | §5.16 | `SetEndian` |
-| `Field` | §5.3 | (delegates to body's compilation) |
-| `Variant` | §5.4 | (delegates to body's compilation) |
-| `FixedCount` | §5.5 | `BeginArray(mode=FixedCount)` |
-| `SepTerm` | §5.6 | `BeginArray(mode=SepTerm)` |
-| `TypeSep` | §5.6 | `ArraySeparator` with type parse |
-| `NoneSep` | §5.6 | (no separator node emitted) |
-| `EofTerm` | §5.6 | EOF check in `ArrayNext` |
-| `CountTerm` | §5.6 | Count check in `ArrayNext` |
-| `UntilTerm` | §5.6 | Condition eval in `ArrayNext` |
-| `TypeTerm` | §5.6 | Try-parse terminator in `ArrayNext` |
-| `SwitchCase` | §5.9 | Case entry in `SwitchDispatch` |
-| `SwitchDefault` | §5.9 | Default entry in `SwitchDispatch` |
-| `IntValue` | §5.9 | Int comparison in dispatch |
-| `StrValue` | §5.9 | String comparison in dispatch |
-| `IdentValue` | §5.9 | Ident comparison in dispatch |
-| `RefValue` | §5.9 | Dotted-ref comparison in dispatch |
-| `StartEnd` | §5.3 | Position save/seek/restore around field |
-| `Length` | §5.11 | Length expression in `MatchBytes` |
-| `IntegerKind` | §5.10 | `MatchPrimitive` with width/sign/endian |
-| `FloatKind` | §5.10 | `MatchPrimitive` with width/endian |
-| `BytesKind` | §5.11 | `MatchBytes` |
-| `StringKind` | §5.11 | `MatchBytes` (string variant) |
-| `BoolKind` | §5.10 | `MatchPrimitive` (1-byte read) |
-| `BinOp` | §6.2 | `CompiledExpr` binary node |
-| `UnaryOp` | §6.2 | `CompiledExpr` unary node |
-| `Ternary` | §6.2 | `CompiledExpr` ternary node |
-| `IntLit` | §6.2 | `CompiledExpr::IntLit` |
-| `FloatLit` | §6.2 | `CompiledExpr::FloatLit` |
-| `StrLit` | §6.2 | `CompiledExpr::StrLit` |
-| `BoolLit` | §6.2 | `CompiledExpr::BoolLit` |
-| `Ref` | §6.2 | `CompiledExpr::Ref` / `FieldAccess` / `IndexAccess` |
-| `Call` | §6.3 | `CompiledExpr::Call` |
-| `EndianLit` | §6.2 | `CompiledExpr::IntLit` (0 or 1) |
-| `EOI` | §6.2 | `CompiledExpr::EOI` |
-| `Simple` | §6.2 | `CompiledExpr::Ref` |
-| `FieldAcc` | §6.2 | `CompiledExpr::FieldAccess` |
-| `IndexAcc` | §6.2 | `CompiledExpr::IndexAccess` |
+**No third state component beyond C/E/K + ac.** Workspace lives in ac;
+bindings live in E. A separate evaluation stack would be neither — it
+has nowhere to fit in the channel split (§3.2). Any design including
+`eval_stack[N]` is wrong.
+
+**No chain-following advance.** `control` is loaded from K's top each
+trampoline iteration. The field is private with `friend class
+CEKMachine`; only the trampoline writes it. Any kont `invoke()` body
+that tries `m->control = X` or `m->control = m->control->next` is a
+compile error. Konts schedule successors via `m->push_kont(next)`
+(public accessor for K append), never by writing to control. The
+weasel pattern from the old VM (`m->control = next; next->invoke(m)`)
+doesn't compile against the new machine.
+
+**No `reinterpret_cast` of values through `int64`.** Typed Values flow
+through ac. Path navigation goes through `FieldCaptureValue` as a real
+Value variant. Any code that smuggles a `FieldCapture*` through an int64
+slot is wrong.
+
+**No `CompiledExpr` and no recursive `eval()` tree-walker.** Expression
+evaluation is K push/pop only. Any function with signature `int64_t
+eval(CompiledExpr*)` is wrong.
+
+**No γ=ret or γ=pair fallbacks in DDCG rules.** The driver wraps γ at
+the top with `jump(Halt)`; rules emit `cg_deliver(_, δ, γ, Lnext)` and
+trust their parameters. Any rule body that branches on γ.tag and
+synthesizes a Halt or a pair-target is wrong.
+
+**No mid-rule Halt or Return invention.** Program exit is the driver's
+responsibility (§5.4). A DDCG rule that allocates `HaltKont` is wrong.
+
+**No shared mutable apply-kont slots.** Apply konts are allocated fresh
+per evaluation. Pre-allocated apply nodes with mutable `saved_right`
+slots are wrong — they break re-evaluation in arrays.
+
+**No silent type coercion.** Type errors fail loudly. Float-truncate-to-
+int, string-zero-fallback, cross-type-implicit-promotion are all wrong.
 
 ---
 
-## Appendix B: Design Decisions and Tradeoffs
+## Appendix A: Design Decisions and Tradeoffs
 
-### B.1 Continuations vs. Bytecode
+### A.1 Continuations vs. bytecode
 
-Both approaches were considered during the original design. Continuations
-(linked node graphs) were chosen over flat bytecode because:
+Continuations were chosen over flat bytecode because:
 
-- **No dispatch overhead** — direct function pointer calls, no opcode decoding.
-- **Natural graph structure** — switch dispatch, backtracking alternatives, and
-  nonterminal calls map naturally to graph edges.
-- **Shared subgraphs** — multiple switch cases can share tail continuations
+- **No dispatch overhead** — direct virtual calls, no opcode decoding.
+- **Natural graph structure** — switch dispatch, backtracking
+  alternatives, and nonterminal calls map naturally to graph edges.
+- **Shared sub-graphs** — multiple switch cases share tail continuations
   without duplication.
-- **Simpler compiler** — emit nodes and link them, no jump offset calculation.
+- **Simpler compiler** — emit nodes and link them, no jump-offset
+  calculation.
 
-The tradeoff is slightly higher memory usage (pointers between nodes) and
-less cache locality than a flat bytecode array. For binary format parsing
-workloads (where I/O dominates), this is negligible.
+The tradeoff is slightly higher memory usage (pointers between nodes)
+and less cache locality than a flat bytecode array. For binary format
+parsing (where I/O dominates), this is negligible.
 
-### B.2 Arena vs. GC
+### A.2 Arena vs. GC
 
-AiPL requires a generational GC because APL has persistent closures, mutable
-arrays, and long-running computations. BBQ parsing is fundamentally different:
+All per-parse allocations are provably short-lived: no closures, no
+mutable arrays, no user-defined functions. Parse duration is bounded by
+input size. Arena-only management eliminates GC pause times and
+bookkeeping.
 
-- All per-parse allocations are provably short-lived.
-- No closures, no mutable arrays, no user-defined functions.
-- Parse duration is bounded by input size.
-
-Arena-only management eliminates GC pause times and GC bookkeeping entirely.
-The O(1) reset is strictly superior for this use case.
-
-### B.3 Immutable Environments vs. Mutable Symbol Tables
-
-AiPL uses mutable `unordered_map`-based environments because APL requires
-variable reassignment. BBQ's environments are immutable linked lists because:
+### A.3 Immutable environments vs. mutable symbol tables
 
 - **Fields are write-once** — once parsed, a field's value never changes.
 - **Backtracking is free** — restore an old environment pointer, done.
-- **No hash table overhead** — linked list lookup is O(d) but d is small
-  (typically 5–20 fields per struct).
+- **No hash-table overhead** — linked list lookup is O(d), d small.
 
-### B.4 Two-Phase Continuations (Not Needed)
+### A.4 Defunctionalized expressions vs. tree-walking interpreter
 
-AiPL uses two-phase continuations extensively (e.g., `DyadicK` →
-`EvalDyadicLeftK` → `ApplyDyadicK`) because APL expressions require
-evaluating subexpressions before applying operators, and each subexpression
-can itself be arbitrarily complex.
+A recursive `eval(CompiledExpr*)` tree-walker fits BBQ's shallow
+expressions but breaks the CEK shape — there is no real K stack
+threading evaluation contexts; the machine stops being a CEK machine
+and becomes a hybrid spine+walker. Defunctionalizing expressions per
+Reynolds 1972 / Ager-Biernacki-Danvy-Midtgaard 2003 puts evaluation
+contexts onto the runtime K, where they belong, and lets the typed
+accumulator carry typed Values cleanly. The overhead — a few arena
+allocations per binop — is negligible against parse cost.
 
-BBQ expressions are evaluated atomically by the stack-based evaluator — they
-don't involve parsing sub-operations or control flow. Therefore the two-phase
-pattern is unnecessary. Each BBQ continuation is single-phase: it does its
-work and advances control.
+This is the same eval-and-apply pattern AiPL uses (see `MonadicK`,
+`DyadicK`, `EvalDyadicLeftK`, `ApplyDyadicK`, `ArgK` in
+`AiPL/include/continuation.h`).
 
-The one exception is `InvokeRule`, which is inherently two-phase (push frame +
-jump, then later return). But this is handled by the frame stack, not by
-splitting into two continuation types.
+### A.5 Typed Values vs. int64-only accumulator
 
-### B.5 Visitor Pattern
+BBQ field types are typed (uN/iN/fN/string/bytes/bool). An int64-only
+accumulator would silently truncate floats, zero-fallback strings, and
+require `reinterpret_cast` for capture pointers. A typed `Value*` sum
+preserves type information end-to-end at trivial cost (one arena
+allocation per produced value).
 
-AiPL uses a `ContinuationVisitor` with 70 `visit()` overloads for debugging,
-optimization, and analysis. BBQ should adopt the same pattern:
+### A.6 String interning scope
 
-```cpp
-struct KontVisitor {
-    virtual void visit(const MatchPrimitiveNode*) = 0;
-    virtual void visit(const BeginStructNode*) = 0;
-    // ... one per node type
-};
-```
-
-This enables:
-- **Pretty-printing** continuation graphs for debugging.
-- **Optimization passes** (dead node elimination, constant folding) as
-  separate visitors.
-- **Graph serialization** for caching compiled grammars to disk.
-
-### B.6 String Interning Scope
-
-AiPL interns all strings globally (GC-managed, never freed). BBQ interns
-strings in the `CompiledGrammar`'s string pool — they live as long as the
-grammar and are freed when the grammar is released. Per-parse strings (error
-messages) use the parse arena and are transient.
+Strings are interned in the `CompiledGrammar`'s string pool — they live
+as long as the grammar and are freed when the grammar is released. Per-
+parse strings (error messages) use the parse arena and are transient.
 
 ---
 
-## Appendix C: Example Execution Trace
+## Appendix B: Worked Examples
 
-Parsing a simple TLV entry:
+### B.1 Structural parse trace
+
+A simple TLV entry:
 
 ```bbq
 TLVEntry = struct {
@@ -1825,68 +930,139 @@ Input: `01 05 00 48 65 6C 6C 6F` (type=1, length=5, data="Hello")
 ```
 STEP 1: BeginStruct("TLVEntry")
   pos=0, env=∅
-  Action: push capture scope "TLVEntry"
+  Action: push capture scope "TLVEntry", push next on K
 
 STEP 2: MatchPrimitive("type", uint8)
-  pos=0 → read 1 byte → value=1
-  pos=1, env={type: 1, [0,1), UInt8}
-  Action: capture field "type" [0,1)
+  pos=0 → read 1 byte → IntValue(1) in ac
+  pos=1, env={type → IntValue(1), [0,1)}
+  Action: capture field "type" [0,1), push next on K
 
 STEP 3: MatchPrimitive("length", uint16le)
-  pos=1 → read 2 bytes LE → value=5
-  pos=3, env={length: 5, [1,3), UInt16LE} → {type: ...}
-  Action: capture field "length" [1,3)
+  pos=1 → read 2 bytes LE → IntValue(5) in ac
+  pos=3, env={length → IntValue(5), [1,3)} → {type → …}
+  Action: capture field "length" [1,3), push next on K
 
-STEP 4: MatchBytes("data", interval=eval(length)=5)
-  pos=3 → read 5 bytes
-  pos=8, env={data: 5, [3,8), Bytes} → {length: ...} → {type: ...}
-  Action: capture field "data" [3,8)
+STEP 4: MatchBytes("data") with length_expr sub-tree
+  Pushes MatchBytesApply consumer + Ref("length") leaf.
+  Ref leaf fires: ac = IntValue(5).
+  MatchBytesApply fires: reads ac, length=5, bounds-checks, captures.
+  pos=8, env={data → …, [3,8)} → ...
 
 STEP 5: EndStruct
   Action: close capture scope "TLVEntry" [0,8)
 
 STEP 6: Halt
-  control=nullptr, success=true
+  K empty → trampoline exits, success
+```
 
-Result CaptureMetadata:
-  TLVEntry [0, 8)
-    type:   [0, 1) UInt8
-    length: [1, 3) UInt16LE
-    data:   [3, 8) Bytes
+### B.2 Binop K-trace
+
+Expression `version == 1` in a `where` clause. The compiled IR is
+`EqKont(RefKont("version"), IntLitKont(1))` wrapped by an
+`EvalConstraintKont` whose `invoke` pushes `EvalConstraintCheck` then
+the EqKont.
+
+```
+Initial K (top → bottom):  [EqKont, EvalConstraintCheck, …]
+
+POP EqKont:
+  Allocate ApplyEqKont (saved_right slot empty).
+  Allocate EvalLeftKont(apply, RefKont).
+  Push apply, eval-left, IntLitKont in reverse exec order.
+  K: [IntLitKont(1), EvalLeftKont, ApplyEqKont, EvalConstraintCheck, …]
+
+POP IntLitKont:
+  ac ← IntValue(1).
+  K: [EvalLeftKont, ApplyEqKont, EvalConstraintCheck, …]
+
+POP EvalLeftKont:
+  apply.saved_right ← ac (= IntValue(1)).
+  Push RefKont.
+  K: [RefKont, ApplyEqKont, EvalConstraintCheck, …]
+
+POP RefKont("version"):
+  ac ← env.lookup("version").value (= IntValue(N)).
+  K: [ApplyEqKont, EvalConstraintCheck, …]
+
+POP ApplyEqKont:
+  left = ac, right = saved_right. Both IntValue.
+  Compare → BoolValue(left == right).
+  ac ← BoolValue(...).
+  K: [EvalConstraintCheck, …]
+
+POP EvalConstraintCheck:
+  Read ac, coerce to bool.
+  If true: push next. If false: push on_false (or fail).
+```
+
+### B.3 Backtracking K-trace
+
+A `Choice` with two alternatives, first one fails after consuming bytes.
+
+```
+Initial: K=[…rule body…], frame_top=…
+EnterChoice → push AlternativeFrame{
+    saved_pos=10, saved_env=E0, saved_kont_size=K.size, saved_endian=…,
+    capture_mark=M0, remaining=[alt2], join=nullptr
+} onto frame_top.
+
+Alt1 starts. K grows: [alt1_node1, alt1_node2, …, …rest of body…].
+pos advances to 14. Some Values + dynamic konts allocated in arena.
+
+alt1_node3 fails: m->fail("...") called.
+  Walk frame_top → find AlternativeFrame.
+  remaining_count > 0 → restore:
+    pos        ← 10
+    env        ← E0
+    endian     ← saved_endian
+    builder    ← M0 (drops captures added during alt1)
+    K.resize(saved_kont_size) → drops all alt1 entries
+  Move alt2 into K. remaining_count → 0.
+  Return; trampoline continues with alt2 on top.
+
+Speculatively-allocated Values + dynamic konts from alt1 are unreachable
+but still occupy arena. They live until parse end. Sound: nothing
+restored points at them.
 ```
 
 ---
 
-## Appendix D: Source References
+## Appendix C: References
 
-The IPG column references the original design docs (`/home/dan/Source/IPG/`).
-The AiPL column references the working CEK machine (`/home/dan/Source/AiPL/`)
-that validates the patterns.
+**Files**
 
-| Concept | Original Design Docs (IPG/) | AiPL Implementation |
-|---------|----------------------------|---------------------|
-| Three-tier memory | `IPG Virtual Machine Design.md` §Memory Management | `machine.h` arena + GC |
-| Continuation types | `IMPLEMENTATION_PLAN.md` §Continuation Types | `continuations.h` (70 types) |
-| Trampoline loop | `IPG Virtual Machine Design.md` §Big-Step Evaluation | `machine.cpp:142-229` |
-| Capture metadata | `IPG Virtual Machine Design.md` §Capture Metadata Output | — |
-| DDCG compilation | `OperationalSemantics.md` §Compilation Rules | — |
-| Environment as index | `IMPLEMENTATION_PLAN.md` Phase 11 | `environment.h` |
-| Backtracking | `IPG Virtual Machine Design.md` §Backtracking Mechanism | — |
-| Visitor pattern | — | `continuation_visitor.h` |
-| Two-phase continuations | — | `continuations.h` DyadicK pattern |
-| String interning | — | `string_pool.h` |
-| Completion records | `IPG Virtual Machine Design.md` §Error Handling | `completion.h` |
-| Arena sizing | — | `machine.h` ARENA_SIZE=65536 |
-| Operational semantics | `IPG Formal Operational Semantics.md` | — |
-| Thread safety | `IPG Virtual Machine Design.md` §Thread-Safety Model | — |
-| Expression evaluation | `IPG Virtual Machine Design.md` §Expression System | `expression_evaluator.cpp` |
-| External parsers | `IPG Virtual Machine Design.md` §External Parser Interface | — |
-| PEG VM patterns | — | `../Peggy/Operational Semantics.txt` |
+- `backends/cek/bbq_ir.asdl` — IR variant declarations (Value sum,
+  static_kont, dynamic_kont)
+- `backends/cek/bbq.ddcg` — AST→IR compilation rules
+- `backends/cek/templates/bbq_ir.inja` — code generation template
+- `ddcgc/lib/dybvig.ddcg` — DDCG codegen primitive library
+- `backends/cek/Machine.cpp`, `Compiler.cpp`, `Capture.h`,
+  `Environment.h`, `Frame.h` — hand-written runtime
+- `frontend/Sema.cpp` — semantic analysis producing the validated AST
+- `jitterator/example/grammar/calc.ddcg` — calc compiler as a worked
+  DDCG example
 
-**Peggy** (`/home/dan/Source/Peggy/`) is a PEG parser generator whose
-operational semantics document (`Operational Semantics.txt`) defines the
-bytecode VM instructions (`OP_CHOICE`, `OP_COMMIT`, `OP_PARTIAL_COMMIT`,
-`OP_JUMP`) that informed the `CommitChoiceNode` pattern (§7.1) and the
-optimization patterns in §7.3. The key theoretical insight — that DDCG
-destinations *are* continuations — connects PEG compilation theory directly
-to the CEK machine architecture.
+**Papers**
+
+- Felleisen & Friedman, *Control Operators, the SECD Machine, and the
+  λ-calculus*, Indiana TR 78 (1986); *A Calculus for Assignments in
+  Higher-Order Languages* (1987) — the CEK machine.
+- Reynolds, *Definitional Interpreters for Higher-Order Programming
+  Languages*, ACM '72 — defunctionalization.
+- Ager, Biernacki, Danvy & Midtgaard, *A Functional Correspondence
+  Between Evaluators and Abstract Machines*, BRICS RS-03-13 (2003) —
+  the recipe used to defunctionalize the BBQ expression evaluator.
+- Dybvig, Hieb & Butler, *Destination-Driven Code Generation* (1990) —
+  the DDCG framework used by `bbq.ddcg`.
+- Medeiros & Ierusalimschy, *A Parsing Machine for PEGs* — the PEG VM
+  patterns (`OP_CHOICE`, `OP_COMMIT`, `OP_PARTIAL_COMMIT`, `OP_JUMP`)
+  that inform Choice/Optional and array-iteration optimizations.
+
+**Implementations**
+
+- `/home/dan/Source/AiPL/` — production CEK machine (~70 continuation
+  variants) that validates the eval-and-apply discipline at scale.
+- `/home/dan/Source/IPG/` — the original BBQ design docs (interval
+  parsing grammars).
+- `/home/dan/Source/Peggy/` — PEG parser generator with operational-
+  semantics document for the PEG VM patterns.

@@ -98,11 +98,29 @@ static void peg_span_chars(peg_state* p, bool (*fn)(char)) {
         peg_advance(p);
 }
 
-/* Scan forward to delimiter, capturing raw content as span. */
+/* Scan forward to delimiter, capturing raw content as span. Skips
+   over C-style `//` line comments and `/` `*` ... `*` `/` block
+   comments — a delimiter inside a comment doesn't terminate the
+   scan. This matters for embedded code blocks like `(. ... .)`
+   where C source legitimately contains the close marker in `//`
+   comment text. */
 static bool peg_scan_to(peg_state* p, const char* delim, peg_span* out) {
     int dlen = (int)strlen(delim);
     const char* start = p->pos;
     while (p->pos + dlen <= p->end) {
+        if (p->pos + 1 < p->end && p->pos[0] == '/' && p->pos[1] == '/') {
+            while (p->pos < p->end && *p->pos != '\n') peg_advance(p);
+            continue;
+        }
+        if (p->pos + 1 < p->end && p->pos[0] == '/' && p->pos[1] == '*') {
+            peg_advance(p); peg_advance(p);
+            while (p->pos + 1 < p->end &&
+                   !(p->pos[0] == '*' && p->pos[1] == '/')) {
+                peg_advance(p);
+            }
+            if (p->pos + 1 < p->end) { peg_advance(p); peg_advance(p); }
+            continue;
+        }
         if (memcmp(p->pos, delim, (size_t)dlen) == 0) {
             out->ptr = start;
             out->len = (int)(p->pos - start);

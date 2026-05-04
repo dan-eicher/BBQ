@@ -1,0 +1,24 @@
+COMPILER big_imports
+
+IMPORTS
+  ast    = "big_ast.json"
+  target = "big_target.json"
+
+DESTINATIONS
+  data_dest delta { effect | ac | spill(slot: int) }
+  ctrl_dest gamma { fail | jump(target: label) }
+  ir_root int
+
+AUXILIARIES
+  trace_fire : (string) -> int
+
+// One fun whose only job is to demonstrate that an imported lib's
+// declarations end up callable from the importer's rule bodies.
+// trace_fire is provided by the importer's MEMBERS (its signature must
+// match the AUXILIARIES line above).
+fun import_demo(n : int) -> int {
+    let _ = trace_fire("import_demo");
+    n;
+}
+
+RULES

@@ -200,11 +200,30 @@ public:
         }
     }
 
-    // Scan forward to delimiter, capturing raw content. Advances past delimiter.
+    // Scan forward to delimiter, capturing raw content. Advances past
+    // delimiter. Skips over C-style `//` line comments and `/* */`
+    // block comments — a delimiter inside a comment doesn't terminate
+    // the scan. This matters for embedded code blocks like `(. ... .)`
+    // where C++ source legitimately contains `.)` in `// comment` text.
     bool scan_to(const char* delim, std::string& out) {
         int dlen = static_cast<int>(strlen(delim));
         const char* start = pos_;
         while (pos_ + dlen <= end_) {
+            // Skip a C++ line comment if we encounter `//`.
+            if (pos_ + 1 < end_ && pos_[0] == '/' && pos_[1] == '/') {
+                while (pos_ < end_ && *pos_ != '\n') advance();
+                continue;
+            }
+            // Skip a C block comment if we encounter `/*`.
+            if (pos_ + 1 < end_ && pos_[0] == '/' && pos_[1] == '*') {
+                advance(); advance();
+                while (pos_ + 1 < end_ &&
+                       !(pos_[0] == '*' && pos_[1] == '/')) {
+                    advance();
+                }
+                if (pos_ + 1 < end_) { advance(); advance(); }
+                continue;
+            }
             if (memcmp(pos_, delim, dlen) == 0) {
                 out.assign(start, pos_);
                 for (int i = 0; i < dlen; i++) advance();

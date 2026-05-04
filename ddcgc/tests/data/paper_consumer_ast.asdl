@@ -1,0 +1,4 @@
+module ast {
+    expr = Lit(int n)
+         | Add(expr left, expr right)
+}

@@ -1,0 +1,1266 @@
+// bbq.ddcg — BBQ AST → CEK kont IR via DDCG.
+//
+// Drives the AST→IR translation per the design doc §5. Imports
+// dybvig.ddcg's δ/γ/ρ destinations and codegen primitives.
+//
+// BBQ uses a narrow slice of DDCG:
+//   * δ ∈ {ac, effect}.  ac for expression rules (the value flows
+//     via the typed accumulator at runtime); effect for spine rules
+//     (kont sub-trees threaded via `next`).
+//   * γ = jump(L) only. The driver wraps each rule with γ=jump(Halt)
+//     by allocating Halt + ReturnRule at the top.
+//   * ρ is unit — BBQ has no break label.
+//
+// Spine konts carry `next` (per-variant in bbq_ir.asdl). Expression
+// operator konts carry sub-tree pointers (left/right/cond/then/else)
+// and have no `next`. Apply / consumer dynamic konts are runtime-
+// allocated; ddcg only emits the static_kont side.
+
+COMPILER bbq INTERNAL_DISPATCHERS
+
+(.
+   #include "BBQ_AST.h"
+   #include "Sema.h"
+   #include "KontNode.h"
+   #include "ParseArena.h"
+   #include "StringPool.h"
+   #include "CompiledGrammar.h"
+   #include <cassert>
+   #include <cstring>
+   #include <cstdio>
+   #include <unordered_map>
+   #include <utility>
+   #include <vector>
+
+   // ddcgc references generated IR types as `bbq_ir::*` (matching the
+   // asdl module name `module bbq_ir`). Our hand-written runtime
+   // declares them in `bbq::cek::` (the existing CEK namespace).
+   // Alias one to the other so the ddcg-generated Compiler class
+   // finds StaticKont / DynamicKont / Value / etc.
+   namespace bbq_ir = bbq::cek;
+
+   // Destination types live at `namespace bbq` scope — that's where
+   // ddcgc generates `class Compiler`, and the generated dispatch
+   // methods reference these as bare names (delta_t / gamma_t / rho_t).
+   namespace bbq {
+
+   // δ — paper §3.1 Location class. BBQ uses {effect, ac}.
+   enum class DeltaTag : unsigned char { Effect, Ac, Stack, Local };
+   struct delta_t { DeltaTag tag; int i; };
+   inline delta_t effect()        { return {DeltaTag::Effect, 0}; }
+   inline delta_t ac()            { return {DeltaTag::Ac,     0}; }
+   inline delta_t stack()         { return {DeltaTag::Stack,  0}; }
+   inline delta_t local(int i)    { return {DeltaTag::Local,  i}; }
+
+   // γ — paper §3.2 control destination. BBQ uses jump(L) only.
+   enum class GammaTag : unsigned char { Jump, Pair, Ret };
+   struct gamma_t {
+       GammaTag tag;
+       bbq::cek::StaticKont* L;
+       bbq::cek::StaticKont* Lt;
+       bbq::cek::StaticKont* Lf;
+   };
+   inline gamma_t jump(bbq::cek::StaticKont* L)                                       { return {GammaTag::Jump, L,       nullptr, nullptr}; }
+   inline gamma_t pair(bbq::cek::StaticKont* Lt, bbq::cek::StaticKont* Lf)            { return {GammaTag::Pair, nullptr, Lt,      Lf}; }
+   inline gamma_t ret()                                                                { return {GammaTag::Ret,  nullptr, nullptr, nullptr}; }
+
+   // ρ — paper environment. BBQ has no break label, so ρ is empty.
+   struct rho_t {};
+
+   } // namespace bbq
+.)
+
+IMPORTS
+  ast = "bbq.json"
+  ir  = "bbq_ir.json"
+
+DESTINATIONS
+  // The compiler emits only static_kont variants (dynamic_kont konts
+  // are runtime-allocated). ir_root binds to that sum.
+  ir_root ir.static_kont
+
+  // BBQ-narrow destination languages. δ uses {effect, ac} only; γ uses
+  // jump only. ρ carries the current field name so structural rules
+  // (Primitive, MatchBytes, Compute, etc.) know what to bind under
+  // — empty/null at rule level for unnamed rule-body captures.
+  data_dest delta { effect | ac }
+  ctrl_dest gamma { jump(L: ir_root) }
+  env_dest  rho   { current_field: interned }
+
+AUXILIARIES
+  // Hard-fail for paper-undefined γ contexts. BBQ's driver wraps
+  // every rule with γ=jump(Halt), so inner rule bodies never see
+  // ret or pair forms. Reaching panic_unreachable means a normalizer
+  // bug or a rule that synthesized the wrong γ.
+  panic_unreachable     : ()                  -> ir_root
+
+  // Static_kont allocators — one per emitted variant. Each is a
+  // thin arena.alloc<*Kont>() wrapper; the runtime invoke()s live
+  // in Machine.cpp.
+
+  // Spine
+  make_match_primitive  : (ident, primitive_info, ir_root) -> ir_root
+  make_begin_struct     : (ident, ir_root) -> ir_root
+  make_end_struct       : (ir_root) -> ir_root
+  make_eval_constraint  : (ir_root, ir_root, ir_root) -> ir_root  // expr, on_false, next
+  make_bind_compute     : (ident, ir_root, ir_root) -> ir_root  // name, expr, next
+  // Allocates an InvokeRuleNode with entry=nullptr and registers
+  // (&node->entry, name) on pending_patches_. compile_grammar resolves
+  // every patch by looking name up in rule_entries_ once all rules are
+  // compiled — this is how recursive grammars link.
+  make_invoke_rule      : (ident, ir_root) -> ir_root  // name, next
+  make_return_rule      : (ir_root) -> ir_root
+  make_begin_choice     : (list<ir_root>, ir_root) -> ir_root  // alternatives, first
+  make_commit_choice    : (ir_root) -> ir_root
+  make_begin_optional   : (ir_root, ir_root) -> ir_root  // inner, next
+  make_end_optional     : (ir_root) -> ir_root
+  make_begin_array      : (ident, array_mode, ir_root, ir_root, ir_root) -> ir_root
+  make_array_next       : (array_mode, ir_root, ir_root, ir_root, ir_root) -> ir_root
+  make_end_array        : (ir_root) -> ir_root
+  make_switch_dispatch  : (ir_root, list<ir.switch_case>, ir_root) -> ir_root
+  make_bitfield_read    : (primitive_info, list<ir.bitfield_entry>, ir_root) -> ir_root
+  make_set_endian       : (ir_root, ir_root) -> ir_root  // expr, next
+  make_external_call    : (string, ident, ir_root) -> ir_root  // func_name, field_name, next
+  make_match_bytes      : (ident, ir_root, bool, ir_root) -> ir_root
+  make_halt             : () -> ir_root
+
+  // Expression leaves
+  make_int_lit          : (int) -> ir_root
+  make_bool_lit         : (bool) -> ir_root
+  make_float_lit        : (float) -> ir_root
+  make_str_lit          : (string) -> ir_root  // StrLit.value is string
+  make_ref              : (ident) -> ir_root
+  make_pos              : () -> ir_root
+  make_remaining        : () -> ir_root
+  make_at_end           : () -> ir_root
+  make_eoi              : () -> ir_root
+  make_loop_var         : () -> ir_root
+
+  // Unary
+  make_neg              : (ir_root) -> ir_root
+  make_bit_not          : (ir_root) -> ir_root
+  make_not              : (ir_root) -> ir_root
+
+  // Binop arithmetic
+  make_add              : (ir_root, ir_root) -> ir_root
+  make_sub              : (ir_root, ir_root) -> ir_root
+  make_mul              : (ir_root, ir_root) -> ir_root
+  make_div              : (ir_root, ir_root) -> ir_root
+  make_mod              : (ir_root, ir_root) -> ir_root
+
+  // Binop bitwise
+  make_bit_and          : (ir_root, ir_root) -> ir_root
+  make_bit_or           : (ir_root, ir_root) -> ir_root
+  make_bit_xor          : (ir_root, ir_root) -> ir_root
+  make_shl              : (ir_root, ir_root) -> ir_root
+  make_shr              : (ir_root, ir_root) -> ir_root
+
+  // Binop comparison
+  make_eq               : (ir_root, ir_root) -> ir_root
+  make_ne               : (ir_root, ir_root) -> ir_root
+  make_lt               : (ir_root, ir_root) -> ir_root
+  make_le               : (ir_root, ir_root) -> ir_root
+  make_gt               : (ir_root, ir_root) -> ir_root
+  make_ge               : (ir_root, ir_root) -> ir_root
+
+  // Logical short-circuit
+  make_logical_and      : (ir_root, ir_root) -> ir_root
+  make_logical_or       : (ir_root, ir_root) -> ir_root
+
+  // Ternary
+  make_ternary          : (ir_root, ir_root, ir_root) -> ir_root
+
+  // Function call
+  make_call             : (ident, list<ir_root>) -> ir_root
+
+  // Path navigation
+  make_path_start       : (ident) -> ir_root
+  make_field_access     : (ident, ir_root) -> ir_root
+  make_index_access     : (ir_root, ir_root) -> ir_root
+  make_capture_value    : (ir_root) -> ir_root
+
+  // ── BBQ-specific helpers ─────────────────────────────────
+
+  // Convert a BBQ AST primitive_kind into the runtime PrimitiveInfo.
+  to_prim_info          : (ast.primitive_kind) -> primitive_info
+
+  // Dispatch on primitive_kind: bytes/string emit MatchBytes with the
+  // length from the interval; int/float/bool emit MatchPrimitive.
+  // Wraps with EvalConstraint when constraint is set.
+  compile_primitive     : (ast.primitive_kind, ast.expr, ast.interval, rho, ir_root) -> ir_root
+
+  // Compile an Array — emits BeginArray + body + ArrayNext + EndArray
+  // with the body→ArrayNext→body cycle. Body's Lnext is the ArrayNext
+  // node; ArrayNext.body_entry is patched to the body head after
+  // compilation (forward-ref via member-mutation rather than fresh_kont).
+  compile_array         : (ast.type_expr, ast.array_spec, rho, ir_root) -> ir_root
+
+  // Compile alternatives / union to BeginChoice + per-alt CommitChoice
+  // chains. Single-alt cases compile the alt directly (no choice).
+  compile_alternatives  : (list<ast.type_expr>, rho, ir_root) -> ir_root
+  compile_union         : (list<ast.variant>, rho, ir_root) -> ir_root
+
+  // Compile a list of args (each ast.expr) into a list of value
+  // sub-tree IRs. Each arg is gen'd with δ=ac, γ=jump(Lnext).
+  compile_call_args     : (list<ast.expr>, rho, ir_root) -> list<ir_root>
+
+  // Compile a sequence of fields into a spine kont chain ending in
+  // the supplied tail. Fields are compiled in reverse (last field
+  // chains into tail, prev chains into next, etc.).
+  compile_fields        : (list<ast.field>, ir_root)   -> ir_root
+
+  // Compile a bitfield entry list into the runtime entry array shape.
+  compile_bitfield_entries : (list<ast.bitfield_entry>) -> list<ir.bitfield_entry>
+
+  // Compile a sequence of switch cases.
+  compile_switch_cases  : (list<ast.switch_case>, rho, ir_root) -> list<ir.switch_case>
+
+  // Compile the optional default branch, returning a kont (or
+  // nullptr-equivalent) for the SwitchDispatch's default_target.
+  compile_switch_default : (ast.switch_default, rho, ir_root) -> ir_root
+
+  // Convert an endianness AST literal to a bool (true=little, false=big).
+  endian_to_bool        : (ast.endianness) -> bool
+
+  // Compile a ref-path into a chain of path-nav konts terminating in
+  // a PathStartKont. `then_capture` controls whether the outermost
+  // call wraps with CaptureValueKont (true at the user-facing edge,
+  // false when this path is the base of another path step).
+  compile_ref_path      : (ast.ref_path, ident, bool) -> ir_root
+  compile_ref_index_path : (ast.ref_path, ir_root, bool) -> ir_root
+
+  // Read the current field name from rho (empty if compiling a
+  // rule-level body — anonymous capture).
+  intern_field_or_anon  : ()                   -> ident
+
+  // Resolve a Simple ref name to either a built-in leaf (i / pos /
+  // remaining / at_end) or a user-defined RefKont. Avoids ddcg's
+  // lack of ident-vs-string equality in rule bodies.
+  make_ref_or_builtin   : (ident)             -> ir_root
+
+MEMBERS (.
+    // ── Public API: the only entry point on bbq::Compiler ──────
+    //
+    // Per design doc §5.4: the driver owns program-exit wrapping.
+    // For each rule:
+    //   1. Allocate the rule's exit kont chain: Halt at the bottom,
+    //      ReturnRule on top. Top-level entries push a throwaway
+    //      ReturnFrame in the runtime so ReturnRule has something to
+    //      pop; inner calls (via InvokeRule) push real ReturnFrames.
+    //   2. Compile the rule body with γ=jump(exit). Top-level Struct
+    //      bodies inline (no BeginStruct wrapper) so user-facing
+    //      results expose `result.<field>` rather than
+    //      `result.<empty>.<field>`.
+    //   3. Record the body head in rule_entries_.
+    //
+    // After every rule has compiled, walk pending_patches_ and resolve
+    // each (slot, name) to rule_entries_[name]. Sema rejects refs to
+    // unknown rule names before we get here, so an unresolved patch
+    // means an internal invariant was broken.
+    bbq::cek::CompiledGrammar* compile_grammar(BBQ::Grammar* grammar) {
+        if (!grammar) return nullptr;
+        auto* result = new bbq::cek::CompiledGrammar();
+        arena_   = &result->arena;
+        strings_ = &result->strings;
+        rule_entries_.clear();
+        pending_patches_.clear();
+
+        std::vector<bbq::cek::CompiledGrammar::RuleEntry> entries;
+        entries.reserve(grammar->rules.size());
+
+        for (auto* rule : grammar->rules) {
+            auto* halt = arena_->alloc<bbq::cek::HaltNode>();
+            auto* exit_kont = make_return_rule(halt);
+            auto* exit_static = static_cast<bbq::cek::StaticKont*>(exit_kont);
+
+            ::bbq::rho_t rho{};
+            bbq::cek::StaticKont* body_head = nullptr;
+            if (auto* st = dynamic_cast<BBQ::Struct*>(rule->body)) {
+                body_head = compile_fields(st->fields, exit_static);
+            } else {
+                body_head = compile_type_expr(
+                    rule->body, rho, ::bbq::effect(),
+                    ::bbq::jump(exit_static), exit_static);
+            }
+
+            rule_entries_[rule->name] = body_head;
+            entries.push_back({result->strings.intern(rule->name), body_head});
+        }
+
+        // Resolve every InvokeRuleNode's entry by looking up its rule
+        // name in rule_entries_. Recursive grammars round-trip cleanly
+        // here: the back-edge from kid → Tree finds Tree's body head.
+        for (auto& [slot, name] : pending_patches_) {
+            auto it = rule_entries_.find(name);
+            if (it == rule_entries_.end()) {
+                std::fprintf(stderr,
+                    "bbq compile: unresolved rule reference '%s' "
+                    "(Sema should have caught this)\n", name.c_str());
+                std::abort();
+            }
+            *slot = it->second;
+        }
+
+        if (!entries.empty()) {
+            result->rules = static_cast<bbq::cek::CompiledGrammar::RuleEntry*>(
+                result->arena.allocate(
+                    entries.size() * sizeof(bbq::cek::CompiledGrammar::RuleEntry),
+                    alignof(bbq::cek::CompiledGrammar::RuleEntry)));
+            for (size_t i = 0; i < entries.size(); ++i) {
+                result->rules[i] = entries[i];
+            }
+            result->rule_count = static_cast<int>(entries.size());
+        }
+
+        for (auto* d : grammar->directives) {
+            if (auto* ed = dynamic_cast<BBQ::EndianDirective*>(d)) {
+                result->default_little_endian =
+                    (ed->endian == BBQ::Endianness::Little);
+            }
+        }
+
+        return result;
+    }
+.)
+
+PRIVATE (.
+    // Allocation arena for IR konts, owned by the compiled grammar.
+    bbq::cek::ParseArena* arena_ = nullptr;
+    bbq::cek::StringPool* strings_ = nullptr;
+
+    // Rule entry table — populated as each rule finishes compiling.
+    // After the per-rule loop in compile_grammar, every rule name maps
+    // to its real body-head kont. pending_patches_ is then resolved
+    // against this table.
+    std::unordered_map<std::string, bbq::cek::StaticKont*> rule_entries_;
+
+    // Forward-reference patch list. make_invoke_rule allocates an
+    // InvokeRuleNode with entry=nullptr and pushes (&node->entry, name)
+    // onto this list. compile_grammar walks the list at the end and
+    // resolves each slot to rule_entries_[name]. Sema rejects any
+    // unknown name before we get here, so unresolved entries indicate
+    // a Sema/compiler invariant violation and abort.
+    std::vector<std::pair<bbq::cek::KontNode**, std::string>> pending_patches_;
+
+    // Currently-compiling field name — set by the Field rule before
+    // recursing into its body, read by Primitive/MatchBytes/Compute
+    // when they need to bind.
+    const char* current_field_name_ = nullptr;
+
+    // ddcgc-generated dispatch threads `current_loc` from each AST
+    // node it traverses (via `current_loc = node->loc`). Type matches
+    // BBQ_AST.h's SourceLoc. Rule bodies don't currently consume it
+    // but keeping it correct so generated code compiles.
+    BBQ::SourceLoc current_loc{};
+
+    // ── make_X allocators ─────────────────────────────────────
+
+    bbq::cek::StaticKont* make_match_primitive(const std::string& nm, bbq::cek::PrimitiveInfo p, bbq::cek::StaticKont* nx) {
+        auto* k = arena_->alloc<bbq::cek::MatchPrimitiveNode>();
+        k->field_name = nm.empty() ? nullptr : strings_->intern(nm); k->prim = p; k->next = nx;
+        return k;
+    }
+    bbq::cek::StaticKont* make_begin_struct(const std::string& nm, bbq::cek::StaticKont* nx) {
+        auto* k = arena_->alloc<bbq::cek::BeginStructNode>();
+        k->struct_name = strings_->intern(nm); k->next = nx;
+        return k;
+    }
+    bbq::cek::StaticKont* make_end_struct(bbq::cek::StaticKont* nx) {
+        auto* k = arena_->alloc<bbq::cek::EndStructNode>();
+        k->next = nx;
+        return k;
+    }
+    bbq::cek::StaticKont* make_eval_constraint(bbq::cek::StaticKont* e, bbq::cek::StaticKont* on_false, bbq::cek::StaticKont* nx) {
+        auto* k = arena_->alloc<bbq::cek::EvalConstraintNode>();
+        k->constraint_expr = e; k->on_false = on_false; k->next = nx;
+        return k;
+    }
+    bbq::cek::StaticKont* make_bind_compute(const std::string& nm, bbq::cek::StaticKont* e, bbq::cek::StaticKont* nx) {
+        auto* k = arena_->alloc<bbq::cek::BindComputeNode>();
+        k->field_name = nm.empty() ? nullptr : strings_->intern(nm); k->compute_expr = e; k->next = nx;
+        return k;
+    }
+    bbq::cek::StaticKont* make_invoke_rule(const std::string& nm, bbq::cek::StaticKont* nx) {
+        auto* k = arena_->alloc<bbq::cek::InvokeRuleNode>();
+        k->rule_name = strings_->intern(nm);
+        k->entry = nullptr;
+        k->next = nx;
+        pending_patches_.emplace_back(&k->entry, nm);
+        return k;
+    }
+    bbq::cek::StaticKont* make_return_rule(bbq::cek::StaticKont* nx) {
+        auto* k = arena_->alloc<bbq::cek::ReturnRuleNode>();
+        k->next = nx;
+        return k;
+    }
+    bbq::cek::StaticKont* make_begin_choice(std::vector<bbq::cek::StaticKont*> alts, bbq::cek::StaticKont* first) {
+        auto* k = arena_->alloc<bbq::cek::BeginChoiceNode>();
+        // Allocate alternatives buffer as KontNode** (the asdl-declared
+        // field type) — each StaticKont* upcasts implicitly to KontNode*.
+        if (!alts.empty()) {
+            auto** buf = static_cast<bbq::cek::KontNode**>(
+                arena_->allocate(alts.size() * sizeof(bbq::cek::KontNode*),
+                                 alignof(bbq::cek::KontNode*)));
+            for (size_t i = 0; i < alts.size(); ++i) buf[i] = alts[i];
+            k->alternatives = buf;
+            k->alternatives_count = static_cast<int>(alts.size());
+        }
+        k->next = first;
+        return k;
+    }
+    bbq::cek::StaticKont* make_commit_choice(bbq::cek::StaticKont* nx) {
+        auto* k = arena_->alloc<bbq::cek::CommitChoiceNode>();
+        k->next = nx;
+        return k;
+    }
+    bbq::cek::StaticKont* make_begin_optional(bbq::cek::StaticKont* inner, bbq::cek::StaticKont* nx) {
+        auto* k = arena_->alloc<bbq::cek::BeginOptionalNode>();
+        k->inner = inner; k->next = nx;
+        return k;
+    }
+    bbq::cek::StaticKont* make_end_optional(bbq::cek::StaticKont* nx) {
+        auto* k = arena_->alloc<bbq::cek::EndOptionalNode>();
+        k->next = nx;
+        return k;
+    }
+    bbq::cek::StaticKont* make_begin_array(const std::string& nm, bbq::cek::ArrayMode mode,
+                                         bbq::cek::StaticKont* count_expr,
+                                         bbq::cek::StaticKont* end_node,
+                                         bbq::cek::StaticKont* nx) {
+        auto* k = arena_->alloc<bbq::cek::BeginArrayNode>();
+        k->array_name = strings_->intern(nm); k->mode = mode;
+        k->count_expr = count_expr; k->end_node = end_node; k->next = nx;
+        return k;
+    }
+    bbq::cek::StaticKont* make_array_next(bbq::cek::ArrayMode mode,
+                                        bbq::cek::StaticKont* count_expr,
+                                        bbq::cek::StaticKont* until_expr,
+                                        bbq::cek::StaticKont* end_node,
+                                        bbq::cek::StaticKont* body_entry) {
+        auto* k = arena_->alloc<bbq::cek::ArrayNextNode>();
+        k->mode = mode;
+        k->count_expr = count_expr; k->until_expr = until_expr;
+        k->end_node = end_node; k->body_entry = body_entry;
+        return k;
+    }
+    bbq::cek::StaticKont* make_end_array(bbq::cek::StaticKont* nx) {
+        auto* k = arena_->alloc<bbq::cek::EndArrayNode>();
+        k->next = nx;
+        return k;
+    }
+    bbq::cek::StaticKont* make_switch_dispatch(bbq::cek::StaticKont* disc,
+                                             std::vector<bbq::cek::switch_case> cases,
+                                             bbq::cek::StaticKont* dflt) {
+        auto* k = arena_->alloc<bbq::cek::SwitchDispatchNode>();
+        k->discriminator_expr = disc;
+        if (!cases.empty()) {
+            auto* buf = static_cast<bbq::cek::switch_case*>(
+                arena_->allocate(cases.size() * sizeof(bbq::cek::switch_case),
+                                 alignof(bbq::cek::switch_case)));
+            for (size_t i = 0; i < cases.size(); ++i) buf[i] = cases[i];
+            k->cases = buf;
+            k->cases_count = static_cast<int>(cases.size());
+        }
+        k->default_target = dflt;
+        return k;
+    }
+    bbq::cek::StaticKont* make_bitfield_read(bbq::cek::PrimitiveInfo container,
+                                           std::vector<bbq::cek::bitfield_entry> entries,
+                                           bbq::cek::StaticKont* nx) {
+        auto* k = arena_->alloc<bbq::cek::BitfieldReadNode>();
+        k->container = container;
+        if (!entries.empty()) {
+            auto* buf = static_cast<bbq::cek::bitfield_entry*>(
+                arena_->allocate(entries.size() * sizeof(bbq::cek::bitfield_entry),
+                                 alignof(bbq::cek::bitfield_entry)));
+            for (size_t i = 0; i < entries.size(); ++i) buf[i] = entries[i];
+            k->entries = buf;
+            k->entries_count = static_cast<int>(entries.size());
+        }
+        k->next = nx;
+        return k;
+    }
+    bbq::cek::StaticKont* make_set_endian(bbq::cek::StaticKont* e, bbq::cek::StaticKont* nx) {
+        auto* k = arena_->alloc<bbq::cek::SetEndianNode>();
+        k->endian_expr = e; k->next = nx;
+        return k;
+    }
+    bbq::cek::StaticKont* make_external_call(const std::string& fn, const std::string& field, bbq::cek::StaticKont* nx) {
+        auto* k = arena_->alloc<bbq::cek::ExternalCallNode>();
+        k->func_name = strings_->intern(fn);
+        k->field_name = strings_->intern(field);
+        k->next = nx;
+        return k;
+    }
+    bbq::cek::StaticKont* make_match_bytes(const std::string& fn, bbq::cek::StaticKont* len, bool is_str, bbq::cek::StaticKont* nx) {
+        auto* k = arena_->alloc<bbq::cek::MatchBytesNode>();
+        k->field_name = strings_->intern(fn);
+        k->length_expr = len;
+        k->is_string = is_str;
+        k->next = nx;
+        return k;
+    }
+    bbq::cek::StaticKont* make_halt() {
+        return arena_->alloc<bbq::cek::HaltNode>();
+    }
+
+    // Expression leaves
+    bbq::cek::StaticKont* make_int_lit(int64_t v) {
+        auto* k = arena_->alloc<bbq::cek::IntLitKont>();
+        k->v = v; return k;
+    }
+    bbq::cek::StaticKont* make_bool_lit(bool v) {
+        auto* k = arena_->alloc<bbq::cek::BoolLitKont>();
+        k->v = v; return k;
+    }
+    bbq::cek::StaticKont* make_float_lit(double v) {
+        auto* k = arena_->alloc<bbq::cek::FloatLitKont>();
+        k->v = v; return k;
+    }
+    bbq::cek::StaticKont* make_str_lit(const std::string& v) {
+        auto* k = arena_->alloc<bbq::cek::StrLitKont>();
+        k->v = strings_->intern(v); return k;
+    }
+    bbq::cek::StaticKont* make_ref(const std::string& nm) {
+        auto* k = arena_->alloc<bbq::cek::RefKont>();
+        k->name = strings_->intern(nm); return k;
+    }
+    bbq::cek::StaticKont* make_pos()       { return arena_->alloc<bbq::cek::PosKont>(); }
+    bbq::cek::StaticKont* make_remaining() { return arena_->alloc<bbq::cek::RemainingKont>(); }
+    bbq::cek::StaticKont* make_at_end()    { return arena_->alloc<bbq::cek::AtEndKont>(); }
+    bbq::cek::StaticKont* make_eoi()       { return arena_->alloc<bbq::cek::EOIKont>(); }
+    bbq::cek::StaticKont* make_loop_var()  { return arena_->alloc<bbq::cek::LoopVarKont>(); }
+
+    // Unary
+    bbq::cek::StaticKont* make_neg(bbq::cek::StaticKont* e) {
+        auto* k = arena_->alloc<bbq::cek::NegKont>(); k->operand = e; return k;
+    }
+    bbq::cek::StaticKont* make_bit_not(bbq::cek::StaticKont* e) {
+        auto* k = arena_->alloc<bbq::cek::BitNotKont>(); k->operand = e; return k;
+    }
+    bbq::cek::StaticKont* make_not(bbq::cek::StaticKont* e) {
+        auto* k = arena_->alloc<bbq::cek::NotKont>(); k->operand = e; return k;
+    }
+
+    // Binop allocators (one per op kont).
+#define BBQ_DDCG_BINOP_MAKE(name, KontType)                                         \
+    bbq::cek::StaticKont* name(bbq::cek::StaticKont* l, bbq::cek::StaticKont* r) {        \
+        auto* k = arena_->alloc<bbq::cek::KontType>();                              \
+        k->left = l; k->right = r;                                                  \
+        return k;                                                                   \
+    }
+    BBQ_DDCG_BINOP_MAKE(make_add,        AddKont)
+    BBQ_DDCG_BINOP_MAKE(make_sub,        SubKont)
+    BBQ_DDCG_BINOP_MAKE(make_mul,        MulKont)
+    BBQ_DDCG_BINOP_MAKE(make_div,        DivKont)
+    BBQ_DDCG_BINOP_MAKE(make_mod,        ModKont)
+    BBQ_DDCG_BINOP_MAKE(make_bit_and,    BitAndKont)
+    BBQ_DDCG_BINOP_MAKE(make_bit_or,     BitOrKont)
+    BBQ_DDCG_BINOP_MAKE(make_bit_xor,    BitXorKont)
+    BBQ_DDCG_BINOP_MAKE(make_shl,        ShlKont)
+    BBQ_DDCG_BINOP_MAKE(make_shr,        ShrKont)
+    BBQ_DDCG_BINOP_MAKE(make_eq,         EqKont)
+    BBQ_DDCG_BINOP_MAKE(make_ne,         NeKont)
+    BBQ_DDCG_BINOP_MAKE(make_lt,         LtKont)
+    BBQ_DDCG_BINOP_MAKE(make_le,         LeKont)
+    BBQ_DDCG_BINOP_MAKE(make_gt,         GtKont)
+    BBQ_DDCG_BINOP_MAKE(make_ge,         GeKont)
+    BBQ_DDCG_BINOP_MAKE(make_logical_and, LogicalAndKont)
+    BBQ_DDCG_BINOP_MAKE(make_logical_or,  LogicalOrKont)
+#undef BBQ_DDCG_BINOP_MAKE
+
+    bbq::cek::StaticKont* make_ternary(bbq::cek::StaticKont* c, bbq::cek::StaticKont* t, bbq::cek::StaticKont* el) {
+        auto* k = arena_->alloc<bbq::cek::TernaryKont>();
+        k->cond = c; k->then_ = t; k->else_ = el;
+        return k;
+    }
+
+    bbq::cek::StaticKont* make_call(const std::string& name, std::vector<bbq::cek::StaticKont*> args) {
+        auto* k = arena_->alloc<bbq::cek::CallKont>();
+        k->func_name = strings_->intern(name);
+        if (!args.empty()) {
+            auto** buf = static_cast<bbq::cek::KontNode**>(
+                arena_->allocate(args.size() * sizeof(bbq::cek::KontNode*),
+                                 alignof(bbq::cek::KontNode*)));
+            for (size_t i = 0; i < args.size(); ++i) buf[i] = args[i];
+            k->args = buf;
+            k->args_count = static_cast<int>(args.size());
+        }
+        return k;
+    }
+
+    bbq::cek::StaticKont* make_path_start(const std::string& nm) {
+        auto* k = arena_->alloc<bbq::cek::PathStartKont>();
+        k->name = strings_->intern(nm); return k;
+    }
+    bbq::cek::StaticKont* make_field_access(const std::string& fld, bbq::cek::StaticKont* base) {
+        auto* k = arena_->alloc<bbq::cek::FieldAccessKont>();
+        k->field = strings_->intern(fld); k->base = base; return k;
+    }
+    bbq::cek::StaticKont* make_index_access(bbq::cek::StaticKont* idx, bbq::cek::StaticKont* base) {
+        auto* k = arena_->alloc<bbq::cek::IndexAccessKont>();
+        k->index_expr = idx; k->base = base; return k;
+    }
+    bbq::cek::StaticKont* make_capture_value(bbq::cek::StaticKont* path) {
+        auto* k = arena_->alloc<bbq::cek::CaptureValueKont>();
+        k->path = path; return k;
+    }
+
+    // ── Panic ─────────────────────────────────────────────────
+
+    [[noreturn]] bbq::cek::StaticKont* panic_unreachable() {
+        std::fprintf(stderr, "bbq.ddcg: paper-undefined gamma context (driver bug)\n");
+        std::abort();
+    }
+
+    // ── Helpers ───────────────────────────────────────────────
+
+    bbq::cek::PrimitiveInfo to_prim_info(BBQ::PrimitiveKind* kind) {
+        bbq::cek::PrimitiveInfo p{};
+        if (auto* ik = dynamic_cast<BBQ::IntegerKind*>(kind)) {
+            p.kind = bbq::cek::PrimKind::Integer;
+            switch (ik->width) {
+                case BBQ::Width::W8:  p.width = bbq::cek::PrimWidth::W8;  break;
+                case BBQ::Width::W16: p.width = bbq::cek::PrimWidth::W16; break;
+                case BBQ::Width::W32: p.width = bbq::cek::PrimWidth::W32; break;
+                case BBQ::Width::W64: p.width = bbq::cek::PrimWidth::W64; break;
+            }
+            p.sign = (ik->sign == BBQ::Signedness::Signed)
+                ? bbq::cek::PrimSign::Signed : bbq::cek::PrimSign::Unsigned;
+            switch (ik->endian) {
+                case BBQ::Endianness::Little:  p.endian = bbq::cek::PrimEndian::Little; break;
+                case BBQ::Endianness::Big:     p.endian = bbq::cek::PrimEndian::Big; break;
+                case BBQ::Endianness::Default: p.endian = bbq::cek::PrimEndian::Native; break;
+            }
+        } else if (auto* fk = dynamic_cast<BBQ::FloatKind*>(kind)) {
+            p.kind = bbq::cek::PrimKind::Float;
+            p.width = (fk->width == BBQ::Width::W32) ? bbq::cek::PrimWidth::W32 : bbq::cek::PrimWidth::W64;
+            switch (fk->endian) {
+                case BBQ::Endianness::Little:  p.endian = bbq::cek::PrimEndian::Little; break;
+                case BBQ::Endianness::Big:     p.endian = bbq::cek::PrimEndian::Big; break;
+                case BBQ::Endianness::Default: p.endian = bbq::cek::PrimEndian::Native; break;
+            }
+        } else if (dynamic_cast<BBQ::BoolKind*>(kind)) {
+            p.kind = bbq::cek::PrimKind::Bool;
+            p.width = bbq::cek::PrimWidth::W8;
+        }
+        return p;
+    }
+
+    bool endian_to_bool(BBQ::Endianness e) {
+        return e == BBQ::Endianness::Little;
+    }
+
+    bbq::cek::StaticKont*
+    compile_array(BBQ::TypeExpr* element,
+                  BBQ::ArraySpec* spec,
+                  ::bbq::rho_t r,
+                  bbq::cek::StaticKont* Lnext) {
+        // Determine mode + count/until exprs from the AST spec.
+        bbq::cek::ArrayMode mode = bbq::cek::ArrayMode::EOF_;
+        bbq::cek::StaticKont* count_expr = nullptr;
+        bbq::cek::StaticKont* until_expr = nullptr;
+
+        if (auto* fc = dynamic_cast<BBQ::FixedCount*>(spec)) {
+            mode = bbq::cek::ArrayMode::FixedCount;
+            count_expr = compile_expr(fc->count, r, ::bbq::ac(),
+                                      ::bbq::jump(Lnext), Lnext);
+        } else if (auto* st = dynamic_cast<BBQ::SepTerm*>(spec)) {
+            // SepTerm shapes — pick the terminator that drives the loop.
+            // Separator handling is a Layer 4 follow-up; for now we
+            // drive the loop by the terminator alone.
+            if (auto* eof_term = dynamic_cast<BBQ::EofTerm*>(st->term)) {
+                mode = bbq::cek::ArrayMode::EOF_;
+                (void)eof_term;
+            } else if (auto* count_term = dynamic_cast<BBQ::CountTerm*>(st->term)) {
+                mode = bbq::cek::ArrayMode::Count;
+                count_expr = compile_expr(count_term->count, r, ::bbq::ac(),
+                                          ::bbq::jump(Lnext), Lnext);
+            } else if (auto* until_term = dynamic_cast<BBQ::UntilTerm*>(st->term)) {
+                mode = bbq::cek::ArrayMode::Until;
+                until_expr = compile_expr(until_term->condition, r, ::bbq::ac(),
+                                          ::bbq::jump(Lnext), Lnext);
+            }
+        }
+
+        // Tail: EndArray pops the LoopFrame and chains into Lnext.
+        bbq::cek::StaticKont* end_kont = make_end_array(Lnext);
+
+        // Allocate ArrayNext with body_entry=null; patch after body
+        // compilation to break the cycle.
+        auto* array_next = arena_->alloc<bbq::cek::ArrayNextNode>();
+        array_next->mode = mode;
+        array_next->count_expr = count_expr;
+        array_next->until_expr = until_expr;
+        array_next->end_node = end_kont;
+        array_next->body_entry = nullptr;  // patched below
+
+        // Array name comes from the enclosing field (e.g. "items" for
+        // `items: array<uint16>[n]`); the elements themselves are
+        // anonymous, so clear current_field_name_ before recursing
+        // into the element body. Restore after.
+        const char* array_name = current_field_name_;
+        current_field_name_ = nullptr;
+        bbq::cek::StaticKont* body_head = compile_type_expr(
+            element, r, ::bbq::effect(),
+            ::bbq::jump(array_next), array_next);
+        current_field_name_ = array_name;
+        array_next->body_entry = body_head;
+
+        return make_begin_array(intern_field_or_anon(), mode,
+                                count_expr, end_kont, body_head);
+    }
+
+    bbq::cek::StaticKont*
+    compile_alternatives(std::vector<BBQ::TypeExpr*> alts,
+                         ::bbq::rho_t r,
+                         bbq::cek::StaticKont* Lnext) {
+        if (alts.empty()) return Lnext;
+        if (alts.size() == 1) {
+            // Single alternative — no choice, just compile it.
+            return compile_type_expr(alts[0], r, ::bbq::effect(),
+                                     ::bbq::jump(Lnext), Lnext);
+        }
+        // commit chains all alternatives EXCEPT the last to a
+        // CommitChoice → Lnext sequence. The last alt has Lnext directly
+        // (per the OP_CHOICE/OP_COMMIT pattern in the design doc).
+        auto* commit = make_commit_choice(Lnext);
+
+        // Build alt2..altN-1 chains (each ends with CommitChoice).
+        // Last alt (altN) chains directly to Lnext.
+        std::vector<bbq::cek::StaticKont*> rest_alts;
+        rest_alts.reserve(alts.size() - 1);
+        for (size_t i = 1; i + 1 < alts.size(); ++i) {
+            rest_alts.push_back(
+                compile_type_expr(alts[i], r, ::bbq::effect(),
+                                  ::bbq::jump(commit), commit));
+        }
+        // Last alternative — no commit needed.
+        rest_alts.push_back(
+            compile_type_expr(alts.back(), r, ::bbq::effect(),
+                              ::bbq::jump(Lnext), Lnext));
+
+        // First alt is the BeginChoice's `next`; it also commits on success.
+        auto* first = compile_type_expr(alts[0], r, ::bbq::effect(),
+                                        ::bbq::jump(commit), commit);
+        return make_begin_choice(rest_alts, first);
+    }
+
+    bbq::cek::StaticKont*
+    compile_union(std::vector<BBQ::Variant*> variants,
+                  ::bbq::rho_t r,
+                  bbq::cek::StaticKont* Lnext) {
+        // Each variant has a body type_expr; treat them as alternatives.
+        std::vector<BBQ::TypeExpr*> alts;
+        alts.reserve(variants.size());
+        for (auto* v : variants) alts.push_back(v->body);
+        return compile_alternatives(alts, r, Lnext);
+    }
+
+    bbq::cek::StaticKont*
+    compile_primitive(BBQ::PrimitiveKind* kind,
+                      std::optional<BBQ::Expr*> constraint,
+                      std::optional<BBQ::Interval*> interval,
+                      ::bbq::rho_t r,
+                      bbq::cek::StaticKont* Lnext) {
+        // Emit the constraint check first (it's the LAST thing to run
+        // after the primitive read), wrapped around Lnext.
+        bbq::cek::StaticKont* tail = Lnext;
+        if (constraint.has_value() && constraint.value()) {
+            auto* expr_ir = compile_expr(constraint.value(), r,
+                                         ::bbq::ac(), ::bbq::jump(Lnext), Lnext);
+            // EvalConstraintNode reads ac, branches to on_false (null
+            // → fail) or next (= Lnext on success).
+            tail = make_eval_constraint(expr_ir, nullptr, Lnext);
+        }
+
+        // Bytes/String → MatchBytes with the interval-derived length.
+        if (dynamic_cast<BBQ::BytesKind*>(kind) != nullptr ||
+            dynamic_cast<BBQ::StringKind*>(kind) != nullptr) {
+            bool is_string = (dynamic_cast<BBQ::StringKind*>(kind) != nullptr);
+            // Interval must be Length(expr) for bytes/string with
+            // variable length.
+            bbq::cek::StaticKont* length_expr = nullptr;
+            if (interval.has_value()) {
+                if (auto* len = dynamic_cast<BBQ::Length*>(interval.value())) {
+                    length_expr = compile_expr(len->length, r,
+                                               ::bbq::ac(),
+                                               ::bbq::jump(tail), tail);
+                }
+            }
+            if (length_expr == nullptr) {
+                // No interval / not Length — emit a literal 0-length;
+                // runtime will produce an empty bytes capture. Sema
+                // catches missing-length-on-bytes earlier so this is
+                // a defensive default.
+                length_expr = make_int_lit(0);
+            }
+            return make_match_bytes(intern_field_or_anon(),
+                                    length_expr, is_string, tail);
+        }
+
+        // Other primitives → MatchPrimitive.
+        bbq::cek::PrimitiveInfo prim = to_prim_info(kind);
+        return make_match_primitive(intern_field_or_anon(), prim, tail);
+    }
+
+    std::string intern_field_or_anon() {
+        return current_field_name_ ? std::string(current_field_name_) : std::string();
+    }
+
+    bbq::cek::StaticKont* make_ref_or_builtin(const std::string& n) {
+        if (n == "i")         return make_loop_var();
+        if (n == "pos")       return make_pos();
+        if (n == "remaining") return make_remaining();
+        if (n == "at_end")    return make_at_end();
+        return make_ref(n);
+    }
+
+    // ── Helper implementations ────────────────────────
+    //
+    // These are MEMBER methods that the rule bodies call. They take
+    // AST nodes/lists by value (matching what ddcgc passes through
+    // the auto-generated dispatch) and return either an IR sub-tree
+    // or a list of IR shapes. They recursively call compile_expr /
+    // compile_type_expr (the auto-generated dispatch entries) which
+    // ddcgc declares on this class.
+
+    std::vector<bbq::cek::StaticKont*>
+    compile_call_args(std::vector<BBQ::Expr*> args, ::bbq::rho_t r,
+                      bbq::cek::StaticKont* Lnext) {
+        std::vector<bbq::cek::StaticKont*> out;
+        out.reserve(args.size());
+        for (auto* a : args) {
+            out.push_back(compile_expr(a, r, ::bbq::ac(), ::bbq::jump(Lnext), Lnext));
+        }
+        return out;
+    }
+
+    bbq::cek::StaticKont*
+    compile_fields(std::vector<BBQ::Field*> fields, bbq::cek::StaticKont* tail) {
+        // Compile fields in reverse so each field's `next` chains to
+        // the already-compiled tail. Each field's body uses the field
+        // name via current_field_name_; rho carries the same.
+        bbq::cek::StaticKont* chain = tail;
+        for (auto it = fields.rbegin(); it != fields.rend(); ++it) {
+            BBQ::Field* f = *it;
+            const char* prev_name = current_field_name_;
+            current_field_name_ = f->name.c_str();
+            ::bbq::rho_t r{};
+            chain = compile_type_expr(f->body, r, ::bbq::effect(),
+                                      ::bbq::jump(chain), chain);
+            current_field_name_ = prev_name;
+        }
+        return chain;
+    }
+
+    std::vector<bbq::cek::bitfield_entry>
+    compile_bitfield_entries(std::vector<BBQ::BitfieldEntry*> entries) {
+        std::vector<bbq::cek::bitfield_entry> out;
+        out.reserve(entries.size());
+        for (auto* e : entries) {
+            bbq::cek::bitfield_entry b{};
+            b.name = strings_->intern(e->name);
+            b.width_bits = static_cast<int>(e->width);
+            out.push_back(b);
+        }
+        return out;
+    }
+
+    bbq::cek::StaticKont*
+    compile_switch_default(std::optional<BBQ::SwitchDefault*> dflt, ::bbq::rho_t r,
+                           bbq::cek::StaticKont* Lnext) {
+        if (!dflt.has_value() || !dflt.value()) return nullptr;
+        return compile_type_expr(dflt.value()->target, r, ::bbq::effect(),
+                                 ::bbq::jump(Lnext), Lnext);
+    }
+
+    std::vector<bbq::cek::switch_case>
+    compile_switch_cases(std::vector<BBQ::SwitchCase*> cases, ::bbq::rho_t r,
+                         bbq::cek::StaticKont* Lnext) {
+        std::vector<bbq::cek::switch_case> out;
+        out.reserve(cases.size());
+        for (auto* c : cases) {
+            bbq::cek::switch_case sc{};
+            sc.match_value = case_value_to_value(c->value);
+            sc.target = compile_type_expr(c->target, r, ::bbq::effect(),
+                                          ::bbq::jump(Lnext), Lnext);
+            out.push_back(sc);
+        }
+        return out;
+    }
+
+    // Convert a BBQ AST case_value variant into a typed Value.
+    // Cases are int or string at the AST level; runtime SwitchSelect
+    // matches by tag + interned-pointer or scalar comparison.
+    bbq::cek::Value* case_value_to_value(BBQ::CaseValue* cv) {
+        if (auto* iv = dynamic_cast<BBQ::IntValue*>(cv)) {
+            auto* v = arena_->alloc<bbq::cek::IntValue>();
+            v->v = iv->value;
+            return v;
+        }
+        if (auto* sv = dynamic_cast<BBQ::StrValue*>(cv)) {
+            auto* v = arena_->alloc<bbq::cek::StringValue>();
+            v->v = strings_->intern(sv->value);
+            return v;
+        }
+        if (auto* iv = dynamic_cast<BBQ::IdentValue*>(cv)) {
+            // IdentValue's payload is `name` (identifier), not `value`.
+            auto* v = arena_->alloc<bbq::cek::StringValue>();
+            v->v = strings_->intern(iv->name);
+            return v;
+        }
+        return nullptr;
+    }
+
+    // Path navigation: walk a RefPath (Simple / FieldAcc / IndexAcc)
+    // outward-in, building a chain of path-nav konts. The outermost
+    // call wraps with CaptureValue when then_capture is true.
+    bbq::cek::StaticKont*
+    compile_ref_path(BBQ::RefPath* path, const std::string& field, bool then_capture) {
+        if (auto* simple = dynamic_cast<BBQ::Simple*>(path)) {
+            auto* base = make_path_start(simple->name);
+            auto* fa = make_field_access(field, base);
+            return then_capture ? make_capture_value(fa) : fa;
+        }
+        if (auto* fa = dynamic_cast<BBQ::FieldAcc*>(path)) {
+            auto* base = compile_ref_path(fa->base, fa->field, false);
+            auto* step = make_field_access(field, base);
+            return then_capture ? make_capture_value(step) : step;
+        }
+        if (auto* ia = dynamic_cast<BBQ::IndexAcc*>(path)) {
+            ::bbq::rho_t r{};
+            auto* idx = compile_expr(ia->index, r, ::bbq::ac(),
+                                     ::bbq::jump(nullptr), nullptr);
+            auto* base = compile_ref_path(ia->base, "", false);
+            auto* step = make_index_access(idx, base);
+            auto* fa_step = make_field_access(field, step);
+            return then_capture ? make_capture_value(fa_step) : fa_step;
+        }
+        return nullptr;
+    }
+
+    bbq::cek::StaticKont*
+    compile_ref_index_path(BBQ::RefPath* base_path, bbq::cek::StaticKont* idx, bool then_capture) {
+        auto* base = compile_ref_path(base_path, "", false);
+        auto* step = make_index_access(idx, base);
+        return then_capture ? make_capture_value(step) : step;
+    }
+.)
+
+// ── DDCG helpers, inlined for BBQ's narrow δ/γ usage ──────
+//
+// BBQ's IR shape encodes control flow via `next` pointers on spine
+// konts and via K push/pop in the trampoline — there are no Goto /
+// Branch / Leave / Halt-with-value IR variants to wrap values in.
+// As a result, cg_deliver collapses to "return the value sub-tree;
+// trust that the rule passed γ=jump(Lnext)." Mismatch (L ≠ Lnext)
+// is paper-undefined for BBQ — would mean a normalizer bug or a rule
+// that synthesized the wrong γ — and panics.
+
+fun cg_jump(g : gamma, Lnext : ir_root) -> ir_root {
+    match (g) {
+        jump(L) => L == Lnext ? Lnext : panic_unreachable()
+    };
+}
+
+fun cg_deliver(value : ir_root, d : delta, g : gamma, Lnext : ir_root) -> ir_root {
+    // δ=ac     — value sub-tree is the answer; caller embeds it in
+    //            its parent producer — binop, ternary, call.
+    // δ=effect — spine kont with `next` already wired to Lnext.
+    // Both cases reduce to returning the value, but only when γ's L
+    // matches Lnext (always true for BBQ rules; otherwise panic).
+    match (g) {
+        jump(L) => L == Lnext ? value : panic_unreachable()
+    };
+}
+
+RULES
+
+// ── Expression leaves ──────────────────────────────────────
+
+rule expr_int_lit : ast.IntLit(value: n) {
+    cg_deliver(make_int_lit(n), delta, gamma, Lnext);
+}
+
+rule expr_bool_lit : ast.BoolLit(value: b) {
+    cg_deliver(make_bool_lit(b), delta, gamma, Lnext);
+}
+
+rule expr_float_lit : ast.FloatLit(value: f) {
+    cg_deliver(make_float_lit(f), delta, gamma, Lnext);
+}
+
+rule expr_str_lit : ast.StrLit(value: s) {
+    cg_deliver(make_str_lit(s), delta, gamma, Lnext);
+}
+
+rule expr_eoi : ast.EOI() {
+    cg_deliver(make_eoi(), delta, gamma, Lnext);
+}
+
+// ── Expression: Ref (variable / built-in / loop var / path) ───
+
+rule expr_ref_simple : ast.Ref(path: ast.Simple(name: n)) {
+    // Built-in pseudo-references (i / pos / remaining / at_end) go
+    // to special leaf konts; ordinary names go through env lookup
+    // at runtime via RefKont. The dispatch lives in C++ — the
+    // make_ref_or_builtin aux handles the strcmp.
+    cg_deliver(make_ref_or_builtin(n), delta, gamma, Lnext);
+}
+
+rule expr_ref_field : ast.Ref(path: ast.FieldAcc(base: b, field: f)) {
+    // Path navigation: PathStart at the base name, FieldAccess for
+    // each step, CaptureValue at the outer to convert the final
+    // FieldCaptureValue to a typed scalar Value.
+    let path_node = compile_ref_path(b, f, false);
+    cg_deliver(make_capture_value(path_node), delta, gamma, Lnext);
+}
+
+rule expr_ref_index : ast.Ref(path: ast.IndexAcc(base: b, index: i)) {
+    let idx = gen(i, rho, ac, jump(Lnext), Lnext);
+    let path_node = compile_ref_index_path(b, idx, false);
+    cg_deliver(make_capture_value(path_node), delta, gamma, Lnext);
+}
+
+// ── Expression: BinOp ─────────────────────────────────────
+
+rule expr_binop_add : ast.BinOp(op: Add, left: l, right: r) {
+    let lv = gen(l, rho, ac, jump(Lnext), Lnext);
+    let rv = gen(r, rho, ac, jump(Lnext), Lnext);
+    cg_deliver(make_add(lv, rv), delta, gamma, Lnext);
+}
+rule expr_binop_sub : ast.BinOp(op: Sub, left: l, right: r) {
+    let lv = gen(l, rho, ac, jump(Lnext), Lnext);
+    let rv = gen(r, rho, ac, jump(Lnext), Lnext);
+    cg_deliver(make_sub(lv, rv), delta, gamma, Lnext);
+}
+rule expr_binop_mul : ast.BinOp(op: Mul, left: l, right: r) {
+    let lv = gen(l, rho, ac, jump(Lnext), Lnext);
+    let rv = gen(r, rho, ac, jump(Lnext), Lnext);
+    cg_deliver(make_mul(lv, rv), delta, gamma, Lnext);
+}
+rule expr_binop_div : ast.BinOp(op: Div, left: l, right: r) {
+    let lv = gen(l, rho, ac, jump(Lnext), Lnext);
+    let rv = gen(r, rho, ac, jump(Lnext), Lnext);
+    cg_deliver(make_div(lv, rv), delta, gamma, Lnext);
+}
+rule expr_binop_mod : ast.BinOp(op: Mod, left: l, right: r) {
+    let lv = gen(l, rho, ac, jump(Lnext), Lnext);
+    let rv = gen(r, rho, ac, jump(Lnext), Lnext);
+    cg_deliver(make_mod(lv, rv), delta, gamma, Lnext);
+}
+rule expr_binop_bit_and : ast.BinOp(op: BitAnd, left: l, right: r) {
+    let lv = gen(l, rho, ac, jump(Lnext), Lnext);
+    let rv = gen(r, rho, ac, jump(Lnext), Lnext);
+    cg_deliver(make_bit_and(lv, rv), delta, gamma, Lnext);
+}
+rule expr_binop_bit_or : ast.BinOp(op: BitOr, left: l, right: r) {
+    let lv = gen(l, rho, ac, jump(Lnext), Lnext);
+    let rv = gen(r, rho, ac, jump(Lnext), Lnext);
+    cg_deliver(make_bit_or(lv, rv), delta, gamma, Lnext);
+}
+rule expr_binop_bit_xor : ast.BinOp(op: BitXor, left: l, right: r) {
+    let lv = gen(l, rho, ac, jump(Lnext), Lnext);
+    let rv = gen(r, rho, ac, jump(Lnext), Lnext);
+    cg_deliver(make_bit_xor(lv, rv), delta, gamma, Lnext);
+}
+rule expr_binop_shl : ast.BinOp(op: Shl, left: l, right: r) {
+    let lv = gen(l, rho, ac, jump(Lnext), Lnext);
+    let rv = gen(r, rho, ac, jump(Lnext), Lnext);
+    cg_deliver(make_shl(lv, rv), delta, gamma, Lnext);
+}
+rule expr_binop_shr : ast.BinOp(op: Shr, left: l, right: r) {
+    let lv = gen(l, rho, ac, jump(Lnext), Lnext);
+    let rv = gen(r, rho, ac, jump(Lnext), Lnext);
+    cg_deliver(make_shr(lv, rv), delta, gamma, Lnext);
+}
+rule expr_binop_eq : ast.BinOp(op: Eq, left: l, right: r) {
+    let lv = gen(l, rho, ac, jump(Lnext), Lnext);
+    let rv = gen(r, rho, ac, jump(Lnext), Lnext);
+    cg_deliver(make_eq(lv, rv), delta, gamma, Lnext);
+}
+rule expr_binop_ne : ast.BinOp(op: Ne, left: l, right: r) {
+    let lv = gen(l, rho, ac, jump(Lnext), Lnext);
+    let rv = gen(r, rho, ac, jump(Lnext), Lnext);
+    cg_deliver(make_ne(lv, rv), delta, gamma, Lnext);
+}
+rule expr_binop_lt : ast.BinOp(op: Lt, left: l, right: r) {
+    let lv = gen(l, rho, ac, jump(Lnext), Lnext);
+    let rv = gen(r, rho, ac, jump(Lnext), Lnext);
+    cg_deliver(make_lt(lv, rv), delta, gamma, Lnext);
+}
+rule expr_binop_le : ast.BinOp(op: Le, left: l, right: r) {
+    let lv = gen(l, rho, ac, jump(Lnext), Lnext);
+    let rv = gen(r, rho, ac, jump(Lnext), Lnext);
+    cg_deliver(make_le(lv, rv), delta, gamma, Lnext);
+}
+rule expr_binop_gt : ast.BinOp(op: Gt, left: l, right: r) {
+    let lv = gen(l, rho, ac, jump(Lnext), Lnext);
+    let rv = gen(r, rho, ac, jump(Lnext), Lnext);
+    cg_deliver(make_gt(lv, rv), delta, gamma, Lnext);
+}
+rule expr_binop_ge : ast.BinOp(op: Ge, left: l, right: r) {
+    let lv = gen(l, rho, ac, jump(Lnext), Lnext);
+    let rv = gen(r, rho, ac, jump(Lnext), Lnext);
+    cg_deliver(make_ge(lv, rv), delta, gamma, Lnext);
+}
+rule expr_binop_and : ast.BinOp(op: And, left: l, right: r) {
+    let lv = gen(l, rho, ac, jump(Lnext), Lnext);
+    let rv = gen(r, rho, ac, jump(Lnext), Lnext);
+    cg_deliver(make_logical_and(lv, rv), delta, gamma, Lnext);
+}
+rule expr_binop_or : ast.BinOp(op: Or, left: l, right: r) {
+    let lv = gen(l, rho, ac, jump(Lnext), Lnext);
+    let rv = gen(r, rho, ac, jump(Lnext), Lnext);
+    cg_deliver(make_logical_or(lv, rv), delta, gamma, Lnext);
+}
+
+// ── Unary ──────────────────────────────────────────────────
+
+rule expr_unary_neg : ast.UnaryOp(op: Neg, operand: e) {
+    let ev = gen(e, rho, ac, jump(Lnext), Lnext);
+    cg_deliver(make_neg(ev), delta, gamma, Lnext);
+}
+
+rule expr_unary_bitnot : ast.UnaryOp(op: BitNot, operand: e) {
+    let ev = gen(e, rho, ac, jump(Lnext), Lnext);
+    cg_deliver(make_bit_not(ev), delta, gamma, Lnext);
+}
+
+rule expr_unary_not : ast.UnaryOp(op: Not, operand: e) {
+    let ev = gen(e, rho, ac, jump(Lnext), Lnext);
+    cg_deliver(make_not(ev), delta, gamma, Lnext);
+}
+
+// ── Ternary ────────────────────────────────────────────────
+
+rule expr_ternary : ast.Ternary(cond: c, then_branch: t, else_branch: el) {
+    let cv = gen(c, rho, ac, jump(Lnext), Lnext);
+    let tv = gen(t, rho, ac, jump(Lnext), Lnext);
+    let ev = gen(el, rho, ac, jump(Lnext), Lnext);
+    cg_deliver(make_ternary(cv, tv, ev), delta, gamma, Lnext);
+}
+
+rule expr_endian_lit : ast.EndianLit(value: v) {
+    // Endian literal compiles to a bool: true=little, false=big.
+    cg_deliver(make_bool_lit(endian_to_bool(v)), delta, gamma, Lnext);
+}
+
+// ── Function call ──────────────────────────────────────────
+
+rule expr_call : ast.Call(func: f, args: as) {
+    let arg_irs = compile_call_args(as, rho, Lnext);
+    cg_deliver(make_call(f, arg_irs), delta, gamma, Lnext);
+}
+
+// ── Structural: Rule (top-level entry compiled by the driver) ──
+
+// Each rule's body compiles as a spine kont chain ending in Lnext.
+// The driver passes Lnext = ReturnRule → Halt for each rule, so the
+// body's tail naturally chains into return/halt.
+rule rule_def : ast.Rule(name: n, body: b) {
+    gen(b, rho, delta, gamma, Lnext);
+}
+
+// ── Structural: Struct ─────────────────────────────────────
+
+rule struct_def : ast.Struct(fields: fs) {
+    // BeginStruct → compile each field in reverse → EndStruct → Lnext
+    let end_kont = make_end_struct(Lnext);
+    let fields_chain = compile_fields(fs, end_kont);
+    cg_deliver(make_begin_struct(intern_field_or_anon(), fields_chain), delta, gamma, Lnext);
+}
+
+// ── Structural: Primitive ──────────────────────────────────
+
+rule primitive_def : ast.Primitive(kind: k, constraint: cn, interval: iv) {
+    // The primitive_kind AST distinguishes bytes/string (variable length
+    // via interval) from int/float/bool (fixed primitive). The helper
+    // dispatches on kind and wraps with EvalConstraint when constraint
+    // is set.
+    cg_deliver(compile_primitive(k, cn, iv, rho, Lnext),
+               delta, gamma, Lnext);
+}
+
+// ── Structural: RuleRef ────────────────────────────────────
+
+rule rule_ref_def : ast.RuleRef(name: n) {
+    // Wrap InvokeRule with BeginStruct/EndStruct under the field name.
+    // For `hdr: Inner`, this puts Inner's captures under a sub-struct
+    // named "hdr" — matching the user-facing convention `result.hdr.x`
+    // and the OLD compiler's behavior. The Inner rule body itself
+    // doesn't add a wrapper (top-level rules inline per the driver).
+    //
+    // make_invoke_rule registers the InvokeRuleNode for forward-ref
+    // patching; entry is filled in by compile_grammar after every rule
+    // body is compiled, so recursive grammars link correctly.
+    let end_st = make_end_struct(Lnext);
+    let invoke = make_invoke_rule(n, end_st);
+    cg_deliver(make_begin_struct(intern_field_or_anon(), invoke),
+               delta, gamma, Lnext);
+}
+
+// ── Structural: Compute ────────────────────────────────────
+// `compute(expr : type)` evaluates expr and binds it. The field name
+// comes from the parent Field; this rule just emits BindCompute with
+// the expression sub-tree.
+
+rule compute_def : ast.Compute(expression: e) {
+    let expr_ir = gen(e, rho, ac, jump(Lnext), Lnext);
+    cg_deliver(make_bind_compute(intern_field_or_anon(), expr_ir, Lnext), delta, gamma, Lnext);
+}
+
+// ── Structural: Extern ─────────────────────────────────────
+
+rule extern_def : ast.Extern(func_name: f) {
+    cg_deliver(make_external_call(f, intern_field_or_anon(), Lnext), delta, gamma, Lnext);
+}
+
+// ── Structural: EndianSwitch ───────────────────────────────
+
+rule endian_switch_def : ast.EndianSwitch(endian_expr: e) {
+    let expr_ir = gen(e, rho, ac, jump(Lnext), Lnext);
+    cg_deliver(make_set_endian(expr_ir, Lnext), delta, gamma, Lnext);
+}
+
+// ── Structural: Bitfield ───────────────────────────────────
+
+rule bitfield_def : ast.Bitfield(container: c, entries: es) {
+    let prim = to_prim_info(c);
+    let entry_list = compile_bitfield_entries(es);
+    cg_deliver(make_bitfield_read(prim, entry_list, Lnext), delta, gamma, Lnext);
+}
+
+// ── Structural: Optional ───────────────────────────────────
+
+rule optional_def : ast.Optional(element: e) {
+    let end = make_end_optional(Lnext);
+    let inner = gen(e, rho, effect, jump(end), end);
+    cg_deliver(make_begin_optional(inner, Lnext), delta, gamma, Lnext);
+}
+
+// ── Structural: Switch ─────────────────────────────────────
+
+rule switch_def : ast.Switch(discriminator: d, cases: cs, default: dflt) {
+    let cs_list = compile_switch_cases(cs, rho, Lnext);
+    let disc = gen(d, rho, ac, jump(Lnext), Lnext);
+    let default_target = compile_switch_default(dflt, rho, Lnext);
+    cg_deliver(make_switch_dispatch(disc, cs_list, default_target),
+               delta, gamma, Lnext);
+}
+
+rule alternatives_def : ast.Alternatives(alts: a) {
+    cg_deliver(compile_alternatives(a, rho, Lnext), delta, gamma, Lnext);
+}
+
+rule union_def : ast.Union(variants: vs) {
+    // Union variants are essentially alternative type-exprs; reuse
+    // the alternatives helper after stripping each variant's body.
+    cg_deliver(compile_union(vs, rho, Lnext), delta, gamma, Lnext);
+}
+
+rule array_def : ast.Array(element: e, spec: s) {
+    cg_deliver(compile_array(e, s, rho, Lnext), delta, gamma, Lnext);
+}
+

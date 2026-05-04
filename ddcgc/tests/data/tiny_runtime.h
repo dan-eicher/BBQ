@@ -57,4 +57,9 @@ struct gamma_t {
 inline gamma_t fail()           { return {GammaTag::Fail, 0}; }
 inline gamma_t restore(int s)   { return {GammaTag::Restore, s}; }
 
+// ── env_dest rho — paper's ρ ────────────────────────────────────────
+struct rho_t {
+    int depth;
+};
+
 } // namespace tiny

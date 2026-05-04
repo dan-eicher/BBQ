@@ -2,27 +2,101 @@ COMPILER Calc
 
 (. #include <string>
    #include <cstdint>
+   #include <vector>
    #include "PegRuntime.h"
 .)
 
 CHARACTERS
-  digit = '0'..'9' .
+  letter         = 'a'..'z' + 'A'..'Z' + '_' .
+  digit          = '0'..'9' .
+  ident_continue = letter + digit .
 
 TOKENS
   integer = digit { digit } .
+  ident   = letter { ident_continue } .
 
 IGNORE '\r' + '\n' + '\t' + ' '
 
 PRODUCTIONS
 
 Calc
-    (. calc::Expr* e; .)
-    = Expr<&e>
+    (. std::vector<calc::Function*> fns;
+       calc::Expr* e; .)
+    = { FunctionDecl<&fns> }
+      Expr<&e>
       (. skip(); if (!at_end()) return false; .)
-    (. ast = new calc::Program(e); .)
+    (. ast = new calc::Program(std::move(fns), e); .)
 .
 
-Expr <. calc::Expr* *result .>  = AddExpr<result> .
+// Phase 9 — top-level function declaration.
+//   fn name($p1, $p2, ...) body
+// Body is a single Atom (parens for compound bodies). Functions are
+// collected by `Calc` and stored in Program.functions; the Phase 9c
+// driver compiles each into its own IR chain.
+FunctionDecl <. std::vector<calc::Function*>* fns .>
+    (. peg::Span name_span;
+       std::vector<std::string> params;
+       calc::Expr* body; .)
+    = "fn" ident<name_span>
+      "(" [ Param<&params> { "," Param<&params> } ] ")"
+      Atom<&body> [ ";" ]
+      (. fns->push_back(new calc::Function(
+             name_span.to_string(), std::move(params), body)); .)
+.
+
+Param <. std::vector<std::string>* params .>
+    (. peg::Span p_span; .)
+    = "$" ident<p_span>
+      (. params->push_back("$" + p_span.to_string()); .)
+.
+
+Expr <. calc::Expr* *result .>  = SeqExpr<result> .
+
+// SeqExpr — right-associative `;` sequencing. Per Dybvig 1990 Figure 5,
+// `seq E1 E2`: E1 is evaluated for effect, E2's value is the result.
+// `a ; b ; c` parses as Sequence(a, Sequence(b, c)).
+SeqExpr <. calc::Expr* *result .>
+    (. calc::Expr* rest; .)
+    = OrExpr<result>
+      [ ";" SeqExpr<&rest>
+        (. *result = new calc::Sequence(*result, rest); .)
+      ]
+.
+
+// Boolean operators — `||` lowest precedence, `&&` next, both
+// left-associative. `!` is unary at UnaryExpr level. Page 12 / Figure
+// 7 handle these per context (test vs non-test); the normalizer
+// rewrites non-test occurrences to if-form.
+OrExpr <. calc::Expr* *result .>
+    (. calc::Expr* rhs; .)
+    = AndExpr<result>
+      { "||" AndExpr<&rhs>  (. *result = new calc::Or(*result, rhs); .)
+      }
+.
+
+AndExpr <. calc::Expr* *result .>
+    (. calc::Expr* rhs; .)
+    = CmpExpr<result>
+      { "&&" CmpExpr<&rhs>  (. *result = new calc::And(*result, rhs); .)
+      }
+.
+
+// CmpExpr — one optional comparison. Non-associative (no chaining).
+// Each comparison kind builds its own AST constructor (CEK shape: no
+// runtime relop enum to dispatch on).
+//   `a < b` → CmpLt(a, b)
+//   `a < b < c` → parse error (the trailing `< c` is not a CmpExpr).
+CmpExpr <. calc::Expr* *result .>
+    (. calc::Expr* rhs; .)
+    = AddExpr<result>
+      [ "==" AddExpr<&rhs>  (. *result = new calc::CmpEq(*result, rhs); .)
+      | "!=" AddExpr<&rhs>  (. *result = new calc::CmpNeq(*result, rhs); .)
+      | "<=" AddExpr<&rhs>  (. *result = new calc::CmpLe(*result, rhs); .)
+      | ">=" AddExpr<&rhs>  (. *result = new calc::CmpGe(*result, rhs); .)
+      | "<"  AddExpr<&rhs>  (. *result = new calc::CmpLt(*result, rhs); .)
+      | ">"  AddExpr<&rhs>  (. *result = new calc::CmpGt(*result, rhs); .)
+      ]
+.
 
 AddExpr <. calc::Expr* *result .>
     (. calc::Expr* right; .)
@@ -41,16 +115,45 @@ MulExpr <. calc::Expr* *result .>
 
 UnaryExpr <. calc::Expr* *result .>
     = "-" UnaryExpr<result>  (. *result = new calc::NegOp(*result); .)
+    | "!" UnaryExpr<result>  (. *result = new calc::Not(*result); .)
     | Atom<result>
 .
 
+// `$N` (integer) is the legacy positional addressing — kept through
+// Phase 9d, removed in 9e. `$<ident>` is the Phase 9 named-variable
+// form (resolved by the normalizer's scope chain to LocalRef/LocalAssign).
+// `let $a = e` declares + initializes a fresh local.
+// `name(args)` is a function call; bare `name` (without `$`, without
+// parens) is currently unused — function names appear only at call
+// sites and in fn decls.
 Atom <. calc::Expr* *result .>
-    (. peg::Span n_span; int64_t n; .)
-    = "$" integer<n_span>  (. n = std::stoll(n_span.to_string());
-                             *result = new calc::SlotRef(n); .)
+    (. peg::Span n_span; peg::Span name_span; int64_t n;
+       calc::Expr* val = nullptr;
+       calc::Expr* cond = nullptr; calc::Expr* then_ = nullptr; calc::Expr* else_ = nullptr;
+       calc::Expr* body = nullptr;
+       std::vector<calc::Expr*> args;
+       calc::Expr* arg = nullptr; .)
+    = "let" "$" ident<name_span> "=" AddExpr<&val>
+                           (. *result = new calc::LetDecl("$" + name_span.to_string(), val); .)
+    | "$" ident<name_span> (. *result = new calc::Var("$" + name_span.to_string()); .)
+                           [ "=" AddExpr<&val>
+                             (. *result = new calc::VarAssign("$" + name_span.to_string(), val); .)
+                           ]
     | integer<n_span>      (. n = std::stoll(n_span.to_string());
                              *result = new calc::IntLit(n); .)
     | "(" Expr<result> ")"
+    | "if" "(" Expr<&cond> ")" CmpExpr<&then_>
+                           [ "else" CmpExpr<&else_> ]
+                           (. *result = new calc::If(cond, then_, else_); .)
+    | "while" "(" Expr<&cond> ")" CmpExpr<&body>
+                           (. *result = new calc::While(cond, body); .)
+    | "break"              (. *result = new calc::Break(); .)
+    | "return" CmpExpr<&val>
+                           (. *result = new calc::Return(val); .)
+    | ident<name_span> "(" [ Expr<&arg> (. args.push_back(arg); .)
+                             { "," Expr<&arg> (. args.push_back(arg); .) }
+                           ] ")"
+                           (. *result = new calc::Call(name_span.to_string(), std::move(args)); .)
 .
 
 END Calc.

@@ -40,11 +40,15 @@ private:
     bool parse_DestFieldDecl(std::vector<DdcgAst::DestField*>& fields);
     bool parse_AuxiliaryDecl(std::vector<DdcgAst::Aux*>& auxiliaries);
     bool parse_PredicateDecl(std::vector<DdcgAst::Pred*>& predicates);
+    bool parse_FunDecl(std::vector<DdcgAst::Fun*>& funs);
+    bool parse_FunParamDecl(std::vector<DdcgAst::FunParam*>& params);
+    bool parse_LibraryImport(std::vector<DdcgAst::LibraryImport*>& libraries);
     bool parse_TypeRefList(std::vector<DdcgAst::TypeRef*>& refs);
     bool parse_TypeRef_(DdcgAst::TypeRef* * result);
     bool parse_RuleDecl(std::vector<DdcgAst::Rule*>& rules);
     bool parse_Block_(std::vector<DdcgAst::Stmt*>& body);
     bool parse_Pattern_(DdcgAst::Pattern* * result);
+    bool parse_MatchArm_(std::vector<DdcgAst::MatchArm*>& arms);
     bool parse_FieldPat_(std::vector<DdcgAst::FieldPat*>& fields);
     bool parse_Stmt_(std::vector<DdcgAst::Stmt*>& stmts);
     bool parse_Bind_(DdcgAst::Bind* * result);

@@ -23,7 +23,7 @@
 #include "Errors.h"
 
 // BBQ CEK backend
-#include "Compiler.h"
+#include "bbq_compile.h"
 #include "Machine.h"
 #include "Capture.h"
 
@@ -180,8 +180,28 @@ static PyObject* decode_int(const FieldCapture* cap, const uint8_t* data) {
         }
         case CaptureType::Bool:
             return PyLong_FromLong(data[off] ? 1 : 0);
-        case CaptureType::Computed:
-            return PyLong_FromLongLong(cap->computed_value);
+        case CaptureType::Computed: {
+            // computed_value is a typed Value* in the new IR. Dispatch
+            // on the Value tag — IntValue/BoolValue → int, FloatValue
+            // → float (truncated to int for back-compat with this
+            // function's int-typed return path), other types fail.
+            if (!cap->computed_value) return PyLong_FromLong(0);
+            switch (cap->computed_value->tag) {
+                case bbq::cek::ValueTag::IntValue:
+                    return PyLong_FromLongLong(
+                        static_cast<bbq::cek::IntValue*>(cap->computed_value)->v);
+                case bbq::cek::ValueTag::BoolValue:
+                    return PyLong_FromLong(
+                        static_cast<bbq::cek::BoolValue*>(cap->computed_value)->v ? 1 : 0);
+                case bbq::cek::ValueTag::FloatValue:
+                    return PyLong_FromLongLong(static_cast<int64_t>(
+                        static_cast<bbq::cek::FloatValue*>(cap->computed_value)->v));
+                default:
+                    PyErr_SetString(PyExc_TypeError,
+                                    "computed value is not numeric");
+                    return NULL;
+            }
+        }
         default:
             PyErr_Format(PyExc_TypeError, "cannot convert %s to int",
                         capture_type_name(cap->type));
@@ -347,8 +367,21 @@ static int PyBBQNode_nb_bool(PyBBQNode* self) {
         case CaptureType::Bytes:
         case CaptureType::External:
             return (self->capture->end_offset > self->capture->start_offset) ? 1 : 0;
-        case CaptureType::Computed:
-            return self->capture->computed_value ? 1 : 0;
+        case CaptureType::Computed: {
+            // Truthy iff the Value pointer exists AND its underlying
+            // value is non-zero / non-empty. Match the runtime's
+            // bool-coercion semantics: IntValue nonzero=true, BoolValue
+            // by-value, others → consider present-ness.
+            auto* v = self->capture->computed_value;
+            if (!v) return 0;
+            if (v->tag == bbq::cek::ValueTag::IntValue) {
+                return static_cast<bbq::cek::IntValue*>(v)->v != 0 ? 1 : 0;
+            }
+            if (v->tag == bbq::cek::ValueTag::BoolValue) {
+                return static_cast<bbq::cek::BoolValue*>(v)->v ? 1 : 0;
+            }
+            return 1;  // any other typed value present → truthy
+        }
         default: {
             PyObject* val = decode_auto_value(self->capture, self->result);
             if (!val) return -1;
@@ -1548,8 +1581,8 @@ static PyObject* compile_source(const char* source, Py_ssize_t length) {
         return NULL;
     }
 
-    CEKCompiler compiler;
-    CompiledGrammar* grammar = compiler.compile(parser.ast, sema);
+    ::bbq::Compiler compiler;
+    CompiledGrammar* grammar = compiler.compile_grammar(parser.ast);
     if (!grammar) {
         PyErr_SetString(PyBBQParseError, "compilation failed");
         return NULL;

@@ -108,71 +108,83 @@ bool Parser::parse_Ddcg() {
        DdcgAst::TypeRef* ir_root = nullptr;
        std::vector<DdcgAst::Aux*> auxiliaries;
        std::vector<DdcgAst::Pred*> predicates;
+       std::vector<DdcgAst::Fun*> funs;
+       std::vector<DdcgAst::LibraryImport*> libraries;
        std::string members;
        std::string priv;
        std::vector<std::string> desugared;
        std::vector<DdcgAst::Rule*> rules;
+       bool internal_dispatchers = false;
     skip();
     if (!match("COMPILER")) return false;
     skip();
     if (!ident(name_span)) return false;
     name = name_span.to_string();
-    for (;;) {
+    {
         auto _m0 = save();
         if (![&]() -> bool {
             skip();
-            if (!parse_HeaderBlock(headers)) return false;
+            if (!match("INTERNAL_DISPATCHERS")) return false;
+            internal_dispatchers = true;
             return true;
-        }()) { restore(_m0); break; }
+        }()) restore(_m0);
     }
-    skip();
-    if (!match("IMPORTS")) return false;
     for (;;) {
         auto _m1 = save();
         if (![&]() -> bool {
             skip();
-            if (!parse_ImportDecl(imports)) return false;
+            if (!parse_HeaderBlock(headers)) return false;
             return true;
         }()) { restore(_m1); break; }
     }
     skip();
-    if (!match("DESTINATIONS")) return false;
+    if (!match("IMPORTS")) return false;
     for (;;) {
         auto _m2 = save();
         if (![&]() -> bool {
             skip();
-            if (!parse_DestEntry(destinations, ir_root)) return false;
+            if (!parse_ImportDecl(imports)) return false;
             return true;
         }()) { restore(_m2); break; }
     }
     skip();
-    if (!match("AUXILIARIES")) return false;
+    if (!match("DESTINATIONS")) return false;
     for (;;) {
         auto _m3 = save();
         if (![&]() -> bool {
             skip();
-            if (!parse_AuxiliaryDecl(auxiliaries)) return false;
+            if (!parse_DestEntry(destinations, ir_root)) return false;
             return true;
         }()) { restore(_m3); break; }
     }
-    {
+    skip();
+    if (!match("AUXILIARIES")) return false;
+    for (;;) {
         auto _m4 = save();
+        if (![&]() -> bool {
+            skip();
+            if (!parse_AuxiliaryDecl(auxiliaries)) return false;
+            return true;
+        }()) { restore(_m4); break; }
+    }
+    {
+        auto _m5 = save();
         if (![&]() -> bool {
             skip();
             if (!match("PREDICATES")) return false;
             for (;;) {
-                auto _m5 = save();
+                auto _m6 = save();
                 if (![&]() -> bool {
                     skip();
                     if (!parse_PredicateDecl(predicates)) return false;
                     return true;
-                }()) { restore(_m5); break; }
+                }()) { restore(_m6); break; }
             }
             return true;
-        }()) restore(_m4);
+        }()) restore(_m5);
     }
     {
-        auto _m6 = save();
+        auto _m7 = save();
         if (![&]() -> bool {
             skip();
             if (!match("MEMBERS")) return false;
@@ -180,10 +192,10 @@ bool Parser::parse_Ddcg() {
             if (!match("(.")) return false;
             if (!scan_to("." ")", members)) return false;
             return true;
-        }()) restore(_m6);
+        }()) restore(_m7);
     }
     {
-        auto _m7 = save();
+        auto _m8 = save();
         if (![&]() -> bool {
             skip();
             if (!match("PRIVATE")) return false;
@@ -191,10 +203,10 @@ bool Parser::parse_Ddcg() {
             if (!match("(.")) return false;
             if (!scan_to("." ")", priv)) return false;
             return true;
-        }()) restore(_m7);
+        }()) restore(_m8);
     }
     {
-        auto _m8 = save();
+        auto _m9 = save();
         if (![&]() -> bool {
             skip();
             if (!match("DESUGARED")) return false;
@@ -202,7 +214,7 @@ bool Parser::parse_Ddcg() {
             if (!ident(name_span)) return false;
             desugared.push_back(name_span.to_string());
             for (;;) {
-                auto _m9 = save();
+                auto _m10 = save();
                 if (![&]() -> bool {
                     skip();
                     if (!match(",")) return false;
@@ -210,27 +222,47 @@ bool Parser::parse_Ddcg() {
                     if (!ident(name_span)) return false;
                     desugared.push_back(name_span.to_string());
                     return true;
-                }()) { restore(_m9); break; }
+                }()) { restore(_m10); break; }
             }
             return true;
-        }()) restore(_m8);
+        }()) restore(_m9);
+    }
+    for (;;) {
+        auto _m11 = save();
+        if (![&]() -> bool {
+            {
+                auto _m12 = save();
+                if ([&]() -> bool {
+                    skip();
+                    if (!parse_FunDecl(funs)) return false;
+                    return true;
+                }()) {} else {
+                restore(_m12);
+                skip();
+                if (!parse_LibraryImport(libraries)) return false;
+                }
+            }
+            return true;
+        }()) { restore(_m11); break; }
     }
     skip();
     if (!match("RULES")) return false;
     for (;;) {
-        auto _m10 = save();
+        auto _m13 = save();
         if (![&]() -> bool {
             skip();
             if (!parse_RuleDecl(rules)) return false;
             return true;
-        }()) { restore(_m10); break; }
+        }()) { restore(_m13); break; }
     }
     ast = new DdcgAst::File(std::move(name),
            std::move(headers), std::move(imports),
            std::move(destinations), ir_root,
            std::move(auxiliaries), std::move(predicates),
+           std::move(funs), std::move(libraries),
            std::move(members), std::move(priv),
-           std::move(desugared), std::move(rules));
+           std::move(desugared), std::move(rules),
+           internal_dispatchers);
        ast->loc = DdcgAst::SourceLoc{nullptr, 1, 1};
     return true;
 }
@@ -266,6 +298,7 @@ bool Parser::parse_ImportDecl(std::vector<DdcgAst::Import*>& imports) {
 bool Parser::parse_DestEntry(std::vector<DdcgAst::DestDecl*>& dests, DdcgAst::TypeRef*& ir_root) {
     peg::Span name_span; std::string name;
        std::vector<DdcgAst::DestVariant*> variants;
+       std::vector<DdcgAst::DestField*> fields;
        DdcgAst::TypeRef* ty = nullptr;
     {
         auto _m0 = save();
@@ -305,11 +338,46 @@ bool Parser::parse_DestEntry(std::vector<DdcgAst::DestDecl*>& dests, DdcgAst::Ty
             return true;
         }()) {} else {
         restore(_m0);
+        if ([&]() -> bool {
+            skip();
+            if (!match("env_dest")) return false;
+            skip();
+            if (!ident(name_span)) return false;
+            name = name_span.to_string();
+            skip();
+            if (!match("{")) return false;
+            {
+                auto _m1 = save();
+                if (![&]() -> bool {
+                    skip();
+                    if (!parse_DestFieldDecl(fields)) return false;
+                    for (;;) {
+                        auto _m2 = save();
+                        if (![&]() -> bool {
+                            skip();
+                            if (!match(",")) return false;
+                            skip();
+                            if (!parse_DestFieldDecl(fields)) return false;
+                            return true;
+                        }()) { restore(_m2); break; }
+                    }
+                    return true;
+                }()) restore(_m1);
+            }
+            skip();
+            if (!match("}")) return false;
+            auto* d = new DdcgAst::EnvDest(std::move(name), std::move(fields));
+         d->loc = Loc();
+         dests.push_back(d);
+            return true;
+        }()) {} else {
+        restore(_m0);
         skip();
         if (!match("ir_root")) return false;
         skip();
         if (!parse_TypeRef_(&ty)) return false;
         ir_root = ty;
+        }
         }
         }
     }
@@ -446,6 +514,79 @@ bool Parser::parse_PredicateDecl(std::vector<DdcgAst::Pred*>& predicates) {
     return true;
 }
 
+bool Parser::parse_FunDecl(std::vector<DdcgAst::Fun*>& funs) {
+    peg::Span name_span; std::string name;
+       std::vector<DdcgAst::FunParam*> params;
+       DdcgAst::TypeRef* ret = nullptr;
+       std::vector<DdcgAst::Stmt*> body;
+    skip();
+    if (!match("fun")) return false;
+    skip();
+    if (!ident(name_span)) return false;
+    name = name_span.to_string();
+    skip();
+    if (!match("(")) return false;
+    {
+        auto _m0 = save();
+        if (![&]() -> bool {
+            skip();
+            if (!parse_FunParamDecl(params)) return false;
+            for (;;) {
+                auto _m1 = save();
+                if (![&]() -> bool {
+                    skip();
+                    if (!match(",")) return false;
+                    skip();
+                    if (!parse_FunParamDecl(params)) return false;
+                    return true;
+                }()) { restore(_m1); break; }
+            }
+            return true;
+        }()) restore(_m0);
+    }
+    skip();
+    if (!match(")")) return false;
+    skip();
+    if (!match("->")) return false;
+    skip();
+    if (!parse_TypeRef_(&ret)) return false;
+    skip();
+    if (!parse_Block_(body)) return false;
+    auto* f = new DdcgAst::Fun(std::move(name), std::move(params), ret, std::move(body));
+         f->loc = Loc();
+         funs.push_back(f);
+    return true;
+}
+
+bool Parser::parse_FunParamDecl(std::vector<DdcgAst::FunParam*>& params) {
+    peg::Span name_span; std::string name;
+       DdcgAst::TypeRef* ty = nullptr;
+    skip();
+    if (!ident(name_span)) return false;
+    name = name_span.to_string();
+    skip();
+    if (!match(":")) return false;
+    skip();
+    if (!parse_TypeRef_(&ty)) return false;
+    auto* p = new DdcgAst::FunParam(std::move(name), ty);
+         p->loc = Loc();
+         params.push_back(p);
+    return true;
+}
+
+bool Parser::parse_LibraryImport(std::vector<DdcgAst::LibraryImport*>& libraries) {
+    peg::Span path_span; std::string path;
+    skip();
+    if (!match("import")) return false;
+    skip();
+    if (!string_lit(path_span)) return false;
+    path = peg::unescape_string_lit(path_span);
+    auto* l = new DdcgAst::LibraryImport(std::move(path));
+         l->loc = Loc();
+         libraries.push_back(l);
+    return true;
+}
+
 bool Parser::parse_TypeRefList(std::vector<DdcgAst::TypeRef*>& refs) {
     DdcgAst::TypeRef* t = nullptr;
     skip();
@@ -466,7 +607,8 @@ bool Parser::parse_TypeRefList(std::vector<DdcgAst::TypeRef*>& refs) {
 }
 
 bool Parser::parse_TypeRef_(DdcgAst::TypeRef* * result) {
-    peg::Span name_span; std::string name;
+    peg::Span name_span; peg::Span sub_span;
+       std::string mod; std::string name;
        std::vector<DdcgAst::TypeRef*> elems;
        DdcgAst::TypeRef* inner = nullptr;
        bool is_ptr = false;
@@ -521,12 +663,24 @@ bool Parser::parse_TypeRef_(DdcgAst::TypeRef* * result) {
             auto _m2 = save();
             if (![&]() -> bool {
                 skip();
-                if (!match("*")) return false;
-                is_ptr = true;
+                if (!match(".")) return false;
+                skip();
+                if (!ident(sub_span)) return false;
+                mod = std::move(name);
+                                     name = sub_span.to_string();
                 return true;
             }()) restore(_m2);
         }
-        auto* t = new DdcgAst::TypeName(std::move(name), is_ptr);
+        {
+            auto _m3 = save();
+            if (![&]() -> bool {
+                skip();
+                if (!match("*")) return false;
+                is_ptr = true;
+                return true;
+            }()) restore(_m3);
+        }
+        auto* t = new DdcgAst::TypeName(std::move(mod), std::move(name), is_ptr);
          t->loc = Loc();
          *result = t;
         }
@@ -664,6 +818,36 @@ bool Parser::parse_Pattern_(DdcgAst::Pattern* * result) {
                 return true;
             }()) {} else {
             restore(_m1);
+            if ([&]() -> bool {
+                skip();
+                if (!match("(")) return false;
+                {
+                    auto _m4 = save();
+                    if (![&]() -> bool {
+                        skip();
+                        if (!parse_FieldPat_(fields)) return false;
+                        for (;;) {
+                            auto _m5 = save();
+                            if (![&]() -> bool {
+                                skip();
+                                if (!match(",")) return false;
+                                skip();
+                                if (!parse_FieldPat_(fields)) return false;
+                                return true;
+                            }()) { restore(_m5); break; }
+                        }
+                        return true;
+                    }()) restore(_m4);
+                }
+                skip();
+                if (!match(")")) return false;
+                auto* p = new DdcgAst::ConstructorPat(std::string(),
+               std::move(first), std::move(fields));
+           p->loc = Loc();
+           *result = p;
+                return true;
+            }()) {} else {
+            restore(_m1);
             DdcgAst::Pattern* p;
            if (first == "_")        p = new DdcgAst::WildcardPat();
            else if (first == "nil") p = new DdcgAst::NilPat();
@@ -671,10 +855,40 @@ bool Parser::parse_Pattern_(DdcgAst::Pattern* * result) {
            p->loc = Loc();
            *result = p;
             }
+            }
         }
         }
         }
     }
+    return true;
+}
+
+bool Parser::parse_MatchArm_(std::vector<DdcgAst::MatchArm*>& arms) {
+    DdcgAst::Pattern* p = nullptr;
+       std::vector<DdcgAst::Stmt*> body;
+       DdcgAst::Expr* tail = nullptr;
+    skip();
+    if (!parse_Pattern_(&p)) return false;
+    skip();
+    if (!match("=>")) return false;
+    {
+        auto _m0 = save();
+        if ([&]() -> bool {
+            skip();
+            if (!parse_Block_(body)) return false;
+            return true;
+        }()) {} else {
+        restore(_m0);
+        skip();
+        if (!parse_Expr_(&tail)) return false;
+        auto* es = new DdcgAst::ExprStmt(tail);
+           es->loc = tail->loc;
+           body.push_back(es);
+        }
+    }
+    auto* a = new DdcgAst::MatchArm(p, std::move(body));
+         a->loc = p->loc;
+         arms.push_back(a);
     return true;
 }
 
@@ -698,13 +912,26 @@ bool Parser::parse_FieldPat_(std::vector<DdcgAst::FieldPat*>& fields) {
         skip();
         if (!ident(name_span)) return false;
         name = name_span.to_string();
-        skip();
-        if (!match(":")) return false;
-        skip();
-        if (!parse_Pattern_(&p)) return false;
-        auto* f = new DdcgAst::NamedFieldPat(std::move(name), p);
-         f->loc = Loc();
-         fields.push_back(f);
+        {
+            auto _m1 = save();
+            if ([&]() -> bool {
+                skip();
+                if (!match(":")) return false;
+                skip();
+                if (!parse_Pattern_(&p)) return false;
+                auto* f = new DdcgAst::NamedFieldPat(std::move(name), p);
+           f->loc = Loc();
+           fields.push_back(f);
+                return true;
+            }()) {} else {
+            restore(_m1);
+            auto* bind = new DdcgAst::BindPat(name);
+           bind->loc = Loc();
+           auto* f = new DdcgAst::NamedFieldPat(std::move(name), bind);
+           f->loc = Loc();
+           fields.push_back(f);
+            }
+        }
         }
     }
     return true;
@@ -1109,61 +1336,87 @@ bool Parser::parse_Postfix(DdcgAst::Expr* * result) {
     DdcgAst::Expr* idx = nullptr;
        std::vector<DdcgAst::Expr*> args;
        DdcgAst::Expr* arg = nullptr;
+       DdcgAst::Expr* with_val = nullptr;
        peg::Span field_span; std::string field;
     skip();
     if (!parse_Primary(result)) return false;
     for (;;) {
         auto _m0 = save();
         if (![&]() -> bool {
-            skip();
-            if (peek_at("(")) {
-                skip();
-                if (!match("(")) return false;
-                {
-                    auto _m1 = save();
-                    if (![&]() -> bool {
-                        skip();
-                        if (!parse_Expr_(&arg)) return false;
-                        args.push_back(arg);
-                        for (;;) {
-                            auto _m2 = save();
-                            if (![&]() -> bool {
-                                skip();
-                                if (!match(",")) return false;
-                                skip();
-                                if (!parse_Expr_(&arg)) return false;
-                                args.push_back(arg);
-                                return true;
-                            }()) { restore(_m2); break; }
-                        }
-                        return true;
-                    }()) restore(_m1);
-                }
-                skip();
-                if (!match(")")) return false;
-                auto* c = new DdcgAst::CallExpr(*result, std::move(args));
+            {
+                auto _m1 = save();
+                if ([&]() -> bool {
+                    skip();
+                    if (!match("(")) return false;
+                    {
+                        auto _m2 = save();
+                        if (![&]() -> bool {
+                            skip();
+                            if (!parse_Expr_(&arg)) return false;
+                            args.push_back(arg);
+                            for (;;) {
+                                auto _m3 = save();
+                                if (![&]() -> bool {
+                                    skip();
+                                    if (!match(",")) return false;
+                                    skip();
+                                    if (!parse_Expr_(&arg)) return false;
+                                    args.push_back(arg);
+                                    return true;
+                                }()) { restore(_m3); break; }
+                            }
+                            return true;
+                        }()) restore(_m2);
+                    }
+                    skip();
+                    if (!match(")")) return false;
+                    auto* c = new DdcgAst::CallExpr(*result, std::move(args));
            c->loc = (*result)->loc;
            *result = c;
            args.clear();
-            } else             if (peek_at(".")) {
+                    return true;
+                }()) {} else {
+                restore(_m1);
+                if ([&]() -> bool {
+                    skip();
+                    if (!match(".")) return false;
+                    skip();
+                    if (!ident(field_span)) return false;
+                    field = field_span.to_string();
+                    auto* f = new DdcgAst::FieldAccExpr(*result, std::move(field));
+           f->loc = (*result)->loc;
+           *result = f;
+                    return true;
+                }()) {} else {
+                restore(_m1);
+                if ([&]() -> bool {
+                    skip();
+                    if (!match("[")) return false;
+                    skip();
+                    if (!parse_Expr_(&idx)) return false;
+                    skip();
+                    if (!match("]")) return false;
+                    auto* x = new DdcgAst::IndexAccExpr(*result, idx);
+           x->loc = (*result)->loc;
+           *result = x;
+                    return true;
+                }()) {} else {
+                restore(_m1);
                 skip();
-                if (!match(".")) return false;
+                if (!match("with")) return false;
                 skip();
                 if (!ident(field_span)) return false;
                 field = field_span.to_string();
-                auto* f = new DdcgAst::FieldAccExpr(*result, std::move(field));
-           f->loc = (*result)->loc;
-           *result = f;
-            } else {
                 skip();
-                if (!match("[")) return false;
+                if (!match(":=")) return false;
                 skip();
-                if (!parse_Expr_(&idx)) return false;
-                skip();
-                if (!match("]")) return false;
-                auto* x = new DdcgAst::IndexAccExpr(*result, idx);
-           x->loc = (*result)->loc;
-           *result = x;
+                if (!parse_Expr_(&with_val)) return false;
+                auto* w = new DdcgAst::WithExpr(*result, std::move(field), with_val);
+           w->loc = (*result)->loc;
+           *result = w;
+                }
+                }
+                }
             }
             return true;
         }()) { restore(_m0); break; }
@@ -1178,9 +1431,11 @@ bool Parser::parse_Primary(DdcgAst::Expr* * result) {
        std::vector<DdcgAst::Expr*> elems;
        DdcgAst::Expr* elem = nullptr;
        DdcgAst::Expr* subj = nullptr;
-       DdcgAst::Expr* ddest = nullptr;
-       DdcgAst::Expr* cdest = nullptr;
-       DdcgAst::Expr* lnext = nullptr;
+       DdcgAst::Expr* arg = nullptr;
+       std::vector<DdcgAst::Expr*> gen_args;
+       std::vector<DdcgAst::MatchArm*> arms;
+       peg::Span schema_span; peg::Span ctor_span;
+       std::string schema_name; std::string ctor_name;
     {
         auto _m0 = save();
         if ([&]() -> bool {
@@ -1217,30 +1472,95 @@ bool Parser::parse_Primary(DdcgAst::Expr* * result) {
             if (!match("(")) return false;
             skip();
             if (!parse_Expr_(&subj)) return false;
-            skip();
-            if (!match(",")) return false;
-            skip();
-            if (!parse_Expr_(&ddest)) return false;
-            skip();
-            if (!match(",")) return false;
-            skip();
-            if (!parse_Expr_(&cdest)) return false;
-            {
+            for (;;) {
                 auto _m1 = save();
                 if (![&]() -> bool {
                     skip();
                     if (!match(",")) return false;
                     skip();
-                    if (!parse_Expr_(&lnext)) return false;
+                    if (!parse_Expr_(&arg)) return false;
+                    gen_args.push_back(arg);
                     return true;
-                }()) restore(_m1);
+                }()) { restore(_m1); break; }
             }
             skip();
             if (!match(")")) return false;
-            auto* g = new DdcgAst::GenCall(subj, ddest, cdest,
-             lnext ? std::optional<DdcgAst::Expr*>(lnext) : std::nullopt);
+            auto* g = new DdcgAst::GenCall(subj, std::move(gen_args));
          g->loc = subj->loc;
          *result = g;
+            return true;
+        }()) {} else {
+        restore(_m0);
+        if ([&]() -> bool {
+            skip();
+            if (!match("match")) return false;
+            skip();
+            if (!match("(")) return false;
+            skip();
+            if (!parse_Expr_(&subj)) return false;
+            skip();
+            if (!match(")")) return false;
+            skip();
+            if (!match("{")) return false;
+            skip();
+            if (!parse_MatchArm_(arms)) return false;
+            for (;;) {
+                auto _m2 = save();
+                if (![&]() -> bool {
+                    skip();
+                    if (!match("|")) return false;
+                    skip();
+                    if (!parse_MatchArm_(arms)) return false;
+                    return true;
+                }()) { restore(_m2); break; }
+            }
+            skip();
+            if (!match("}")) return false;
+            auto* m = new DdcgAst::MatchExpr(subj, std::move(arms));
+         m->loc = subj->loc;
+         *result = m;
+            return true;
+        }()) {} else {
+        restore(_m0);
+        if ([&]() -> bool {
+            skip();
+            if (!match("build")) return false;
+            skip();
+            if (!ident(schema_span)) return false;
+            schema_name = schema_span.to_string();
+            skip();
+            if (!match(".")) return false;
+            skip();
+            if (!ident(ctor_span)) return false;
+            ctor_name = ctor_span.to_string();
+            skip();
+            if (!match("(")) return false;
+            {
+                auto _m3 = save();
+                if (![&]() -> bool {
+                    skip();
+                    if (!parse_Expr_(&elem)) return false;
+                    elems.push_back(elem);
+                    for (;;) {
+                        auto _m4 = save();
+                        if (![&]() -> bool {
+                            skip();
+                            if (!match(",")) return false;
+                            skip();
+                            if (!parse_Expr_(&elem)) return false;
+                            elems.push_back(elem);
+                            return true;
+                        }()) { restore(_m4); break; }
+                    }
+                    return true;
+                }()) restore(_m3);
+            }
+            skip();
+            if (!match(")")) return false;
+            auto* b = new DdcgAst::BuildExpr(std::move(schema_name),
+             std::move(ctor_name), std::move(elems));
+         b->loc = Loc();
+         *result = b;
             return true;
         }()) {} else {
         restore(_m0);
@@ -1268,13 +1588,13 @@ bool Parser::parse_Primary(DdcgAst::Expr* * result) {
             skip();
             if (!match("[")) return false;
             {
-                auto _m2 = save();
+                auto _m5 = save();
                 if (![&]() -> bool {
                     skip();
                     if (!parse_Expr_(&elem)) return false;
                     elems.push_back(elem);
                     for (;;) {
-                        auto _m3 = save();
+                        auto _m6 = save();
                         if (![&]() -> bool {
                             skip();
                             if (!match(",")) return false;
@@ -1282,10 +1602,10 @@ bool Parser::parse_Primary(DdcgAst::Expr* * result) {
                             if (!parse_Expr_(&elem)) return false;
                             elems.push_back(elem);
                             return true;
-                        }()) { restore(_m3); break; }
+                        }()) { restore(_m6); break; }
                     }
                     return true;
-                }()) restore(_m2);
+                }()) restore(_m5);
             }
             skip();
             if (!match("]")) return false;
@@ -1312,7 +1632,7 @@ bool Parser::parse_Primary(DdcgAst::Expr* * result) {
                 if (!parse_Expr_(&elem)) return false;
                 elems.push_back(inner); elems.push_back(elem);
                 for (;;) {
-                    auto _m4 = save();
+                    auto _m7 = save();
                     if (![&]() -> bool {
                         skip();
                         if (!match(",")) return false;
@@ -1320,7 +1640,7 @@ bool Parser::parse_Primary(DdcgAst::Expr* * result) {
                         if (!parse_Expr_(&elem)) return false;
                         elems.push_back(elem);
                         return true;
-                    }()) { restore(_m4); break; }
+                    }()) { restore(_m7); break; }
                 }
                 skip();
                 if (!match(")")) return false;
@@ -1337,6 +1657,8 @@ bool Parser::parse_Primary(DdcgAst::Expr* * result) {
         auto* id = new DdcgAst::IdentExpr(std::move(name));
          id->loc = Loc();
          *result = id;
+        }
+        }
         }
         }
         }

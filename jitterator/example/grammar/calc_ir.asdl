@@ -1,15 +1,61 @@
-// calc_ir.asdl — Slot-based continuation graph for the calculator
+// calc_ir.asdl — CEK-tree-shaped continuation graph for the calculator
 //
-// int64 fields are slot indices or constant data.
-// node fields are continuation edges (control flow).
+// Two node classes per the yoctojc / AiPL pattern:
+//
+//   PRODUCERS — value sub-trees, NO `next` field. Operands are
+//   sub-tree fields (real IR pointers, not integer side-channels).
+//     LoadConst(value)
+//     LoadLocal(src)                     // leaf — frame[fp+src]
+//     Add/Sub/Mul(left, right)
+//     Neg(operand)
+//     CmpEq/Neq/Lt/Le/Gt/Ge(left, right)
+//     Call(target, args, frame_size)     // value = function's return value
+//
+//   CONSUMERS — `next` field; take a value sub-tree where they need
+//   one. Form the spine of the continuation graph.
+//     StoreLocal(dest, value, next)      // frame[fp+dest] = value, then next
+//     ExprEffect(value, next)            // evaluate value for effect, discard, then next
+//     Branch(test, then_, else_)         // evaluate test, dispatch to then_/else_
+//     Goto(target)                       // unconditional transfer
+//     Leave(value)                       // function exit; lowering puts value in ac
+//     Halt(value)                        // top-level program exit
+//     Nop(next)                          // forward-ref placeholder for loop back-edges
+//
+// Lowering: the JIT lowers each producer sub-tree, then emits the
+// consumer's stencil. ctx.ac is the lowering target's calling-convention
+// register between stencils — NOT an IR concept. F8 case 1-4 selection
+// is BURG's job (literal tree patterns); operand-shape specialization
+// happens at the BURG level, not in the IR.
 
 module calc_ir {
 
-    node = SlotRef(int64 slot, node next)
-         | LoadConst(int64 value, int64 dest, node next)
-         | Add(int64 lhs, int64 rhs, int64 dest, node next)
-         | Sub(int64 lhs, int64 rhs, int64 dest, node next)
-         | Mul(int64 lhs, int64 rhs, int64 dest, node next)
-         | Neg(int64 src, int64 dest, node next)
-         | Halt(int64 result_slot)
+    node = LoadConst(int64 value)
+         | LoadLocal(int64 src)
+         | Add(node left, node right)
+         | Sub(node left, node right)
+         | Mul(node left, node right)
+         | Neg(node operand)
+         | CmpEq(node left, node right)
+         | CmpNeq(node left, node right)
+         | CmpLt(node left, node right)
+         | CmpLe(node left, node right)
+         | CmpGt(node left, node right)
+         | CmpGe(node left, node right)
+         // Paper page 14 CG[call]. Value-producer like any binop:
+         // produces value in BURG destination `reg` (ctx.ac via cpu
+         // RET). Args are sub-tree children with destination
+         // `stack_reg` — the BURG chain rule `stack_reg: reg`
+         // auto-inserts a push_stack stencil per arg. The lowering
+         // (per-arity BURG rules `reg: Call(stack_reg, ...)`)
+         // sequences args, then emits the call stencil. `target` is
+         // a separate spine successor (function entry node) used by
+         // the JIT for cpu CALL backpatching, NOT a BURG operand.
+         | Call(node target, node* args, int64 frame_size)
+         | StoreLocal(int64 dest, node value, node next)
+         | ExprEffect(node value, node next)
+         | Branch(node test, node then_, node else_)
+         | Goto(node target)
+         | Leave(node value)
+         | Halt(node value)
+         | Nop(node next)
 }

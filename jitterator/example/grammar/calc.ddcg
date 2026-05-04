@@ -1,0 +1,412 @@
+// calc.ddcg — calc's DDCG rules built on the dybvig.ddcg lib.
+//
+// Phase 9R IR shape: CEK-tree per yoctojc / AiPL pattern. Producers
+// (LoadConst, LoadLocal, binops, cmps, Call) carry sub-tree operand
+// fields and have no `next`. Consumers (StoreLocal, ExprEffect,
+// Branch, Goto, Leave, Halt, Nop) thread the spine via `next`.
+//
+// Paper Figure 8 case dispatch (S₁ op S₂ / S op E / E op S / E₁ op E₂)
+// is the BURG matcher's job at lowering time — it sees the literal
+// tree shape (LoadLocal vs LoadConst vs complex sub-tree) and picks
+// the appropriate stencil per case. ONE rule per binop here; no case
+// specialization in DDCG.
+//
+// The page-12 normalizer (calc_runner.cpp::Normalizer) rewrites
+// boolean expressions in non-test contexts before DDCG sees them, so
+// figure-7 and/or/not rules are restricted to γ=pair(Lt, Lf).
+
+COMPILER calc
+
+(. #include "calc_runner.h"
+   #include "CalcAST.h"
+   #include "CalcIR.h"
+   #include <cassert>
+   #include <cstdio>
+   #include <cstdlib>
+   #include <unordered_map>
+   #include <utility>
+   #include <vector>
+
+   namespace calc {
+
+   // δ — paper §3.1 Location class (4-variant per dybvig.ddcg lib).
+   //   effect    : value not needed
+   //   ac        : paper r0 — in CEK-tree shape, "value sub-tree"
+   //   stack     : paper eval-stack class (call args)
+   //   local(i)  : frame-relative slot ctx.frame[ctx.fp+i]
+   enum class DeltaTag : unsigned char { Effect, Ac, Stack, Local };
+   struct delta_t { DeltaTag tag; int i; };
+   inline delta_t effect()        { return {DeltaTag::Effect, 0}; }
+   inline delta_t ac()            { return {DeltaTag::Ac,     0}; }
+   inline delta_t stack()         { return {DeltaTag::Stack,  0}; }
+   inline delta_t local(int i)    { return {DeltaTag::Local,  i}; }
+
+   // γ — paper §3.2 control destination.
+   enum class GammaTag : unsigned char { Jump, Pair, Ret };
+   struct gamma_t {
+       GammaTag tag;
+       calc_ir::Node* L;
+       calc_ir::Node* Lt;
+       calc_ir::Node* Lf;
+   };
+   inline gamma_t jump(calc_ir::Node* L)                       { return {GammaTag::Jump, L,       nullptr, nullptr}; }
+   inline gamma_t pair(calc_ir::Node* Lt, calc_ir::Node* Lf)   { return {GammaTag::Pair, nullptr, Lt,      Lf}; }
+   inline gamma_t ret()                                         { return {GammaTag::Ret,  nullptr, nullptr, nullptr}; }
+
+   // ρ — paper environment, break-label only (locals are positional).
+   struct rho_t { calc_ir::Node* L_break; };
+
+   } // namespace calc
+.)
+
+IMPORTS
+  ast = "calc.json"
+  ir  = "calc_ir.json"
+
+DESTINATIONS
+  ir_root ir.node
+
+AUXILIARIES
+  // Per-function frame allocator (case-4-like spills allocate fresh
+  // frame slots above the user's max). The driver resets between
+  // function compiles.
+  alloc_local           : ()         -> int
+  reset_next_local      : (int)      -> int
+  current_next_local    : ()         -> int
+
+  // Forward-reference placeholder for loop back-edges (paper page 10
+  // generic loop: body refers to Ltop before Ltop's continuation is
+  // known). fresh_kont allocates a Nop with null next; patch_kont
+  // assigns the real successor once the cycle's other half is built.
+  fresh_kont            : ()                  -> ir_root
+  patch_kont            : (ir_root, ir_root)  -> int
+
+  // Hard-fail for paper-undefined contexts (driver wrap or page-12
+  // normalizer bug). Returns ir_root for type unification but never
+  // actually returns — std::abort.
+  panic_unreachable     : ()         -> ir_root
+
+  // Function call codegen — internal-only helper called from the
+  // call_op rule. Looks up the function table, gens each arg as a
+  // value sub-tree, returns Call value sub-tree (which the rule
+  // wraps via cg_deliver per outer δ/γ — same as any binop value).
+  compile_call          : (ident, list<ast.expr>, rho, ir_root) -> ir_root
+
+MEMBERS (.
+    SourceLoc current_loc;
+
+    int next_local_ = 0;
+    int alloc_local() { return next_local_++; }
+    int reset_next_local(int n) { next_local_ = n; return 0; }
+    int current_next_local() const { return next_local_; }
+
+    // IR allocators consumed by the spliced dybvig.ddcg helpers.
+    // CEK-tree shape: producers carry sub-tree operand fields,
+    // consumers thread the spine via `next`.
+    calc_ir::Node* make_load_const(int v)                              { return new calc_ir::LoadConst(v); }
+    calc_ir::Node* make_load_local(int s)                              { return new calc_ir::LoadLocal(s); }
+    calc_ir::Node* make_add(calc_ir::Node* l, calc_ir::Node* r)        { return new calc_ir::Add(l, r); }
+
+    calc_ir::Node* make_store_local(int d, calc_ir::Node* v, calc_ir::Node* n) {
+        return new calc_ir::StoreLocal(d, v, n);
+    }
+    calc_ir::Node* make_expr_effect(calc_ir::Node* v, calc_ir::Node* n) {
+        return new calc_ir::ExprEffect(v, n);
+    }
+    calc_ir::Node* make_call(calc_ir::Node* target,
+                             std::vector<calc_ir::Node*> args, int fs) {
+        return new calc_ir::Call(target, std::move(args), fs);
+    }
+    calc_ir::Node* make_branch(calc_ir::Node* t, calc_ir::Node* th, calc_ir::Node* el) {
+        return new calc_ir::Branch(t, th, el);
+    }
+    calc_ir::Node* make_goto(calc_ir::Node* t)                         { return new calc_ir::Goto(t); }
+    calc_ir::Node* make_leave(calc_ir::Node* v)                        { return new calc_ir::Leave(v); }
+    calc_ir::Node* make_halt(calc_ir::Node* v)                         { return new calc_ir::Halt(v); }
+
+    // Function table — populated by the calc top-level driver before
+    // any DDCG rule body fires. Every reference must resolve; an
+    // unknown name asserts (dev error, not a sema pass).
+    std::unordered_map<std::string, std::pair<calc_ir::Node*, int>> fn_table;
+
+    // Internal-only: call_op rule delegates here. Builds a Call
+    // value sub-tree (args = list of value sub-trees, each gen'd as
+    // δ=ac). The BURG chain rule `stack_reg: reg = 1 (push_stack)`
+    // auto-pushes each arg before the call stencil; per-arity Call
+    // rules drive the lowering. Same shape as any binop value:
+    // Call(target, args, fs) is consumed by the caller's cg_deliver.
+    calc_ir::Node* compile_call(std::string name,
+                                std::vector<calc::Expr*> args,
+                                rho_t rho, calc_ir::Node* Lnext) {
+        auto it = fn_table.find(name);
+        assert(it != fn_table.end() && "compile_call: unknown function");
+        std::vector<calc_ir::Node*> arg_trees;
+        arg_trees.reserve(args.size());
+        for (auto* a : args) {
+            arg_trees.push_back(compile_expr(a, rho, ac(),
+                                              jump(Lnext), Lnext));
+        }
+        return new calc_ir::Call(it->second.first, std::move(arg_trees),
+                                 it->second.second);
+    }
+
+    // Forward-reference placeholder. fresh_kont() returns a Nop with a
+    // null next; patch_kont assigns the real successor once the
+    // cyclically-referenced sibling chain is built.
+    calc_ir::Node* fresh_kont() { return new calc_ir::Nop(nullptr); }
+    int patch_kont(calc_ir::Node* nop, calc_ir::Node* target) {
+        if (auto* n = dynamic_cast<calc_ir::Nop*>(nop)) n->next = target;
+        return 0;
+    }
+
+    [[noreturn]] calc_ir::Node* panic_unreachable() {
+        std::fprintf(stderr, "calc DDCG: paper-undefined γ context reached "
+                             "(driver wrap or page-12 normalizer bug)\n");
+        std::abort();
+    }
+.)
+
+// While → Loop is page-10 paper rewrite (calc_runner Normalizer).
+// Var/VarAssign → LocalRef/LocalAssign after scope resolution.
+// LetDecl is desugared to a LocalAssign with the next free local index.
+// All resolved by the calc_runner Normalizer before DDCG sees the AST.
+DESUGARED While, Var, VarAssign, LetDecl
+
+import "dybvig.ddcg"
+
+RULES
+
+// Paper page 14 — CG[int n] ρ δ γ ⇒ CG_store n δ γ.
+rule int_lit : ast.IntLit(value: n) {
+    cg_deliver(make_load_const(n), delta, gamma, Lnext);
+}
+
+// Paper page 14 — CG[var x] ρ δ γ ⇒ CG_store m[x] δ γ.
+// Calc's m[x] = local(i) for frame-relative addressing; the value
+// producer is LoadLocal(i).
+rule var_local_ref : ast.LocalRef(index: i) {
+    cg_deliver(make_load_local(i), delta, gamma, Lnext);
+}
+
+// Paper page 10 assign: CG[assign x E] ρ δ γ ⇒ CG[E] ρ m[x] γ.
+// With m[x] = local(i), gen the value with δ=local(i); cg_deliver
+// wraps it in make_store_local. The outer δ/γ delivery for "assign
+// has a value too" is paper page 10's `assign x E ⇒ sequence (assign x E) (var x)`
+// rewrite — the calc_runner Normalizer handles that for value-context
+// assignments. In effect context, the wrap-in-store is the whole IR.
+rule var_local_assign : ast.LocalAssign(index: i, value: e) {
+    gen(e, rho, local(i), gamma, Lnext);
+}
+
+// Paper figure 6 — CG[sequence E break] (Lbreak,m) effect γ ⇒
+//   CG[E] (Lbreak,m) effect Lbreak.
+// The break replaces the outer γ; E's tail goes directly to Lbreak
+// (saves a Goto via the L==Lnext peephole when Lbreak == Lnext).
+rule seq_break : ast.Sequence(first: e1, rest: ast.Break()) {
+    gen(e1, rho, effect, jump(rho.L_break), Lnext);
+}
+
+// Paper figure 5 — CG[seq E1 E2] ρ δ γ ⇒
+//   CG[E1] ρ effect L; L: CG[E2] ρ δ γ.
+// Build E2 first so we have its entry to chain E1 into via γ=jump(E2).
+rule sequence : ast.Sequence(first: e1, rest: e2) {
+    let e2_entry = gen(e2, rho, delta, gamma, Lnext);
+    gen(e1, rho, effect, jump(e2_entry), e2_entry);
+}
+
+// Paper figure 6 — CG[if Etest break Eelse] (Lbreak,m) δ γ ⇒
+//   test gets γ=(Lbreak, Lelse); else inherits outer δ/γ.
+// The then-arm (break) is replaced by jumping to Lbreak directly via
+// the test's pair-γ — no Goto allocated for the break.
+rule if_break_else : ast.If(test: t, then_: ast.Break(), else_: el) {
+    let exit = rho.L_break;
+    let else_entry = gen(el, rho, delta, gamma, Lnext);
+    gen(t, rho, effect, pair(exit, else_entry), exit);
+}
+
+// Paper figure 6 — CG[if Etest Ethen break] (Lbreak,m) δ γ ⇒
+//   test gets γ=(Lthen, Lbreak); then inherits outer δ/γ. Else-arm
+// (break) is replaced by jumping to Lbreak directly.
+rule if_then_break : ast.If(test: t, then_: th, else_: ast.Break()) {
+    let exit = rho.L_break;
+    let then_entry = gen(th, rho, delta, gamma, Lnext);
+    gen(t, rho, effect, pair(then_entry, exit), then_entry);
+}
+
+// Paper figure 5 two-arm if: CG[if Etest Ethen Eelse] ρ δ γ ⇒
+//   test in effect+pair(Lthen, Lelse) context; both arms inherit
+//   outer δ/γ. Calc has no semantic one-arm if — the calc_runner
+// Normalizer fills any missing else_ with IntLit(0) before DDCG sees
+// the AST, so every If is two-arm by the time this rule matches.
+rule if_two : ast.If(test: t, then_: th, else_: el) {
+    let then_entry = gen(th, rho, delta, gamma, Lnext);
+    let else_entry = gen(el, rho, delta, gamma, Lnext);
+    gen(t, rho, effect, pair(then_entry, else_entry), then_entry);
+}
+
+// =============================================================
+// Figure 8 — binary operations. In CEK-tree shape, ONE rule per
+// binop: gen both operands as value sub-trees (δ=ac with the L==Lnext
+// peephole returns the value alone), build the producer node, deliver
+// per outer δ/γ. BURG owns paper figure 8's case 1-4 dispatch at
+// lowering time — it sees the literal tree shape (LoadLocal vs
+// LoadConst vs complex sub-tree) and picks the appropriate stencil.
+//
+// No case specializations in DDCG. No constant folds (paper §4).
+// No commutative-vs-non-commutative carve-outs (BURG handles via
+// per-shape rules, including the cmp-swap identity and rev_sub for
+// Sub).
+// =============================================================
+
+rule bin_op_add : ast.BinOp(op: Add, left: l, right: r) {
+    let lv = gen(l, rho, ac, jump(Lnext), Lnext);
+    let rv = gen(r, rho, ac, jump(Lnext), Lnext);
+    cg_deliver(build ir.Add(lv, rv), delta, gamma, Lnext);
+}
+
+rule bin_op_sub : ast.BinOp(op: Sub, left: l, right: r) {
+    let lv = gen(l, rho, ac, jump(Lnext), Lnext);
+    let rv = gen(r, rho, ac, jump(Lnext), Lnext);
+    cg_deliver(build ir.Sub(lv, rv), delta, gamma, Lnext);
+}
+
+rule bin_op_mul : ast.BinOp(op: Mul, left: l, right: r) {
+    let lv = gen(l, rho, ac, jump(Lnext), Lnext);
+    let rv = gen(r, rho, ac, jump(Lnext), Lnext);
+    cg_deliver(build ir.Mul(lv, rv), delta, gamma, Lnext);
+}
+
+rule neg_op : ast.NegOp(operand: e) {
+    let ev = gen(e, rho, ac, jump(Lnext), Lnext);
+    cg_deliver(build ir.Neg(ev), delta, gamma, Lnext);
+}
+
+rule cmp_eq : ast.CmpEq(left: l, right: r) {
+    let lv = gen(l, rho, ac, jump(Lnext), Lnext);
+    let rv = gen(r, rho, ac, jump(Lnext), Lnext);
+    cg_deliver(build ir.CmpEq(lv, rv), delta, gamma, Lnext);
+}
+
+rule cmp_neq : ast.CmpNeq(left: l, right: r) {
+    let lv = gen(l, rho, ac, jump(Lnext), Lnext);
+    let rv = gen(r, rho, ac, jump(Lnext), Lnext);
+    cg_deliver(build ir.CmpNeq(lv, rv), delta, gamma, Lnext);
+}
+
+rule cmp_lt : ast.CmpLt(left: l, right: r) {
+    let lv = gen(l, rho, ac, jump(Lnext), Lnext);
+    let rv = gen(r, rho, ac, jump(Lnext), Lnext);
+    cg_deliver(build ir.CmpLt(lv, rv), delta, gamma, Lnext);
+}
+
+rule cmp_le : ast.CmpLe(left: l, right: r) {
+    let lv = gen(l, rho, ac, jump(Lnext), Lnext);
+    let rv = gen(r, rho, ac, jump(Lnext), Lnext);
+    cg_deliver(build ir.CmpLe(lv, rv), delta, gamma, Lnext);
+}
+
+rule cmp_gt : ast.CmpGt(left: l, right: r) {
+    let lv = gen(l, rho, ac, jump(Lnext), Lnext);
+    let rv = gen(r, rho, ac, jump(Lnext), Lnext);
+    cg_deliver(build ir.CmpGt(lv, rv), delta, gamma, Lnext);
+}
+
+rule cmp_ge : ast.CmpGe(left: l, right: r) {
+    let lv = gen(l, rho, ac, jump(Lnext), Lnext);
+    let rv = gen(r, rho, ac, jump(Lnext), Lnext);
+    cg_deliver(build ir.CmpGe(lv, rv), delta, gamma, Lnext);
+}
+
+// Paper page 10 — CG[loop E] (Lbreak,m) effect γ ⇒
+//   Ltop:
+//     CG[E] (γ,m) effect Ltop
+// Body's γ_break is the outer γ; body's continuation is Ltop (back-edge).
+// Ltop is a forward reference: body refers to it via jump(Ltop); after
+// the body chain is built, patch Ltop's next to body_entry.
+//
+// While syntax is rewritten to Loop by the calc_runner Normalizer
+// (page 10: while T B ⇒ loop (if T B break)), so DDCG only sees Loop.
+//
+// γ is restricted to jump(L) per paper. The calc top-level driver
+// (calc_runner.cpp::calc_compile) wraps the program with an exit Halt
+// so γ at the top is jump(exit_halt), not ret. ret/pair γ contexts
+// are paper-undefined for loop; reaching them is a driver-wrap bug.
+rule loop_op : ast.Loop(body: e) {
+    match (gamma) {
+        jump(L) => {
+            let body_rho = rho with L_break := L;
+            let Ltop = fresh_kont();
+            let body_entry = gen(e, body_rho, effect, jump(Ltop), Ltop);
+            patch_kont(Ltop, body_entry);
+            Ltop;
+        }
+      | ret          => panic_unreachable()
+      | pair(Lt, Lf) => panic_unreachable()
+    };
+}
+
+// Paper figure 5 — CG[break] (Lbreak,m) effect γ ⇒ CG_jump Lbreak.
+// γ is dropped; the break replaces it with a jump to Lbreak.
+rule break_simple : ast.Break() {
+    cg_break(rho, Lnext);
+}
+
+// Paper figure 5 — CG[return E] ρ δ γ ⇒ CG[E] ρ ac return.
+// The return-expression's value lands in ac; γ becomes ret. cg_deliver's
+// δ=ac+γ=ret arm wraps the value in make_leave (function exit).
+rule return_op : ast.Return(value: e) {
+    gen(e, rho, ac, ret, Lnext);
+}
+
+// Paper figure 7 — CG[and E1 E2] ρ effect (Lt, Lf) ⇒
+//   CG[E1] ρ effect (L, Lf)    L: CG[E2] ρ effect (Lt, Lf).
+// E1 is a test; if true continue to L, if false skip to Lf. L is
+// E2's entry (also a test). Both arms inherit the outer Lt/Lf.
+//
+// γ is restricted to pair(Lt, Lf) per paper. The page-12 normalizer
+// (calc_runner.cpp::Normalizer) rewrites and/or/not in non-test
+// contexts before DDCG sees them.
+rule and_op : ast.And(left: l, right: r) {
+    match (gamma) {
+        pair(Lt, Lf) => {
+            let r_entry = gen(r, rho, effect, gamma, Lnext);
+            gen(l, rho, effect, pair(r_entry, Lf), r_entry);
+        }
+      | jump(L)      => panic_unreachable()
+      | ret          => panic_unreachable()
+    };
+}
+
+// Paper figure 7 — CG[or E1 E2] ρ effect (Lt, Lf) ⇒
+//   CG[E1] ρ effect (Lt, L)    L: CG[E2] ρ effect (Lt, Lf).
+// Dual of and: if E1 true short-circuit to Lt, else continue to E2.
+rule or_op : ast.Or(left: l, right: r) {
+    match (gamma) {
+        pair(Lt, Lf) => {
+            let r_entry = gen(r, rho, effect, gamma, Lnext);
+            gen(l, rho, effect, pair(Lt, r_entry), r_entry);
+        }
+      | jump(L)      => panic_unreachable()
+      | ret          => panic_unreachable()
+    };
+}
+
+// Paper figure 7 — CG[not E] ρ effect (Lt, Lf) ⇒ CG[E] ρ effect (Lf, Lt).
+// Captures `not` semantics by swapping the γ-pair arms.
+rule not_op : ast.Not(operand: e) {
+    match (gamma) {
+        pair(Lt, Lf) => gen(e, rho, effect, pair(Lf, Lt), Lnext)
+      | jump(L)      => panic_unreachable()
+      | ret          => panic_unreachable()
+    };
+}
+
+// Paper page 14 CG[call f E1..En] ρ δ γ ⇒
+//   gen each Ei with δ=stack, then `calls $n,f`, then CG_store ac δ γ.
+// CEK-tree shape: each arg is a value sub-tree pulled into Call.args
+// (no separate PushStack IR node — JIT lowering emits push_stack
+// stencils inline at codegen time). cg_deliver wraps the call value
+// per outer δ/γ.
+rule call_op : ast.Call(name: n, args: as) {
+    cg_deliver(compile_call(n, as, rho, Lnext), delta, gamma, Lnext);
+}

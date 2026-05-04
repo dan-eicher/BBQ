@@ -54,12 +54,16 @@ Ddcg
        DdcgAst::TypeRef* ir_root = nullptr;
        std::vector<DdcgAst::Aux*> auxiliaries;
        std::vector<DdcgAst::Pred*> predicates;
+       std::vector<DdcgAst::Fun*> funs;
+       std::vector<DdcgAst::LibraryImport*> libraries;
        std::string members;
        std::string priv;
        std::vector<std::string> desugared;
-       std::vector<DdcgAst::Rule*> rules; .)
+       std::vector<DdcgAst::Rule*> rules;
+       bool internal_dispatchers = false; .)
     = "COMPILER"
       ident<name_span>            (. name = name_span.to_string(); .)
+      [ "INTERNAL_DISPATCHERS"     (. internal_dispatchers = true; .) ]
       { HeaderBlock<headers> }
       "IMPORTS"
       { ImportDecl<imports> }
@@ -80,14 +84,17 @@ Ddcg
         ident<name_span>            (. desugared.push_back(name_span.to_string()); .)
         { "," ident<name_span>      (. desugared.push_back(name_span.to_string()); .) }
       ]
+      { FunDecl<funs> | LibraryImport<libraries> }
       "RULES"
       { RuleDecl<rules> }
     (. ast = new DdcgAst::File(std::move(name),
            std::move(headers), std::move(imports),
            std::move(destinations), ir_root,
            std::move(auxiliaries), std::move(predicates),
+           std::move(funs), std::move(libraries),
            std::move(members), std::move(priv),
-           std::move(desugared), std::move(rules));
+           std::move(desugared), std::move(rules),
+           internal_dispatchers);
        ast->loc = DdcgAst::SourceLoc{nullptr, 1, 1}; .)
 .
 
@@ -126,6 +133,7 @@ ImportDecl <. std::vector<DdcgAst::Import*> &imports .>
 DestEntry <. std::vector<DdcgAst::DestDecl*> &dests, DdcgAst::TypeRef* &ir_root .>
     (. peg::Span name_span; std::string name;
        std::vector<DdcgAst::DestVariant*> variants;
+       std::vector<DdcgAst::DestField*> fields;
        DdcgAst::TypeRef* ty = nullptr; .)
     = "data_dest"
       ident<name_span>            (. name = name_span.to_string(); .)
@@ -141,6 +149,16 @@ DestEntry <. std::vector<DdcgAst::DestDecl*> &dests, DdcgAst::TypeRef* &ir_root 
       VariantList<variants>
       "}"
       (. auto* d = new DdcgAst::CtrlDest(std::move(name), std::move(variants));
+         d->loc = Loc();
+         dests.push_back(d); .)
+    | "env_dest"
+      ident<name_span>            (. name = name_span.to_string(); .)
+      "{"
+      [ DestFieldDecl<fields>
+        { "," DestFieldDecl<fields> }
+      ]
+      "}"
+      (. auto* d = new DdcgAst::EnvDest(std::move(name), std::move(fields));
          d->loc = Loc();
          dests.push_back(d); .)
     | "ir_root"
@@ -214,6 +232,60 @@ PredicateDecl <. std::vector<DdcgAst::Pred*> &predicates .>
          predicates.push_back(p); .)
 .
 
+// ═══════════════════════════════════════════════════════════════
+// fun declarations — action-language function definitions
+// ═══════════════════════════════════════════════════════════════
+//
+// Phase A milestone A.1. Unlike Aux (signature-only, body in MEMBERS),
+// a Fun's body is an action-language stmt block, type-checked and
+// compiled to target code. The trailing ExprStmt produces the return
+// value (same convention as rule bodies).
+//
+//   fun name(arg : Type, …) -> RetType { stmts… ; tail-expr; }
+
+FunDecl <. std::vector<DdcgAst::Fun*> &funs .>
+    (. peg::Span name_span; std::string name;
+       std::vector<DdcgAst::FunParam*> params;
+       DdcgAst::TypeRef* ret = nullptr;
+       std::vector<DdcgAst::Stmt*> body; .)
+    = "fun"
+      ident<name_span>            (. name = name_span.to_string(); .)
+      "("
+      [ FunParamDecl<params>
+        { "," FunParamDecl<params> }
+      ]
+      ")"
+      "->"
+      TypeRef_<&ret>
+      Block_<body>
+      (. auto* f = new DdcgAst::Fun(std::move(name), std::move(params), ret, std::move(body));
+         f->loc = Loc();
+         funs.push_back(f); .)
+.
+
+FunParamDecl <. std::vector<DdcgAst::FunParam*> &params .>
+    (. peg::Span name_span; std::string name;
+       DdcgAst::TypeRef* ty = nullptr; .)
+    = ident<name_span>            (. name = name_span.to_string(); .)
+      ":"
+      TypeRef_<&ty>
+      (. auto* p = new DdcgAst::FunParam(std::move(name), ty);
+         p->loc = Loc();
+         params.push_back(p); .)
+.
+
+// `import "path.ddcg"` — pulls another .ddcg file's fun declarations
+// into this one. Resolution + load happens in the CLI driver after
+// parse; the AST just records the path as written.
+LibraryImport <. std::vector<DdcgAst::LibraryImport*> &libraries .>
+    (. peg::Span path_span; std::string path; .)
+    = "import"
+      string_lit<path_span>       (. path = peg::unescape_string_lit(path_span); .)
+      (. auto* l = new DdcgAst::LibraryImport(std::move(path));
+         l->loc = Loc();
+         libraries.push_back(l); .)
+.
+
 TypeRefList <. std::vector<DdcgAst::TypeRef*> &refs .>
     (. DdcgAst::TypeRef* t = nullptr; .)
     = TypeRef_<&t>                (. refs.push_back(t); .)
@@ -225,7 +297,8 @@ TypeRefList <. std::vector<DdcgAst::TypeRef*> &refs .>
 // ═══════════════════════════════════════════════════════════════
 
 TypeRef_ <. DdcgAst::TypeRef* *result .>
-    (. peg::Span name_span; std::string name;
+    (. peg::Span name_span; peg::Span sub_span;
+       std::string mod; std::string name;
        std::vector<DdcgAst::TypeRef*> elems;
        DdcgAst::TypeRef* inner = nullptr;
        bool is_ptr = false; .)
@@ -245,8 +318,12 @@ TypeRef_ <. DdcgAst::TypeRef* *result .>
          t->loc = Loc();
          *result = t; .)
     | ident<name_span>            (. name = name_span.to_string(); .)
+      [ "."                       // module.Constructor — schema ref
+        ident<sub_span>           (. mod = std::move(name);
+                                     name = sub_span.to_string(); .)
+      ]
       [ "*"                       (. is_ptr = true; .) ]
-      (. auto* t = new DdcgAst::TypeName(std::move(name), is_ptr);
+      (. auto* t = new DdcgAst::TypeName(std::move(mod), std::move(name), is_ptr);
          t->loc = Loc();
          *result = t; .)
 .
@@ -317,6 +394,15 @@ Pattern_ <. DdcgAst::Pattern* *result .>
                std::move(ctor), std::move(fields));
            p->loc = Loc();
            *result = p; .)
+      | "("                                       // bare-name constructor: dest variant
+        [ FieldPat_<fields>
+          { "," FieldPat_<fields> }
+        ]
+        ")"
+        (. auto* p = new DdcgAst::ConstructorPat(std::string(),
+               std::move(first), std::move(fields));
+           p->loc = Loc();
+           *result = p; .)
       |                                           // bare ident; dispatch by name
         (. DdcgAst::Pattern* p;
            if (first == "_")        p = new DdcgAst::WildcardPat();
@@ -325,6 +411,27 @@ Pattern_ <. DdcgAst::Pattern* *result .>
            p->loc = Loc();
            *result = p; .)
       )
+.
+
+// One arm of a `match`: pattern + body block.
+// `pat => { stmts… }` for multi-stmt arms; `pat => expr;` for the
+// common single-tail-expression arm (parser inserts the implicit
+// block). The body is a stmt list either way.
+MatchArm_ <. std::vector<DdcgAst::MatchArm*> &arms .>
+    (. DdcgAst::Pattern* p = nullptr;
+       std::vector<DdcgAst::Stmt*> body;
+       DdcgAst::Expr* tail = nullptr; .)
+    = Pattern_<&p>
+      "=>"
+      ( Block_<body>
+      | Expr_<&tail>
+        (. auto* es = new DdcgAst::ExprStmt(tail);
+           es->loc = tail->loc;
+           body.push_back(es); .)
+      )
+      (. auto* a = new DdcgAst::MatchArm(p, std::move(body));
+         a->loc = p->loc;
+         arms.push_back(a); .)
 .
 
 FieldPat_ <. std::vector<DdcgAst::FieldPat*> &fields .>
@@ -336,11 +443,18 @@ FieldPat_ <. std::vector<DdcgAst::FieldPat*> &fields .>
          f->loc = Loc();
          fields.push_back(f); .)
     | ident<name_span>            (. name = name_span.to_string(); .)
-      ":"
-      Pattern_<&p>
-      (. auto* f = new DdcgAst::NamedFieldPat(std::move(name), p);
-         f->loc = Loc();
-         fields.push_back(f); .)
+      ( ":"
+        Pattern_<&p>
+        (. auto* f = new DdcgAst::NamedFieldPat(std::move(name), p);
+           f->loc = Loc();
+           fields.push_back(f); .)
+      |                            // shorthand: `slot` ≡ `slot: slot`
+        (. auto* bind = new DdcgAst::BindPat(name);
+           bind->loc = Loc();
+           auto* f = new DdcgAst::NamedFieldPat(std::move(name), bind);
+           f->loc = Loc();
+           fields.push_back(f); .)
+      )
 .
 
 // ═══════════════════════════════════════════════════════════════
@@ -558,6 +672,7 @@ Postfix <. DdcgAst::Expr* *result .>
     (. DdcgAst::Expr* idx = nullptr;
        std::vector<DdcgAst::Expr*> args;
        DdcgAst::Expr* arg = nullptr;
+       DdcgAst::Expr* with_val = nullptr;
        peg::Span field_span; std::string field; .)
     = Primary<result>
       { "("
@@ -580,6 +695,13 @@ Postfix <. DdcgAst::Expr* *result .>
         (. auto* x = new DdcgAst::IndexAccExpr(*result, idx);
            x->loc = (*result)->loc;
            *result = x; .)
+      | "with"
+        ident<field_span>         (. field = field_span.to_string(); .)
+        ":="
+        Expr_<&with_val>
+        (. auto* w = new DdcgAst::WithExpr(*result, std::move(field), with_val);
+           w->loc = (*result)->loc;
+           *result = w; .)
       }
 .
 
@@ -590,9 +712,11 @@ Primary <. DdcgAst::Expr* *result .>
        std::vector<DdcgAst::Expr*> elems;
        DdcgAst::Expr* elem = nullptr;
        DdcgAst::Expr* subj = nullptr;
-       DdcgAst::Expr* ddest = nullptr;
-       DdcgAst::Expr* cdest = nullptr;
-       DdcgAst::Expr* lnext = nullptr; .)
+       DdcgAst::Expr* arg = nullptr;
+       std::vector<DdcgAst::Expr*> gen_args;
+       std::vector<DdcgAst::MatchArm*> arms;
+       peg::Span schema_span; peg::Span ctor_span;
+       std::string schema_name; std::string ctor_name; .)
     = "true"
       (. auto* b = new DdcgAst::BoolLit(true);
          b->loc = Loc();
@@ -613,16 +737,40 @@ Primary <. DdcgAst::Expr* *result .>
     | "gen"
       "("
       Expr_<&subj>
-      ","
-      Expr_<&ddest>
-      ","
-      Expr_<&cdest>
-      [ "," Expr_<&lnext> ]
+      { "," Expr_<&arg>            (. gen_args.push_back(arg); .) }
       ")"
-      (. auto* g = new DdcgAst::GenCall(subj, ddest, cdest,
-             lnext ? std::optional<DdcgAst::Expr*>(lnext) : std::nullopt);
+      (. auto* g = new DdcgAst::GenCall(subj, std::move(gen_args));
          g->loc = subj->loc;
          *result = g; .)
+    // match (subject) { pat => body | pat => body | ... }
+    // Body is a stmt block (same shape as fun/rule bodies); the
+    // trailing ExprStmt produces the arm's value.
+    | "match"
+      "("
+      Expr_<&subj>
+      ")"
+      "{"
+      MatchArm_<arms>
+      { "|" MatchArm_<arms> }
+      "}"
+      (. auto* m = new DdcgAst::MatchExpr(subj, std::move(arms));
+         m->loc = subj->loc;
+         *result = m; .)
+    // build Schema.Constructor(args) — construct a schema value.
+    // Lowers to `new Namespace::Ctor(args)` in the C++ backend.
+    | "build"
+      ident<schema_span>          (. schema_name = schema_span.to_string(); .)
+      "."
+      ident<ctor_span>            (. ctor_name = ctor_span.to_string(); .)
+      "("
+      [ Expr_<&elem>              (. elems.push_back(elem); .)
+        { "," Expr_<&elem>        (. elems.push_back(elem); .) }
+      ]
+      ")"
+      (. auto* b = new DdcgAst::BuildExpr(std::move(schema_name),
+             std::move(ctor_name), std::move(elems));
+         b->loc = Loc();
+         *result = b; .)
     | integer<lit_span>
       (. int64_t n = std::stoll(lit_span.to_string());
          auto* i = new DdcgAst::IntLit(static_cast<int>(n));

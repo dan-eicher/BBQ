@@ -9,6 +9,10 @@
 
 namespace bbq::cek {
 
+// Value is declared in KontNode.h. Forward-declare to avoid an include
+// cycle — FieldCapture stores `Value*` for Computed fields.
+struct Value;
+
 enum class CaptureType : uint8_t {
     UInt8, UInt16LE, UInt16BE, UInt32LE, UInt32BE, UInt64LE, UInt64BE,
     Int8,  Int16LE,  Int16BE,  Int32LE,  Int32BE,  Int64LE,  Int64BE,
@@ -23,10 +27,14 @@ struct FieldCapture {
     size_t end_offset = 0;
     CaptureType type = CaptureType::UInt8;
 
+    // children is nullptr during the build phase. CaptureBuilder::finish()
+    // resolves it to a real pointer into the arena. During build, navigation
+    // into children happens via build_buf_index (an offset into child_buf_).
     FieldCapture* children = nullptr;
     int child_count = 0;
+    int build_buf_index = -1;       // Build-phase only; -1 once resolved
 
-    int64_t computed_value = 0;     // For Computed fields
+    Value* computed_value = nullptr;    // For Computed fields (typed Value)
 
     const FieldCapture* child(const char* n) const {
         // Pointer comparison — names must be interned
@@ -71,12 +79,12 @@ public:
     }
 
     void add_field(const char* name, size_t start, size_t end,
-                   CaptureType type, int64_t computed_value = 0) {
-        fields_.push_back({name, start, end, type, nullptr, 0, computed_value});
+                   CaptureType type, Value* computed_value = nullptr) {
+        fields_.push_back({name, start, end, type, nullptr, 0, -1, computed_value});
     }
 
-    void add_computed(const char* name, int64_t value, size_t pos) {
-        fields_.push_back({name, pos, pos, CaptureType::Computed, nullptr, 0, value});
+    void add_computed(const char* name, Value* value, size_t pos) {
+        fields_.push_back({name, pos, pos, CaptureType::Computed, nullptr, 0, -1, value});
     }
 
     Mark mark() const {
@@ -117,7 +125,7 @@ public:
             root->type = CaptureType::Struct;
             root->children = top_captures;
             root->child_count = static_cast<int>(fields_.size());
-            root->computed_value = 0;
+            root->computed_value = nullptr;
             meta.root = root;
         }
 
@@ -136,10 +144,11 @@ public:
         return nullptr;
     }
 
-    // Navigate into a struct/array capture's children by name.
+    // Navigate into a struct/array capture's children by name. Build-phase
+    // only — uses build_buf_index, which becomes invalid once finish() runs.
     const FieldCapture* find_child(const FieldCapture* parent, const char* name) const {
-        if (parent->child_count <= 0) return nullptr;
-        size_t buf_start = reinterpret_cast<size_t>(parent->children);
+        if (parent->child_count <= 0 || parent->build_buf_index < 0) return nullptr;
+        size_t buf_start = static_cast<size_t>(parent->build_buf_index);
         for (int i = 0; i < parent->child_count; i++) {
             if (child_buf_[buf_start + i].name == name)
                 return &child_buf_[buf_start + i];
@@ -147,10 +156,11 @@ public:
         return nullptr;
     }
 
-    // Navigate into an array capture's children by index.
+    // Navigate into an array capture's children by index. Build-phase only.
     const FieldCapture* find_child_at(const FieldCapture* parent, int index) const {
         if (index < 0 || index >= parent->child_count) return nullptr;
-        size_t buf_start = reinterpret_cast<size_t>(parent->children);
+        if (parent->build_buf_index < 0) return nullptr;
+        size_t buf_start = static_cast<size_t>(parent->build_buf_index);
         return &child_buf_[buf_start + index];
     }
 
@@ -188,21 +198,17 @@ private:
         fc.type = scope.type;
         fc.children = nullptr;
         fc.child_count = static_cast<int>(count);
-        fc.computed_value = 0;
+        fc.computed_value = nullptr;
 
-        // Stash children inline: we'll copy child pointers into the
-        // scope capture during finish(). For now, store the children
-        // as a packed range. We save the child data temporarily.
+        // Move children into child_buf_ as a packed range. The scope's
+        // FieldCapture records the range via build_buf_index until finish()
+        // resolves it to a real arena pointer.
         if (count > 0) {
-            // Move children out — they'll be stored in child_buf_
             size_t buf_start = child_buf_.size();
             for (size_t i = first; i < fields_.size(); i++) {
                 child_buf_.push_back(fields_[i]);
             }
-            // Encode the child_buf_ range in the FieldCapture.
-            // children pointer is reinterpreted as buf_start index during building,
-            // resolved to real pointers in finish().
-            fc.children = reinterpret_cast<FieldCapture*>(buf_start);
+            fc.build_buf_index = static_cast<int>(buf_start);
         }
 
         // Remove children from fields_ and replace with the scope capture
@@ -212,7 +218,7 @@ private:
         scopes_.pop_back();
     }
 
-    // Recursively copy fields to arena, resolving child_buf_ references
+    // Recursively copy fields to arena, resolving build_buf_index → children.
     FieldCapture* copy_to_arena(ParseArena& arena, const FieldCapture* src, int count) {
         if (count == 0) return nullptr;
         auto* dst = static_cast<FieldCapture*>(
@@ -222,12 +228,12 @@ private:
 
         for (int i = 0; i < count; i++) {
             if ((dst[i].type == CaptureType::Struct || dst[i].type == CaptureType::Array)
-                && dst[i].child_count > 0) {
-                // Resolve child_buf_ index
-                size_t buf_start = reinterpret_cast<size_t>(dst[i].children);
+                && dst[i].child_count > 0 && dst[i].build_buf_index >= 0) {
+                size_t buf_start = static_cast<size_t>(dst[i].build_buf_index);
                 dst[i].children = copy_to_arena(arena,
                                                 child_buf_.data() + buf_start,
                                                 dst[i].child_count);
+                dst[i].build_buf_index = -1;
             }
         }
         return dst;

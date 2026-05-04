@@ -294,3 +294,54 @@ TEST(Parse, ArrayUntilTerm) {
     ASSERT_NE(st, nullptr);
     EXPECT_NE(dynamic_cast<UntilTerm*>(st->term), nullptr);
 }
+
+// --- Extern declaration ---
+
+TEST(Parse, ExternDecl) {
+    auto* g = parse("Payload = extern(\"decompress_zlib\", \"std::vector<uint8_t>\")");
+    ASSERT_NE(g, nullptr);
+    ASSERT_EQ(g->rules.size(), 1u);
+    auto* ext = dynamic_cast<Extern*>(g->rules[0]->body);
+    ASSERT_NE(ext, nullptr);
+    EXPECT_EQ(ext->func_name, "decompress_zlib");
+    EXPECT_EQ(ext->cpp_type, "std::vector<uint8_t>");
+}
+
+// --- Bitfield declaration ---
+
+TEST(Parse, BitfieldDecl) {
+    auto* g = parse("Flags = bitfield<uint16be> { hi: 4, mid: 8, lo: 4 }");
+    ASSERT_NE(g, nullptr);
+    auto* bf = dynamic_cast<Bitfield*>(g->rules[0]->body);
+    ASSERT_NE(bf, nullptr);
+    auto* ik = dynamic_cast<IntegerKind*>(bf->container);
+    ASSERT_NE(ik, nullptr);
+    EXPECT_EQ(ik->width, Width::W16);
+    ASSERT_EQ(bf->entries.size(), 3u);
+    EXPECT_EQ(bf->entries[0]->name, "hi");
+    EXPECT_EQ(bf->entries[0]->width, 4);
+    EXPECT_EQ(bf->entries[1]->name, "mid");
+    EXPECT_EQ(bf->entries[1]->width, 8);
+    EXPECT_EQ(bf->entries[2]->name, "lo");
+    EXPECT_EQ(bf->entries[2]->width, 4);
+}
+
+// --- Endian switch (runtime) ---
+
+TEST(Parse, EndianSwitchField) {
+    auto* g = parse(
+        "Hdr = struct {\n"
+        "    bom: uint16be,\n"
+        "    @endian: bom == 0x4949 ? little : big,\n"
+        "    value: uint32\n"
+        "}");
+    ASSERT_NE(g, nullptr);
+    auto* st = dynamic_cast<Struct*>(g->rules[0]->body);
+    ASSERT_NE(st, nullptr);
+    ASSERT_EQ(st->fields.size(), 3u);
+    auto* es = dynamic_cast<EndianSwitch*>(st->fields[1]->body);
+    ASSERT_NE(es, nullptr);
+    // The endian_expr should be a Ternary with Eq comparison as condition
+    auto* tern = dynamic_cast<Ternary*>(es->endian_expr);
+    ASSERT_NE(tern, nullptr);
+}

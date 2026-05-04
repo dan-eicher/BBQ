@@ -15,6 +15,7 @@
 #include <cstring>
 #include <sstream>
 #include <string>
+#include <unistd.h>
 
 namespace ddcgc {
 
@@ -127,14 +128,15 @@ TEST(SchemaLoader, DdcgHasMultipleSums) {
     auto s = load_asdl_schema(kDdcgJson, err);
     ASSERT_TRUE(s.has_value());
 
-    // ddcg.asdl has 15 sums (file/header/import/dest_decl/dest_variant/
-    // dest_field/aux_decl/pred_decl/type_ref/rule/pattern/field_pat/
-    // stmt/bind/expr).
-    EXPECT_EQ(s->sum_names.size(), 15u);
+    // ddcg.asdl has 19 sums (file/header/import/dest_decl/dest_variant/
+    // dest_field/aux_decl/pred_decl/fun_decl/fun_param/library_decl/
+    // type_ref/rule/pattern/field_pat/stmt/bind/expr/match_arm).
+    EXPECT_EQ(s->sum_names.size(), 19u);
 
     for (const char* name :
          {"file", "header", "import", "dest_decl", "type_ref",
-          "rule", "pattern", "stmt", "bind", "expr"}) {
+          "rule", "pattern", "stmt", "bind", "expr",
+          "fun_decl", "fun_param", "match_arm", "library_decl"}) {
         EXPECT_EQ(s->sum_names.count(name), 1u) << "missing sum: " << name;
     }
 }
@@ -277,7 +279,11 @@ AUXILIARIES
   cg_x : (int) -> int
 RULES
 rule lit : ast.Lit(n: x) { cg_x(x); }
-rule add : ast.Add(left: l, right: r) { cg_x(l); }
+rule add : ast.Add(left: l, right: r) {
+    let lk = gen(l, effect, fail);
+    let rk = gen(r, effect, fail);
+    cg_x(lk);
+}
 rule bad : ast.Bogus(n: x) { cg_x(x); }
 )";
     auto* file = parse_ddcg(src);
@@ -301,7 +307,11 @@ AUXILIARIES
   cg_x : (int) -> int
 RULES
 rule lit : ast.Lit(wrong: x) { cg_x(x); }
-rule add : ast.Add(left: l, right: r) { cg_x(l); }
+rule add : ast.Add(left: l, right: r) {
+    let lk = gen(l, effect, fail);
+    let rk = gen(r, effect, fail);
+    cg_x(lk);
+}
 )";
     auto* file = parse_ddcg(src);
     ASSERT_NE(file, nullptr);
@@ -324,7 +334,11 @@ AUXILIARIES
   cg_x : (int) -> int
 RULES
 rule lit : ast.Lit(n: x) { cg_x(undefined_name); }
-rule add : ast.Add(left: l, right: r) { cg_x(l); }
+rule add : ast.Add(left: l, right: r) {
+    let lk = gen(l, effect, fail);
+    let rk = gen(r, effect, fail);
+    cg_x(lk);
+}
 )";
     auto* file = parse_ddcg(src);
     ASSERT_NE(file, nullptr);
@@ -588,6 +602,699 @@ std::string emit_with_body(const std::string& body_text,
 }
 
 } // namespace
+
+// ─── Phase A.1: fun declarations ────────────────────────────
+
+TEST(Fun, ParsesAndTypechecks) {
+    static const char* src = R"(
+COMPILER hello
+IMPORTS
+  ast = "ast.json"
+DESTINATIONS
+  data_dest delta { effect }
+  ctrl_dest gamma { fail }
+  ir_root int
+AUXILIARIES
+  cg_x : (int) -> int
+
+fun double_it(n : int) -> int {
+    cg_x(n);
+}
+
+RULES
+rule lit : ast.Lit(n: x) { double_it(x); }
+rule add : ast.Add(left: l, right: r) {
+    let lk = gen(l, effect, fail);
+    let rk = gen(r, effect, fail);
+    cg_x(lk);
+}
+)";
+    auto* file = parse_ddcg(src);
+    ASSERT_NE(file, nullptr);
+    std::map<std::string, Schema> schemas{{"ast", make_tiny_schema()}};
+    auto r = check_file(file, schemas);
+    for (const auto& e : r.errors) ADD_FAILURE() << e.message;
+    EXPECT_TRUE(r.ok());
+    ASSERT_EQ(file->funs.size(), 1u);
+    EXPECT_EQ(file->funs[0]->name, "double_it");
+    EXPECT_EQ(file->funs[0]->params.size(), 1u);
+}
+
+TEST(Fun, CalledFromAnotherFun) {
+    static const char* src = R"(
+COMPILER hello
+IMPORTS
+  ast = "ast.json"
+DESTINATIONS
+  data_dest delta { effect }
+  ctrl_dest gamma { fail }
+  ir_root int
+AUXILIARIES
+  cg_x : (int) -> int
+
+fun helper(n : int) -> int { cg_x(n); }
+fun caller(n : int) -> int { helper(n); }
+
+RULES
+rule lit : ast.Lit(n: x) { caller(x); }
+rule add : ast.Add(left: l, right: r) {
+    let lk = gen(l, effect, fail);
+    let rk = gen(r, effect, fail);
+    cg_x(lk);
+}
+)";
+    auto* file = parse_ddcg(src);
+    ASSERT_NE(file, nullptr);
+    std::map<std::string, Schema> schemas{{"ast", make_tiny_schema()}};
+    auto r = check_file(file, schemas);
+    for (const auto& e : r.errors) ADD_FAILURE() << e.message;
+    EXPECT_TRUE(r.ok());
+}
+
+TEST(Fun, ArityMismatch) {
+    static const char* src = R"(
+COMPILER hello
+IMPORTS
+  ast = "ast.json"
+DESTINATIONS
+  data_dest delta { effect }
+  ctrl_dest gamma { fail }
+  ir_root int
+AUXILIARIES
+  cg_x : (int) -> int
+
+fun two_args(a : int, b : int) -> int { cg_x(a); }
+
+RULES
+rule lit : ast.Lit(n: x) { two_args(x); }
+rule add : ast.Add(left: l, right: r) {
+    let lk = gen(l, effect, fail);
+    let rk = gen(r, effect, fail);
+    cg_x(lk);
+}
+)";
+    auto* file = parse_ddcg(src);
+    ASSERT_NE(file, nullptr);
+    std::map<std::string, Schema> schemas{{"ast", make_tiny_schema()}};
+    auto r = check_file(file, schemas);
+    EXPECT_FALSE(r.ok());
+    EXPECT_TRUE(has_err_substring(r, "fun 'two_args' expects 2"));
+}
+
+TEST(Fun, ReturnTypeMismatch) {
+    static const char* src = R"(
+COMPILER hello
+IMPORTS
+  ast = "ast.json"
+DESTINATIONS
+  data_dest delta { effect }
+  ctrl_dest gamma { fail }
+  ir_root int
+AUXILIARIES
+  cg_x : (int) -> int
+
+fun bad(n : int) -> string { cg_x(n); }
+
+RULES
+rule lit : ast.Lit(n: x) { cg_x(x); }
+rule add : ast.Add(left: l, right: r) {
+    let lk = gen(l, effect, fail);
+    let rk = gen(r, effect, fail);
+    cg_x(lk);
+}
+)";
+    auto* file = parse_ddcg(src);
+    ASSERT_NE(file, nullptr);
+    std::map<std::string, Schema> schemas{{"ast", make_tiny_schema()}};
+    auto r = check_file(file, schemas);
+    EXPECT_FALSE(r.ok());
+    EXPECT_TRUE(has_err_substring(r, "tail expression"));
+}
+
+// ─── Phase A.2: match expression ────────────────────────────
+
+TEST(Match, ParsesAndTypechecks) {
+    static const char* src = R"(
+COMPILER hello
+IMPORTS
+  ast = "ast.json"
+DESTINATIONS
+  data_dest delta { effect | loc(slot: int) }
+  ctrl_dest gamma { fail }
+  ir_root int
+AUXILIARIES
+  cg_x : (int) -> int
+
+fun pick(d : delta) -> int {
+    match (d) {
+        effect    => 0
+      | loc(slot) => slot
+    };
+}
+
+RULES
+rule lit : ast.Lit(n: x) { cg_x(x); }
+rule add : ast.Add(left: l, right: r) {
+    let lk = gen(l, effect, fail);
+    let rk = gen(r, effect, fail);
+    cg_x(lk);
+}
+)";
+    auto* file = parse_ddcg(src);
+    ASSERT_NE(file, nullptr);
+    std::map<std::string, Schema> schemas{{"ast", make_tiny_schema()}};
+    auto r = check_file(file, schemas);
+    for (const auto& e : r.errors) ADD_FAILURE() << e.message;
+    EXPECT_TRUE(r.ok());
+}
+
+TEST(Match, NonExhaustiveErrors) {
+    static const char* src = R"(
+COMPILER hello
+IMPORTS
+  ast = "ast.json"
+DESTINATIONS
+  data_dest delta { effect | loc(slot: int) }
+  ctrl_dest gamma { fail }
+  ir_root int
+AUXILIARIES
+  cg_x : (int) -> int
+
+fun pick(d : delta) -> int {
+    match (d) { effect => 0 };
+}
+
+RULES
+rule lit : ast.Lit(n: x) { cg_x(x); }
+rule add : ast.Add(left: l, right: r) {
+    let lk = gen(l, effect, fail);
+    let rk = gen(r, effect, fail);
+    cg_x(lk);
+}
+)";
+    auto* file = parse_ddcg(src);
+    ASSERT_NE(file, nullptr);
+    std::map<std::string, Schema> schemas{{"ast", make_tiny_schema()}};
+    auto r = check_file(file, schemas);
+    EXPECT_FALSE(r.ok());
+    EXPECT_TRUE(has_err_substring(r, "variant 'loc' not covered"));
+}
+
+TEST(Match, WildcardSatisfiesExhaustiveness) {
+    static const char* src = R"(
+COMPILER hello
+IMPORTS
+  ast = "ast.json"
+DESTINATIONS
+  data_dest delta { effect | loc(slot: int) }
+  ctrl_dest gamma { fail }
+  ir_root int
+AUXILIARIES
+  cg_x : (int) -> int
+
+fun pick(d : delta) -> int {
+    match (d) {
+        effect => 0
+      | _      => 99
+    };
+}
+
+RULES
+rule lit : ast.Lit(n: x) { cg_x(x); }
+rule add : ast.Add(left: l, right: r) {
+    let lk = gen(l, effect, fail);
+    let rk = gen(r, effect, fail);
+    cg_x(lk);
+}
+)";
+    auto* file = parse_ddcg(src);
+    ASSERT_NE(file, nullptr);
+    std::map<std::string, Schema> schemas{{"ast", make_tiny_schema()}};
+    auto r = check_file(file, schemas);
+    for (const auto& e : r.errors) ADD_FAILURE() << e.message;
+    EXPECT_TRUE(r.ok());
+}
+
+TEST(Match, EmitsSwitch) {
+    static const char* src = R"(
+COMPILER hello
+IMPORTS
+  ast = "ast.json"
+DESTINATIONS
+  data_dest delta { effect | loc(slot: int) }
+  ctrl_dest gamma { fail }
+  ir_root int
+AUXILIARIES
+  cg_x : (int) -> int
+
+fun pick(d : delta) -> int {
+    match (d) {
+        effect    => 0
+      | loc(slot) => slot
+    };
+}
+
+RULES
+rule lit : ast.Lit(n: x) { cg_x(x); }
+rule add : ast.Add(left: l, right: r) {
+    let lk = gen(l, effect, fail);
+    let rk = gen(r, effect, fail);
+    cg_x(lk);
+}
+)";
+    auto* file = parse_ddcg(src);
+    ASSERT_NE(file, nullptr);
+    std::map<std::string, Schema> schemas{{"ast", make_tiny_schema()}};
+    auto chk = check_file(file, schemas);
+    ASSERT_TRUE(chk.ok());
+
+    std::ostringstream out;
+    std::vector<std::string> errs;
+    ASSERT_TRUE(emit_cpp(file, schemas, chk, out, errs));
+    std::string emitted = out.str();
+    EXPECT_NE(emitted.find("switch (_m.tag)"), std::string::npos);
+    EXPECT_NE(emitted.find("DeltaTag::Effect"), std::string::npos);
+    EXPECT_NE(emitted.find("DeltaTag::Loc"), std::string::npos);
+    EXPECT_NE(emitted.find("auto slot = _m.slot"), std::string::npos);
+}
+
+// ─── asdl enum sums ─────────────────────────────────────────
+//
+// Sums whose constructors are all zero-arg are flagged `is_enum: true`
+// by asdl and lowered to `enum class` at the C++ level. ddcgc treats
+// the constructor names as constants in pattern position rather than
+// value-binds — both inside rule-head field patterns and inside `match`
+// expressions whose subject has an enum type.
+
+namespace {
+
+// Hand-rolled schema with one enum sum (`op = OpAdd|OpSub|OpMul`) plus
+// a `BinOp(op, expr, expr)` constructor that carries the enum as a
+// field. `make_tiny_schema()`'s `expr` sum is overlaid so existing
+// `ast.Lit` / `ast.Add` rule shapes still type-check.
+Schema make_enum_schema() {
+    Schema s = make_tiny_schema();
+    s.sum_names.insert("op");
+    s.enum_sums.insert("op");
+    s.sum_constructors["op"] = {"OpAdd", "OpSub", "OpMul"};
+    Constructor binop;
+    binop.name = "BinOp";
+    binop.sum_name = "expr";
+    binop.fields.push_back({"op",    "op",   FieldFlag::None});
+    binop.fields.push_back({"left",  "expr", FieldFlag::None});
+    binop.fields.push_back({"right", "expr", FieldFlag::None});
+    s.constructors["BinOp"] = std::move(binop);
+    s.sum_constructors["expr"].push_back("BinOp");
+    Constructor sel;
+    sel.name = "Sel";
+    sel.sum_name = "expr";
+    sel.fields.push_back({"which", "op", FieldFlag::None});
+    s.constructors["Sel"] = std::move(sel);
+    s.sum_constructors["expr"].push_back("Sel");
+    return s;
+}
+
+} // namespace
+
+TEST(SchemaLoader, EnumSumsRoundTrip) {
+    // Round-trip an inline JSON sidecar to confirm the loader propagates
+    // asdl's `is_enum: true` into Schema::enum_sums.
+    const char* json_src = R"({
+        "name": "ex",
+        "definitions": [
+            {
+                "type": "sum",
+                "name": "op",
+                "is_enum": true,
+                "types": [
+                    {"name": "OpAdd", "fields": []},
+                    {"name": "OpSub", "fields": []}
+                ]
+            },
+            {
+                "type": "sum",
+                "name": "expr",
+                "is_enum": false,
+                "types": [
+                    {"name": "Lit", "fields": [{"name": "n", "type": "int"}]}
+                ]
+            }
+        ]
+    })";
+    char path[] = "/tmp/ddcgc_enum_schema_XXXXXX.json";
+    int fd = mkstemps(path, 5);
+    ASSERT_GE(fd, 0);
+    ASSERT_EQ(write(fd, json_src, std::strlen(json_src)),
+              static_cast<ssize_t>(std::strlen(json_src)));
+    close(fd);
+    std::string err;
+    auto s = load_asdl_schema(path, err);
+    unlink(path);
+    ASSERT_TRUE(s.has_value()) << err;
+    EXPECT_EQ(s->enum_sums.count("op"), 1u);
+    EXPECT_EQ(s->enum_sums.count("expr"), 0u);
+}
+
+TEST(EnumPattern, FieldPatBindNameMatchingEnumValueIsConstant) {
+    static const char* src = R"(
+COMPILER hello
+IMPORTS
+  ast = "ast.json"
+DESTINATIONS
+  data_dest delta { effect }
+  ctrl_dest gamma { fail }
+  ir_root int
+AUXILIARIES
+  cg_x : (int) -> int
+RULES
+rule binop_add : ast.BinOp(op: OpAdd, left: l, right: r) {
+    let lk = gen(l, effect, fail);
+    let rk = gen(r, effect, fail);
+    cg_x(lk);
+}
+rule binop_other : ast.BinOp(op: o, left: l, right: r) {
+    let lk = gen(l, effect, fail);
+    let rk = gen(r, effect, fail);
+    cg_x(lk);
+}
+rule sel : ast.Sel(which: w) { cg_x(0); }
+rule lit : ast.Lit(n: x) { cg_x(x); }
+rule add : ast.Add(left: l, right: r) {
+    let lk = gen(l, effect, fail);
+    let rk = gen(r, effect, fail);
+    cg_x(lk);
+}
+)";
+    auto* file = parse_ddcg(src);
+    ASSERT_NE(file, nullptr);
+    std::map<std::string, Schema> schemas{{"ast", make_enum_schema()}};
+    auto chk = check_file(file, schemas);
+    for (const auto& e : chk.errors) ADD_FAILURE() << e.message;
+    ASSERT_TRUE(chk.ok());
+
+    std::ostringstream out;
+    std::vector<std::string> errs;
+    ASSERT_TRUE(emit_cpp(file, schemas, chk, out, errs));
+    std::string emitted = out.str();
+    // OpAdd should land as a leaf-check, not as `auto OpAdd = ...`.
+    EXPECT_NE(emitted.find("op == ast::Op::OpAdd"), std::string::npos)
+        << emitted;
+    EXPECT_EQ(emitted.find("auto OpAdd ="), std::string::npos)
+        << "OpAdd must not be bound as a name";
+    // The binop_other rule's `o` BindPat is a real value-bind.
+    EXPECT_NE(emitted.find("auto o ="), std::string::npos);
+}
+
+TEST(EnumPattern, MatchOverEnumSubjectEmitsSwitch) {
+    static const char* src = R"(
+COMPILER hello
+IMPORTS
+  ast = "ast.json"
+DESTINATIONS
+  data_dest delta { effect }
+  ctrl_dest gamma { fail }
+  ir_root int
+AUXILIARIES
+  cg_x : (int) -> int
+
+fun op_to_int(o : ast.op) -> int {
+    match (o) {
+        OpAdd => 1
+      | OpSub => 2
+      | OpMul => 3
+    };
+}
+
+RULES
+rule sel : ast.Sel(which: w) { cg_x(op_to_int(w)); }
+rule binop : ast.BinOp(op: o, left: l, right: r) {
+    let lk = gen(l, effect, fail);
+    cg_x(lk);
+}
+rule lit : ast.Lit(n: x) { cg_x(x); }
+rule add : ast.Add(left: l, right: r) {
+    let lk = gen(l, effect, fail);
+    let rk = gen(r, effect, fail);
+    cg_x(lk);
+}
+)";
+    auto* file = parse_ddcg(src);
+    ASSERT_NE(file, nullptr);
+    std::map<std::string, Schema> schemas{{"ast", make_enum_schema()}};
+    auto chk = check_file(file, schemas);
+    for (const auto& e : chk.errors) ADD_FAILURE() << e.message;
+    ASSERT_TRUE(chk.ok());
+
+    std::ostringstream out;
+    std::vector<std::string> errs;
+    ASSERT_TRUE(emit_cpp(file, schemas, chk, out, errs));
+    std::string emitted = out.str();
+    EXPECT_NE(emitted.find("switch (_m)"), std::string::npos) << emitted;
+    EXPECT_NE(emitted.find("case ast::Op::OpAdd:"), std::string::npos);
+    EXPECT_NE(emitted.find("case ast::Op::OpSub:"), std::string::npos);
+    EXPECT_NE(emitted.find("case ast::Op::OpMul:"), std::string::npos);
+}
+
+TEST(EnumPattern, MatchOverEnumNonExhaustiveErrors) {
+    static const char* src = R"(
+COMPILER hello
+IMPORTS
+  ast = "ast.json"
+DESTINATIONS
+  data_dest delta { effect }
+  ctrl_dest gamma { fail }
+  ir_root int
+AUXILIARIES
+  cg_x : (int) -> int
+
+fun op_to_int(o : ast.op) -> int {
+    match (o) { OpAdd => 1 | OpSub => 2 };
+}
+
+RULES
+rule sel : ast.Sel(which: w) { cg_x(op_to_int(w)); }
+rule binop : ast.BinOp(op: o, left: l, right: r) {
+    let lk = gen(l, effect, fail);
+    cg_x(lk);
+}
+rule lit : ast.Lit(n: x) { cg_x(x); }
+rule add : ast.Add(left: l, right: r) {
+    let lk = gen(l, effect, fail);
+    let rk = gen(r, effect, fail);
+    cg_x(lk);
+}
+)";
+    auto* file = parse_ddcg(src);
+    ASSERT_NE(file, nullptr);
+    std::map<std::string, Schema> schemas{{"ast", make_enum_schema()}};
+    auto chk = check_file(file, schemas);
+    EXPECT_FALSE(chk.ok());
+    EXPECT_TRUE(has_err_substring(chk, "value 'OpMul' not covered"));
+}
+
+// ─── library imports ────────────────────────────────────────
+
+TEST(LibraryImport, ParsesIntoLibrariesArray) {
+    static const char* src = R"(
+COMPILER hello
+IMPORTS
+  ast = "ast.json"
+DESTINATIONS
+  data_dest delta { effect }
+  ctrl_dest gamma { fail }
+  ir_root int
+AUXILIARIES
+  cg_x : (int) -> int
+
+import "lib1.ddcg"
+import "lib2.ddcg"
+
+RULES
+rule lit : ast.Lit(n: x) { cg_x(x); }
+rule add : ast.Add(left: l, right: r) {
+    let lk = gen(l, effect, fail);
+    let rk = gen(r, effect, fail);
+    cg_x(lk);
+}
+)";
+    auto* file = parse_ddcg(src);
+    ASSERT_NE(file, nullptr);
+    ASSERT_EQ(file->libraries.size(), 2u);
+    EXPECT_EQ(file->libraries[0]->path, "lib1.ddcg");
+    EXPECT_EQ(file->libraries[1]->path, "lib2.ddcg");
+}
+
+// ─── Phase A.3: build expression ────────────────────────────
+
+TEST(Build, ParsesAndTypechecks) {
+    static const char* src = R"(
+COMPILER hello
+IMPORTS
+  ast = "ast.json"
+DESTINATIONS
+  data_dest delta { effect }
+  ctrl_dest gamma { fail }
+  ir_root int
+AUXILIARIES
+  cg_x : (int) -> int
+
+fun make_lit(n : int) -> ast.Lit {
+    build ast.Lit(n);
+}
+
+RULES
+rule lit : ast.Lit(n: x) { cg_x(x); }
+rule add : ast.Add(left: l, right: r) {
+    let lk = gen(l, effect, fail);
+    let rk = gen(r, effect, fail);
+    cg_x(lk);
+}
+)";
+    auto* file = parse_ddcg(src);
+    ASSERT_NE(file, nullptr);
+    std::map<std::string, Schema> schemas{{"ast", make_tiny_schema()}};
+    auto r = check_file(file, schemas);
+    for (const auto& e : r.errors) ADD_FAILURE() << e.message;
+    EXPECT_TRUE(r.ok());
+}
+
+TEST(Build, ArityMismatch) {
+    static const char* src = R"(
+COMPILER hello
+IMPORTS
+  ast = "ast.json"
+DESTINATIONS
+  data_dest delta { effect }
+  ctrl_dest gamma { fail }
+  ir_root int
+AUXILIARIES
+  cg_x : (int) -> int
+
+fun bad() -> ast.Lit {
+    build ast.Lit();
+}
+
+RULES
+rule lit : ast.Lit(n: x) { cg_x(x); }
+rule add : ast.Add(left: l, right: r) {
+    let lk = gen(l, effect, fail);
+    let rk = gen(r, effect, fail);
+    cg_x(lk);
+}
+)";
+    auto* file = parse_ddcg(src);
+    ASSERT_NE(file, nullptr);
+    std::map<std::string, Schema> schemas{{"ast", make_tiny_schema()}};
+    auto r = check_file(file, schemas);
+    EXPECT_FALSE(r.ok());
+    EXPECT_TRUE(has_err_substring(r, "build ast.Lit: expected 1 arg(s), got 0"));
+}
+
+TEST(Build, UnknownConstructorErrors) {
+    static const char* src = R"(
+COMPILER hello
+IMPORTS
+  ast = "ast.json"
+DESTINATIONS
+  data_dest delta { effect }
+  ctrl_dest gamma { fail }
+  ir_root int
+AUXILIARIES
+  cg_x : (int) -> int
+
+fun bad() -> ast.Lit {
+    build ast.Bogus(0);
+}
+
+RULES
+rule lit : ast.Lit(n: x) { cg_x(x); }
+rule add : ast.Add(left: l, right: r) {
+    let lk = gen(l, effect, fail);
+    let rk = gen(r, effect, fail);
+    cg_x(lk);
+}
+)";
+    auto* file = parse_ddcg(src);
+    ASSERT_NE(file, nullptr);
+    std::map<std::string, Schema> schemas{{"ast", make_tiny_schema()}};
+    auto r = check_file(file, schemas);
+    EXPECT_FALSE(r.ok());
+    EXPECT_TRUE(has_err_substring(r, "unknown constructor 'ast.Bogus'"));
+}
+
+TEST(Build, EmitsAsNew) {
+    static const char* src = R"(
+COMPILER hello
+IMPORTS
+  ast = "ast.json"
+DESTINATIONS
+  data_dest delta { effect }
+  ctrl_dest gamma { fail }
+  ir_root int
+AUXILIARIES
+  cg_x : (int) -> int
+
+fun make_lit(n : int) -> ast.Lit {
+    build ast.Lit(n);
+}
+
+RULES
+rule lit : ast.Lit(n: x) { cg_x(x); }
+rule add : ast.Add(left: l, right: r) {
+    let lk = gen(l, effect, fail);
+    let rk = gen(r, effect, fail);
+    cg_x(lk);
+}
+)";
+    auto* file = parse_ddcg(src);
+    ASSERT_NE(file, nullptr);
+    std::map<std::string, Schema> schemas{{"ast", make_tiny_schema()}};
+    auto chk = check_file(file, schemas);
+    ASSERT_TRUE(chk.ok());
+
+    std::ostringstream out;
+    std::vector<std::string> errs;
+    ASSERT_TRUE(emit_cpp(file, schemas, chk, out, errs));
+    std::string emitted = out.str();
+    EXPECT_NE(emitted.find("new ast::Lit(n)"), std::string::npos);
+}
+
+TEST(Fun, EmitsAsMethod) {
+    static const char* src = R"(
+COMPILER hello
+IMPORTS
+  ast = "ast.json"
+DESTINATIONS
+  data_dest delta { effect }
+  ctrl_dest gamma { fail }
+  ir_root int
+AUXILIARIES
+  cg_x : (int) -> int
+
+fun double_it(n : int) -> int { cg_x(n); }
+
+RULES
+rule lit : ast.Lit(n: x) { double_it(x); }
+rule add : ast.Add(left: l, right: r) {
+    let lk = gen(l, effect, fail);
+    let rk = gen(r, effect, fail);
+    cg_x(lk);
+}
+)";
+    auto* file = parse_ddcg(src);
+    ASSERT_NE(file, nullptr);
+    std::map<std::string, Schema> schemas{{"ast", make_tiny_schema()}};
+    auto chk = check_file(file, schemas);
+    ASSERT_TRUE(chk.ok());
+
+    std::ostringstream out;
+    std::vector<std::string> errs;
+    ASSERT_TRUE(emit_cpp(file, schemas, chk, out, errs));
+    std::string emitted = out.str();
+    EXPECT_NE(emitted.find("// fun double_it"), std::string::npos);
+    EXPECT_NE(emitted.find("int double_it(int n)"), std::string::npos);
+    EXPECT_NE(emitted.find("protected:"), std::string::npos);
+}
 
 TEST(EmitExpr, IntLiteral) {
     std::vector<std::string> errs;
@@ -869,7 +1576,7 @@ rule lit  : ast.Lit(n: x) { cg_x(x); }
     std::string text = out.str();
     // The nested cast MUST be on the field expression (`_n0->left`),
     // not on `node`. Search for the field-cast specifically.
-    EXPECT_NE(text.find("dynamic_cast<Lit*>(_n0->left)"), std::string::npos)
+    EXPECT_NE(text.find("dynamic_cast<ast::Lit*>(_n0->left)"), std::string::npos)
         << "nested constructor pattern must dynamic_cast the field:\n" << text;
     EXPECT_NE(text.find("->n == 0"), std::string::npos)
         << "nested IntPat must emit value check:\n" << text;
@@ -1399,9 +2106,9 @@ rule both : ast.Lit(n: _), ast.Add(left: _, right: _) {
     std::vector<std::string> emit_errs;
     ASSERT_TRUE(emit_cpp(file, schemas, check, out, emit_errs));
     std::string text = out.str();
-    EXPECT_NE(text.find("dynamic_cast<Lit*>"), std::string::npos)
+    EXPECT_NE(text.find("dynamic_cast<ast::Lit*>"), std::string::npos)
         << "missing Lit branch:\n" << text;
-    EXPECT_NE(text.find("dynamic_cast<Add*>"), std::string::npos)
+    EXPECT_NE(text.find("dynamic_cast<ast::Add*>"), std::string::npos)
         << "missing Add branch:\n" << text;
 }
 
@@ -1617,8 +2324,13 @@ rule add : ast.Add(left: l, right: r) {
     EXPECT_NE(text.find("stack(0)"), std::string::npos)
         << "payload dest variant should preserve args:\n" << text;
     // Dispatcher signature has both.
-    EXPECT_NE(text.find("delta_t d, gamma_t g)"), std::string::npos)
-        << "dispatcher signature missing one of δ/γ:\n" << text;
+    // Dispatcher signature binds the dispatcher's incoming destinations
+    // by their declared names (paper §3.2 explicit ρ, δ, γ). Lnext is
+    // the optional Figure-8 fall-through hint.
+    EXPECT_NE(text.find("delta_t delta, gamma_t gamma"), std::string::npos)
+        << "dispatcher signature missing δ/γ params bound by name:\n" << text;
+    EXPECT_NE(text.find("Lnext = {}"), std::string::npos)
+        << "dispatcher missing optional Lnext:\n" << text;
 }
 
 // ─── Codegen tests ──────────────────────────────────────────────
@@ -1727,8 +2439,8 @@ rule sseq : ast.SSeq(next: n)    { let k = gen(n, effect, fail); cg_sseq(k); }
     // δ + γ types both derived from the .ddcg's DESTINATIONS — the
     // dispatcher signature follows the paper's CG : E → ρ → δ → γ → Code,
     // with ρ folded into the class itself.
-    EXPECT_NE(text.find("delta_t d, gamma_t g)"), std::string::npos)
-        << "dispatcher should take both δ and γ:\n" << text;
+    EXPECT_NE(text.find("delta_t delta, gamma_t gamma"), std::string::npos)
+        << "dispatcher should take both δ and γ bound by name:\n" << text;
 }
 
 TEST(Codegen, GenCallReturnTypePropagatesToLet) {
@@ -1811,7 +2523,11 @@ DESUGARED
   NotARealCtor
 RULES
 rule lit : ast.Lit(n: x) { cg_x(x); }
-rule add : ast.Add(left: l, right: r) { cg_x(l); }
+rule add : ast.Add(left: l, right: r) {
+    let lk = gen(l, effect, fail);
+    let rk = gen(r, effect, fail);
+    cg_x(lk);
+}
 )";
     auto* file = parse_ddcg(src);
     ASSERT_NE(file, nullptr);

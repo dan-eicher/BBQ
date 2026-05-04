@@ -105,8 +105,11 @@ struct Type {
 
 // True if `value_t` can be assigned to a binding/parameter of `expected_t`.
 // Lenient: Unknown matches anything; nil matches any Schema; same kind &
-// payload otherwise.
-bool assignable(const Type& expected, const Type& value);
+// payload otherwise. When `schemas` is non-null, also recognises the
+// constructor → parent-sum subtyping baked into the asdl schema (e.g.
+// `target.Imm` is assignable to `target.value`).
+bool assignable(const Type& expected, const Type& value,
+                 const std::map<std::string, Schema>* schemas = nullptr);
 
 // ── Diagnostics ─────────────────────────────────────────────
 

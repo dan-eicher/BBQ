@@ -56,7 +56,13 @@ private:
 
     // Phase 3: validate references, build dependency graph
     void validate_rule(BBQ::Rule* rule);
-    void validate_type(BBQ::TypeExpr* type, const std::string& ctx);
+    // `guarded` = true when this type sits under an Array.element or
+    // Optional.element, where the recursion is finite at runtime
+    // (count=0 / absence terminates). RuleRefs reached while guarded
+    // do NOT count as topo-sort dependencies — the cycle is legal and
+    // the compiler resolves the forward ref via patch_kont.
+    void validate_type(BBQ::TypeExpr* type, const std::string& ctx,
+                        bool guarded = false);
     void validate_expr(BBQ::Expr* expr, const std::string& ctx);
     void validate_ref_path(BBQ::RefPath* path, const std::string& ctx);
 

@@ -9,13 +9,17 @@
     "DestField",
     "Aux",
     "Pred",
+    "Fun",
+    "FunParam",
+    "LibraryImport",
     "TypeRef",
     "Rule",
     "Pattern",
     "FieldPat",
     "Stmt",
     "Bind",
-    "Expr"
+    "Expr",
+    "MatchArm"
   ],
   "definitions": [
     {
@@ -29,58 +33,87 @@
           "fields": [
             {
               "flag": "none",
+              "is_schema": false,
               "name": "compiler_name",
               "type": "identifier"
             },
             {
               "flag": "sequence",
+              "is_schema": true,
               "name": "headers",
               "type": "header"
             },
             {
               "flag": "sequence",
+              "is_schema": true,
               "name": "imports",
               "type": "import"
             },
             {
               "flag": "sequence",
+              "is_schema": true,
               "name": "destinations",
               "type": "dest_decl"
             },
             {
               "flag": "none",
+              "is_schema": true,
               "name": "ir_root",
               "type": "type_ref"
             },
             {
               "flag": "sequence",
+              "is_schema": true,
               "name": "auxiliaries",
               "type": "aux_decl"
             },
             {
               "flag": "sequence",
+              "is_schema": true,
               "name": "predicates",
               "type": "pred_decl"
             },
             {
+              "flag": "sequence",
+              "is_schema": true,
+              "name": "funs",
+              "type": "fun_decl"
+            },
+            {
+              "flag": "sequence",
+              "is_schema": true,
+              "name": "libraries",
+              "type": "library_decl"
+            },
+            {
               "flag": "none",
+              "is_schema": false,
               "name": "members",
               "type": "string"
             },
             {
               "flag": "none",
+              "is_schema": false,
               "name": "private_helpers",
               "type": "string"
             },
             {
               "flag": "sequence",
+              "is_schema": false,
               "name": "desugared_by_normalization",
               "type": "identifier"
             },
             {
               "flag": "sequence",
+              "is_schema": true,
               "name": "rules",
               "type": "rule"
+            },
+            {
+              "flag": "none",
+              "is_schema": false,
+              "name": "internal_dispatchers",
+              "type": "bool"
             }
           ],
           "name": "File"
@@ -98,6 +131,7 @@
           "fields": [
             {
               "flag": "none",
+              "is_schema": false,
               "name": "code",
               "type": "string"
             }
@@ -117,11 +151,13 @@
           "fields": [
             {
               "flag": "none",
+              "is_schema": false,
               "name": "name",
               "type": "identifier"
             },
             {
               "flag": "none",
+              "is_schema": false,
               "name": "path",
               "type": "string"
             }
@@ -141,11 +177,13 @@
           "fields": [
             {
               "flag": "none",
+              "is_schema": false,
               "name": "name",
               "type": "identifier"
             },
             {
               "flag": "sequence",
+              "is_schema": true,
               "name": "variants",
               "type": "dest_variant"
             }
@@ -157,16 +195,36 @@
           "fields": [
             {
               "flag": "none",
+              "is_schema": false,
               "name": "name",
               "type": "identifier"
             },
             {
               "flag": "sequence",
+              "is_schema": true,
               "name": "variants",
               "type": "dest_variant"
             }
           ],
           "name": "CtrlDest"
+        },
+        {
+          "base": "DestDecl",
+          "fields": [
+            {
+              "flag": "none",
+              "is_schema": false,
+              "name": "name",
+              "type": "identifier"
+            },
+            {
+              "flag": "sequence",
+              "is_schema": true,
+              "name": "fields",
+              "type": "dest_field"
+            }
+          ],
+          "name": "EnvDest"
         }
       ]
     },
@@ -181,11 +239,13 @@
           "fields": [
             {
               "flag": "none",
+              "is_schema": false,
               "name": "name",
               "type": "identifier"
             },
             {
               "flag": "sequence",
+              "is_schema": true,
               "name": "fields",
               "type": "dest_field"
             }
@@ -205,11 +265,13 @@
           "fields": [
             {
               "flag": "none",
+              "is_schema": false,
               "name": "name",
               "type": "identifier"
             },
             {
               "flag": "none",
+              "is_schema": true,
               "name": "ty",
               "type": "type_ref"
             }
@@ -229,16 +291,19 @@
           "fields": [
             {
               "flag": "none",
+              "is_schema": false,
               "name": "name",
               "type": "identifier"
             },
             {
               "flag": "sequence",
+              "is_schema": true,
               "name": "param_types",
               "type": "type_ref"
             },
             {
               "flag": "none",
+              "is_schema": true,
               "name": "return_ty",
               "type": "type_ref"
             }
@@ -258,16 +323,102 @@
           "fields": [
             {
               "flag": "none",
+              "is_schema": false,
               "name": "name",
               "type": "identifier"
             },
             {
               "flag": "sequence",
+              "is_schema": true,
               "name": "param_types",
               "type": "type_ref"
             }
           ],
           "name": "Pred"
+        }
+      ]
+    },
+    {
+      "attributes": [],
+      "is_enum": false,
+      "name": "fun_decl",
+      "type": "sum",
+      "types": [
+        {
+          "base": "ASTNode",
+          "fields": [
+            {
+              "flag": "none",
+              "is_schema": false,
+              "name": "name",
+              "type": "identifier"
+            },
+            {
+              "flag": "sequence",
+              "is_schema": true,
+              "name": "params",
+              "type": "fun_param"
+            },
+            {
+              "flag": "none",
+              "is_schema": true,
+              "name": "ret_ty",
+              "type": "type_ref"
+            },
+            {
+              "flag": "sequence",
+              "is_schema": true,
+              "name": "body",
+              "type": "stmt"
+            }
+          ],
+          "name": "Fun"
+        }
+      ]
+    },
+    {
+      "attributes": [],
+      "is_enum": false,
+      "name": "fun_param",
+      "type": "sum",
+      "types": [
+        {
+          "base": "ASTNode",
+          "fields": [
+            {
+              "flag": "none",
+              "is_schema": false,
+              "name": "name",
+              "type": "identifier"
+            },
+            {
+              "flag": "none",
+              "is_schema": true,
+              "name": "ty",
+              "type": "type_ref"
+            }
+          ],
+          "name": "FunParam"
+        }
+      ]
+    },
+    {
+      "attributes": [],
+      "is_enum": false,
+      "name": "library_decl",
+      "type": "sum",
+      "types": [
+        {
+          "base": "ASTNode",
+          "fields": [
+            {
+              "flag": "none",
+              "is_schema": false,
+              "name": "path",
+              "type": "string"
+            }
+          ],
+          "name": "LibraryImport"
         }
       ]
     },
@@ -282,11 +433,19 @@
           "fields": [
             {
               "flag": "none",
+              "is_schema": false,
+              "name": "module",
+              "type": "identifier"
+            },
+            {
+              "flag": "none",
+              "is_schema": false,
               "name": "name",
               "type": "identifier"
             },
             {
               "flag": "none",
+              "is_schema": false,
               "name": "is_pointer",
               "type": "bool"
             }
@@ -298,6 +457,7 @@
           "fields": [
             {
               "flag": "none",
+              "is_schema": true,
               "name": "elem",
               "type": "type_ref"
             }
@@ -309,6 +469,7 @@
           "fields": [
             {
               "flag": "sequence",
+              "is_schema": true,
               "name": "elems",
               "type": "type_ref"
             }
@@ -328,16 +489,19 @@
           "fields": [
             {
               "flag": "sequence",
+              "is_schema": true,
               "name": "heads",
               "type": "pattern"
             },
             {
               "flag": "optional",
+              "is_schema": true,
               "name": "guard",
               "type": "expr"
             },
             {
               "flag": "sequence",
+              "is_schema": true,
               "name": "body",
               "type": "stmt"
             }
@@ -357,16 +521,19 @@
           "fields": [
             {
               "flag": "none",
+              "is_schema": false,
               "name": "module",
               "type": "identifier"
             },
             {
               "flag": "none",
+              "is_schema": false,
               "name": "ctor",
               "type": "identifier"
             },
             {
               "flag": "sequence",
+              "is_schema": true,
               "name": "fields",
               "type": "field_pat"
             }
@@ -378,6 +545,7 @@
           "fields": [
             {
               "flag": "none",
+              "is_schema": false,
               "name": "name",
               "type": "identifier"
             }
@@ -399,6 +567,7 @@
           "fields": [
             {
               "flag": "none",
+              "is_schema": false,
               "name": "value",
               "type": "int"
             }
@@ -410,6 +579,7 @@
           "fields": [
             {
               "flag": "none",
+              "is_schema": false,
               "name": "value",
               "type": "string"
             }
@@ -429,11 +599,13 @@
           "fields": [
             {
               "flag": "none",
+              "is_schema": false,
               "name": "name",
               "type": "identifier"
             },
             {
               "flag": "none",
+              "is_schema": true,
               "name": "pat",
               "type": "pattern"
             }
@@ -445,6 +617,7 @@
           "fields": [
             {
               "flag": "none",
+              "is_schema": false,
               "name": "name",
               "type": "identifier"
             }
@@ -464,11 +637,13 @@
           "fields": [
             {
               "flag": "sequence",
+              "is_schema": true,
               "name": "binds",
               "type": "bind"
             },
             {
               "flag": "none",
+              "is_schema": true,
               "name": "value",
               "type": "expr"
             }
@@ -480,11 +655,13 @@
           "fields": [
             {
               "flag": "none",
+              "is_schema": false,
               "name": "name",
               "type": "identifier"
             },
             {
               "flag": "none",
+              "is_schema": true,
               "name": "value",
               "type": "expr"
             }
@@ -496,16 +673,19 @@
           "fields": [
             {
               "flag": "none",
+              "is_schema": true,
               "name": "iter",
               "type": "bind"
             },
             {
               "flag": "none",
+              "is_schema": true,
               "name": "seq",
               "type": "expr"
             },
             {
               "flag": "sequence",
+              "is_schema": true,
               "name": "body",
               "type": "stmt"
             }
@@ -517,6 +697,7 @@
           "fields": [
             {
               "flag": "none",
+              "is_schema": false,
               "name": "name",
               "type": "identifier"
             }
@@ -528,6 +709,7 @@
           "fields": [
             {
               "flag": "none",
+              "is_schema": true,
               "name": "value",
               "type": "expr"
             }
@@ -547,11 +729,13 @@
           "fields": [
             {
               "flag": "none",
+              "is_schema": false,
               "name": "name",
               "type": "identifier"
             },
             {
               "flag": "optional",
+              "is_schema": true,
               "name": "ty",
               "type": "type_ref"
             }
@@ -576,16 +760,19 @@
           "fields": [
             {
               "flag": "none",
+              "is_schema": true,
               "name": "cond",
               "type": "expr"
             },
             {
               "flag": "none",
+              "is_schema": true,
               "name": "then_",
               "type": "expr"
             },
             {
               "flag": "none",
+              "is_schema": true,
               "name": "else_",
               "type": "expr"
             }
@@ -597,16 +784,19 @@
           "fields": [
             {
               "flag": "none",
+              "is_schema": false,
               "name": "op",
               "type": "string"
             },
             {
               "flag": "none",
+              "is_schema": true,
               "name": "left",
               "type": "expr"
             },
             {
               "flag": "none",
+              "is_schema": true,
               "name": "right",
               "type": "expr"
             }
@@ -618,11 +808,13 @@
           "fields": [
             {
               "flag": "none",
+              "is_schema": false,
               "name": "op",
               "type": "string"
             },
             {
               "flag": "none",
+              "is_schema": true,
               "name": "operand",
               "type": "expr"
             }
@@ -634,11 +826,13 @@
           "fields": [
             {
               "flag": "none",
+              "is_schema": true,
               "name": "fn",
               "type": "expr"
             },
             {
               "flag": "sequence",
+              "is_schema": true,
               "name": "args",
               "type": "expr"
             }
@@ -650,11 +844,13 @@
           "fields": [
             {
               "flag": "none",
+              "is_schema": true,
               "name": "base",
               "type": "expr"
             },
             {
               "flag": "none",
+              "is_schema": false,
               "name": "field",
               "type": "identifier"
             }
@@ -666,11 +862,13 @@
           "fields": [
             {
               "flag": "none",
+              "is_schema": true,
               "name": "base",
               "type": "expr"
             },
             {
               "flag": "none",
+              "is_schema": true,
               "name": "index",
               "type": "expr"
             }
@@ -682,6 +880,7 @@
           "fields": [
             {
               "flag": "none",
+              "is_schema": false,
               "name": "name",
               "type": "identifier"
             }
@@ -693,6 +892,7 @@
           "fields": [
             {
               "flag": "none",
+              "is_schema": false,
               "name": "value",
               "type": "int"
             }
@@ -704,6 +904,7 @@
           "fields": [
             {
               "flag": "none",
+              "is_schema": false,
               "name": "value",
               "type": "string"
             }
@@ -715,6 +916,7 @@
           "fields": [
             {
               "flag": "none",
+              "is_schema": false,
               "name": "value",
               "type": "bool"
             }
@@ -731,6 +933,7 @@
           "fields": [
             {
               "flag": "sequence",
+              "is_schema": true,
               "name": "elems",
               "type": "expr"
             }
@@ -742,6 +945,7 @@
           "fields": [
             {
               "flag": "sequence",
+              "is_schema": true,
               "name": "elems",
               "type": "expr"
             }
@@ -753,11 +957,13 @@
           "fields": [
             {
               "flag": "none",
+              "is_schema": false,
               "name": "name",
               "type": "identifier"
             },
             {
               "flag": "sequence",
+              "is_schema": true,
               "name": "args",
               "type": "expr"
             }
@@ -769,26 +975,110 @@
           "fields": [
             {
               "flag": "none",
+              "is_schema": true,
               "name": "subject",
               "type": "expr"
             },
             {
-              "flag": "none",
-              "name": "data_dest",
-              "type": "expr"
-            },
-            {
-              "flag": "none",
-              "name": "ctrl_dest",
-              "type": "expr"
-            },
-            {
-              "flag": "optional",
-              "name": "lnext",
+              "flag": "sequence",
+              "is_schema": true,
+              "name": "args",
               "type": "expr"
             }
           ],
           "name": "GenCall"
+        },
+        {
+          "base": "Expr",
+          "fields": [
+            {
+              "flag": "none",
+              "is_schema": true,
+              "name": "subject",
+              "type": "expr"
+            },
+            {
+              "flag": "sequence",
+              "is_schema": true,
+              "name": "arms",
+              "type": "match_arm"
+            }
+          ],
+          "name": "MatchExpr"
+        },
+        {
+          "base": "Expr",
+          "fields": [
+            {
+              "flag": "none",
+              "is_schema": false,
+              "name": "schema",
+              "type": "identifier"
+            },
+            {
+              "flag": "none",
+              "is_schema": false,
+              "name": "ctor",
+              "type": "identifier"
+            },
+            {
+              "flag": "sequence",
+              "is_schema": true,
+              "name": "args",
+              "type": "expr"
+            }
+          ],
+          "name": "BuildExpr"
+        },
+        {
+          "base": "Expr",
+          "fields": [
+            {
+              "flag": "none",
+              "is_schema": true,
+              "name": "base",
+              "type": "expr"
+            },
+            {
+              "flag": "none",
+              "is_schema": false,
+              "name": "field",
+              "type": "identifier"
+            },
+            {
+              "flag": "none",
+              "is_schema": true,
+              "name": "value",
+              "type": "expr"
+            }
+          ],
+          "name": "WithExpr"
+        }
+      ]
+    },
+    {
+      "attributes": [],
+      "is_enum": false,
+      "name": "match_arm",
+      "type": "sum",
+      "types": [
+        {
+          "base": "ASTNode",
+          "fields": [
+            {
+              "flag": "none",
+              "is_schema": true,
+              "name": "pat",
+              "type": "pattern"
+            },
+            {
+              "flag": "sequence",
+              "is_schema": true,
+              "name": "body",
+              "type": "stmt"
+            }
+          ],
+          "name": "MatchArm"
         }
       ]
     }

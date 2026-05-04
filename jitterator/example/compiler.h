@@ -7,7 +7,23 @@
 #include <vector>
 #include <unordered_map>
 #include <cassert>
+#include <cstdint>
 #include <cstring>
+#include <functional>
+
+// Runtime context — must match the layout in calc_stencils.c exactly.
+// Paper's accumulator (r0) is `ac`. Frame-relative locals (paper's
+// local_i Location class) live in `frame[fp..fp+frame_size)`. Stack
+// temps + outgoing args (paper's stack Location class) push to
+// `frame[sp]`. Return continuations + saved fp ride on the cpu's
+// hardware call stack via the call stencil's regular C call (not
+// musttail) — see calc_stencils.c.
+struct Ctx {
+    int64_t ac;
+    int64_t frame[1024];
+    int32_t fp;
+    int32_t sp;
+};
 
 // ── Stencil emit/backpatch helpers ───────────────────────────
 
@@ -84,118 +100,125 @@ static void backpatch(jitterator::CodeBuffer &buf, size_t stencil_base,
 
 // ── IR node tag enum (BURG terminal IDs) ────────────────────
 
-enum CalcIRTag {
-    IR_SLOT_REF   = 0,  // not a BURG terminal — passthrough
-    IR_LOAD_CONST = 1,
-    IR_ADD        = 2,
-    IR_SUB        = 3,
-    IR_MUL        = 4,
-    IR_NEG        = 5,
-    IR_HALT       = 6,
-};
-
+// BURG terminals = the asdl-emitted NodeTag values. calc.burg's TERM
+// declarations reference `<Type>::kind_value` directly, so the numbers
+// stay in sync without a hand-maintained mirror enum.
 static int ir_tag(const calc_ir::Node* n) {
-    if (dynamic_cast<const calc_ir::SlotRef*>(n))   return IR_SLOT_REF;
-    if (dynamic_cast<const calc_ir::LoadConst*>(n)) return IR_LOAD_CONST;
-    if (dynamic_cast<const calc_ir::Add*>(n))       return IR_ADD;
-    if (dynamic_cast<const calc_ir::Sub*>(n))       return IR_SUB;
-    if (dynamic_cast<const calc_ir::Mul*>(n))       return IR_MUL;
-    if (dynamic_cast<const calc_ir::Neg*>(n))       return IR_NEG;
-    if (dynamic_cast<const calc_ir::Halt*>(n))      return IR_HALT;
-    return 0;
+    return static_cast<int>(n->tag);
 }
 
 // ── BURG node access helpers ────────────────────────────────
 
-// Def-use tracking: which node wrote to each slot?
-struct SlotTracker {
-    calc_ir::Node* defs[64] = {};
-
-    void record(calc_ir::Node* n, int64_t slot) {
-        assert(slot >= 0 && slot < 64);
-        defs[slot] = n;
-    }
-
-    calc_ir::Node* def_of(int64_t slot) const {
-        assert(slot >= 0 && slot < 64);
-        return defs[slot];
-    }
-};
-
-static SlotTracker slot_tracker;
-
-// Operand count: how many slot-read operands does this node have?
+// CEK-tree IR (Phase 9R): operands are real sub-tree fields. BURG
+// walks them via these accessors during pattern matching. No more
+// `per_node_writers` side-channel — every operand reference is a
+// concrete IR pointer.
+//
+// Arity table (BURG_NODE_ARITY): how many sub-tree children does
+// the node have? Producers expose their value sub-tree fields;
+// consumers expose their value-input sub-tree(s). Node-graph
+// successors (spine `next` etc.) are NOT counted here — those go
+// through successor()/successor_count() for backpatch_all's RPO.
 static int operand_count(const calc_ir::Node* n) {
-    int tag = ir_tag(n);
-    switch (tag) {
-    case IR_ADD: case IR_SUB: case IR_MUL: return 2;
-    case IR_NEG: return 1;
-    case IR_LOAD_CONST: case IR_HALT: return 0;
-    default: return 0;
+    using T = calc_ir::NodeTag;
+    switch (n->tag) {
+    // Binops / cmps: two value sub-trees (left, right)
+    case T::Add: case T::Sub: case T::Mul:
+    case T::CmpEq: case T::CmpNeq:
+    case T::CmpLt: case T::CmpLe: case T::CmpGt: case T::CmpGe:
+        return 2;
+    // Unary producer: one value sub-tree
+    case T::Neg:
+        return 1;
+    // Consumers that take a value sub-tree
+    case T::StoreLocal: case T::ExprEffect:
+    case T::Branch: case T::Leave: case T::Halt:
+        return 1;
+    // Call: variable arity = args.size(). BURG auto-recurses on
+    // each arg as stack_reg (chain rule pushes them).
+    case T::Call:
+        return (int)static_cast<const calc_ir::Call*>(n)->args.size();
+    // Leaves
+    case T::LoadConst: case T::LoadLocal:
+    case T::Goto: case T::Nop:
+        return 0;
     }
+    return 0;
 }
 
-// Operand producer: which node defined the slot that operand i reads?
 static calc_ir::Node* operand_producer(const calc_ir::Node* n, int i) {
-    switch (ir_tag(n)) {
-    case IR_ADD: {
-        auto* a = static_cast<const calc_ir::Add*>(n);
-        return slot_tracker.def_of(i == 0 ? a->lhs : a->rhs);
-    }
-    case IR_SUB: {
-        auto* s = static_cast<const calc_ir::Sub*>(n);
-        return slot_tracker.def_of(i == 0 ? s->lhs : s->rhs);
-    }
-    case IR_MUL: {
-        auto* m = static_cast<const calc_ir::Mul*>(n);
-        return slot_tracker.def_of(i == 0 ? m->lhs : m->rhs);
-    }
-    case IR_NEG: {
-        auto* neg = static_cast<const calc_ir::Neg*>(n);
-        return slot_tracker.def_of(neg->src);
-    }
+    using T = calc_ir::NodeTag;
+    switch (n->tag) {
+    case T::Add:       return i == 0 ? static_cast<const calc_ir::Add*      >(n)->left
+                                     : static_cast<const calc_ir::Add*      >(n)->right;
+    case T::Sub:       return i == 0 ? static_cast<const calc_ir::Sub*      >(n)->left
+                                     : static_cast<const calc_ir::Sub*      >(n)->right;
+    case T::Mul:       return i == 0 ? static_cast<const calc_ir::Mul*      >(n)->left
+                                     : static_cast<const calc_ir::Mul*      >(n)->right;
+    case T::CmpEq:     return i == 0 ? static_cast<const calc_ir::CmpEq*    >(n)->left
+                                     : static_cast<const calc_ir::CmpEq*    >(n)->right;
+    case T::CmpNeq:    return i == 0 ? static_cast<const calc_ir::CmpNeq*   >(n)->left
+                                     : static_cast<const calc_ir::CmpNeq*   >(n)->right;
+    case T::CmpLt:     return i == 0 ? static_cast<const calc_ir::CmpLt*    >(n)->left
+                                     : static_cast<const calc_ir::CmpLt*    >(n)->right;
+    case T::CmpLe:     return i == 0 ? static_cast<const calc_ir::CmpLe*    >(n)->left
+                                     : static_cast<const calc_ir::CmpLe*    >(n)->right;
+    case T::CmpGt:     return i == 0 ? static_cast<const calc_ir::CmpGt*    >(n)->left
+                                     : static_cast<const calc_ir::CmpGt*    >(n)->right;
+    case T::CmpGe:     return i == 0 ? static_cast<const calc_ir::CmpGe*    >(n)->left
+                                     : static_cast<const calc_ir::CmpGe*    >(n)->right;
+    case T::Neg:       return static_cast<const calc_ir::Neg*       >(n)->operand;
+    case T::StoreLocal:return static_cast<const calc_ir::StoreLocal*>(n)->value;
+    case T::ExprEffect:return static_cast<const calc_ir::ExprEffect*>(n)->value;
+    case T::Branch:    return static_cast<const calc_ir::Branch*    >(n)->test;
+    case T::Leave:     return static_cast<const calc_ir::Leave*     >(n)->value;
+    case T::Halt:      return static_cast<const calc_ir::Halt*      >(n)->value;
+    case T::Call:      return static_cast<const calc_ir::Call*      >(n)->args[i];
     default: return nullptr;
     }
 }
 
-// Successor count/access: follow continuation edges
+// Successor count/access: follow spine continuation edges (NOT
+// value sub-trees — those go through operand_producer). Used by
+// the JIT's backpatch_all to chase emitted-stencil offsets.
+//
+// Spine consumers thread `next`; Branch threads then_ + else_;
+// Goto threads its `target`. Call (value-producer) has only the
+// `target` graph edge (function entry IR root) — used for RPO
+// graph walk into the function body and for backpatch _HOLE_target.
+// Producers (Add/Sub/...) are NOT on the spine — sub-tree children
+// of their parent consumer.
+//
+// Halt and Leave are terminators — no spine successor.
 static int successor_count(const calc_ir::Node* n) {
-    if (dynamic_cast<const calc_ir::Halt*>(n)) return 0;
-    return 1; // all other nodes have a single 'next' continuation
+    using T = calc_ir::NodeTag;
+    switch (n->tag) {
+    case T::Halt:       return 0;
+    case T::Leave:      return 0;
+    case T::Branch:     return 2;
+    case T::Call:       return 1;  // target only (no spine `next`; Call is value-producer)
+    case T::StoreLocal: return 1;
+    case T::ExprEffect: return 1;
+    case T::Goto:       return 1;
+    case T::Nop:        return 1;
+    default:            return 0;  // producers (Add, Sub, etc.) — sub-tree-only
+    }
 }
 
-static calc_ir::Node* successor(const calc_ir::Node* n, int /*i*/) {
-    if (auto* sr = dynamic_cast<const calc_ir::SlotRef*>(n))   return sr->next;
-    if (auto* lc = dynamic_cast<const calc_ir::LoadConst*>(n)) return lc->next;
-    if (auto* a  = dynamic_cast<const calc_ir::Add*>(n))       return a->next;
-    if (auto* s  = dynamic_cast<const calc_ir::Sub*>(n))       return s->next;
-    if (auto* m  = dynamic_cast<const calc_ir::Mul*>(n))       return m->next;
-    if (auto* ne = dynamic_cast<const calc_ir::Neg*>(n))       return ne->next;
-    return nullptr;
-}
-
-// Get the destination slot for a node (where it writes)
-static int64_t node_dest(const calc_ir::Node* n) {
-    if (auto* sr = dynamic_cast<const calc_ir::SlotRef*>(n))   return sr->slot;
-    if (auto* lc = dynamic_cast<const calc_ir::LoadConst*>(n)) return lc->dest;
-    if (auto* a  = dynamic_cast<const calc_ir::Add*>(n))       return a->dest;
-    if (auto* s  = dynamic_cast<const calc_ir::Sub*>(n))       return s->dest;
-    if (auto* m  = dynamic_cast<const calc_ir::Mul*>(n))       return m->dest;
-    if (auto* ne = dynamic_cast<const calc_ir::Neg*>(n))       return ne->dest;
-    return -1;
-}
-
-// Get constant value for a LoadConst node
-static int64_t const_value(const calc_ir::Node* n) {
-    auto* lc = dynamic_cast<const calc_ir::LoadConst*>(n);
-    assert(lc);
-    return lc->value;
-}
-
-// Helper for where-guards: get const value of operand i
-static int64_t const_val(calc_ir::Node* node, int i) {
-    calc_ir::Node* child = operand_producer(node, i);
-    return const_value(child);
+static calc_ir::Node* successor(const calc_ir::Node* n, int i) {
+    using T = calc_ir::NodeTag;
+    switch (n->tag) {
+    case T::Branch: {
+        auto* b = static_cast<const calc_ir::Branch*>(n);
+        return i == 0 ? b->then_ : b->else_;
+    }
+    case T::Call:       return static_cast<const calc_ir::Call*      >(n)->target;
+    case T::Goto:       return static_cast<const calc_ir::Goto*      >(n)->target;
+    case T::Nop:        return static_cast<const calc_ir::Nop*       >(n)->next;
+    case T::StoreLocal: return static_cast<const calc_ir::StoreLocal*>(n)->next;
+    case T::ExprEffect: return static_cast<const calc_ir::ExprEffect*>(n)->next;
+    default:            return nullptr;
+    }
 }
 
 // ── JIT context ─────────────────────────────────────────────
@@ -229,10 +252,64 @@ struct JitContext {
         return off;
     }
 
+    // Backpatching strategy for CEK-tree IR:
+    //
+    //   * Linear chain default: each emitted stencil's _HOLE_cont
+    //     points at the NEXT emitted stencil in `emitted[]`. BURG's
+    //     reduce traversal emits stencils in execution order (post-
+    //     order on operand sub-trees, then parent's emit; spine
+    //     successors via RPO), so "next emitted" == "next at
+    //     runtime" for any stencil whose continuation is sequential.
+    //
+    //   * Branch / Goto / Call need IR-driven target resolution
+    //     because the next stencil at runtime is NOT the next emitted:
+    //       - Branch: _HOLE_then_target = first stencil of then_'s
+    //         sub-IR; _HOLE_else_target = first stencil of else_'s.
+    //         Branch has no _HOLE_cont (it always transfers).
+    //       - Goto: _HOLE_cont = first stencil of target's sub-IR.
+    //       - Call: _HOLE_target = first stencil of target (function
+    //         entry, separately compiled); _HOLE_cont = next emitted
+    //         (the post-call kont).
+    //
+    //   * Halt / Leave terminate (no cont; ret).
+    //
+    //   * Nop is cost-0 (no stencil emitted); resolve walks past it
+    //     via successor().
     void backpatch_all() {
         uint8_t* base = buf.data();
 
-        // Chain stencils in emission order: entry → [0] → [1] → ... → halt
+        // node_to_first_offset: for each IR node, the offset of the
+        // FIRST stencil emitted whose ir_node was that node. Used
+        // to resolve "where does this spine node's lowering start."
+        std::unordered_map<calc_ir::Node*, size_t> node_to_first_offset;
+        node_to_first_offset.reserve(emitted.size());
+        for (auto& e : emitted) {
+            node_to_first_offset.emplace(e.node, e.offset);
+        }
+
+        // For a spine node N, find the offset of the first stencil
+        // emitted within N's BURG-reduce subtree (operand sub-trees,
+        // recursively, then N itself). Walks past Nop placeholders
+        // via successor() — Nop is cost-0 and emits nothing, so its
+        // "first" is whatever it points at.
+        std::function<int64_t(calc_ir::Node*)> first_in_tree =
+            [&](calc_ir::Node* n) -> int64_t {
+                while (n && n->tag == calc_ir::NodeTag::Nop) {
+                    n = successor(n, 0);
+                }
+                if (!n) return -1;
+                int oc = operand_count(n);
+                for (int i = 0; i < oc; i++) {
+                    int64_t r = first_in_tree(operand_producer(n, i));
+                    if (r >= 0) return r;
+                }
+                auto it = node_to_first_offset.find(n);
+                if (it != node_to_first_offset.end())
+                    return (int64_t)it->second;
+                return -1;
+            };
+
+        // entry → first stencil overall (linear chain head).
         if (!emitted.empty()) {
             auto& entry_def = stencil_table[STENCIL_ENTRY];
             int cont_idx = find_hole(entry_def, "_HOLE_cont");
@@ -243,10 +320,79 @@ struct JitContext {
         for (size_t i = 0; i < emitted.size(); i++) {
             auto& e = emitted[i];
             auto& def = stencil_table[e.stencil_id];
-            int cont_idx = find_hole(def, "_HOLE_cont");
-            if (cont_idx < 0) continue; // halt has no cont
+            calc_ir::NodeTag tag = e.node->tag;
 
-            if (i + 1 < emitted.size()) {
+            // Branch: two IR-driven targets, no _HOLE_cont.
+            if (tag == calc_ir::NodeTag::Branch) {
+                int then_idx = find_hole(def, "_HOLE_then_target");
+                int else_idx = find_hole(def, "_HOLE_else_target");
+                if (then_idx >= 0) {
+                    int64_t off = first_in_tree(successor(e.node, 0));
+                    if (off >= 0) backpatch(buf, e.offset, def, then_idx,
+                                             (uint64_t)(base + off));
+                }
+                if (else_idx >= 0) {
+                    int64_t off = first_in_tree(successor(e.node, 1));
+                    if (off >= 0) backpatch(buf, e.offset, def, else_idx,
+                                             (uint64_t)(base + off));
+                }
+                continue;
+            }
+
+            // Goto: IR-driven target into _HOLE_cont (no other holes).
+            if (tag == calc_ir::NodeTag::Goto) {
+                int cont_idx = find_hole(def, "_HOLE_cont");
+                if (cont_idx >= 0) {
+                    int64_t off = first_in_tree(successor(e.node, 0));
+                    if (off >= 0) backpatch(buf, e.offset, def, cont_idx,
+                                             (uint64_t)(base + off));
+                }
+                continue;
+            }
+
+            // Call: _HOLE_target = function entry (IR-driven via
+            // successor 0); _HOLE_cont = post-call kont (next-emitted
+            // in the buffer — Call is a value-producer, so its spine
+            // continuation is whatever stencil BURG emitted next).
+            if (tag == calc_ir::NodeTag::Call) {
+                int target_idx = find_hole(def, "_HOLE_target");
+                int cont_idx   = find_hole(def, "_HOLE_cont");
+                if (target_idx >= 0) {
+                    int64_t off = first_in_tree(successor(e.node, 0));
+                    if (off >= 0) backpatch(buf, e.offset, def, target_idx,
+                                             (uint64_t)(base + off));
+                }
+                if (cont_idx >= 0 && i + 1 < emitted.size()) {
+                    backpatch(buf, e.offset, def, cont_idx,
+                              (uint64_t)(base + emitted[i + 1].offset));
+                }
+                continue;
+            }
+
+            // Halt / Leave: terminators, no _HOLE_cont to patch.
+            if (tag == calc_ir::NodeTag::Halt ||
+                tag == calc_ir::NodeTag::Leave) {
+                continue;
+            }
+
+            int cont_idx = find_hole(def, "_HOLE_cont");
+            if (cont_idx < 0) continue;
+
+            // Spine consumers (successor_count > 0): IR-driven —
+            // _HOLE_cont = first stencil of spine successor's tree.
+            // Required for non-sequential flow (loop back-edges,
+            // sequence rejoins, etc.) where the next emitted stencil
+            // in buffer order is NOT the runtime continuation.
+            //
+            // Value-producers (successor_count == 0): linear chain —
+            // _HOLE_cont = next emitted stencil. BURG's tree-walk
+            // emits in execution order, so adjacency in `emitted[]`
+            // is adjacency at runtime.
+            if (successor_count(e.node) > 0) {
+                int64_t off = first_in_tree(successor(e.node, 0));
+                if (off >= 0) backpatch(buf, e.offset, def, cont_idx,
+                                         (uint64_t)(base + off));
+            } else if (i + 1 < emitted.size()) {
                 backpatch(buf, e.offset, def, cont_idx,
                           (uint64_t)(base + emitted[i + 1].offset));
             }
@@ -257,196 +403,180 @@ struct JitContext {
 static JitContext* jit_ctx = nullptr;
 
 // ── BURG semantic action helpers ────────────────────────────
+//
+// CEK-tree IR + paper figure 8 cases via specialized BURG patterns.
+// Per binop, three rule shapes:
+//   (LoadLocal, reg)  — F8 case 2, left-slot stencil with right in ac
+//   (reg, LoadLocal)  — F8 case 3, commutative ops use right-slot
+//                       stencil; non-commutative use rev_sub or
+//                       swapped-cmp
+//   (stack_reg, reg)  — F8 case 4, *_pop stencil reading frame[--sp]+ac
+//
+// LoadConst and LoadLocal are leaves; LoadAc is a no-op leaf
+// (value already in ctx.ac after a Call's cpu RET).
 
 static void jit_emit_load_const(calc_ir::Node* node) {
     auto* lc = static_cast<calc_ir::LoadConst*>(node);
     auto& def = stencil_table[STENCIL_LOAD_CONST];
-    uint64_t vals[3];
+    uint64_t vals[2];
     vals[JitContext::find_hole(def, "_HOLE_value")] = (uint64_t)lc->value;
-    vals[JitContext::find_hole(def, "_HOLE_dst")]   = (uint64_t)lc->dest;
     vals[JitContext::find_hole(def, "_HOLE_cont")]  = 0;
     jit_ctx->emit(STENCIL_LOAD_CONST, vals, node);
 }
 
-static void jit_emit_binop(calc_ir::Node* node, int stencil_id) {
-    int64_t lhs = -1, rhs = -1, dest = -1;
-    if (auto* a = dynamic_cast<calc_ir::Add*>(node)) { lhs = a->lhs; rhs = a->rhs; dest = a->dest; }
-    if (auto* s = dynamic_cast<calc_ir::Sub*>(node)) { lhs = s->lhs; rhs = s->rhs; dest = s->dest; }
-    if (auto* m = dynamic_cast<calc_ir::Mul*>(node)) { lhs = m->lhs; rhs = m->rhs; dest = m->dest; }
+static void jit_emit_load_local(calc_ir::Node* node) {
+    auto* n = static_cast<calc_ir::LoadLocal*>(node);
+    auto& def = stencil_table[STENCIL_LOAD_LOCAL];
+    uint64_t vals[2];
+    vals[JitContext::find_hole(def, "_HOLE_local_offset")] = (uint64_t)n->src;
+    vals[JitContext::find_hole(def, "_HOLE_cont")]         = 0;
+    jit_ctx->emit(STENCIL_LOAD_LOCAL, vals, node);
+}
 
+// Helper: emit a 1-hole-slot binop stencil (add/sub/mul/cmp_*) with
+// its _HOLE_lhs filled from a slot index. BURG has already lowered
+// the right operand into ctx.ac before calling this.
+static void jit_emit_lhs_local_stencil(int stencil_id, int64_t slot,
+                                        calc_ir::Node* node) {
     auto& def = stencil_table[stencil_id];
-    uint64_t vals[4];
-    vals[JitContext::find_hole(def, "_HOLE_lhs")]  = (uint64_t)lhs;
-    vals[JitContext::find_hole(def, "_HOLE_rhs")]  = (uint64_t)rhs;
-    vals[JitContext::find_hole(def, "_HOLE_dst")]  = (uint64_t)dest;
+    uint64_t vals[2];
+    vals[JitContext::find_hole(def, "_HOLE_lhs")]  = (uint64_t)slot;
     vals[JitContext::find_hole(def, "_HOLE_cont")] = 0;
     jit_ctx->emit(stencil_id, vals, node);
 }
 
-static void jit_emit_neg(calc_ir::Node* node) {
-    auto* n = static_cast<calc_ir::Neg*>(node);
-    auto& def = stencil_table[STENCIL_NEG];
-    uint64_t vals[3];
-    vals[JitContext::find_hole(def, "_HOLE_src")]  = (uint64_t)n->src;
-    vals[JitContext::find_hole(def, "_HOLE_dst")]  = (uint64_t)n->dest;
+// F8 case 2 — `reg: Op(LoadLocal, reg)`. Right operand auto-recursed
+// to ac; emit Op stencil reading frame[fp+left.src] + ac → ac.
+template <class OpT>
+static void jit_emit_op_lhs_local(calc_ir::Node* node, int stencil_id) {
+    auto* op = static_cast<OpT*>(node);
+    auto* ll = static_cast<calc_ir::LoadLocal*>(op->left);
+    jit_emit_lhs_local_stencil(stencil_id, ll->src, node);
+}
+static void jit_emit_add_lhs_local(calc_ir::Node* n)     { jit_emit_op_lhs_local<calc_ir::Add  >(n, STENCIL_ADD); }
+static void jit_emit_sub_lhs_local(calc_ir::Node* n)     { jit_emit_op_lhs_local<calc_ir::Sub  >(n, STENCIL_SUB); }
+static void jit_emit_mul_lhs_local(calc_ir::Node* n)     { jit_emit_op_lhs_local<calc_ir::Mul  >(n, STENCIL_MUL); }
+static void jit_emit_cmp_eq_lhs_local(calc_ir::Node* n)  { jit_emit_op_lhs_local<calc_ir::CmpEq >(n, STENCIL_CMP_EQ); }
+static void jit_emit_cmp_neq_lhs_local(calc_ir::Node* n) { jit_emit_op_lhs_local<calc_ir::CmpNeq>(n, STENCIL_CMP_NEQ); }
+static void jit_emit_cmp_lt_lhs_local(calc_ir::Node* n)  { jit_emit_op_lhs_local<calc_ir::CmpLt >(n, STENCIL_CMP_LT); }
+static void jit_emit_cmp_le_lhs_local(calc_ir::Node* n)  { jit_emit_op_lhs_local<calc_ir::CmpLe >(n, STENCIL_CMP_LE); }
+static void jit_emit_cmp_gt_lhs_local(calc_ir::Node* n)  { jit_emit_op_lhs_local<calc_ir::CmpGt >(n, STENCIL_CMP_GT); }
+static void jit_emit_cmp_ge_lhs_local(calc_ir::Node* n)  { jit_emit_op_lhs_local<calc_ir::CmpGe >(n, STENCIL_CMP_GE); }
+
+// F8 case 3 commutative — `reg: Op(reg, LoadLocal)`. Left operand
+// auto-recursed to ac; emit Op stencil reading frame[fp+right.src]
+// + ac → ac (commutativity makes this equivalent to case 2).
+template <class OpT>
+static void jit_emit_op_rhs_local(calc_ir::Node* node, int stencil_id) {
+    auto* op = static_cast<OpT*>(node);
+    auto* ll = static_cast<calc_ir::LoadLocal*>(op->right);
+    jit_emit_lhs_local_stencil(stencil_id, ll->src, node);
+}
+static void jit_emit_add_rhs_local(calc_ir::Node* n)    { jit_emit_op_rhs_local<calc_ir::Add  >(n, STENCIL_ADD); }
+static void jit_emit_mul_rhs_local(calc_ir::Node* n)    { jit_emit_op_rhs_local<calc_ir::Mul  >(n, STENCIL_MUL); }
+static void jit_emit_cmp_eq_rhs_local(calc_ir::Node* n) { jit_emit_op_rhs_local<calc_ir::CmpEq >(n, STENCIL_CMP_EQ); }
+static void jit_emit_cmp_neq_rhs_local(calc_ir::Node* n){ jit_emit_op_rhs_local<calc_ir::CmpNeq>(n, STENCIL_CMP_NEQ); }
+
+// F8 case 3 non-commutative cmp swap — `reg: CmpLt(reg, LoadLocal)`
+// uses cmp_gt stencil (CmpLt(E, S) ≡ CmpGt(S, E)); Le↔Ge, Gt↔Lt,
+// Ge↔Le. Same right-slot extraction.
+static void jit_emit_cmp_lt_rhs_local(calc_ir::Node* n) { jit_emit_op_rhs_local<calc_ir::CmpLt>(n, STENCIL_CMP_GT); }
+static void jit_emit_cmp_le_rhs_local(calc_ir::Node* n) { jit_emit_op_rhs_local<calc_ir::CmpLe>(n, STENCIL_CMP_GE); }
+static void jit_emit_cmp_gt_rhs_local(calc_ir::Node* n) { jit_emit_op_rhs_local<calc_ir::CmpGt>(n, STENCIL_CMP_LT); }
+static void jit_emit_cmp_ge_rhs_local(calc_ir::Node* n) { jit_emit_op_rhs_local<calc_ir::CmpGe>(n, STENCIL_CMP_LE); }
+
+// F8 case 3 Sub non-commutative — `reg: Sub(reg, LoadLocal)` uses
+// rev_sub stencil: ctx.ac = ctx.ac - frame[fp+rhs] = E - S.
+static void jit_emit_rev_sub_rhs_local(calc_ir::Node* node) {
+    auto* op = static_cast<calc_ir::Sub*>(node);
+    auto* ll = static_cast<calc_ir::LoadLocal*>(op->right);
+    auto& def = stencil_table[STENCIL_REV_SUB];
+    uint64_t vals[2];
+    vals[JitContext::find_hole(def, "_HOLE_rhs")]  = (uint64_t)ll->src;
     vals[JitContext::find_hole(def, "_HOLE_cont")] = 0;
-    jit_ctx->emit(STENCIL_NEG, vals, node);
+    jit_ctx->emit(STENCIL_REV_SUB, vals, node);
 }
 
-static void jit_emit_halt(calc_ir::Node* node) {
-    jit_ctx->emit(STENCIL_HALT, nullptr, node);
+// F8 case 4 — `reg: Op(stack_reg, reg)`. Left lifted to eval-stack
+// via the chain rule (push_stack stencil); right auto-recursed to
+// ac. Emit *_pop stencil: ctx.ac = ctx.frame[--sp] OP ctx.ac.
+static void jit_emit_pop_stencil(int stencil_id, calc_ir::Node* node) {
+    auto& def = stencil_table[stencil_id];
+    uint64_t vals[1];
+    vals[JitContext::find_hole(def, "_HOLE_cont")] = 0;
+    jit_ctx->emit(stencil_id, vals, node);
+}
+static void jit_emit_add_pop(calc_ir::Node* n)     { jit_emit_pop_stencil(STENCIL_ADD_POP, n); }
+static void jit_emit_sub_pop(calc_ir::Node* n)     { jit_emit_pop_stencil(STENCIL_SUB_POP, n); }
+static void jit_emit_mul_pop(calc_ir::Node* n)     { jit_emit_pop_stencil(STENCIL_MUL_POP, n); }
+static void jit_emit_cmp_eq_pop(calc_ir::Node* n)  { jit_emit_pop_stencil(STENCIL_CMP_EQ_POP, n); }
+static void jit_emit_cmp_neq_pop(calc_ir::Node* n) { jit_emit_pop_stencil(STENCIL_CMP_NEQ_POP, n); }
+static void jit_emit_cmp_lt_pop(calc_ir::Node* n)  { jit_emit_pop_stencil(STENCIL_CMP_LT_POP, n); }
+static void jit_emit_cmp_le_pop(calc_ir::Node* n)  { jit_emit_pop_stencil(STENCIL_CMP_LE_POP, n); }
+static void jit_emit_cmp_gt_pop(calc_ir::Node* n)  { jit_emit_pop_stencil(STENCIL_CMP_GT_POP, n); }
+static void jit_emit_cmp_ge_pop(calc_ir::Node* n)  { jit_emit_pop_stencil(STENCIL_CMP_GE_POP, n); }
+
+// Neg — unary; operand auto-recursed to ac, emit neg stencil.
+static void jit_emit_neg(calc_ir::Node* node) { jit_emit_pop_stencil(STENCIL_NEG, node); }
+
+// Push-stack — fires from the chain rule `stack_reg: reg = 1` for
+// any value-producer that needs to land on the eval stack: binop
+// case-4 spills AND call args. Same stencil for both.
+static void jit_emit_push_stack(calc_ir::Node* node) { jit_emit_pop_stencil(STENCIL_PUSH_STACK, node); }
+
+// ── Spine consumers ─────────────────────────────────────────
+
+static void jit_emit_store_local(calc_ir::Node* node) {
+    auto* n = static_cast<calc_ir::StoreLocal*>(node);
+    auto& def = stencil_table[STENCIL_STORE_LOCAL];
+    uint64_t vals[2];
+    vals[JitContext::find_hole(def, "_HOLE_local_offset")] = (uint64_t)n->dest;
+    vals[JitContext::find_hole(def, "_HOLE_cont")]         = 0;
+    jit_ctx->emit(STENCIL_STORE_LOCAL, vals, node);
 }
 
-// Constant folding: replace a binop node's stencil with a load_const
-static void jit_fold_binop(calc_ir::Node* node, char op) {
-    int64_t a = const_val(node, 0);
-    int64_t b = const_val(node, 1);
-    int64_t result = 0;
-    switch (op) {
-    case '+': result = a + b; break;
-    case '-': result = a - b; break;
-    case '*': result = a * b; break;
-    }
-    // Emit a load_const with the folded value into this node's dest slot
-    int64_t dest = node_dest(node);
-    auto& def = stencil_table[STENCIL_LOAD_CONST];
-    uint64_t vals[3];
-    vals[JitContext::find_hole(def, "_HOLE_value")] = (uint64_t)result;
-    vals[JitContext::find_hole(def, "_HOLE_dst")]   = (uint64_t)dest;
-    vals[JitContext::find_hole(def, "_HOLE_cont")]  = 0;
-    jit_ctx->emit(STENCIL_LOAD_CONST, vals, node);
+// ExprEffect — value sub-tree was lowered to ac for side effect;
+// then jbr to next (cont gets patched). Reuses the jbr stencil
+// since "evaluate then unconditional jump" is exactly that.
+static void jit_emit_expr_effect(calc_ir::Node* node) { jit_emit_pop_stencil(STENCIL_JBR, node); }
+
+static void jit_emit_branch(calc_ir::Node* node) {
+    auto& def = stencil_table[STENCIL_BRANCH];
+    uint64_t vals[2];
+    vals[JitContext::find_hole(def, "_HOLE_then_target")] = 0;
+    vals[JitContext::find_hole(def, "_HOLE_else_target")] = 0;
+    jit_ctx->emit(STENCIL_BRANCH, vals, node);
 }
 
-// Mul by 0: result is always 0
-static void jit_fold_zero(calc_ir::Node* node) {
-    int64_t dest = node_dest(node);
-    auto& def = stencil_table[STENCIL_LOAD_CONST];
-    uint64_t vals[3];
-    vals[JitContext::find_hole(def, "_HOLE_value")] = 0;
-    vals[JitContext::find_hole(def, "_HOLE_dst")]   = (uint64_t)dest;
-    vals[JitContext::find_hole(def, "_HOLE_cont")]  = 0;
-    jit_ctx->emit(STENCIL_LOAD_CONST, vals, node);
+static void jit_emit_goto(calc_ir::Node* node) { jit_emit_pop_stencil(STENCIL_JBR, node); }
+
+// Halt and Leave terminate; value sub-tree was lowered to ac before.
+// Stencils have no holes other than implicit return.
+static void jit_emit_halt(calc_ir::Node* node)  { jit_ctx->emit(STENCIL_HALT,  nullptr, node); }
+static void jit_emit_leave(calc_ir::Node* node) { jit_ctx->emit(STENCIL_LEAVE, nullptr, node); }
+
+// Paper page 14 CG[call]. Args were lowered by BURG via the
+// per-arity Call rules (each arg auto-recursed as stack_reg → chain
+// rule emits push_stack stencil). This stencil sets up the new
+// frame, cpu CALLs target, and on RET the function's return value
+// materializes in ctx.ac. Two patch sites: _HOLE_target (function
+// entry, via successor(0)=target) and _HOLE_cont (post-call kont,
+// via next-emitted in the buffer since Call is a value-producer).
+static void jit_emit_call(calc_ir::Node* node) {
+    auto* c = static_cast<calc_ir::Call*>(node);
+    auto& def = stencil_table[STENCIL_CALL];
+    uint64_t vals[4];
+    vals[JitContext::find_hole(def, "_HOLE_n_args")]     = (uint64_t)c->args.size();
+    vals[JitContext::find_hole(def, "_HOLE_frame_size")] = (uint64_t)c->frame_size;
+    vals[JitContext::find_hole(def, "_HOLE_target")]     = 0;
+    vals[JitContext::find_hole(def, "_HOLE_cont")]       = 0;
+    jit_ctx->emit(STENCIL_CALL, vals, node);
 }
 
-// ── DDCG Compiler (AST → IR continuation graph) ─────────────
-
-class Compiler {
-public:
-    calc_ir::Node* compile(calc::Expr* expr) {
-        auto* halt = new calc_ir::Halt(0); // placeholder result slot
-        calc_ir::Node* entry = compile_expr(expr, halt);
-
-        // Fix halt's result_slot to the final expression's dest
-        static_cast<calc_ir::Halt*>(halt)->result_slot = result_slot_;
-
-        // Register def-use for all nodes (walk the chain)
-        for (auto* n = entry; n; ) {
-            int64_t dest = node_dest(n);
-            if (dest >= 0) slot_tracker.record(n, dest);
-            if (successor_count(n) > 0) n = successor(n, 0);
-            else break;
-        }
-
-        return entry;
-    }
-
-    int64_t result_slot() const { return result_slot_; }
-
-private:
-    int64_t next_slot_ = 0;
-    int64_t result_slot_ = 0;
-
-    int64_t alloc_slot() { return next_slot_++; }
-
-    // Compile an expression into a chain of IR nodes ending at 'next'.
-    // Returns the entry node of the chain. Result goes to the returned slot.
-    struct CompileResult {
-        calc_ir::Node* entry;
-        int64_t dest;
-    };
-
-    CompileResult compile_expr_inner(calc::Expr* expr, calc_ir::Node* next) {
-        if (auto* lit = dynamic_cast<calc::IntLit*>(expr)) {
-            int64_t dest = alloc_slot();
-            auto* node = new calc_ir::LoadConst(lit->value, dest, next);
-            return {node, dest};
-        }
-
-        if (auto* ref = dynamic_cast<calc::SlotRef*>(expr)) {
-            // SlotRef: the value is already in the named slot.
-            // No IR node needed — just record the slot and pass through.
-            // Reserve slots up to that index so the compiler doesn't reuse them.
-            while (next_slot_ <= ref->slot) alloc_slot();
-            // Create a SlotRef node for BURG to see (for def-use tracing),
-            // but it's a passthrough — no stencil will be emitted.
-            auto* node = new calc_ir::SlotRef(ref->slot, next);
-            return {node, ref->slot};
-        }
-
-        if (auto* bin = dynamic_cast<calc::BinOp*>(expr)) {
-            // Pre-scan children to reserve any SlotRef slots first
-            reserve_slots(bin->left);
-            reserve_slots(bin->right);
-
-            int64_t dest = alloc_slot();
-            calc_ir::Node* op_node = nullptr;
-
-            switch (bin->op) {
-            case calc::Op::Add:
-                op_node = new calc_ir::Add(0, 0, dest, next);
-                break;
-            case calc::Op::Sub:
-                op_node = new calc_ir::Sub(0, 0, dest, next);
-                break;
-            case calc::Op::Mul:
-                op_node = new calc_ir::Mul(0, 0, dest, next);
-                break;
-            }
-
-            // Compile right operand, then left (bottom-up threading)
-            auto [right_entry, right_dest] = compile_expr_inner(bin->right, op_node);
-            auto [left_entry, left_dest] = compile_expr_inner(bin->left, right_entry);
-
-            // Patch the slot references
-            patch_binop_slots(op_node, left_dest, right_dest);
-
-            return {left_entry, dest};
-        }
-
-        if (auto* neg = dynamic_cast<calc::NegOp*>(expr)) {
-            reserve_slots(neg->operand);
-            int64_t dest = alloc_slot();
-            auto* op_node = new calc_ir::Neg(0, dest, next);
-            auto [inner_entry, inner_dest] = compile_expr_inner(neg->operand, op_node);
-            static_cast<calc_ir::Neg*>(op_node)->src = inner_dest;
-            return {inner_entry, dest};
-        }
-
-        assert(false && "unknown expression type");
-        return {nullptr, -1};
-    }
-
-    calc_ir::Node* compile_expr(calc::Expr* expr, calc_ir::Node* next) {
-        auto [entry, dest] = compile_expr_inner(expr, next);
-        result_slot_ = dest;
-        return entry;
-    }
-
-    // Pre-scan to reserve SlotRef slots before allocating dest slots
-    void reserve_slots(calc::Expr* expr) {
-        if (auto* ref = dynamic_cast<calc::SlotRef*>(expr)) {
-            while (next_slot_ <= ref->slot) alloc_slot();
-        } else if (auto* bin = dynamic_cast<calc::BinOp*>(expr)) {
-            reserve_slots(bin->left);
-            reserve_slots(bin->right);
-        } else if (auto* neg = dynamic_cast<calc::NegOp*>(expr)) {
-            reserve_slots(neg->operand);
-        }
-    }
-
-    static void patch_binop_slots(calc_ir::Node* n, int64_t lhs, int64_t rhs) {
-        if (auto* a = dynamic_cast<calc_ir::Add*>(n)) { a->lhs = lhs; a->rhs = rhs; }
-        if (auto* s = dynamic_cast<calc_ir::Sub*>(n)) { s->lhs = lhs; s->rhs = rhs; }
-        if (auto* m = dynamic_cast<calc_ir::Mul*>(n)) { m->lhs = lhs; m->rhs = rhs; }
-    }
-};
+// ── DDCG Compiler ───────────────────────────────────────────
+// The hand-written `Compiler` class has been replaced by the
+// ddcgc-generated `calc::Compiler` in calc_compile.h. The .ddcg
+// source lives at jitterator/example/grammar/calc.ddcg; rule
+// bodies mirror the previous compile_expr_inner cases. Aux
+// implementations + slot allocator are in the .ddcg's MEMBERS
+// block.

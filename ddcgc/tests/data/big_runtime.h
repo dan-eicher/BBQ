@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -50,8 +51,26 @@ struct Tag : Expr {
 };
 
 struct Maybe : Expr {
-    Expr* sub;  // nullable
-    explicit Maybe(Expr* s) : sub(s) {}
+    // asdl `expr? sub` lowers to std::optional<Expr*>; ddcgc's pattern
+    // emitter unwraps with .has_value() / *sub at use sites.
+    std::optional<Expr*> sub;
+    explicit Maybe(std::optional<Expr*> s) : sub(s) {}
+};
+
+// asdl lowers all-zero-arg sums to `enum class`; the generated code
+// references these values as `big::Op::OpAdd` etc.
+enum class Op { OpAdd, OpSub, OpMul };
+
+struct BinOp : Expr {
+    Op op;
+    Expr* left;
+    Expr* right;
+    BinOp(Op o, Expr* l, Expr* r) : op(o), left(l), right(r) {}
+};
+
+struct Sel : Expr {
+    Op which;
+    explicit Sel(Op w) : which(w) {}
 };
 
 // ── data_dest delta — paper's δ ──
@@ -67,4 +86,31 @@ struct gamma_t { GammaTag tag; int target; };
 inline gamma_t fail()         { return {GammaTag::Fail, 0}; }
 inline gamma_t jump(int L)    { return {GammaTag::Jump, L}; }
 
+// ── env_dest rho — paper's ρ ──
+struct rho_t { int depth; };
+
 } // namespace big
+
+namespace target {
+
+struct Value {
+    virtual ~Value() = default;
+    virtual int kind_tag() const = 0;
+    virtual int payload() const = 0;
+};
+
+struct Imm : Value {
+    int v;
+    explicit Imm(int v_) : v(v_) {}
+    int kind_tag() const override { return 0; }
+    int payload() const override  { return v; }
+};
+
+struct Slot : Value {
+    int s;
+    explicit Slot(int s_) : s(s_) {}
+    int kind_tag() const override { return 1; }
+    int payload() const override  { return s; }
+};
+
+} // namespace target

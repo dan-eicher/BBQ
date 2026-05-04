@@ -56,7 +56,8 @@ std::string Type::display() const {
     return "?";
 }
 
-bool assignable(const Type& expected, const Type& value) {
+bool assignable(const Type& expected, const Type& value,
+                 const std::map<std::string, Schema>* schemas) {
     if (expected.is_unknown() || value.is_unknown()) return true;
     if (value.kind == TypeKind::NilLit && expected.kind == TypeKind::Schema) return true;
     if (expected.kind == TypeKind::NilLit && value.kind == TypeKind::Schema) return true;
@@ -65,16 +66,32 @@ bool assignable(const Type& expected, const Type& value) {
     // `[]` typed as `list<?>`, vs a concrete `list<int>`).
     if (expected.kind == TypeKind::List && value.kind == TypeKind::List) {
         if (expected.elems.empty() || value.elems.empty()) return true;
-        return assignable(expected.elems[0], value.elems[0]);
+        return assignable(expected.elems[0], value.elems[0], schemas);
     }
     if (expected.kind == TypeKind::Tuple && value.kind == TypeKind::Tuple) {
         if (expected.elems.size() != value.elems.size()) return false;
         for (size_t i = 0; i < expected.elems.size(); ++i) {
-            if (!assignable(expected.elems[i], value.elems[i])) return false;
+            if (!assignable(expected.elems[i], value.elems[i], schemas)) return false;
         }
         return true;
     }
-    return expected == value;
+    if (expected == value) return true;
+    // Schema constructor → parent-sum subtyping. C++ inherits the upcast
+    // automatically (Imm* → Value*); this teaches the typechecker to
+    // recognise it. Only checked when caller passes a schemas map.
+    if (schemas &&
+        expected.kind == TypeKind::Schema && value.kind == TypeKind::Schema &&
+        expected.schema_import == value.schema_import) {
+        auto sit = schemas->find(value.schema_import);
+        if (sit != schemas->end()) {
+            auto cit = sit->second.constructors.find(value.name);
+            if (cit != sit->second.constructors.end() &&
+                cit->second.sum_name == expected.name) {
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
 // ── Ctx ──────────────────────────────────────────────────────
@@ -89,6 +106,8 @@ enum class NameKind {
     DestVariant,
     Auxiliary,
     Predicate,
+    Fun,            // action-language `fun` definition
+    FunParam,       // bound inside a fun body
     SchemaModule,
 };
 
@@ -106,12 +125,26 @@ struct Ctx {
     std::set<std::string> import_names;
     std::map<std::string, AuxSig> auxes;
     std::map<std::string, AuxSig> preds;
+    // Action-language `fun` declarations. Same shape as auxes (typed
+    // signature) but the body is action-language code defined in the
+    // .ddcg, not opaque target code in MEMBERS.
+    std::map<std::string, AuxSig> funs;
+    // Per-fun parameter names (for binding inside the fun body when
+    // type-checking — funs has only the types, not the names).
+    std::map<std::string, std::vector<std::string>> fun_param_names;
     std::map<std::string, AuxSig> dest_variants;   // ctor_name -> arity + arg types
     std::map<std::string, std::string> dest_variant_owner;  // ctor_name -> dest name (e.g. "gamma")
+    // BindPat nodes whose name resolves to an asdl-enum constructor —
+    // these are constants in pattern position, not variable binds.
+    // Populated by check_pattern; consulted by serialize_pattern so the
+    // duplicate / overlap checks treat them as distinguishing values
+    // rather than alpha-equating them all as `bind`.
+    std::set<const DdcgAst::BindPat*> enum_value_bindpats;
     // The .ddcg's data_dest and ctrl_dest names (paper's δ and γ).
     // Set during collect_decls; empty string means missing.
     std::string data_dest_name;
     std::string ctrl_dest_name;
+    std::string env_dest_name;  // empty when no env_dest declared
 
     // Stack of name -> (kind, type) bindings.
     struct Binding { NameKind kind; Type ty; };
@@ -134,6 +167,25 @@ struct Ctx {
     }
 };
 
+// Return the common asdl-sum name of two Schema types (their parent
+// in the constructor → sum hierarchy), or empty if they don't share
+// one. Used to widen sibling constructors in match arm joins.
+std::string common_schema_sum(const Ctx& c, const Type& a, const Type& b) {
+    if (a.kind != TypeKind::Schema || b.kind != TypeKind::Schema) return "";
+    if (a.schema_import != b.schema_import) return "";
+    auto sit = c.schemas->find(a.schema_import);
+    if (sit == c.schemas->end()) return "";
+    auto get_sum = [&](const std::string& n) -> std::string {
+        if (sit->second.sum_names.count(n)) return n;
+        auto cit = sit->second.constructors.find(n);
+        if (cit != sit->second.constructors.end()) return cit->second.sum_name;
+        return "";
+    };
+    std::string sa = get_sum(a.name);
+    std::string sb = get_sum(b.name);
+    return (sa == sb && !sa.empty()) ? sa : "";
+}
+
 void err(Ctx& c, DdcgAst::SourceLoc loc, std::string msg) {
     c.result->errors.push_back({loc, std::move(msg)});
 }
@@ -141,6 +193,7 @@ void err(Ctx& c, DdcgAst::SourceLoc loc, std::string msg) {
 void warn(Ctx& c, DdcgAst::SourceLoc loc, std::string msg) {
     c.result->warnings.push_back({loc, std::move(msg)});
 }
+
 
 // ── Type translation: schema field -> Type ───────────────────
 
@@ -150,6 +203,7 @@ Type type_from_field(Ctx& c, const std::string& schema_import,
                       const std::string& field_type, FieldFlag flag) {
     Type base;
     if      (field_type == "int")        base = Type::int_();
+    else if (field_type == "int64")      base = Type::int_();
     else if (field_type == "string")     base = Type::str();
     else if (field_type == "bool")       base = Type::bool_();
     else if (field_type == "identifier") base = Type::ident();
@@ -176,6 +230,32 @@ Type type_from_field(Ctx& c, const std::string& schema_import,
 Type type_from_dsl_typeref(Ctx& c, DdcgAst::TypeRef* tr) {
     if (auto* tn = dynamic_cast<DdcgAst::TypeName*>(tr)) {
         const std::string& n = tn->name;
+
+        // Module-qualified schema reference: module.Constructor.
+        if (!tn->module.empty()) {
+            auto sit = c.schemas->find(tn->module);
+            if (sit != c.schemas->end()) {
+                const Schema& sch = sit->second;
+                if (sch.sum_names.count(n) || sch.constructors.count(n)) {
+                    return Type::schema(tn->module, n);
+                }
+            }
+            return Type::unknown_named(tn->module + "." + n);
+        }
+
+        // `ir_root` is a placeholder that resolves to the importing
+        // file's declared ir_root type — lets shared libraries write
+        // signatures like `make_X : (..., ir_root) -> ir_root` without
+        // baking in a specific schema/sum name. Each consumer declares
+        // their own `ir_root <type>` in DESTINATIONS; the spliced lib's
+        // typerefs resolve through that, no contract on naming.
+        if (n == "ir_root") {
+            if (c.file->ir_root) {
+                return type_from_dsl_typeref(c, c.file->ir_root);
+            }
+            return Type::unknown_named("ir_root");
+        }
+
         if (n == "int")        return Type::int_();
         if (n == "string")     return Type::str();
         if (n == "bool")       return Type::bool_();
@@ -184,20 +264,33 @@ Type type_from_dsl_typeref(Ctx& c, DdcgAst::TypeRef* tr) {
         if (n == "label")      return Type::label();
         if (n == "void")       return Type::voidty();
 
-        // Destination type?
+        // Destination type? (data_dest, ctrl_dest, or env_dest)
         for (auto* d : c.file->destinations) {
             if (auto* dd = dynamic_cast<DdcgAst::DataDest*>(d)) {
                 if (dd->name == n) return Type::dest(dd->name);
             } else if (auto* cd = dynamic_cast<DdcgAst::CtrlDest*>(d)) {
                 if (cd->name == n) return Type::dest(cd->name);
+            } else if (auto* ed = dynamic_cast<DdcgAst::EnvDest*>(d)) {
+                if (ed->name == n) return Type::dest(ed->name);
             }
         }
-        // Schema sum/ctor — search loaded schemas
+        // Schema sum/ctor — search loaded schemas. Multiple schemas
+        // matching is a hard error (ambiguous); the typechecker pushes
+        // an error and returns Unknown so a sensible message wins.
+        const Schema* hit = nullptr;
+        std::string hit_imp;
         for (const auto& [imp, schema] : *c.schemas) {
             if (schema.sum_names.count(n) || schema.constructors.count(n)) {
-                return Type::schema(imp, n);
+                if (hit) {
+                    err(c, tr->loc, "typeref '" + n +
+                        "' is ambiguous (defined in '" + hit_imp +
+                        "' and '" + imp + "') — qualify as <module>." + n);
+                    return Type::unknown_named(n);
+                }
+                hit = &schema; hit_imp = imp;
             }
         }
+        if (hit) return Type::schema(hit_imp, n);
         // Unknown / runtime-supplied: keep the name so display is useful
         return Type::unknown_named(n);
     }
@@ -218,6 +311,62 @@ Type type_from_dsl_typeref(Ctx& c, DdcgAst::TypeRef* tr) {
 // every named variable into the current scope with its schema-declared type.
 void check_pattern(Ctx& c, DdcgAst::Pattern* pat, const Type& expected) {
     if (auto* cp = dynamic_cast<DdcgAst::ConstructorPat*>(pat)) {
+        // Bare-name constructor pattern (no module prefix) — must be
+        // matching a dest tagged-union variant.
+        if (cp->module.empty()) {
+            auto vit = c.dest_variants.find(cp->ctor);
+            if (vit == c.dest_variants.end()) {
+                err(c, pat->loc, "unknown dest variant: " + cp->ctor);
+                return;
+            }
+            // Validate dest type matches if known.
+            if (expected.kind == TypeKind::Dest) {
+                const std::string& owner = c.dest_variant_owner[cp->ctor];
+                if (owner != expected.name) {
+                    err(c, pat->loc, "variant '" + cp->ctor + "' belongs to " +
+                                     owner + ", not matched subject type " +
+                                     expected.display());
+                }
+            }
+            // Walk fields. Find each named field in the dest_variant
+            // declaration to recover its type.
+            const DdcgAst::DestVariant* variant = nullptr;
+            for (auto* d : c.file->destinations) {
+                std::vector<DdcgAst::DestVariant*> vs;
+                if (auto* dd = dynamic_cast<DdcgAst::DataDest*>(d)) vs = dd->variants;
+                else if (auto* cd = dynamic_cast<DdcgAst::CtrlDest*>(d)) vs = cd->variants;
+                for (auto* v : vs) if (v->name == cp->ctor) { variant = v; break; }
+                if (variant) break;
+            }
+            std::set<std::string> seen;
+            for (auto* fp : cp->fields) {
+                std::string fname;
+                DdcgAst::Pattern* sub = nullptr;
+                if (auto* nf = dynamic_cast<DdcgAst::NamedFieldPat*>(fp)) {
+                    fname = nf->name; sub = nf->pat;
+                } else if (auto* rf = dynamic_cast<DdcgAst::RestFieldPat*>(fp)) {
+                    err(c, pat->loc, "rest pattern not supported on dest variants");
+                    fname = rf->name;
+                }
+                const DdcgAst::DestField* field = nullptr;
+                if (variant) {
+                    for (auto* f : variant->fields) {
+                        if (f->name == fname) { field = f; break; }
+                    }
+                }
+                if (!field) {
+                    err(c, pat->loc, "dest variant '" + cp->ctor +
+                                     "' has no field '" + fname + "'");
+                    continue;
+                }
+                if (!seen.insert(fname).second) {
+                    err(c, pat->loc, "duplicate field '" + fname + "' in pattern");
+                }
+                Type fty = type_from_dsl_typeref(c, field->ty);
+                if (sub) check_pattern(c, sub, fty);
+            }
+            return;
+        }
         auto sit = c.schemas->find(cp->module);
         if (sit == c.schemas->end()) {
             err(c, pat->loc, "unknown schema module: " + cp->module);
@@ -265,6 +414,25 @@ void check_pattern(Ctx& c, DdcgAst::Pattern* pat, const Type& expected) {
         return;
     }
     if (auto* bp = dynamic_cast<DdcgAst::BindPat*>(pat)) {
+        // Enum-value disambiguation: if the field's type is an asdl
+        // enum sum and the bind name matches one of its constructors,
+        // treat as a constant match (no binding) — same shape the
+        // MatchExpr arm code uses for zero-arg dest variants.
+        if (expected.kind == TypeKind::Schema) {
+            auto sit = c.schemas->find(expected.schema_import);
+            if (sit != c.schemas->end() &&
+                sit->second.enum_sums.count(expected.name)) {
+                auto cit = sit->second.sum_constructors.find(expected.name);
+                if (cit != sit->second.sum_constructors.end()) {
+                    for (const auto& cn : cit->second) {
+                        if (cn == bp->name) {
+                            c.enum_value_bindpats.insert(bp);
+                            return;
+                        }
+                    }
+                }
+            }
+        }
         c.bind(bp->name, NameKind::PatternBind, expected);
         return;
     }
@@ -300,6 +468,11 @@ void check_pattern(Ctx& c, DdcgAst::Pattern* pat, const Type& expected) {
 
 Type infer_expr(Ctx& c, DdcgAst::Expr* e);
 
+// Forward decls so MatchExpr's body-walking code can call them.
+void check_stmt(Ctx& c, DdcgAst::Stmt* s, const Type& tail_expected, bool is_tail);
+void check_block(Ctx& c, const std::vector<DdcgAst::Stmt*>& body,
+                  const Type& tail_expected);
+
 void record(Ctx& c, DdcgAst::Expr* e, Type t) {
     c.result->expr_types[e] = t;
 }
@@ -320,9 +493,29 @@ Type infer_call(Ctx& c, DdcgAst::CallExpr* call) {
                                   std::to_string(arg_types.size()));
             } else {
                 for (size_t i = 0; i < arg_types.size(); ++i) {
-                    if (!assignable(sig.param_types[i], arg_types[i])) {
+                    if (!assignable(sig.param_types[i], arg_types[i], c.schemas)) {
                         err(c, call->args[i]->loc,
                             "auxiliary '" + fn_id->name + "' arg " +
+                            std::to_string(i + 1) + ": expected " +
+                            sig.param_types[i].display() + ", got " +
+                            arg_types[i].display());
+                    }
+                }
+            }
+            return sig.return_type;
+        }
+        // Fun? (action-language function defined in the .ddcg)
+        if (auto it = c.funs.find(fn_id->name); it != c.funs.end()) {
+            const auto& sig = it->second;
+            if ((int)arg_types.size() != sig.param_count) {
+                err(c, call->loc, "fun '" + fn_id->name + "' expects " +
+                                  std::to_string(sig.param_count) + " arg(s), got " +
+                                  std::to_string(arg_types.size()));
+            } else {
+                for (size_t i = 0; i < arg_types.size(); ++i) {
+                    if (!assignable(sig.param_types[i], arg_types[i], c.schemas)) {
+                        err(c, call->args[i]->loc,
+                            "fun '" + fn_id->name + "' arg " +
                             std::to_string(i + 1) + ": expected " +
                             sig.param_types[i].display() + ", got " +
                             arg_types[i].display());
@@ -340,7 +533,7 @@ Type infer_call(Ctx& c, DdcgAst::CallExpr* call) {
                                   std::to_string(arg_types.size()));
             } else {
                 for (size_t i = 0; i < arg_types.size(); ++i) {
-                    if (!assignable(sig.param_types[i], arg_types[i])) {
+                    if (!assignable(sig.param_types[i], arg_types[i], c.schemas)) {
                         err(c, call->args[i]->loc,
                             "predicate '" + fn_id->name + "' arg " +
                             std::to_string(i + 1) + ": expected " +
@@ -360,7 +553,7 @@ Type infer_call(Ctx& c, DdcgAst::CallExpr* call) {
                                   " arg(s), got " + std::to_string(arg_types.size()));
             } else {
                 for (size_t i = 0; i < arg_types.size(); ++i) {
-                    if (!assignable(sig.param_types[i], arg_types[i])) {
+                    if (!assignable(sig.param_types[i], arg_types[i], c.schemas)) {
                         err(c, call->args[i]->loc,
                             "destination constructor '" + fn_id->name + "' arg " +
                             std::to_string(i + 1) + ": expected " +
@@ -411,7 +604,7 @@ Type infer_expr(Ctx& c, DdcgAst::Expr* e) {
         }
         Type tt = infer_expr(c, t->then_);
         Type ft = infer_expr(c, t->else_);
-        if (!assignable(tt, ft) && !assignable(ft, tt)) {
+        if (!assignable(tt, ft, c.schemas) && !assignable(ft, tt, c.schemas)) {
             err(c, e->loc, "ternary branches have incompatible types: " +
                            tt.display() + " vs " + ft.display());
         }
@@ -428,7 +621,7 @@ Type infer_expr(Ctx& c, DdcgAst::Expr* e) {
                 err(c, b->right->loc, "operator '" + op + "' expects bool, got " + rt.display());
             ret = Type::bool_();
         } else if (op == "==" || op == "!=") {
-            if (!lt.is_unknown() && !rt.is_unknown() && !assignable(lt, rt) && !assignable(rt, lt))
+            if (!lt.is_unknown() && !rt.is_unknown() && !assignable(lt, rt, c.schemas) && !assignable(rt, lt, c.schemas))
                 err(c, e->loc, "operator '" + op + "' on incompatible types: " +
                                lt.display() + " vs " + rt.display());
             ret = Type::bool_();
@@ -446,7 +639,7 @@ Type infer_expr(Ctx& c, DdcgAst::Expr* e) {
                 err(c, b->left->loc, "list concat '+' expects list on left, got " + lt.display());
             else if (rt.kind != TypeKind::List)
                 err(c, b->right->loc, "list concat '+' expects list on right, got " + rt.display());
-            else if (!assignable(lt, rt) && !assignable(rt, lt))
+            else if (!assignable(lt, rt, c.schemas) && !assignable(rt, lt, c.schemas))
                 err(c, e->loc, "list concat '+' element types differ: " +
                                lt.display() + " vs " + rt.display());
             // Pick the more concrete element type if available.
@@ -480,7 +673,60 @@ Type infer_expr(Ctx& c, DdcgAst::Expr* e) {
     }
     else if (auto* fa = dynamic_cast<DdcgAst::FieldAccExpr*>(e)) {
         Type bt = infer_expr(c, fa->base);
-        if (bt.kind == TypeKind::Schema) {
+        if (bt.kind == TypeKind::Dest) {
+            // Field access on a destination (paper's δ/γ/ρ).
+            //   data_dest / ctrl_dest are tagged unions: a field is
+            //   reachable when it appears on at least one variant; if
+            //   multiple variants name the same field they must agree
+            //   on type. Variant tag isn't checked statically — runtime
+            //   correctness (e.g. only access γ.Lf when γ is `pair`) is
+            //   the rule body's concern, typically via a `where` predicate.
+            //   env_dest is a flat record: the field lookup is direct.
+            Type common; bool found = false; bool conflict = false;
+            for (auto* d : c.file->destinations) {
+                if (auto* dd = dynamic_cast<DdcgAst::DataDest*>(d)) {
+                    if (dd->name != bt.name) continue;
+                    for (auto* v : dd->variants)
+                        for (auto* f : v->fields)
+                            if (f->name == fa->field) {
+                                Type t = type_from_dsl_typeref(c, f->ty);
+                                if (!found) { common = t; found = true; }
+                                else if (!(common == t)) conflict = true;
+                            }
+                    break;
+                } else if (auto* cd = dynamic_cast<DdcgAst::CtrlDest*>(d)) {
+                    if (cd->name != bt.name) continue;
+                    for (auto* v : cd->variants)
+                        for (auto* f : v->fields)
+                            if (f->name == fa->field) {
+                                Type t = type_from_dsl_typeref(c, f->ty);
+                                if (!found) { common = t; found = true; }
+                                else if (!(common == t)) conflict = true;
+                            }
+                    break;
+                } else if (auto* ed = dynamic_cast<DdcgAst::EnvDest*>(d)) {
+                    if (ed->name != bt.name) continue;
+                    for (auto* f : ed->fields)
+                        if (f->name == fa->field) {
+                            common = type_from_dsl_typeref(c, f->ty);
+                            found = true;
+                        }
+                    break;
+                }
+            }
+            if (conflict) {
+                err(c, fa->loc, "field '" + fa->field + "' has conflicting types "
+                                "across variants of " + bt.display());
+                ret = Type::unknown();
+            } else if (!found) {
+                err(c, fa->loc, "destination type " + bt.display() +
+                                " has no variant with field '" + fa->field + "'");
+                ret = Type::unknown();
+            } else {
+                ret = common;
+            }
+        }
+        else if (bt.kind == TypeKind::Schema) {
             // Field lookup only resolves when the base is a specific
             // constructor — a sum-typed value would require dispatching
             // first to know which constructor's fields are visible.
@@ -555,7 +801,7 @@ Type infer_expr(Ctx& c, DdcgAst::Expr* e) {
             Type first = infer_expr(c, l->elems[0]);
             for (size_t i = 1; i < l->elems.size(); ++i) {
                 Type t = infer_expr(c, l->elems[i]);
-                if (!assignable(first, t) && !assignable(t, first)) {
+                if (!assignable(first, t, c.schemas) && !assignable(t, first, c.schemas)) {
                     err(c, l->elems[i]->loc,
                         "list element type mismatch: expected " + first.display() +
                         ", got " + t.display());
@@ -584,7 +830,7 @@ Type infer_expr(Ctx& c, DdcgAst::Expr* e) {
             } else {
                 for (size_t i = 0; i < dp->args.size(); ++i) {
                     Type at = infer_expr(c, dp->args[i]);
-                    if (!assignable(sig.param_types[i], at)) {
+                    if (!assignable(sig.param_types[i], at, c.schemas)) {
                         err(c, dp->args[i]->loc,
                             "destination constructor '" + dp->name + "' arg " +
                             std::to_string(i + 1) + ": expected " +
@@ -597,31 +843,268 @@ Type infer_expr(Ctx& c, DdcgAst::Expr* e) {
     }
     else if (auto* g = dynamic_cast<DdcgAst::GenCall*>(e)) {
         Type st = infer_expr(c, g->subject);
-        Type dd = infer_expr(c, g->data_dest);
-        Type cd = infer_expr(c, g->ctrl_dest);
         if (!st.is_unknown() && st.kind != TypeKind::Schema)
             err(c, g->subject->loc, "gen subject must be a schema-typed AST node, got " + st.display());
-        // δ must belong to the declared data_dest type (paper's δ slot).
-        if (!c.data_dest_name.empty()) {
-            Type expected_dd = Type::dest(c.data_dest_name);
-            if (!assignable(expected_dd, dd)) {
-                err(c, g->data_dest->loc,
-                    "gen data destination must be a " + c.data_dest_name +
-                    " variant, got " + dd.display());
+
+        // Arg-slot layout depends on whether the file declares an
+        // env_dest (paper's ρ). With env_dest, layout is (ρ, δ, γ, [Lnext]);
+        // without it, (δ, γ, [Lnext]). Count disambiguates.
+        std::string env_name;
+        for (auto* d : c.file->destinations) {
+            if (auto* ed = dynamic_cast<DdcgAst::EnvDest*>(d)) {
+                env_name = ed->name; break;
             }
         }
-        // γ must belong to the declared ctrl_dest type.
-        if (!c.ctrl_dest_name.empty()) {
-            Type expected_cd = Type::dest(c.ctrl_dest_name);
-            if (!assignable(expected_cd, cd)) {
-                err(c, g->ctrl_dest->loc,
-                    "gen control destination must be a " + c.ctrl_dest_name +
-                    " variant, got " + cd.display());
-            }
+        size_t n = g->args.size();
+        size_t expected_min = env_name.empty() ? 2 : 3;
+        size_t expected_max = expected_min + 1;
+        if (n < expected_min || n > expected_max) {
+            err(c, g->loc, "gen expects " + std::to_string(expected_min) +
+                " or " + std::to_string(expected_max) + " arg(s) after subject" +
+                (env_name.empty() ? " (δ, γ, [Lnext])"
+                                  : " (ρ, δ, γ, [Lnext])") +
+                ", got " + std::to_string(n));
         }
-        if (g->lnext.has_value()) infer_expr(c, *g->lnext);
-        // Result is the ir_root type
+        size_t idx = 0;
+        if (!env_name.empty() && n >= expected_min) {
+            Type rt = infer_expr(c, g->args[idx]);
+            if (!assignable(Type::dest(env_name), rt, c.schemas)) {
+                err(c, g->args[idx]->loc,
+                    "gen environment must be a " + env_name +
+                    " value, got " + rt.display());
+            }
+            idx++;
+        }
+        if (idx < n) {
+            Type dd = infer_expr(c, g->args[idx]);
+            if (!c.data_dest_name.empty()) {
+                Type expected_dd = Type::dest(c.data_dest_name);
+                if (!assignable(expected_dd, dd, c.schemas)) {
+                    err(c, g->args[idx]->loc,
+                        "gen data destination must be a " + c.data_dest_name +
+                        " variant, got " + dd.display());
+                }
+            }
+            idx++;
+        }
+        if (idx < n) {
+            Type cd = infer_expr(c, g->args[idx]);
+            if (!c.ctrl_dest_name.empty()) {
+                Type expected_cd = Type::dest(c.ctrl_dest_name);
+                if (!assignable(expected_cd, cd, c.schemas)) {
+                    err(c, g->args[idx]->loc,
+                        "gen control destination must be a " + c.ctrl_dest_name +
+                        " variant, got " + cd.display());
+                }
+            }
+            idx++;
+        }
+        if (idx < n) {
+            // Lnext slot — typecheck but don't constrain (it's an ir.node).
+            infer_expr(c, g->args[idx]);
+        }
         ret = type_from_dsl_typeref(c, c.file->ir_root);
+    }
+    else if (auto* w = dynamic_cast<DdcgAst::WithExpr*>(e)) {
+        Type bt = infer_expr(c, w->base);
+        Type vt = infer_expr(c, w->value);
+        if (bt.kind != TypeKind::Dest) {
+            err(c, w->loc, "with-update base must be an env-typed value, got " + bt.display());
+            ret = Type::unknown();
+        } else {
+            // Find the env_dest by name; locate the field; verify value type.
+            DdcgAst::EnvDest* env = nullptr;
+            for (auto* d : c.file->destinations) {
+                if (auto* ed = dynamic_cast<DdcgAst::EnvDest*>(d); ed && ed->name == bt.name) {
+                    env = ed; break;
+                }
+            }
+            if (!env) {
+                err(c, w->loc, "with-update applies only to env_dest values, not " + bt.display());
+                ret = Type::unknown();
+            } else {
+                DdcgAst::DestField* field = nullptr;
+                for (auto* f : env->fields) {
+                    if (f->name == w->field) { field = f; break; }
+                }
+                if (!field) {
+                    err(c, w->loc, "env_dest '" + bt.name + "' has no field '" + w->field + "'");
+                    ret = bt;  // best-effort: result keeps base type
+                } else {
+                    Type ft = type_from_dsl_typeref(c, field->ty);
+                    if (!assignable(ft, vt, c.schemas)) {
+                        err(c, w->value->loc, "with-update of '" + w->field +
+                            "': expected " + ft.display() + ", got " + vt.display());
+                    }
+                    ret = bt;  // result is same env type as base
+                }
+            }
+        }
+    }
+    else if (auto* b = dynamic_cast<DdcgAst::BuildExpr*>(e)) {
+        // Resolve schema → asdl-loaded module.
+        auto sit = c.schemas->find(b->schema);
+        if (sit == c.schemas->end()) {
+            err(c, b->loc, "build: unknown schema module '" + b->schema + "'");
+            for (auto* a : b->args) infer_expr(c, a);
+            ret = Type::unknown();
+        } else {
+            const Schema& s = sit->second;
+            auto ci = s.constructors.find(b->ctor);
+            if (ci == s.constructors.end()) {
+                err(c, b->loc, "build: unknown constructor '" + b->schema +
+                               "." + b->ctor + "'");
+                for (auto* a : b->args) infer_expr(c, a);
+                ret = Type::unknown();
+            } else {
+                const Constructor& ctor = ci->second;
+                if (b->args.size() != ctor.fields.size()) {
+                    err(c, b->loc, "build " + b->schema + "." + b->ctor +
+                                   ": expected " +
+                                   std::to_string(ctor.fields.size()) +
+                                   " arg(s), got " +
+                                   std::to_string(b->args.size()));
+                }
+                size_t n = std::min(b->args.size(), ctor.fields.size());
+                for (size_t i = 0; i < n; ++i) {
+                    Type at = infer_expr(c, b->args[i]);
+                    Type ft = type_from_field(c, b->schema,
+                                              ctor.fields[i].type_name,
+                                              ctor.fields[i].flag);
+                    if (!assignable(ft, at, c.schemas)) {
+                        err(c, b->args[i]->loc,
+                            "build " + b->schema + "." + b->ctor + " arg " +
+                            std::to_string(i + 1) + " ('" +
+                            ctor.fields[i].name + "'): expected " +
+                            ft.display() + ", got " + at.display());
+                    }
+                }
+                // Type-check any extra args so cached expr_types are populated.
+                for (size_t i = n; i < b->args.size(); ++i) infer_expr(c, b->args[i]);
+                ret = Type::schema(b->schema, b->ctor);
+            }
+        }
+    }
+    else if (auto* m = dynamic_cast<DdcgAst::MatchExpr*>(e)) {
+        Type st = infer_expr(c, m->subject);
+
+        // Exhaustiveness check.
+        // Collect variant names matched and any wildcard/bind catch-all.
+        // A BindPat whose name matches a zero-arg dest variant (or an
+        // enum-sum constructor) of the subject's type is treated as a
+        // constant match, not a name-bind — so users can write
+        // `effect => …` (dest) or `Add => …` (asdl enum) without parens.
+        bool subj_is_enum = false;
+        const Schema* enum_schema = nullptr;
+        std::vector<std::string> enum_ctors;
+        if (st.kind == TypeKind::Schema) {
+            auto sit = c.schemas->find(st.schema_import);
+            if (sit != c.schemas->end() && sit->second.enum_sums.count(st.name)) {
+                subj_is_enum = true;
+                enum_schema = &sit->second;
+                if (auto eit = sit->second.sum_constructors.find(st.name);
+                    eit != sit->second.sum_constructors.end()) {
+                    enum_ctors = eit->second;
+                }
+            }
+        }
+
+        std::set<std::string> matched_variants;
+        bool has_catchall = false;
+        for (auto* arm : m->arms) {
+            if (dynamic_cast<DdcgAst::WildcardPat*>(arm->pat)) {
+                has_catchall = true;
+            } else if (auto* bp = dynamic_cast<DdcgAst::BindPat*>(arm->pat)) {
+                bool is_constant = false;
+                if (st.kind == TypeKind::Dest) {
+                    auto vit = c.dest_variants.find(bp->name);
+                    if (vit != c.dest_variants.end() &&
+                        vit->second.param_count == 0 &&
+                        c.dest_variant_owner[bp->name] == st.name) {
+                        matched_variants.insert(bp->name);
+                        is_constant = true;
+                    }
+                } else if (subj_is_enum) {
+                    for (const auto& cn : enum_ctors) {
+                        if (cn == bp->name) {
+                            matched_variants.insert(bp->name);
+                            is_constant = true;
+                            break;
+                        }
+                    }
+                }
+                if (!is_constant) has_catchall = true;
+            } else if (auto* cp = dynamic_cast<DdcgAst::ConstructorPat*>(arm->pat)) {
+                if (cp->module.empty()) matched_variants.insert(cp->ctor);
+            }
+        }
+        if (!has_catchall && st.kind == TypeKind::Dest) {
+            // Walk this dest's variants; report any not matched.
+            for (auto* d : c.file->destinations) {
+                std::string dname;
+                std::vector<DdcgAst::DestVariant*> variants;
+                if (auto* dd = dynamic_cast<DdcgAst::DataDest*>(d)) {
+                    dname = dd->name; variants = dd->variants;
+                } else if (auto* cd = dynamic_cast<DdcgAst::CtrlDest*>(d)) {
+                    dname = cd->name; variants = cd->variants;
+                }
+                if (dname != st.name) continue;
+                for (auto* v : variants) {
+                    if (!matched_variants.count(v->name)) {
+                        err(c, m->loc, "non-exhaustive match on " + st.display() +
+                                       ": variant '" + v->name + "' not covered");
+                    }
+                }
+            }
+        }
+        if (!has_catchall && subj_is_enum) {
+            (void)enum_schema;
+            for (const auto& cn : enum_ctors) {
+                if (!matched_variants.count(cn)) {
+                    err(c, m->loc, "non-exhaustive match on " + st.display() +
+                                   ": value '" + cn + "' not covered");
+                }
+            }
+        }
+
+        // Walk each arm in its own scope; the join of arm types is the
+        // match's overall type.
+        Type result_t = Type::unknown();
+        for (auto* arm : m->arms) {
+            c.push_scope();
+            check_pattern(c, arm->pat, st);
+            // Body's tail-expression type becomes the arm's value.
+            check_block(c, arm->body, /*tail_expected=*/Type::unknown());
+            // Pull the tail expression type from the cache and merge
+            // it with the running join. Sibling constructors of the
+            // same asdl sum widen to the sum (e.g. `target.Imm` and
+            // `target.Slot` both fold up to `target.value`).
+            if (!arm->body.empty()) {
+                if (auto* es = dynamic_cast<DdcgAst::ExprStmt*>(arm->body.back())) {
+                    auto it = c.result->expr_types.find(es->value);
+                    if (it != c.result->expr_types.end()) {
+                        const Type& at = it->second;
+                        if (result_t.is_unknown()) {
+                            result_t = at;
+                        } else if (assignable(result_t, at, c.schemas)) {
+                            // arm fits running join — keep result_t.
+                        } else if (assignable(at, result_t, c.schemas)) {
+                            // running join is sub-type of this arm — widen.
+                            result_t = at;
+                        } else if (auto sum = common_schema_sum(c, result_t, at);
+                                   !sum.empty()) {
+                            result_t = Type::schema(result_t.schema_import, sum);
+                        } else {
+                            err(c, arm->loc, "match arm type " +
+                                at.display() + " differs from earlier " +
+                                result_t.display());
+                        }
+                    }
+                }
+            }
+            c.pop_scope();
+        }
+        ret = result_t;
     }
     else {
         ret = Type::unknown();
@@ -650,7 +1133,7 @@ void check_stmt(Ctx& c, DdcgAst::Stmt* s,
         if (let->binds.size() == 1) {
             if (auto* sb = dynamic_cast<DdcgAst::SimpleBind*>(let->binds[0])) {
                 Type bt = sb->ty.has_value() ? type_from_dsl_typeref(c, *sb->ty) : vt;
-                if (sb->ty.has_value() && !assignable(bt, vt)) {
+                if (sb->ty.has_value() && !assignable(bt, vt, c.schemas)) {
                     err(c, let->loc, "let bind '" + sb->name + "': expected " +
                                      bt.display() + ", got " + vt.display());
                 }
@@ -700,7 +1183,7 @@ void check_stmt(Ctx& c, DdcgAst::Stmt* s,
             return;
         }
         Type vt = infer_expr(c, ma->value);
-        if (!assignable(b->ty, vt)) {
+        if (!assignable(b->ty, vt, c.schemas)) {
             err(c, ma->loc, "rebind of '" + ma->name + "': expected " +
                             b->ty.display() + ", got " + vt.display());
         }
@@ -729,7 +1212,7 @@ void check_stmt(Ctx& c, DdcgAst::Stmt* s,
     if (auto* es = dynamic_cast<DdcgAst::ExprStmt*>(s)) {
         Type vt = infer_expr(c, es->value);
         if (is_tail && tail_expected.kind != TypeKind::Void &&
-            !assignable(tail_expected, vt)) {
+            !assignable(tail_expected, vt, c.schemas)) {
             err(c, es->loc, "tail expression: expected " + tail_expected.display() +
                             ", got " + vt.display());
         }
@@ -774,8 +1257,23 @@ void check_coverage(Ctx& c, const HeadIndex& idx) {
         exempt.insert(name);
     }
 
+    // Coverage applies only to sums the .ddcg actually dispatches on.
+    // A schema may have multiple sums (e.g. expr, stmt, plus container
+    // types like grammar/header that the consumer's frontend handles
+    // directly); we only demand exhaustive coverage of sums whose
+    // constructors appear as rule heads.
+    std::set<std::string> covered_sums;
+    for (const auto& [k, rules] : idx) {
+        (void)rules;
+        if (k.first != mod) continue;
+        auto cit = sit->second.constructors.find(k.second);
+        if (cit != sit->second.constructors.end()) {
+            covered_sums.insert(cit->second.sum_name);
+        }
+    }
+
     for (const auto& [sum_name, ctor_list] : sit->second.sum_constructors) {
-        (void)sum_name;
+        if (covered_sums.count(sum_name) == 0) continue;
         for (const auto& cname : ctor_list) {
             if (exempt.count(cname)) continue;
             auto k = std::make_pair(mod, cname);
@@ -788,17 +1286,19 @@ void check_coverage(Ctx& c, const HeadIndex& idx) {
     }
 }
 
-void serialize_pattern(const DdcgAst::Pattern* p, std::ostringstream& os);
+void serialize_pattern(const DdcgAst::Pattern* p, std::ostringstream& os,
+                       const std::set<const DdcgAst::BindPat*>& enum_bps);
 
 // Compute a structural-shape signature for a head, ignoring bind-variable
 // names. Two heads with the same signature are interchangeable — only
 // guards or rule order can distinguish them. Differing signatures mean
 // one rule is a specialisation of the other (nested ConstructorPats,
-// IntPat / StringPat / NilPat value checks) — PEG ordered choice
-// handles the disambiguation, no warning warranted.
-std::string head_shape_signature(const DdcgAst::Pattern* p) {
+// IntPat / StringPat / NilPat value checks, enum-value field-pats) —
+// PEG ordered choice handles the disambiguation, no warning warranted.
+std::string head_shape_signature(const DdcgAst::Pattern* p,
+                                 const std::set<const DdcgAst::BindPat*>& enum_bps) {
     std::ostringstream os;
-    serialize_pattern(p, os);
+    serialize_pattern(p, os, enum_bps);
     return os.str();
 }
 
@@ -814,7 +1314,7 @@ void check_overlap(Ctx& c, const HeadIndex& idx) {
             for (auto* h : r->heads) {
                 if (auto* cp = dynamic_cast<DdcgAst::ConstructorPat*>(h)) {
                     if (cp->module == k.first && cp->ctor == k.second) {
-                        by_shape[head_shape_signature(h)].push_back(r);
+                        by_shape[head_shape_signature(h, c.enum_value_bindpats)].push_back(r);
                         break;
                     }
                 }
@@ -853,7 +1353,8 @@ void check_overlap(Ctx& c, const HeadIndex& idx) {
 // Cheap textual signature for a guard expression — used to detect rules
 // that are flat-out duplicates (same head, same guard text).
 void serialize_expr(const DdcgAst::Expr* e, std::ostringstream& os);
-void serialize_pattern(const DdcgAst::Pattern* p, std::ostringstream& os);
+void serialize_pattern(const DdcgAst::Pattern* p, std::ostringstream& os,
+                       const std::set<const DdcgAst::BindPat*>& enum_bps);
 
 void serialize_expr(const DdcgAst::Expr* e, std::ostringstream& os) {
     if (!e) { os << "_"; return; }
@@ -882,14 +1383,15 @@ void serialize_expr(const DdcgAst::Expr* e, std::ostringstream& os) {
     os << "?";  // good enough — duplicate detection is a hint
 }
 
-void serialize_pattern(const DdcgAst::Pattern* p, std::ostringstream& os) {
+void serialize_pattern(const DdcgAst::Pattern* p, std::ostringstream& os,
+                       const std::set<const DdcgAst::BindPat*>& enum_bps) {
     if (auto* cp = dynamic_cast<const DdcgAst::ConstructorPat*>(p)) {
         os << cp->module << "." << cp->ctor << "(";
         for (size_t i = 0; i < cp->fields.size(); ++i) {
             if (i) os << ",";
             if (auto* nf = dynamic_cast<const DdcgAst::NamedFieldPat*>(cp->fields[i])) {
                 os << nf->name << ":";
-                serialize_pattern(nf->pat, os);
+                serialize_pattern(nf->pat, os, enum_bps);
             } else if (auto* rf = dynamic_cast<const DdcgAst::RestFieldPat*>(cp->fields[i])) {
                 os << "..." << rf->name;
             }
@@ -904,10 +1406,11 @@ void serialize_pattern(const DdcgAst::Pattern* p, std::ostringstream& os) {
     } else if (auto* sp = dynamic_cast<const DdcgAst::StringPat*>(p)) {
         os << "str(" << sp->value << ")";
     } else if (auto* bp = dynamic_cast<const DdcgAst::BindPat*>(p)) {
-        // BindPats with different names are still the same rule — we
-        // alpha-equate them via a fixed token.
-        (void)bp;
-        os << "bind";
+        // BindPats whose name resolves to an asdl-enum constructor are
+        // constants — distinguish them by name. Plain value-binds still
+        // alpha-equate to a single token.
+        if (enum_bps.count(bp)) os << "enum(" << bp->name << ")";
+        else                    os << "bind";
     } else {
         os << "?";
     }
@@ -917,7 +1420,10 @@ void check_duplicates(Ctx& c) {
     std::map<std::string, const DdcgAst::Rule*> seen;
     for (auto* r : c.file->rules) {
         std::ostringstream sig;
-        for (auto* h : r->heads) { serialize_pattern(h, sig); sig << "|"; }
+        for (auto* h : r->heads) {
+            serialize_pattern(h, sig, c.enum_value_bindpats);
+            sig << "|";
+        }
         sig << "@";
         if (r->guard.has_value()) serialize_expr(*r->guard, sig);
         else sig << "_";
@@ -960,6 +1466,15 @@ void seed_context(Ctx& c) {
             } else {
                 c.ctrl_dest_name = dname;
             }
+        } else if (auto* ed = dynamic_cast<DdcgAst::EnvDest*>(d)) {
+            if (!c.env_dest_name.empty()) {
+                err(c, c.file->loc,
+                    "multiple env_dest declarations: '" + c.env_dest_name +
+                    "' and '" + ed->name + "' (ρ is a single record)");
+            } else {
+                c.env_dest_name = ed->name;
+            }
+            // env_dest has no variants — no entries in dest_variants.
         }
         (void)is_data;
         for (auto* v : variants) {
@@ -998,6 +1513,23 @@ void seed_context(Ctx& c) {
         sig.return_type = Type::bool_();
         c.preds[p->name] = std::move(sig);
     }
+    // Action-language `fun` declarations. Register signatures up front
+    // so funs can call each other (forward references, mutual recursion).
+    // Bodies are type-checked separately after seed_context, so all
+    // sig types are known before any body is walked.
+    for (auto* f : c.file->funs) {
+        AuxSig sig;
+        sig.param_count = static_cast<int>(f->params.size());
+        std::vector<std::string> names;
+        names.reserve(f->params.size());
+        for (auto* p : f->params) {
+            sig.param_types.push_back(type_from_dsl_typeref(c, p->ty));
+            names.push_back(p->name);
+        }
+        sig.return_type = type_from_dsl_typeref(c, f->ret_ty);
+        c.funs[f->name] = std::move(sig);
+        c.fun_param_names[f->name] = std::move(names);
+    }
 
     c.push_scope();
     for (const auto& n : c.import_names)        c.bind(n, NameKind::SchemaModule, Type::unknown());
@@ -1010,6 +1542,24 @@ void seed_context(Ctx& c) {
     }
     for (const auto& [n, sig] : c.auxes)         c.bind(n, NameKind::Auxiliary, sig.return_type);
     for (const auto& [n, sig] : c.preds)         c.bind(n, NameKind::Predicate, Type::bool_());
+    for (const auto& [n, sig] : c.funs)          c.bind(n, NameKind::Fun, sig.return_type);
+}
+
+// Type-check one action-language fun body. Pushes a scope with the
+// fun's parameters bound, walks the body stmts requiring the trailing
+// expression to match the declared return type.
+void check_fun(Ctx& c, DdcgAst::Fun* f) {
+    auto sig_it = c.funs.find(f->name);
+    if (sig_it == c.funs.end()) return;  // already errored at decl time
+    const AuxSig& sig = sig_it->second;
+    const auto& names = c.fun_param_names[f->name];
+
+    c.push_scope();
+    for (size_t i = 0; i < f->params.size(); ++i) {
+        c.bind(names[i], NameKind::FunParam, sig.param_types[i]);
+    }
+    check_block(c, f->body, /*tail_expected=*/sig.return_type);
+    c.pop_scope();
 }
 
 // Walk each head in its own throwaway scope so we can compare the
@@ -1052,8 +1602,8 @@ void check_rule(Ctx& c, const DdcgAst::Rule* r) {
                     err(c, r->heads[i]->loc,
                         "multi-pattern head " + std::to_string(i + 1) +
                         " is missing variable '" + n + "' bound by head 1");
-                } else if (!assignable(t, it->second) ||
-                           !assignable(it->second, t)) {
+                } else if (!assignable(t, it->second, c.schemas) ||
+                           !assignable(it->second, t, c.schemas)) {
                     err(c, r->heads[i]->loc,
                         "multi-pattern head " + std::to_string(i + 1) +
                         " binds '" + n + "' as " + it->second.display() +
@@ -1068,6 +1618,28 @@ void check_rule(Ctx& c, const DdcgAst::Rule* r) {
         for (const auto& [n, t] : head_binds.front()) {
             c.bind(n, NameKind::PatternBind, t);
         }
+    }
+    // Bind the dispatcher's incoming destinations under their declared
+    // names so rule bodies can write `gen(e, delta, gamma)` to propagate
+    // the rule's own δ/γ to recursive calls (per Dybvig 1990 §3.2). The
+    // names match the .ddcg's `data_dest <name>` / `ctrl_dest <name>`
+    // declarations exactly. `Lnext` is the paper Figure-8 fall-through
+    // hint; bound to the ir_root type and defaults to {} at the call.
+    if (!c.data_dest_name.empty()) {
+        c.bind(c.data_dest_name, NameKind::PatternBind,
+               Type::dest(c.data_dest_name));
+    }
+    if (!c.ctrl_dest_name.empty()) {
+        c.bind(c.ctrl_dest_name, NameKind::PatternBind,
+               Type::dest(c.ctrl_dest_name));
+    }
+    if (!c.env_dest_name.empty()) {
+        c.bind(c.env_dest_name, NameKind::PatternBind,
+               Type::dest(c.env_dest_name));
+    }
+    if (c.file->ir_root) {
+        c.bind("Lnext", NameKind::PatternBind,
+               type_from_dsl_typeref(c, c.file->ir_root));
     }
     if (r->guard.has_value()) {
         Type gt = infer_expr(c, *r->guard);
@@ -1098,6 +1670,7 @@ CheckResult check_file(const DdcgAst::File* file,
         }
     }
 
+    for (auto* f : file->funs)  check_fun(c, f);
     for (auto* r : file->rules) check_rule(c, r);
 
     HeadIndex idx;

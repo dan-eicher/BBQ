@@ -22,13 +22,26 @@ namespace calc_ir {
 // ── Forward declarations ────────────────────────────────────
 
 struct Node;
-struct SlotRef;
 struct LoadConst;
+struct LoadLocal;
 struct Add;
 struct Sub;
 struct Mul;
 struct Neg;
+struct CmpEq;
+struct CmpNeq;
+struct CmpLt;
+struct CmpLe;
+struct CmpGt;
+struct CmpGe;
+struct Call;
+struct StoreLocal;
+struct ExprEffect;
+struct Branch;
+struct Goto;
+struct Leave;
 struct Halt;
+struct Nop;
 
 // ── Source location ─────────────────────────────────────────
 
@@ -100,13 +113,26 @@ private:
 struct ASTVisitor {
     virtual ~ASTVisitor() = default;
 
-    virtual void visit(SlotRef* node) {}
     virtual void visit(LoadConst* node) {}
+    virtual void visit(LoadLocal* node) {}
     virtual void visit(Add* node) {}
     virtual void visit(Sub* node) {}
     virtual void visit(Mul* node) {}
     virtual void visit(Neg* node) {}
+    virtual void visit(CmpEq* node) {}
+    virtual void visit(CmpNeq* node) {}
+    virtual void visit(CmpLt* node) {}
+    virtual void visit(CmpLe* node) {}
+    virtual void visit(CmpGt* node) {}
+    virtual void visit(CmpGe* node) {}
+    virtual void visit(Call* node) {}
+    virtual void visit(StoreLocal* node) {}
+    virtual void visit(ExprEffect* node) {}
+    virtual void visit(Branch* node) {}
+    virtual void visit(Goto* node) {}
+    virtual void visit(Leave* node) {}
     virtual void visit(Halt* node) {}
+    virtual void visit(Nop* node) {}
 };
 
 // ── AST node base ───────────────────────────────────────────
@@ -131,113 +157,354 @@ struct ASTNode {
 // ── Sum types (class hierarchies) ───────────────────────────
 
 // node
+//
+// Per-sum Tag enum + non-virtual `tag` field on the base class give
+// O(1) dispatch via `switch (node->tag)` and let callers `static_cast`
+// instead of `dynamic_cast` once the tag is matched. Each derived
+// stamps a `static constexpr NodeTag kind` (the
+// canonical value for that subclass, used to initialise the base's
+// tag) and a `static constexpr int kind_value` (plain-int form for
+// burgc TERM declarations and any other place that wants the
+// discriminator as an integer literal).
+enum class NodeTag : int {
+    LoadConst,
+    LoadLocal,
+    Add,
+    Sub,
+    Mul,
+    Neg,
+    CmpEq,
+    CmpNeq,
+    CmpLt,
+    CmpLe,
+    CmpGt,
+    CmpGe,
+    Call,
+    StoreLocal,
+    ExprEffect,
+    Branch,
+    Goto,
+    Leave,
+    Halt,
+    Nop
+};
+
 struct Node : public ASTNode {
+    NodeTag tag;
+    explicit Node(NodeTag t) : tag(t) {}
     virtual ~Node() = default;
 };
 
-struct SlotRef : public Node {
-    SlotRef(
-        int64_t slot,
-        Node* next
-    )
-        : slot(slot), next(next) {}
-
-    void accept(ASTVisitor& visitor) override { visitor.visit(this); }
-
-    int64_t slot;
-    Node* next;
-};
-
 struct LoadConst : public Node {
+    static constexpr NodeTag kind = NodeTag::LoadConst;
+    static constexpr int kind_value = static_cast<int>(NodeTag::LoadConst);
+
     LoadConst(
-        int64_t value,
-        int64_t dest,
-        Node* next
+        int64_t value
     )
-        : value(value), dest(dest), next(next) {}
+        : Node(kind), value(value) {}
 
     void accept(ASTVisitor& visitor) override { visitor.visit(this); }
 
     int64_t value;
-    int64_t dest;
-    Node* next;
 };
 
-struct Add : public Node {
-    Add(
-        int64_t lhs,
-        int64_t rhs,
-        int64_t dest,
-        Node* next
+struct LoadLocal : public Node {
+    static constexpr NodeTag kind = NodeTag::LoadLocal;
+    static constexpr int kind_value = static_cast<int>(NodeTag::LoadLocal);
+
+    LoadLocal(
+        int64_t src
     )
-        : lhs(lhs), rhs(rhs), dest(dest), next(next) {}
-
-    void accept(ASTVisitor& visitor) override { visitor.visit(this); }
-
-    int64_t lhs;
-    int64_t rhs;
-    int64_t dest;
-    Node* next;
-};
-
-struct Sub : public Node {
-    Sub(
-        int64_t lhs,
-        int64_t rhs,
-        int64_t dest,
-        Node* next
-    )
-        : lhs(lhs), rhs(rhs), dest(dest), next(next) {}
-
-    void accept(ASTVisitor& visitor) override { visitor.visit(this); }
-
-    int64_t lhs;
-    int64_t rhs;
-    int64_t dest;
-    Node* next;
-};
-
-struct Mul : public Node {
-    Mul(
-        int64_t lhs,
-        int64_t rhs,
-        int64_t dest,
-        Node* next
-    )
-        : lhs(lhs), rhs(rhs), dest(dest), next(next) {}
-
-    void accept(ASTVisitor& visitor) override { visitor.visit(this); }
-
-    int64_t lhs;
-    int64_t rhs;
-    int64_t dest;
-    Node* next;
-};
-
-struct Neg : public Node {
-    Neg(
-        int64_t src,
-        int64_t dest,
-        Node* next
-    )
-        : src(src), dest(dest), next(next) {}
+        : Node(kind), src(src) {}
 
     void accept(ASTVisitor& visitor) override { visitor.visit(this); }
 
     int64_t src;
-    int64_t dest;
-    Node* next;
 };
 
-struct Halt : public Node {
-    Halt(
-        int64_t result_slot
+struct Add : public Node {
+    static constexpr NodeTag kind = NodeTag::Add;
+    static constexpr int kind_value = static_cast<int>(NodeTag::Add);
+
+    Add(
+        Node* left,
+        Node* right
     )
-        : result_slot(result_slot) {}
+        : Node(kind), left(left), right(right) {}
 
     void accept(ASTVisitor& visitor) override { visitor.visit(this); }
 
-    int64_t result_slot;
+    Node* left;
+    Node* right;
+};
+
+struct Sub : public Node {
+    static constexpr NodeTag kind = NodeTag::Sub;
+    static constexpr int kind_value = static_cast<int>(NodeTag::Sub);
+
+    Sub(
+        Node* left,
+        Node* right
+    )
+        : Node(kind), left(left), right(right) {}
+
+    void accept(ASTVisitor& visitor) override { visitor.visit(this); }
+
+    Node* left;
+    Node* right;
+};
+
+struct Mul : public Node {
+    static constexpr NodeTag kind = NodeTag::Mul;
+    static constexpr int kind_value = static_cast<int>(NodeTag::Mul);
+
+    Mul(
+        Node* left,
+        Node* right
+    )
+        : Node(kind), left(left), right(right) {}
+
+    void accept(ASTVisitor& visitor) override { visitor.visit(this); }
+
+    Node* left;
+    Node* right;
+};
+
+struct Neg : public Node {
+    static constexpr NodeTag kind = NodeTag::Neg;
+    static constexpr int kind_value = static_cast<int>(NodeTag::Neg);
+
+    Neg(
+        Node* operand
+    )
+        : Node(kind), operand(operand) {}
+
+    void accept(ASTVisitor& visitor) override { visitor.visit(this); }
+
+    Node* operand;
+};
+
+struct CmpEq : public Node {
+    static constexpr NodeTag kind = NodeTag::CmpEq;
+    static constexpr int kind_value = static_cast<int>(NodeTag::CmpEq);
+
+    CmpEq(
+        Node* left,
+        Node* right
+    )
+        : Node(kind), left(left), right(right) {}
+
+    void accept(ASTVisitor& visitor) override { visitor.visit(this); }
+
+    Node* left;
+    Node* right;
+};
+
+struct CmpNeq : public Node {
+    static constexpr NodeTag kind = NodeTag::CmpNeq;
+    static constexpr int kind_value = static_cast<int>(NodeTag::CmpNeq);
+
+    CmpNeq(
+        Node* left,
+        Node* right
+    )
+        : Node(kind), left(left), right(right) {}
+
+    void accept(ASTVisitor& visitor) override { visitor.visit(this); }
+
+    Node* left;
+    Node* right;
+};
+
+struct CmpLt : public Node {
+    static constexpr NodeTag kind = NodeTag::CmpLt;
+    static constexpr int kind_value = static_cast<int>(NodeTag::CmpLt);
+
+    CmpLt(
+        Node* left,
+        Node* right
+    )
+        : Node(kind), left(left), right(right) {}
+
+    void accept(ASTVisitor& visitor) override { visitor.visit(this); }
+
+    Node* left;
+    Node* right;
+};
+
+struct CmpLe : public Node {
+    static constexpr NodeTag kind = NodeTag::CmpLe;
+    static constexpr int kind_value = static_cast<int>(NodeTag::CmpLe);
+
+    CmpLe(
+        Node* left,
+        Node* right
+    )
+        : Node(kind), left(left), right(right) {}
+
+    void accept(ASTVisitor& visitor) override { visitor.visit(this); }
+
+    Node* left;
+    Node* right;
+};
+
+struct CmpGt : public Node {
+    static constexpr NodeTag kind = NodeTag::CmpGt;
+    static constexpr int kind_value = static_cast<int>(NodeTag::CmpGt);
+
+    CmpGt(
+        Node* left,
+        Node* right
+    )
+        : Node(kind), left(left), right(right) {}
+
+    void accept(ASTVisitor& visitor) override { visitor.visit(this); }
+
+    Node* left;
+    Node* right;
+};
+
+struct CmpGe : public Node {
+    static constexpr NodeTag kind = NodeTag::CmpGe;
+    static constexpr int kind_value = static_cast<int>(NodeTag::CmpGe);
+
+    CmpGe(
+        Node* left,
+        Node* right
+    )
+        : Node(kind), left(left), right(right) {}
+
+    void accept(ASTVisitor& visitor) override { visitor.visit(this); }
+
+    Node* left;
+    Node* right;
+};
+
+struct Call : public Node {
+    static constexpr NodeTag kind = NodeTag::Call;
+    static constexpr int kind_value = static_cast<int>(NodeTag::Call);
+
+    Call(
+        Node* target,
+        std::vector<Node*> args,
+        int64_t frame_size
+    )
+        : Node(kind), target(target), args(std::move(args)), frame_size(frame_size) {}
+
+    void accept(ASTVisitor& visitor) override { visitor.visit(this); }
+
+    Node* target;
+    std::vector<Node*> args;
+    int64_t frame_size;
+};
+
+struct StoreLocal : public Node {
+    static constexpr NodeTag kind = NodeTag::StoreLocal;
+    static constexpr int kind_value = static_cast<int>(NodeTag::StoreLocal);
+
+    StoreLocal(
+        int64_t dest,
+        Node* value,
+        Node* next
+    )
+        : Node(kind), dest(dest), value(value), next(next) {}
+
+    void accept(ASTVisitor& visitor) override { visitor.visit(this); }
+
+    int64_t dest;
+    Node* value;
+    Node* next;
+};
+
+struct ExprEffect : public Node {
+    static constexpr NodeTag kind = NodeTag::ExprEffect;
+    static constexpr int kind_value = static_cast<int>(NodeTag::ExprEffect);
+
+    ExprEffect(
+        Node* value,
+        Node* next
+    )
+        : Node(kind), value(value), next(next) {}
+
+    void accept(ASTVisitor& visitor) override { visitor.visit(this); }
+
+    Node* value;
+    Node* next;
+};
+
+struct Branch : public Node {
+    static constexpr NodeTag kind = NodeTag::Branch;
+    static constexpr int kind_value = static_cast<int>(NodeTag::Branch);
+
+    Branch(
+        Node* test,
+        Node* then_,
+        Node* else_
+    )
+        : Node(kind), test(test), then_(then_), else_(else_) {}
+
+    void accept(ASTVisitor& visitor) override { visitor.visit(this); }
+
+    Node* test;
+    Node* then_;
+    Node* else_;
+};
+
+struct Goto : public Node {
+    static constexpr NodeTag kind = NodeTag::Goto;
+    static constexpr int kind_value = static_cast<int>(NodeTag::Goto);
+
+    Goto(
+        Node* target
+    )
+        : Node(kind), target(target) {}
+
+    void accept(ASTVisitor& visitor) override { visitor.visit(this); }
+
+    Node* target;
+};
+
+struct Leave : public Node {
+    static constexpr NodeTag kind = NodeTag::Leave;
+    static constexpr int kind_value = static_cast<int>(NodeTag::Leave);
+
+    Leave(
+        Node* value
+    )
+        : Node(kind), value(value) {}
+
+    void accept(ASTVisitor& visitor) override { visitor.visit(this); }
+
+    Node* value;
+};
+
+struct Halt : public Node {
+    static constexpr NodeTag kind = NodeTag::Halt;
+    static constexpr int kind_value = static_cast<int>(NodeTag::Halt);
+
+    Halt(
+        Node* value
+    )
+        : Node(kind), value(value) {}
+
+    void accept(ASTVisitor& visitor) override { visitor.visit(this); }
+
+    Node* value;
+};
+
+struct Nop : public Node {
+    static constexpr NodeTag kind = NodeTag::Nop;
+    static constexpr int kind_value = static_cast<int>(NodeTag::Nop);
+
+    Nop(
+        Node* next
+    )
+        : Node(kind), next(next) {}
+
+    void accept(ASTVisitor& visitor) override { visitor.visit(this); }
+
+    Node* next;
 };
 
 // ── Product types ───────────────────────────────────────────

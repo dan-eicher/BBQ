@@ -1,3 +1,7 @@
+// ============================================================
+// BBQ CEK IR — auto-generated from bbq_ir.asdl
+// Do not edit by hand. Regenerate via the asdl tool.
+// ============================================================
 #pragma once
 
 #include <cstddef>
@@ -5,15 +9,18 @@
 
 namespace bbq::cek {
 
-// Forward declaration
+// Forward declaration for the runtime that consumes nodes.
 struct CEKMachine;
 
-// --- Primitive type enums (own enums, no dependency on BBQ_AST.h) ---
+// FieldCapture lives in Capture.h. Forward-declare so FieldCaptureValue
+// can reference it without a header dependency.
+struct FieldCapture;
+
+// ── Primitive type descriptor ───────────────────────────────
 
 enum class PrimWidth : uint8_t { W8, W16, W32, W64 };
 enum class PrimSign  : uint8_t { Unsigned, Signed };
 enum class PrimEndian : uint8_t { Little, Big, Native };
-
 enum class PrimKind : uint8_t { Integer, Float, Bool };
 
 struct PrimitiveInfo {
@@ -37,222 +44,944 @@ struct PrimitiveInfo {
     }
 };
 
-// --- Continuation node types (for debugging/visitor use) ---
+// ── Generated enums ─────────────────────────────────────────
 
-// Forward declaration for expression nodes
-struct CompiledExpr;
-
-enum class KontType : uint8_t {
-    MatchPrimitive,
-    BeginStruct,
-    EndStruct,
-    EvalConstraint,
-    BindCompute,
-    InvokeRule,
-    ReturnRule,
-    BeginChoice,
-    CommitChoice,
-    BeginOptional,
-    EndOptional,
-    BeginArray,
-    ArrayNext,
-    EndArray,
-    SwitchDispatch,
-    SetEndian,
-    ExternalCall,
-    MatchBytes,
-    Halt,
+enum class ArrayMode : uint8_t {
+    FixedCount,
+    EOF_,
+    Count,
+    Until
 };
 
-// --- Base continuation node ---
+// ── Forward declarations ────────────────────────────────────
+
+struct KontNode;
+struct Value;
+struct StaticKont;
+struct DynamicKont;
+struct switch_case;
+struct bitfield_entry;
+struct IntValue;
+struct FloatValue;
+struct StringValue;
+struct BoolValue;
+struct FieldCaptureValue;
+struct MatchPrimitiveNode;
+struct BeginStructNode;
+struct EndStructNode;
+struct EvalConstraintNode;
+struct BindComputeNode;
+struct InvokeRuleNode;
+struct ReturnRuleNode;
+struct BeginChoiceNode;
+struct CommitChoiceNode;
+struct BeginOptionalNode;
+struct EndOptionalNode;
+struct BeginArrayNode;
+struct ArrayNextNode;
+struct EndArrayNode;
+struct SwitchDispatchNode;
+struct BitfieldReadNode;
+struct SetEndianNode;
+struct ExternalCallNode;
+struct MatchBytesNode;
+struct HaltNode;
+struct IntLitKont;
+struct BoolLitKont;
+struct FloatLitKont;
+struct StrLitKont;
+struct RefKont;
+struct PosKont;
+struct RemainingKont;
+struct AtEndKont;
+struct EOIKont;
+struct LoopVarKont;
+struct NegKont;
+struct BitNotKont;
+struct NotKont;
+struct AddKont;
+struct SubKont;
+struct MulKont;
+struct DivKont;
+struct ModKont;
+struct BitAndKont;
+struct BitOrKont;
+struct BitXorKont;
+struct ShlKont;
+struct ShrKont;
+struct EqKont;
+struct NeKont;
+struct LtKont;
+struct LeKont;
+struct GtKont;
+struct GeKont;
+struct LogicalAndKont;
+struct LogicalOrKont;
+struct TernaryKont;
+struct CallKont;
+struct PathStartKont;
+struct FieldAccessKont;
+struct IndexAccessKont;
+struct CaptureValueKont;
+struct ApplyAddKont;
+struct ApplySubKont;
+struct ApplyMulKont;
+struct ApplyDivKont;
+struct ApplyModKont;
+struct ApplyBitAndKont;
+struct ApplyBitOrKont;
+struct ApplyBitXorKont;
+struct ApplyShlKont;
+struct ApplyShrKont;
+struct ApplyEqKont;
+struct ApplyNeKont;
+struct ApplyLtKont;
+struct ApplyLeKont;
+struct ApplyGtKont;
+struct ApplyGeKont;
+struct ApplyNegKont;
+struct ApplyBitNotKont;
+struct ApplyNotKont;
+struct EvalLeftKont;
+struct LogicalAndCheckKont;
+struct LogicalOrCheckKont;
+struct NormalizeKont;
+struct TernaryDispatchKont;
+struct ArgStoreKont;
+struct CallApplyKont;
+struct FieldAccessApplyKont;
+struct IndexAccessApplyKont;
+struct CaptureValueApplyKont;
+struct EvalConstraintCheckKont;
+struct SwitchSelectKont;
+struct BindComputeStoreKont;
+struct BeginArrayWithLimitKont;
+struct ArrayCountCheckKont;
+struct ArrayUntilCheckKont;
+struct MatchBytesApplyKont;
+struct SetEndianApplyKont;
+
+// ── KontNode root ───────────────────────────────────────────
+//
+// The shared root for static_kont and dynamic_kont variants.
+// `invoke()` is private with `friend class CEKMachine` so the
+// trampoline (`CEKMachine::execute_from()`) is the only legal
+// call site. Any kont's invoke body that tries to call another
+// kont's invoke directly is a compile error — schedule via
+// `m->push_kont(other)` instead.
 
 struct KontNode {
-    KontNode* next = nullptr;
-    virtual void invoke(CEKMachine* m) = 0;
+    virtual ~KontNode() = default;
+
+private:
+    friend struct CEKMachine;
+    virtual void invoke(CEKMachine* m) const = 0;
+};
+
+// ── Product types (inline structs nested in node fields) ────
+
+struct switch_case {
+    Value* match_value{};
+    KontNode* target{};
+};
+
+struct bitfield_entry {
+    const char* name{};
+    int width_bits{};
+};
+
+// ── Sum types ───────────────────────────────────────────────
+//
+// `value` is a sum of plain data records — no virtual methods,
+// tag-based dispatch via `kind` constants (consumed by `expect<T>`
+// in Machine.cpp).
+//
+// `static_kont` and `dynamic_kont` are sums of kont variants —
+// each inherits from its sum base, which inherits from `KontNode`.
+// Variants override the private `invoke()` declared on KontNode.
+
+// Value sum — typed accumulator values + binding values + computed_value.
+enum class ValueTag : int {
+    IntValue,
+    FloatValue,
+    StringValue,
+    BoolValue,
+    FieldCaptureValue
+};
+
+struct Value {
+    ValueTag tag;
+    explicit Value(ValueTag t) : tag(t) {}
 
 protected:
-    ~KontNode() = default; // Arena-allocated, never delete'd
+    ~Value() = default;  // arena-allocated, never delete'd
 };
 
-// --- MatchPrimitiveNode ---
+struct IntValue : public Value {
+    static constexpr ValueTag kind = ValueTag::IntValue;
 
-struct MatchPrimitiveNode : KontNode {
-    const char* field_name = nullptr;   // Interned
-    PrimitiveInfo prim;
+    IntValue() : Value(kind) {}
 
-    void invoke(CEKMachine* m) override;
+    int64_t v{};
 };
 
-// --- BeginStructNode ---
+struct FloatValue : public Value {
+    static constexpr ValueTag kind = ValueTag::FloatValue;
 
-struct BeginStructNode : KontNode {
-    const char* struct_name = nullptr;  // Interned (may be nullptr for anonymous)
-    void invoke(CEKMachine* m) override;
+    FloatValue() : Value(kind) {}
+
+    double v{};
 };
 
-// --- EndStructNode ---
+struct StringValue : public Value {
+    static constexpr ValueTag kind = ValueTag::StringValue;
 
-struct EndStructNode : KontNode {
-    void invoke(CEKMachine* m) override;
+    StringValue() : Value(kind) {}
+
+    const char* v{};
 };
 
-// --- EvalConstraintNode ---
+struct BoolValue : public Value {
+    static constexpr ValueTag kind = ValueTag::BoolValue;
 
-struct EvalConstraintNode : KontNode {
-    CompiledExpr* constraint = nullptr;
-    KontNode* on_false = nullptr;   // If non-null, branch here instead of failing
-    void invoke(CEKMachine* m) override;
+    BoolValue() : Value(kind) {}
+
+    bool v{};
 };
 
-// --- BindComputeNode ---
+struct FieldCaptureValue : public Value {
+    static constexpr ValueTag kind = ValueTag::FieldCaptureValue;
 
-struct BindComputeNode : KontNode {
-    const char* field_name = nullptr;   // Interned
-    CompiledExpr* expr = nullptr;
-    void invoke(CEKMachine* m) override;
+    FieldCaptureValue() : Value(kind) {}
+
+    FieldCapture* capture{};
 };
 
-// --- InvokeRuleNode ---
-
-struct InvokeRuleNode : KontNode {
-    const char* rule_name = nullptr;    // Interned (for diagnostics + env binding)
-    KontNode* entry = nullptr;          // Target rule's entry point
-    void invoke(CEKMachine* m) override;
+// StaticKont — sum base inheriting from the shared `KontNode` root.
+struct StaticKont : public KontNode {
 };
 
-// --- ReturnRuleNode ---
+struct MatchPrimitiveNode : public StaticKont {
+    const char* field_name{};
+    PrimitiveInfo prim{};
+    KontNode* next{};
 
-struct ReturnRuleNode : KontNode {
-    void invoke(CEKMachine* m) override;
+private:
+    void invoke(CEKMachine* m) const override;
 };
 
-// --- BeginChoiceNode ---
+struct BeginStructNode : public StaticKont {
+    const char* struct_name{};
+    KontNode* next{};
 
-struct BeginChoiceNode : KontNode {
-    KontNode** alternatives = nullptr;  // Remaining alternatives (after the first)
-    int alt_count = 0;                  // Count of remaining alternatives
-    void invoke(CEKMachine* m) override;
-    // The first alternative is wired as whatever follows `next`.
-    // `alternatives` holds entries for alt 2, 3, ..., N.
-    // On backtrack, the machine tries alternatives[0] and advances.
+private:
+    void invoke(CEKMachine* m) const override;
 };
 
-// --- CommitChoiceNode ---
+struct EndStructNode : public StaticKont {
+    KontNode* next{};
 
-struct CommitChoiceNode : KontNode {
-    void invoke(CEKMachine* m) override;
-    // Pops the AlternativeFrame after a successful choice alternative.
-    // Codegen pattern for (a | b | c):
-    //   BeginChoice [alt2, alt3] → alt1 → Commit → join
-    //                               alt2 → Commit → join
-    //                               alt3 → join    (last alt needs no commit)
+private:
+    void invoke(CEKMachine* m) const override;
 };
 
-// --- BeginOptionalNode ---
+struct EvalConstraintNode : public StaticKont {
+    KontNode* constraint_expr{};
+    KontNode* on_false{};
+    KontNode* next{};
 
-struct BeginOptionalNode : KontNode {
-    KontNode* inner = nullptr;          // The optional body entry
-    void invoke(CEKMachine* m) override;
-    // `next` is the skip point (where to go if optional absent).
-    // `inner` is the body entry (where to go if optional present).
+private:
+    void invoke(CEKMachine* m) const override;
 };
 
-// --- EndOptionalNode ---
+struct BindComputeNode : public StaticKont {
+    const char* field_name{};
+    KontNode* compute_expr{};
+    KontNode* next{};
 
-struct EndOptionalNode : KontNode {
-    void invoke(CEKMachine* m) override;
-    // Pops the AlternativeFrame (optional succeeded).
+private:
+    void invoke(CEKMachine* m) const override;
 };
 
-// --- Array mode ---
+struct InvokeRuleNode : public StaticKont {
+    const char* rule_name{};
+    KontNode* entry{};
+    KontNode* next{};
 
-enum class ArrayMode : uint8_t { FixedCount, EOF_, Count, Until };
-
-// --- BeginArrayNode ---
-
-struct BeginArrayNode : KontNode {
-    const char* array_name = nullptr;   // Interned
-    ArrayMode mode = ArrayMode::FixedCount;
-    CompiledExpr* count_expr = nullptr; // FixedCount/Count: evaluated for limit
-    KontNode* end_node = nullptr;       // EndArray node (for empty-array shortcut)
-    // next = first element body entry
-    void invoke(CEKMachine* m) override;
+private:
+    void invoke(CEKMachine* m) const override;
 };
 
-// --- ArrayNextNode ---
+struct ReturnRuleNode : public StaticKont {
+    KontNode* next{};
 
-struct ArrayNextNode : KontNode {
-    KontNode* end_node = nullptr;       // EndArray node (jump when done)
-    ArrayMode mode = ArrayMode::FixedCount;
-    CompiledExpr* count_expr = nullptr; // Count mode: re-evaluated each iteration
-    CompiledExpr* until_expr = nullptr; // Until mode: condition expression
-    // next = continue target (body_entry for no-sep, sep_chain for sep)
-    void invoke(CEKMachine* m) override;
+private:
+    void invoke(CEKMachine* m) const override;
 };
 
-// --- EndArrayNode ---
+struct BeginChoiceNode : public StaticKont {
+    KontNode** alternatives = nullptr;
+    int alternatives_count = 0;
+    KontNode* next{};
 
-struct EndArrayNode : KontNode {
-    // next = continuation after array
-    void invoke(CEKMachine* m) override;
+private:
+    void invoke(CEKMachine* m) const override;
 };
 
-// --- SwitchDispatchNode ---
+struct CommitChoiceNode : public StaticKont {
+    KontNode* next{};
 
-struct SwitchDispatchNode : KontNode {
-    struct Case {
-        int64_t int_val = 0;        // Case value (int, or interned ptr cast to int64)
-        const char* str_val = nullptr; // For diagnostics (interned); not used in dispatch
-        KontNode* target = nullptr;
-    };
-    CompiledExpr* discriminator = nullptr;
-    Case* cases = nullptr;          // Arena-allocated array
-    int case_count = 0;
-    KontNode* default_target = nullptr; // nullptr = no default (fatal on miss)
-    void invoke(CEKMachine* m) override;
+private:
+    void invoke(CEKMachine* m) const override;
 };
 
-// --- BitfieldReadNode ---
+struct BeginOptionalNode : public StaticKont {
+    KontNode* inner{};
+    KontNode* next{};
 
-struct BitfieldReadNode : KontNode {
-    PrimitiveInfo container;            // Container type (e.g., u16be)
-    struct Entry {
-        const char* name = nullptr;     // Interned
-        int width_bits = 0;
-    };
-    Entry* entries = nullptr;           // Arena-allocated array
-    int entry_count = 0;
-    void invoke(CEKMachine* m) override;
+private:
+    void invoke(CEKMachine* m) const override;
 };
 
-// --- SetEndianNode ---
+struct EndOptionalNode : public StaticKont {
+    KontNode* next{};
 
-struct SetEndianNode : KontNode {
-    CompiledExpr* expr = nullptr;       // 0 = big endian, non-zero = little endian
-    void invoke(CEKMachine* m) override;
+private:
+    void invoke(CEKMachine* m) const override;
 };
 
-// --- ExternalCallNode ---
+struct BeginArrayNode : public StaticKont {
+    const char* array_name{};
+    ArrayMode mode{};
+    KontNode* count_expr{};
+    KontNode* end_node{};
+    KontNode* next{};
 
-struct ExternalCallNode : KontNode {
-    const char* func_name = nullptr;    // Interned, looked up in ext_parsers
-    const char* field_name = nullptr;   // Interned, capture/env binding name
-    void invoke(CEKMachine* m) override;
+private:
+    void invoke(CEKMachine* m) const override;
 };
 
-// --- MatchBytesNode ---
+struct ArrayNextNode : public StaticKont {
+    ArrayMode mode{};
+    KontNode* count_expr{};
+    KontNode* until_expr{};
+    KontNode* end_node{};
+    KontNode* body_entry{};
 
-struct MatchBytesNode : KontNode {
-    const char* field_name = nullptr;   // Interned
-    CompiledExpr* length_expr = nullptr;
-    bool is_string = false;             // CaptureType::String vs Bytes
-    void invoke(CEKMachine* m) override;
+private:
+    void invoke(CEKMachine* m) const override;
 };
 
-// --- HaltNode ---
+struct EndArrayNode : public StaticKont {
+    KontNode* next{};
 
-struct HaltNode : KontNode {
-    void invoke(CEKMachine* m) override;
+private:
+    void invoke(CEKMachine* m) const override;
+};
+
+struct SwitchDispatchNode : public StaticKont {
+    KontNode* discriminator_expr{};
+    switch_case* cases = nullptr;
+    int cases_count = 0;
+    KontNode* default_target{};
+
+private:
+    void invoke(CEKMachine* m) const override;
+};
+
+struct BitfieldReadNode : public StaticKont {
+    PrimitiveInfo container{};
+    bitfield_entry* entries = nullptr;
+    int entries_count = 0;
+    KontNode* next{};
+
+private:
+    void invoke(CEKMachine* m) const override;
+};
+
+struct SetEndianNode : public StaticKont {
+    KontNode* endian_expr{};
+    KontNode* next{};
+
+private:
+    void invoke(CEKMachine* m) const override;
+};
+
+struct ExternalCallNode : public StaticKont {
+    const char* func_name{};
+    const char* field_name{};
+    KontNode* next{};
+
+private:
+    void invoke(CEKMachine* m) const override;
+};
+
+struct MatchBytesNode : public StaticKont {
+    const char* field_name{};
+    KontNode* length_expr{};
+    bool is_string{};
+    KontNode* next{};
+
+private:
+    void invoke(CEKMachine* m) const override;
+};
+
+struct HaltNode : public StaticKont {
+
+private:
+    void invoke(CEKMachine* m) const override;
+};
+
+struct IntLitKont : public StaticKont {
+    int64_t v{};
+
+private:
+    void invoke(CEKMachine* m) const override;
+};
+
+struct BoolLitKont : public StaticKont {
+    bool v{};
+
+private:
+    void invoke(CEKMachine* m) const override;
+};
+
+struct FloatLitKont : public StaticKont {
+    float v{};
+
+private:
+    void invoke(CEKMachine* m) const override;
+};
+
+struct StrLitKont : public StaticKont {
+    const char* v{};
+
+private:
+    void invoke(CEKMachine* m) const override;
+};
+
+struct RefKont : public StaticKont {
+    const char* name{};
+
+private:
+    void invoke(CEKMachine* m) const override;
+};
+
+struct PosKont : public StaticKont {
+
+private:
+    void invoke(CEKMachine* m) const override;
+};
+
+struct RemainingKont : public StaticKont {
+
+private:
+    void invoke(CEKMachine* m) const override;
+};
+
+struct AtEndKont : public StaticKont {
+
+private:
+    void invoke(CEKMachine* m) const override;
+};
+
+struct EOIKont : public StaticKont {
+
+private:
+    void invoke(CEKMachine* m) const override;
+};
+
+struct LoopVarKont : public StaticKont {
+
+private:
+    void invoke(CEKMachine* m) const override;
+};
+
+struct NegKont : public StaticKont {
+    KontNode* operand{};
+
+private:
+    void invoke(CEKMachine* m) const override;
+};
+
+struct BitNotKont : public StaticKont {
+    KontNode* operand{};
+
+private:
+    void invoke(CEKMachine* m) const override;
+};
+
+struct NotKont : public StaticKont {
+    KontNode* operand{};
+
+private:
+    void invoke(CEKMachine* m) const override;
+};
+
+struct AddKont : public StaticKont {
+    KontNode* left{};
+    KontNode* right{};
+
+private:
+    void invoke(CEKMachine* m) const override;
+};
+
+struct SubKont : public StaticKont {
+    KontNode* left{};
+    KontNode* right{};
+
+private:
+    void invoke(CEKMachine* m) const override;
+};
+
+struct MulKont : public StaticKont {
+    KontNode* left{};
+    KontNode* right{};
+
+private:
+    void invoke(CEKMachine* m) const override;
+};
+
+struct DivKont : public StaticKont {
+    KontNode* left{};
+    KontNode* right{};
+
+private:
+    void invoke(CEKMachine* m) const override;
+};
+
+struct ModKont : public StaticKont {
+    KontNode* left{};
+    KontNode* right{};
+
+private:
+    void invoke(CEKMachine* m) const override;
+};
+
+struct BitAndKont : public StaticKont {
+    KontNode* left{};
+    KontNode* right{};
+
+private:
+    void invoke(CEKMachine* m) const override;
+};
+
+struct BitOrKont : public StaticKont {
+    KontNode* left{};
+    KontNode* right{};
+
+private:
+    void invoke(CEKMachine* m) const override;
+};
+
+struct BitXorKont : public StaticKont {
+    KontNode* left{};
+    KontNode* right{};
+
+private:
+    void invoke(CEKMachine* m) const override;
+};
+
+struct ShlKont : public StaticKont {
+    KontNode* left{};
+    KontNode* right{};
+
+private:
+    void invoke(CEKMachine* m) const override;
+};
+
+struct ShrKont : public StaticKont {
+    KontNode* left{};
+    KontNode* right{};
+
+private:
+    void invoke(CEKMachine* m) const override;
+};
+
+struct EqKont : public StaticKont {
+    KontNode* left{};
+    KontNode* right{};
+
+private:
+    void invoke(CEKMachine* m) const override;
+};
+
+struct NeKont : public StaticKont {
+    KontNode* left{};
+    KontNode* right{};
+
+private:
+    void invoke(CEKMachine* m) const override;
+};
+
+struct LtKont : public StaticKont {
+    KontNode* left{};
+    KontNode* right{};
+
+private:
+    void invoke(CEKMachine* m) const override;
+};
+
+struct LeKont : public StaticKont {
+    KontNode* left{};
+    KontNode* right{};
+
+private:
+    void invoke(CEKMachine* m) const override;
+};
+
+struct GtKont : public StaticKont {
+    KontNode* left{};
+    KontNode* right{};
+
+private:
+    void invoke(CEKMachine* m) const override;
+};
+
+struct GeKont : public StaticKont {
+    KontNode* left{};
+    KontNode* right{};
+
+private:
+    void invoke(CEKMachine* m) const override;
+};
+
+struct LogicalAndKont : public StaticKont {
+    KontNode* left{};
+    KontNode* right{};
+
+private:
+    void invoke(CEKMachine* m) const override;
+};
+
+struct LogicalOrKont : public StaticKont {
+    KontNode* left{};
+    KontNode* right{};
+
+private:
+    void invoke(CEKMachine* m) const override;
+};
+
+struct TernaryKont : public StaticKont {
+    KontNode* cond{};
+    KontNode* then_{};
+    KontNode* else_{};
+
+private:
+    void invoke(CEKMachine* m) const override;
+};
+
+struct CallKont : public StaticKont {
+    const char* func_name{};
+    KontNode** args = nullptr;
+    int args_count = 0;
+
+private:
+    void invoke(CEKMachine* m) const override;
+};
+
+struct PathStartKont : public StaticKont {
+    const char* name{};
+
+private:
+    void invoke(CEKMachine* m) const override;
+};
+
+struct FieldAccessKont : public StaticKont {
+    const char* field{};
+    KontNode* base{};
+
+private:
+    void invoke(CEKMachine* m) const override;
+};
+
+struct IndexAccessKont : public StaticKont {
+    KontNode* index_expr{};
+    KontNode* base{};
+
+private:
+    void invoke(CEKMachine* m) const override;
+};
+
+struct CaptureValueKont : public StaticKont {
+    KontNode* path{};
+
+private:
+    void invoke(CEKMachine* m) const override;
+};
+
+// DynamicKont — sum base inheriting from the shared `KontNode` root.
+struct DynamicKont : public KontNode {
+};
+
+struct ApplyAddKont : public DynamicKont {
+    Value* saved_right{};
+
+private:
+    void invoke(CEKMachine* m) const override;
+};
+
+struct ApplySubKont : public DynamicKont {
+    Value* saved_right{};
+
+private:
+    void invoke(CEKMachine* m) const override;
+};
+
+struct ApplyMulKont : public DynamicKont {
+    Value* saved_right{};
+
+private:
+    void invoke(CEKMachine* m) const override;
+};
+
+struct ApplyDivKont : public DynamicKont {
+    Value* saved_right{};
+
+private:
+    void invoke(CEKMachine* m) const override;
+};
+
+struct ApplyModKont : public DynamicKont {
+    Value* saved_right{};
+
+private:
+    void invoke(CEKMachine* m) const override;
+};
+
+struct ApplyBitAndKont : public DynamicKont {
+    Value* saved_right{};
+
+private:
+    void invoke(CEKMachine* m) const override;
+};
+
+struct ApplyBitOrKont : public DynamicKont {
+    Value* saved_right{};
+
+private:
+    void invoke(CEKMachine* m) const override;
+};
+
+struct ApplyBitXorKont : public DynamicKont {
+    Value* saved_right{};
+
+private:
+    void invoke(CEKMachine* m) const override;
+};
+
+struct ApplyShlKont : public DynamicKont {
+    Value* saved_right{};
+
+private:
+    void invoke(CEKMachine* m) const override;
+};
+
+struct ApplyShrKont : public DynamicKont {
+    Value* saved_right{};
+
+private:
+    void invoke(CEKMachine* m) const override;
+};
+
+struct ApplyEqKont : public DynamicKont {
+    Value* saved_right{};
+
+private:
+    void invoke(CEKMachine* m) const override;
+};
+
+struct ApplyNeKont : public DynamicKont {
+    Value* saved_right{};
+
+private:
+    void invoke(CEKMachine* m) const override;
+};
+
+struct ApplyLtKont : public DynamicKont {
+    Value* saved_right{};
+
+private:
+    void invoke(CEKMachine* m) const override;
+};
+
+struct ApplyLeKont : public DynamicKont {
+    Value* saved_right{};
+
+private:
+    void invoke(CEKMachine* m) const override;
+};
+
+struct ApplyGtKont : public DynamicKont {
+    Value* saved_right{};
+
+private:
+    void invoke(CEKMachine* m) const override;
+};
+
+struct ApplyGeKont : public DynamicKont {
+    Value* saved_right{};
+
+private:
+    void invoke(CEKMachine* m) const override;
+};
+
+struct ApplyNegKont : public DynamicKont {
+
+private:
+    void invoke(CEKMachine* m) const override;
+};
+
+struct ApplyBitNotKont : public DynamicKont {
+
+private:
+    void invoke(CEKMachine* m) const override;
+};
+
+struct ApplyNotKont : public DynamicKont {
+
+private:
+    void invoke(CEKMachine* m) const override;
+};
+
+struct EvalLeftKont : public DynamicKont {
+    Value** saved_right_slot{};
+    KontNode* left_kont{};
+
+private:
+    void invoke(CEKMachine* m) const override;
+};
+
+struct LogicalAndCheckKont : public DynamicKont {
+    KontNode* right{};
+
+private:
+    void invoke(CEKMachine* m) const override;
+};
+
+struct LogicalOrCheckKont : public DynamicKont {
+    KontNode* right{};
+
+private:
+    void invoke(CEKMachine* m) const override;
+};
+
+struct NormalizeKont : public DynamicKont {
+
+private:
+    void invoke(CEKMachine* m) const override;
+};
+
+struct TernaryDispatchKont : public DynamicKont {
+    KontNode* then_{};
+    KontNode* else_{};
+
+private:
+    void invoke(CEKMachine* m) const override;
+};
+
+struct ArgStoreKont : public DynamicKont {
+    Value** args_buf{};
+    int slot{};
+
+private:
+    void invoke(CEKMachine* m) const override;
+};
+
+struct CallApplyKont : public DynamicKont {
+    const char* func_name{};
+    Value** args_buf{};
+    int arg_count{};
+
+private:
+    void invoke(CEKMachine* m) const override;
+};
+
+struct FieldAccessApplyKont : public DynamicKont {
+    const char* field{};
+
+private:
+    void invoke(CEKMachine* m) const override;
+};
+
+struct IndexAccessApplyKont : public DynamicKont {
+    Value* saved_index{};
+
+private:
+    void invoke(CEKMachine* m) const override;
+};
+
+struct CaptureValueApplyKont : public DynamicKont {
+
+private:
+    void invoke(CEKMachine* m) const override;
+};
+
+struct EvalConstraintCheckKont : public DynamicKont {
+    KontNode* on_false{};
+    KontNode* next{};
+
+private:
+    void invoke(CEKMachine* m) const override;
+};
+
+struct SwitchSelectKont : public DynamicKont {
+    switch_case* cases = nullptr;
+    int cases_count = 0;
+    KontNode* default_target{};
+
+private:
+    void invoke(CEKMachine* m) const override;
+};
+
+struct BindComputeStoreKont : public DynamicKont {
+    const char* field_name{};
+    KontNode* next{};
+
+private:
+    void invoke(CEKMachine* m) const override;
+};
+
+struct BeginArrayWithLimitKont : public DynamicKont {
+    const char* array_name{};
+    ArrayMode mode{};
+    KontNode* end_node{};
+    KontNode* next{};
+
+private:
+    void invoke(CEKMachine* m) const override;
+};
+
+struct ArrayCountCheckKont : public DynamicKont {
+    KontNode* end_node{};
+    KontNode* body_entry{};
+
+private:
+    void invoke(CEKMachine* m) const override;
+};
+
+struct ArrayUntilCheckKont : public DynamicKont {
+    KontNode* end_node{};
+    KontNode* body_entry{};
+
+private:
+    void invoke(CEKMachine* m) const override;
+};
+
+struct MatchBytesApplyKont : public DynamicKont {
+    const char* field_name{};
+    bool is_string{};
+    KontNode* next{};
+
+private:
+    void invoke(CEKMachine* m) const override;
+};
+
+struct SetEndianApplyKont : public DynamicKont {
+    KontNode* next{};
+
+private:
+    void invoke(CEKMachine* m) const override;
 };
 
 } // namespace bbq::cek

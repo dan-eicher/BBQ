@@ -29,6 +29,9 @@ struct DestVariant;
 struct DestField;
 struct Aux;
 struct Pred;
+struct Fun;
+struct FunParam;
+struct LibraryImport;
 struct TypeRef;
 struct Rule;
 struct Pattern;
@@ -36,15 +39,20 @@ struct FieldPat;
 struct Stmt;
 struct Bind;
 struct Expr;
+struct MatchArm;
 struct File;
 struct Header;
 struct Import;
 struct DataDest;
 struct CtrlDest;
+struct EnvDest;
 struct DestVariant;
 struct DestField;
 struct Aux;
 struct Pred;
+struct Fun;
+struct FunParam;
+struct LibraryImport;
 struct TypeName;
 struct TypeList;
 struct TypeTuple;
@@ -79,6 +87,10 @@ struct ListLit;
 struct TupleLit;
 struct DestPattern;
 struct GenCall;
+struct MatchExpr;
+struct BuildExpr;
+struct WithExpr;
+struct MatchArm;
 
 // ── Source location ─────────────────────────────────────────
 
@@ -155,10 +167,14 @@ struct ASTVisitor {
     virtual void visit(Import* node) {}
     virtual void visit(DataDest* node) {}
     virtual void visit(CtrlDest* node) {}
+    virtual void visit(EnvDest* node) {}
     virtual void visit(DestVariant* node) {}
     virtual void visit(DestField* node) {}
     virtual void visit(Aux* node) {}
     virtual void visit(Pred* node) {}
+    virtual void visit(Fun* node) {}
+    virtual void visit(FunParam* node) {}
+    virtual void visit(LibraryImport* node) {}
     virtual void visit(TypeName* node) {}
     virtual void visit(TypeList* node) {}
     virtual void visit(TypeTuple* node) {}
@@ -193,6 +209,10 @@ struct ASTVisitor {
     virtual void visit(TupleLit* node) {}
     virtual void visit(DestPattern* node) {}
     virtual void visit(GenCall* node) {}
+    virtual void visit(MatchExpr* node) {}
+    virtual void visit(BuildExpr* node) {}
+    virtual void visit(WithExpr* node) {}
+    virtual void visit(MatchArm* node) {}
 };
 
 // ── AST node base ───────────────────────────────────────────
@@ -225,12 +245,15 @@ struct File : public ASTNode {
         TypeRef* ir_root,
         std::vector<Aux*> auxiliaries,
         std::vector<Pred*> predicates,
+        std::vector<Fun*> funs,
+        std::vector<LibraryImport*> libraries,
         std::string members,
         std::string private_helpers,
         std::vector<std::string> desugared_by_normalization,
-        std::vector<Rule*> rules
+        std::vector<Rule*> rules,
+        bool internal_dispatchers
     )
-        : compiler_name(compiler_name), headers(std::move(headers)), imports(std::move(imports)), destinations(std::move(destinations)), ir_root(ir_root), auxiliaries(std::move(auxiliaries)), predicates(std::move(predicates)), members(members), private_helpers(private_helpers), desugared_by_normalization(std::move(desugared_by_normalization)), rules(std::move(rules)){}
+        : compiler_name(compiler_name), headers(std::move(headers)), imports(std::move(imports)), destinations(std::move(destinations)), ir_root(ir_root), auxiliaries(std::move(auxiliaries)), predicates(std::move(predicates)), funs(std::move(funs)), libraries(std::move(libraries)), members(members), private_helpers(private_helpers), desugared_by_normalization(std::move(desugared_by_normalization)), rules(std::move(rules)), internal_dispatchers(internal_dispatchers){}
 
     void accept(ASTVisitor& visitor) override { visitor.visit(this); }
 
@@ -241,10 +264,13 @@ struct File : public ASTNode {
     TypeRef* ir_root;
     std::vector<Aux*> auxiliaries;
     std::vector<Pred*> predicates;
+    std::vector<Fun*> funs;
+    std::vector<LibraryImport*> libraries;
     std::string members;
     std::string private_helpers;
     std::vector<std::string> desugared_by_normalization;
     std::vector<Rule*> rules;
+    bool internal_dispatchers;
 };
 
 struct Header : public ASTNode {
@@ -302,6 +328,19 @@ struct CtrlDest : public DestDecl {
     std::vector<DestVariant*> variants;
 };
 
+struct EnvDest : public DestDecl {
+    EnvDest(
+        std::string name,
+        std::vector<DestField*> fields
+    )
+        : name(name), fields(std::move(fields)){}
+
+    void accept(ASTVisitor& visitor) override { visitor.visit(this); }
+
+    std::string name;
+    std::vector<DestField*> fields;
+};
+
 struct DestVariant : public ASTNode {
     DestVariant(
         std::string name,
@@ -356,6 +395,47 @@ struct Pred : public ASTNode {
     std::vector<TypeRef*> param_types;
 };
 
+struct Fun : public ASTNode {
+    Fun(
+        std::string name,
+        std::vector<FunParam*> params,
+        TypeRef* ret_ty,
+        std::vector<Stmt*> body
+    )
+        : name(name), params(std::move(params)), ret_ty(ret_ty), body(std::move(body)){}
+
+    void accept(ASTVisitor& visitor) override { visitor.visit(this); }
+
+    std::string name;
+    std::vector<FunParam*> params;
+    TypeRef* ret_ty;
+    std::vector<Stmt*> body;
+};
+
+struct FunParam : public ASTNode {
+    FunParam(
+        std::string name,
+        TypeRef* ty
+    )
+        : name(name), ty(ty){}
+
+    void accept(ASTVisitor& visitor) override { visitor.visit(this); }
+
+    std::string name;
+    TypeRef* ty;
+};
+
+struct LibraryImport : public ASTNode {
+    LibraryImport(
+        std::string path
+    )
+        : path(path){}
+
+    void accept(ASTVisitor& visitor) override { visitor.visit(this); }
+
+    std::string path;
+};
+
 // type_ref
 struct TypeRef : public ASTNode {
     virtual ~TypeRef() = default;
@@ -363,13 +443,15 @@ struct TypeRef : public ASTNode {
 
 struct TypeName : public TypeRef {
     TypeName(
+        std::string module,
         std::string name,
         bool is_pointer
     )
-        : name(name), is_pointer(is_pointer){}
+        : module(module), name(name), is_pointer(is_pointer){}
 
     void accept(ASTVisitor& visitor) override { visitor.visit(this); }
 
+    std::string module;
     std::string name;
     bool is_pointer;
 };
@@ -772,18 +854,70 @@ struct DestPattern : public Expr {
 struct GenCall : public Expr {
     GenCall(
         Expr* subject,
-        Expr* data_dest,
-        Expr* ctrl_dest,
-        std::optional<Expr*> lnext
+        std::vector<Expr*> args
     )
-        : subject(subject), data_dest(data_dest), ctrl_dest(ctrl_dest), lnext(std::move(lnext)){}
+        : subject(subject), args(std::move(args)){}
 
     void accept(ASTVisitor& visitor) override { visitor.visit(this); }
 
     Expr* subject;
-    Expr* data_dest;
-    Expr* ctrl_dest;
-    std::optional<Expr*> lnext;
+    std::vector<Expr*> args;
+};
+
+struct MatchExpr : public Expr {
+    MatchExpr(
+        Expr* subject,
+        std::vector<MatchArm*> arms
+    )
+        : subject(subject), arms(std::move(arms)){}
+
+    void accept(ASTVisitor& visitor) override { visitor.visit(this); }
+
+    Expr* subject;
+    std::vector<MatchArm*> arms;
+};
+
+struct BuildExpr : public Expr {
+    BuildExpr(
+        std::string schema,
+        std::string ctor,
+        std::vector<Expr*> args
+    )
+        : schema(schema), ctor(ctor), args(std::move(args)){}
+
+    void accept(ASTVisitor& visitor) override { visitor.visit(this); }
+
+    std::string schema;
+    std::string ctor;
+    std::vector<Expr*> args;
+};
+
+struct WithExpr : public Expr {
+    WithExpr(
+        Expr* base,
+        std::string field,
+        Expr* value
+    )
+        : base(base), field(field), value(value){}
+
+    void accept(ASTVisitor& visitor) override { visitor.visit(this); }
+
+    Expr* base;
+    std::string field;
+    Expr* value;
+};
+
+struct MatchArm : public ASTNode {
+    MatchArm(
+        Pattern* pat,
+        std::vector<Stmt*> body
+    )
+        : pat(pat), body(std::move(body)){}
+
+    void accept(ASTVisitor& visitor) override { visitor.visit(this); }
+
+    Pattern* pat;
+    std::vector<Stmt*> body;
 };
 
 // ── Product types ───────────────────────────────────────────

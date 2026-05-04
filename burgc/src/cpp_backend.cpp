@@ -21,11 +21,11 @@ public:
             return;
         }
 
-        fp.CopyFramePart("constants");
-        emit_defines(out);
-
         fp.CopyFramePart("user_headers");
         emit_user_headers(out);
+
+        fp.CopyFramePart("constants");
+        emit_defines(out);
 
         fp.CopyFramePart("macros_check");
         emit_macros_check(out);

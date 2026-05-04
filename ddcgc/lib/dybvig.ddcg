@@ -1,0 +1,145 @@
+// dybvig.ddcg — paper-direct DDCG library (Dybvig, Hieb & Butler 1990).
+//
+// Encodes the §3.2 / page-13 cg_jump / cg_deliver / cg_call helpers
+// once, in the action language, so every consumer (calc, BBQ-CEK,
+// future targets) can `import "dybvig.ddcg"` and write rules as
+// direct transcriptions of the paper's Figure 5 / 7 / 8 rules.
+//
+// CEK-tree IR shape (post-Phase-9R, yoctojc / AiPL pattern):
+//   * PRODUCERS (value sub-trees, no `next`): LoadConst, LoadLocal,
+//     binops/cmps with sub-tree operand fields, Call (target + args).
+//   * CONSUMERS (`next` field): StoreLocal, ExprEffect, Branch, Goto,
+//     Leave, Halt, Nop.
+//
+// δ semantics in tree shape:
+//   * δ=ac    — gen returns the value sub-tree directly. The caller
+//               embeds it in a parent producer (e.g., make_add(lv, rv))
+//               or wraps it in a consumer via cg_deliver.
+//   * δ=stack — gen returns the value sub-tree. Call's args list pulls
+//               them in directly; no separate "push" IR node exists
+//               (the call codegen emits push_stack stencils inline).
+//   * δ=local(i) — gen wraps value in make_store_local(i, value, next).
+//   * δ=effect — gen wraps value in a γ-appropriate consumer
+//                (Branch / ExprEffect+goto / Leave).
+//
+// Lowering target's "ac" register is a stencil calling-convention
+// artifact, NOT an IR concept. F8 case 1-4 selection is the BURG
+// matcher's job (literal tree patterns over operand shape).
+//
+// Consumer requirements:
+//   * IMPORTS  ir = "<your IR>.json" — must contain the constructors
+//     that the make_X auxiliaries below allocate.
+//   * Implement the AUXILIARIES below in their MEMBERS block.
+//   * Declare δ / γ / ρ shapes that match — or omit them; the lib's
+//     destinations are spliced in on import.
+
+COMPILER dybvig
+
+IMPORTS
+
+DESTINATIONS
+  // δ: paper §3.2 data destination. Paper §3.1 Location class:
+  //   effect   : value not needed
+  //   ac       : value sub-tree returned to caller (paper r0 in lowering)
+  //   stack    : value sub-tree pulled into Call.args list
+  //   local(i) : frame-relative slot at ctx.frame[ctx.fp + i]
+  data_dest delta { effect | ac | stack | local(i: int) }
+
+  // γ: paper's control destination.
+  ctrl_dest gamma { jump(L: ir_root) | pair(Lt: ir_root, Lf: ir_root) | ret }
+
+  // ρ: paper's environment. Carries the break-label only — locals are
+  // consumer-specific.
+  env_dest  rho   { L_break: ir_root }
+
+AUXILIARIES
+  // Required hook — consumers must implement. Called by lib helpers
+  // when a paper-undefined γ context is reached (e.g., cg_jump with
+  // γ=ret or γ=pair, or loop_op with γ=ret in a value-context). Hard
+  // failure path; never returns. Returns ir_root for type unification
+  // — implementations std::abort() or equivalent.
+  panic_unreachable : ()                           -> ir_root
+
+  // Producers — value sub-trees, no `next`. Operands are sub-tree
+  // pointers (real IR nodes, not int + side channel).
+  make_load_const  : (int)                         -> ir_root
+  make_load_local  : (int)                         -> ir_root
+  make_add         : (ir_root, ir_root)            -> ir_root
+  // Paper page 14 CG[call]. Value-producer; args are sub-trees
+  // with destination `stack_reg` (BURG chain rule auto-inserts a
+  // push_stack stencil per arg). Returns the call's value (in
+  // ctx.ac via cpu RET) — the caller wraps via cg_deliver per its
+  // outer δ/γ, same as any binop.
+  make_call        : (ir_root, list<ir_root>, int) -> ir_root  // target, args, frame_size
+
+  // Consumers — `next` field, take a value sub-tree where needed.
+  make_store_local : (int, ir_root, ir_root)       -> ir_root  // dest, value, next
+  make_expr_effect : (ir_root, ir_root)            -> ir_root  // value, next
+  make_branch      : (ir_root, ir_root, ir_root)   -> ir_root  // test, then, else
+  make_goto        : (ir_root)                     -> ir_root
+  make_leave       : (ir_root)                     -> ir_root  // function exit
+  make_halt        : (ir_root)                     -> ir_root  // program exit
+
+// ── Helpers (paper-direct, CEK-tree-shape) ──────────────────
+
+// Page 13 — CG_jump γ Lnext.
+// Pure-control helper: emits a goto-or-fall-through based on γ.
+//   ret           → paper-undefined for this helper (a bare `ret`
+//                   without a value doesn't exist in tree shape;
+//                   ret semantics are realized via Leave(value) in
+//                   cg_deliver).
+//   jump(L)       → fall-through if L == Lnext, else goto L (peephole).
+//   pair(_, _)    → caller error (no value to test).
+fun cg_jump(g : gamma, Lnext : ir_root) -> ir_root {
+    match (g) {
+        ret          => panic_unreachable()
+      | jump(L)      => L == Lnext ? Lnext : make_goto(L)
+      | pair(Lt, Lf) => panic_unreachable()
+    };
+}
+
+// Deliver a value sub-tree per (δ, γ, Lnext). Replaces the
+// pre-9R cg_after_value / cg_store_int / cg_store_local / cg_store_ac
+// matrix with a single helper, since value extraction is now a
+// sub-tree return rather than a kont-chain placement.
+//
+// δ semantics:
+//   ac       → "value lands in ac, then γ." Dispatches on γ:
+//                jump(L=Lnext) → return value sub-tree alone (caller
+//                                embeds it in its parent producer —
+//                                this is the sub-tree extraction case
+//                                used by binop operand gen).
+//                jump(L≠Lnext) → produce value, then jump to L.
+//                pair(Lt, Lf)  → branch on the value (paper page 12
+//                                rule 1 if the boolean wasn't
+//                                normalized away upstream).
+//                ret           → wrap in Leave (function exit).
+//   stack    → return value sub-tree. Caller (compile_call) pulls
+//              it into Call.args list; the call codegen emits the
+//              push_stack stencil inline at lowering time.
+//   local(i) → make_store_local(i, value, post-control).
+//   effect   → wrap per γ (Branch on value / ExprEffect+goto /
+//              Leave value).
+fun cg_deliver(value : ir_root, d : delta, g : gamma, Lnext : ir_root) -> ir_root {
+    match (d) {
+        ac       => match (g) {
+                       jump(L)      => L == Lnext ? value : make_expr_effect(value, make_goto(L))
+                     | pair(Lt, Lf) => make_branch(value, Lt, Lf)
+                     | ret          => make_leave(value)
+                     }
+      | stack    => value
+      | local(i) => make_store_local(i, value, cg_jump(g, Lnext))
+      | effect   => match (g) {
+                       pair(Lt, Lf) => make_branch(value, Lt, Lf)
+                     | jump(L)      => make_expr_effect(value, cg_jump(g, Lnext))
+                     | ret          => make_leave(value)
+                     }
+    };
+}
+
+// `break` ⇒ unconditional transfer to ρ.L_break.
+fun cg_break(r : rho, Lnext : ir_root) -> ir_root {
+    cg_jump(jump(r.L_break), Lnext);
+}
+
+RULES

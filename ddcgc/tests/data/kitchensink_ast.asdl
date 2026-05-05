@@ -1,11 +1,11 @@
-module big {
+module ast {
     op = OpAdd | OpSub | OpMul
 
     expr = Lit(int n)
          | Add(expr left, expr right)
          | Seq(expr* items)
          | Pair(expr first, expr second)
-         | Tag(string name)
+         | Sym(string name)
          | Maybe(expr? sub)
          | BinOp(op op, expr left, expr right)
          | Sel(op which)

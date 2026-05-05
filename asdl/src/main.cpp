@@ -28,7 +28,7 @@ int main(int argc, char** argv) {
             if (a == "-i" && i + 1 < argc) infile = argv[++i];
             else if (a == "-o" && i + 1 < argc) outfile = argv[++i];
             else if (a == "-t" && i + 1 < argc) templatefile = argv[++i];
-            else if (a == "-l" && i + 1 < argc) lang = argv[++i];
+            else if ((a == "-l" || a == "-lang") && i + 1 < argc) lang = argv[++i];
             else if (a == "--json" && i + 1 < argc) jsonfile = argv[++i];
             else if (a == "-h") show_help = true;
             else {

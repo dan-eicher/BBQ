@@ -35,5 +35,6 @@ public:
 };
 
 std::unique_ptr<Backend> create_cpp_backend();
+std::unique_ptr<Backend> create_c_backend();
 
 } // namespace ddcgc

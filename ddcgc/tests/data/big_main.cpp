@@ -23,6 +23,7 @@ const std::vector<std::pair<const char*, const char*>> kFeatures = {
     {"add",         "Multi-rule fallback after nested specialisation"},
     {"seq",         "For-loop accumulator + list concat + Sequence field"},
     {"pair",        "Label statement + label-payload γ variant + place()"},
+    {"pair_x99",    "WildcardPat in rule head + nested ConstructorPat literal"},
     {"tag_x",       "StringPat literal match"},
     {"tag_short",   "Where-guard predicate over string field"},
     {"tag",         "Generic string-field fallback"},
@@ -32,15 +33,18 @@ const std::vector<std::pair<const char*, const char*>> kFeatures = {
     {"binop_sub",   "Enum-value field-pat (OpSub constant match)"},
     {"binop_mul",   "Enum-value field-pat (OpMul constant match)"},
     {"sel",         "match over asdl-enum subject (op_to_int fun)"},
+    {"multi",       "RestFieldPat (`...nums`) on sequence-typed field"},
 };
 
 // Action-language markers logged by the dest_to_value fun (match → build),
 // invoked from the `pair` rule body. Each entry: (trace marker, what the
 // arm exercised).
 const std::vector<std::pair<const char*, const char*>> kActionMarkers = {
-    {"log_value:imm:99", "fun + match `ac` arm + build target.Imm"},
-    {"log_value:slot:7", "fun + match `spill(slot)` arm + build target.Slot"},
-    {"rule:import_demo", "fun imported from big_imports.ddcg via `import` directive"},
+    {"log_value:imm:99",  "fun + match `ac` arm + build target.Imm"},
+    {"log_value:slot:7",  "fun + match `spill(slot)` arm + build target.Slot"},
+    {"rule:import_demo",  "fun imported from big_imports.ddcg via `import` directive"},
+    {"bool_demo:true",    "BoolLit `true` literal in expression"},
+    {"tup_sum:50:-50",    "TupleLit `(a, b)` constructor + tuple-typed aux arg"},
 };
 
 bool trace_contains(const std::vector<std::string>& trace,
@@ -89,12 +93,21 @@ int main() {
     BinOp binop_mul_node(Op::OpMul, &l2, &l3);  // → binop_mul (2+3=5)
     Sel sel_node(Op::OpMul);                    // → sel (op_to_int(OpMul)=3)
 
+    // pair_x99 (WildcardPat in rule head) — fires on Pair(_, Lit(99)).
+    Lit l1(1), l99(99);
+    Pair pair_99_node(&l1, &l99);
+
+    // multi (RestFieldPat) — exercises `...nums` on a sequence-typed field.
+    Multi multi_node({10, 20, 30});
+
     Seq root({
         &add_zero_left,
         &lit_zero_node,
         &lit_50,
         &add_general,
         &pair_node,
+        &pair_99_node,
+        &multi_node,
         &tag_x_node,
         &tag_short_node,
         &tag_long_node,
@@ -137,6 +150,8 @@ int main() {
     //   lit(50)                    → 50
     //   add(Lit(2), Lit(3))        → lit(2) + lit(3)           = 2 + 3    = 5
     //   pair(Lit(10), Lit(20))     → cg_pick(lit(20) , 0)      = 20 + 0   = 20
+    //   pair_x99(Lit(1), Lit(99))  → cg_lit(99)                = 99
+    //   multi([10,20,30])          → cg_seq(...)               = 60
     //   tag_x                      → len("x-special")          = 9
     //   tag_short("ab")            → len("ab")                 = 2
     //   tag("longname")            → len("longname")           = 8
@@ -146,8 +161,8 @@ int main() {
     //   binop_sub(Lit(8), Lit(9))  → cg_pick(lit(8) , lit(9))  = 8 + 9   = 17
     //   binop_mul(Lit(2), Lit(3))  → cg_pick(lit(2) , lit(3))  = 2 + 3   = 5
     //   sel(OpMul)                 → cg_lit(op_to_int(OpMul))   = 3
-    //                                                  Σ items = 140
-    constexpr int kExpected = 140;
+    //                                                  Σ items = 299
+    constexpr int kExpected = 299;
     if (result != kExpected) {
         std::fprintf(stderr, "FAIL: expected result=%d, got %d\n",
                      kExpected, result);

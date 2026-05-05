@@ -24,6 +24,10 @@ AUXILIARIES
   cg_split   : (int) -> tuple<int, int>
   place      : (label) -> int
   log_value  : (target.value) -> int
+  // Coverage-only auxes (mirror kitchensink.ddcg) — exercise BoolLit,
+  // TupleLit constructor, and tuple-typed aux argument.
+  bool_demo  : (bool) -> int
+  tup_sum    : (tuple<int, int>) -> int
 
 PREDICATES
   is_zero       : (int) -> bool
@@ -69,6 +73,16 @@ MEMBERS (.
     bool is_zero(int n)              { return n == 0; }
     bool is_short_name(std::string s) { return s.size() < 4; }
 
+    int bool_demo(bool b) {
+        trace.push_back(std::string("bool_demo:") + (b ? "true" : "false"));
+        return b ? 1 : 0;
+    }
+    int tup_sum(std::tuple<int,int> t) {
+        trace.push_back("tup_sum:" + std::to_string(std::get<0>(t)) +
+                        ":" + std::to_string(std::get<1>(t)));
+        return std::get<0>(t) + std::get<1>(t);
+    }
+
     int log_value(target::Value* v) {
         // 0=Imm, 1=Slot — see target::Value::kind_tag().
         const char* kind = v->kind_tag() == 0 ? "imm" : "slot";
@@ -89,12 +103,35 @@ fun dest_to_value(d : delta) -> target.value {
 }
 
 // `match` over an asdl-enum subject lowers to `switch` on the enum value.
+// `_` covers any future variants (and exercises WildcardPat in arm).
 fun op_to_int(o : ast.op) -> int {
     match (o) {
         OpAdd => 1
       | OpSub => 2
       | OpMul => 3
+      | _     => 0
     };
+}
+
+// Exercises BindPat-default-with-subject-bind in a match arm.
+fun delta_default(d : delta) -> int {
+    match (d) {
+        effect => 1
+      | _other => 99
+    };
+}
+
+// One fun per untested DSL form bundled into a single sink — UnaryOp,
+// ListLit + IndexAccExpr, WithExpr, FieldAccExpr on a Dest value,
+// BoolLit, TupleLit constructor.
+fun feature_demo(r : rho, x : int) -> int {
+    let neg  = -x;
+    let xs   = [x, neg];
+    let head = xs[0];
+    let r2   = r with depth := 1;
+    let _    = bool_demo(true);
+    let _    = tup_sum((head, neg));
+    cg_pick(head, r2.depth);
 }
 
 import "big_imports.ddcg"
@@ -113,9 +150,14 @@ rule lit_zero : ast.Lit(n: x) where is_zero(x) {
     cg_lit(0);
 }
 
-// ── Tuple-destructuring let + ternary + tuple-returning aux
+// ── Tuple-destructuring let + ternary + tuple-returning aux.
+//    Also fires `feature_demo` and `delta_default` to exercise
+//    UnaryOp, ListLit, IndexAccExpr, WithExpr, FieldAccExpr, BoolLit,
+//    TupleLit, and BindPat-default-with-subject-bind in match arms.
 rule lit : ast.Lit(n: x) {
     trace_fire("lit");
+    let _ = feature_demo(rho, x);
+    let _ = delta_default(spill(7));
     let (lo, hi) = cg_split(x > 100 ? 100 : x);
     cg_pick(lo, hi);
 }
@@ -124,6 +166,19 @@ rule lit : ast.Lit(n: x) {
 rule add : ast.Add(left: l, right: r) {
     trace_fire("add");
     cg_pick(gen(l, rho, ac, fail), gen(r, rho, ac, fail));
+}
+
+// ── WildcardPat in rule head: first field wildcarded, second
+//    constrained to a literal sub-pattern via nested ConstructorPat.
+rule pair_x99 : ast.Pair(first: _, second: ast.Lit(n: 99)) {
+    trace_fire("pair_x99");
+    cg_lit(99);
+}
+
+// ── RestFieldPat (`...nums`) on a sequence-typed field.
+rule multi : ast.Multi(...nums) {
+    trace_fire("multi");
+    cg_seq(nums);
 }
 
 // ── For-loop accumulator + list concat + Sequence-typed field

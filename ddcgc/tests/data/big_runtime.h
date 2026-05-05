@@ -73,6 +73,11 @@ struct Sel : Expr {
     explicit Sel(Op w) : which(w) {}
 };
 
+struct Multi : Expr {
+    std::vector<int> nums;
+    explicit Multi(std::vector<int> ns) : nums(std::move(ns)) {}
+};
+
 // ── data_dest delta — paper's δ ──
 enum class DeltaTag : unsigned char { Effect, Ac, Spill };
 struct delta_t { DeltaTag tag; int slot; };

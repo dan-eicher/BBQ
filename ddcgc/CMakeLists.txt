@@ -52,7 +52,9 @@ target_include_directories(ddcgc_frontend PUBLIC
 add_library(ddcgc_lib STATIC
     src/schema.cpp
     src/typecheck.cpp
+    src/emit_backend.cpp
     src/cpp_backend.cpp
+    src/c_backend.cpp
     ${DDCG_JSON})
 set_source_files_properties(${DDCG_JSON} PROPERTIES HEADER_FILE_ONLY ON)
 target_include_directories(ddcgc_lib PUBLIC
@@ -124,6 +126,63 @@ target_include_directories(ddcgc_tiny_e2e PRIVATE
 
 # 4. Register as a ctest case
 add_test(NAME ddcgc_tiny_e2e COMMAND ddcgc_tiny_e2e)
+
+# ── C-backend e2e: kitchensink — single comprehensive C test that  ──
+# ── exercises every ddcgc rule-body form (lists, tuples, match,    ──
+# ── build, label, sequence-bind, etc.). Mirrors big_main.cpp's     ──
+# ── feature-table structure but compiled and run as C.             ──
+add_custom_command(
+    OUTPUT ${DDCG_TEST_OUT}/kitchensink_ast.json
+           ${DDCG_TEST_OUT}/kitchensink_target.json
+           ${DDCG_TEST_OUT}/kitchensink_ast.h
+           ${DDCG_TEST_OUT}/kitchensink_target.h
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${DDCG_TEST_OUT}
+    COMMAND asdl -lang c
+                 -i ${DDCG_TEST_DATA}/kitchensink_ast.asdl
+                 -t ${CMAKE_SOURCE_DIR}/asdl/templates/c.inja
+                 -o ${DDCG_TEST_OUT}/kitchensink_ast.h
+                 --json ${DDCG_TEST_OUT}/kitchensink_ast.json
+    COMMAND asdl -lang c
+                 -i ${DDCG_TEST_DATA}/kitchensink_target.asdl
+                 -t ${CMAKE_SOURCE_DIR}/asdl/templates/c.inja
+                 -o ${DDCG_TEST_OUT}/kitchensink_target.h
+                 --json ${DDCG_TEST_OUT}/kitchensink_target.json
+    DEPENDS asdl
+            ${DDCG_TEST_DATA}/kitchensink_ast.asdl
+            ${DDCG_TEST_DATA}/kitchensink_target.asdl
+            ${CMAKE_SOURCE_DIR}/asdl/templates/c.inja
+    COMMENT "Generating kitchensink schemas (asdl-c headers + JSON sidecars)"
+    VERBATIM
+)
+
+add_custom_command(
+    OUTPUT ${DDCG_TEST_OUT}/kitchensink_compile.h
+    COMMAND ddcgc -lang c
+                  -i ${DDCG_TEST_DATA}/kitchensink.ddcg
+                  -ast ${DDCG_TEST_OUT}/kitchensink_ast.json
+                  -ir  ${DDCG_TEST_OUT}/kitchensink_target.json
+                  -o   ${DDCG_TEST_OUT}/kitchensink_compile.h
+    DEPENDS ddcgc
+            ${DDCG_TEST_DATA}/kitchensink.ddcg
+            ${DDCG_TEST_OUT}/kitchensink_ast.json
+            ${DDCG_TEST_OUT}/kitchensink_target.json
+    COMMENT "Running ddcgc -lang c on tests/data/kitchensink.ddcg"
+    VERBATIM
+)
+
+add_executable(ddcgc_kitchensink_c_e2e
+    ${DDCG_TEST_DATA}/kitchensink_main.c
+    ${DDCG_TEST_OUT}/kitchensink_compile.h)
+set_target_properties(ddcgc_kitchensink_c_e2e PROPERTIES
+    C_STANDARD 11
+    C_STANDARD_REQUIRED ON)
+target_compile_options(ddcgc_kitchensink_c_e2e PRIVATE
+    -Wall -Wextra -Werror)
+target_include_directories(ddcgc_kitchensink_c_e2e PRIVATE
+    ${DDCG_TEST_DATA}
+    ${DDCG_TEST_OUT})
+target_link_libraries(ddcgc_kitchensink_c_e2e PRIVATE bbq_crt)
+add_test(NAME ddcgc_kitchensink_c_e2e COMMAND ddcgc_kitchensink_c_e2e)
 
 # ── "big" e2e — wider feature surface (nested patterns, predicate     ──
 # ── guard, for-accumulator, list concat, ternary, Sequence field).    ──

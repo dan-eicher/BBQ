@@ -26,16 +26,17 @@
 static void usage() {
     std::fprintf(stderr,
         "Usage: ddcgc -i <input.ddcg> -ast <ast.json> -ir <ir.json>\n"
-        "             [-L <libdir>]... [-o <output.cpp>]\n"
+        "             [-lang c|c++] [-L <libdir>]... [-o <output>]\n"
         "  -i <file>          Input .ddcg file\n"
         "  -ast <file.json>   asdl JSON for the source AST (matched against\n"
         "                     the .ddcg's source-import name)\n"
         "  -ir  <file.json>   asdl JSON for the target IR (matched against\n"
         "                     the .ddcg's target-import name)\n"
+        "  -lang c|c++        Output language (default: c++)\n"
         "  -L   <dir>         Add a library search path for `import \"...ddcg\"`.\n"
         "                     Repeatable; searched in order after the importing\n"
         "                     file's own directory.\n"
-        "  -o   <file>        Output .cpp file (default: stdout)\n"
+        "  -o   <file>        Output file (default: stdout)\n"
         "  -h                 Show this help message\n");
 }
 
@@ -327,6 +328,7 @@ int main(int argc, char** argv) {
     std::string ast_json_file;
     std::string ir_json_file;
     std::string output_file;
+    std::string lang = "c++";   // default — back-compat with existing usage
     std::vector<std::filesystem::path> lib_search_paths;
 
     for (int i = 1; i < argc; i++) {
@@ -340,6 +342,14 @@ int main(int argc, char** argv) {
             lib_search_paths.emplace_back(argv[++i]);
         } else if (std::strcmp(argv[i], "-o") == 0 && i + 1 < argc) {
             output_file = argv[++i];
+        } else if (std::strcmp(argv[i], "-lang") == 0 && i + 1 < argc) {
+            lang = argv[++i];
+            if (lang != "c" && lang != "c++") {
+                std::fprintf(stderr,
+                    "Unknown -lang value: %s (expected c or c++)\n",
+                    lang.c_str());
+                return 1;
+            }
         } else if (std::strcmp(argv[i], "-h") == 0) {
             usage();
             return 0;
@@ -438,7 +448,8 @@ int main(int argc, char** argv) {
         }
         out = &out_file;
     }
-    auto backend = ddcgc::create_cpp_backend();
+    auto backend = (lang == "c") ? ddcgc::create_c_backend()
+                                  : ddcgc::create_cpp_backend();
     std::vector<std::string> emit_errs;
     if (!backend->emit(file, schemas, check, *out, emit_errs)) {
         for (const auto& e : emit_errs) std::fprintf(stderr, "emit error: %s\n", e.c_str());

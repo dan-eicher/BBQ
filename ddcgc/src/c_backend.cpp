@@ -29,14 +29,26 @@ namespace ddcgc {
 namespace {
 
 bool is_c_keyword(const std::string& s) {
+    // Matches asdl's reserved_keywords (C + C++) so the variant arm
+    // names this function returns line up with the asdl-c-emitted
+    // tagged-union member names. Adding C-only keywords here without
+    // the corresponding asdl entry causes downstream generated-code
+    // mismatch.
     static const std::set<std::string> kw = {
-        "auto","break","case","char","const","continue","default","do",
-        "double","else","enum","extern","float","for","goto","if","inline",
-        "int","long","register","restrict","return","short","signed",
-        "sizeof","static","struct","switch","typedef","union","unsigned",
-        "void","volatile","while","_Alignas","_Alignof","_Atomic","_Bool",
-        "_Complex","_Generic","_Imaginary","_Noreturn","_Static_assert",
-        "_Thread_local","bool","true","false","NULL"
+        "alignas","alignof","and","and_eq","asm","auto","bitand","bitor",
+        "bool","break","case","catch","char","char8_t","char16_t","char32_t",
+        "class","compl","concept","const","consteval","constexpr","const_cast",
+        "continue","co_await","co_return","co_yield","decltype","default","delete",
+        "do","double","dynamic_cast","else","enum","explicit","export","extern",
+        "false","float","for","friend","goto","if","inline","int","long",
+        "mutable","namespace","new","noexcept","not","not_eq","nullptr","operator",
+        "or","or_eq","private","protected","public","register","reinterpret_cast",
+        "requires","return","short","signed","sizeof","static","static_assert",
+        "static_cast","struct","switch","template","this","thread_local","throw",
+        "true","try","typedef","typeid","typename","union","unsigned","using",
+        "virtual","void","volatile","wchar_t","while","xor","xor_eq",
+        "restrict","_Alignas","_Alignof","_Atomic","_Bool","_Complex","_Generic",
+        "_Imaginary","_Noreturn","_Static_assert","_Thread_local","NULL"
     };
     return kw.count(s) > 0;
 }
@@ -51,14 +63,25 @@ std::string to_upper(const std::string& s) {
     return r;
 }
 
+// Mirror asdl's SnakeCase: insert `_` between lowercase→uppercase and
+// digit→letter boundaries (e.g., S2I → s2_i, FieldAccess → field_access).
+// Must match asdl/src/string_utils.cpp:SnakeCase exactly so the
+// emitted factory names line up with asdl-c's output.
 std::string to_snake(const std::string& name) {
     std::string out;
     for (size_t i = 0; i < name.size(); ++i) {
         char c = name[i];
-        if (std::isupper((unsigned char)c) && i > 0 &&
-            std::islower((unsigned char)name[i - 1])) {
-            out += '_';
+        bool add_underscore = false;
+        if (i > 0) {
+            if (std::isupper((unsigned char)c) &&
+                std::islower((unsigned char)name[i - 1])) {
+                add_underscore = true;
+            } else if (std::isalpha((unsigned char)c) &&
+                       std::isdigit((unsigned char)name[i - 1])) {
+                add_underscore = true;
+            }
         }
+        if (add_underscore) out += '_';
         out += (char)std::tolower((unsigned char)c);
     }
     return out;
@@ -123,6 +146,11 @@ protected:
 protected:
     // Per-form hooks (override of EmitBackend's abstract surface).
     std::string null_literal() const override { return "NULL"; }
+    std::string emit_enum_value_ref(const std::string& module,
+                                    const std::string& /*sum*/,
+                                    const std::string& ctor) const override {
+        return c_tag_value(module, ctor);
+    }
     void emit_call(DdcgAst::CallExpr* c) override;
     void emit_list_concat(DdcgAst::Expr* parent,
                           DdcgAst::Expr* left,
@@ -134,11 +162,13 @@ protected:
     void emit_match_expr(DdcgAst::MatchExpr* m) override;
     void emit_gen_call(DdcgAst::GenCall* g) override;
     void emit_index_acc(DdcgAst::IndexAccExpr* ix) override;
+    bool emit_seq_field_acc(DdcgAst::FieldAccExpr* fa) override;
     void emit_let_simple(DdcgAst::LetStmt* l,
                           DdcgAst::SimpleBind* sb) override;
     void emit_let_destructure(DdcgAst::LetStmt* l) override;
     void emit_for_stmt(DdcgAst::ForStmt* f) override;
     void emit_label_stmt(DdcgAst::LabelStmt* lb) override;
+    void emit_dest_pattern(DdcgAst::DestPattern* dp) override;
     int emit_match(const Schema& schema,
                    DdcgAst::ConstructorPat* cp,
                    const std::string& value_expr,
@@ -203,6 +233,9 @@ private:
     std::string field_check_expr(DdcgAst::Pattern* sub,
                                   const std::string& field_expr,
                                   const Field* field);
+    // Fun emit is split: the signature goes in the header (extern
+    // forward decl) and the body in the source.
+    void emit_fun_signature(DdcgAst::Fun* f);
     void emit_fun(DdcgAst::Fun* f);
 
     void emit_file_preamble();
@@ -211,6 +244,13 @@ private:
     void emit_aux_forward_decls();
     void emit_dispatcher_signature(const std::string& sum_name);
     void emit_dispatcher(const std::string& sum_name);
+
+    // Source-side and forward-decl helpers introduced by the .h/.c
+    // split. emit_source_preamble writes the .c's `#include` of the
+    // companion header.
+    void emit_source_preamble();
+    void emit_fun_forward_decls();
+    void emit_dispatcher_forward_decls();
 };
 
 // ── Type translation ──────────────────────────────────────────
@@ -271,6 +311,8 @@ std::string CBackend::c_for_typeref(DdcgAst::TypeRef* tr) {
                 if (cd->name == n) return n + "_t";
             } else if (auto* ed = dynamic_cast<DdcgAst::EnvDest*>(d)) {
                 if (ed->name == n) return n + "_t";
+            } else if (auto* sd = dynamic_cast<DdcgAst::Sum*>(d)) {
+                if (sd->name == n) return n + "_t";
             }
         }
         const Schema* hit = nullptr;
@@ -305,7 +347,14 @@ std::string CBackend::c_for_field_elem(const Schema& schema, const Field& f) {
         return c_type_for(schema, f.type_name);
     }
     if (f.type_name == "int")        return "int";
+    if (f.type_name == "int8")       return "int8_t";
+    if (f.type_name == "int16")      return "int16_t";
+    if (f.type_name == "int32")      return "int32_t";
     if (f.type_name == "int64")      return "int64_t";
+    if (f.type_name == "uint8")      return "uint8_t";
+    if (f.type_name == "uint16")     return "uint16_t";
+    if (f.type_name == "uint32")     return "uint32_t";
+    if (f.type_name == "uint64")     return "uint64_t";
     if (f.type_name == "string")     return "const char*";
     if (f.type_name == "bool")       return "bool";
     if (f.type_name == "identifier") return "const char*";
@@ -381,7 +430,12 @@ std::string CBackend::tuple_type_name(const std::vector<std::string>& shape) {
 void CBackend::register_type(const Type& t) {
     if (t.kind == TypeKind::List) {
         if (!t.elems.empty()) {
-            list_elems_.insert(c_for_type(t.elems[0]));
+            std::string elem_c = c_for_type(t.elems[0]);
+            // Skip when the element type didn't resolve (NilLit-typed
+            // empty literals, Unknown placeholders) — registering "" as
+            // a list elem emits a broken `ycdg_list__t` helper. The
+            // typed concrete uses register their elem separately.
+            if (!elem_c.empty()) list_elems_.insert(elem_c);
             register_type(t.elems[0]);
         }
     } else if (t.kind == TypeKind::Tuple) {
@@ -398,7 +452,8 @@ void CBackend::register_type(const Type& t) {
 
 void CBackend::register_typeref(DdcgAst::TypeRef* tr) {
     if (auto* tl = dynamic_cast<DdcgAst::TypeList*>(tr)) {
-        list_elems_.insert(c_for_typeref(tl->elem));
+        std::string elem_c = c_for_typeref(tl->elem);
+        if (!elem_c.empty()) list_elems_.insert(elem_c);
         register_typeref(tl->elem);
     } else if (auto* tt = dynamic_cast<DdcgAst::TypeTuple*>(tr)) {
         std::vector<std::string> shape;
@@ -475,6 +530,10 @@ void CBackend::register_stmt(DdcgAst::Stmt* s) {
     } else if (auto* f = dynamic_cast<DdcgAst::ForStmt*>(s)) {
         register_expr(f->seq);
         register_stmts(f->body);
+    } else if (auto* ifs = dynamic_cast<DdcgAst::IfStmt*>(s)) {
+        register_expr(ifs->cond);
+        register_stmts(ifs->then_body);
+        register_stmts(ifs->else_body);
     } else if (auto* es = dynamic_cast<DdcgAst::ExprStmt*>(s)) {
         register_expr(es->value);
     }
@@ -609,6 +668,32 @@ void CBackend::emit_call(DdcgAst::CallExpr* call) {
             out() << ")";
             return;
         }
+        // Dest-variant constructor (effect/loc/single/pair/ret/...).
+        // ddcgc prepends `ctx` so the user's runtime constructor has
+        // access to ctx state (arena for recursive variants, etc.) —
+        // matching the AUX/pred/fun convention. The constructor is
+        // user-supplied via the runtime header, no compiler prefix.
+        bool is_dest_variant = false;
+        for (auto* d : file_->destinations) {
+            std::vector<DdcgAst::DestVariant*> vs;
+            if (auto* dd = dynamic_cast<DdcgAst::DataDest*>(d)) vs = dd->variants;
+            else if (auto* cd = dynamic_cast<DdcgAst::CtrlDest*>(d)) vs = cd->variants;
+            else if (auto* ed = dynamic_cast<DdcgAst::EnvDest*>(d)) vs = ed->variants;
+            else if (auto* sd = dynamic_cast<DdcgAst::Sum*>(d)) vs = sd->variants;
+            for (auto* v : vs) {
+                if (v->name == nm) { is_dest_variant = true; break; }
+            }
+            if (is_dest_variant) break;
+        }
+        if (is_dest_variant) {
+            out() << nm << "(ctx";
+            for (auto* a : call->args) {
+                out() << ", ";
+                emit_expr(a);
+            }
+            out() << ")";
+            return;
+        }
     }
     emit_expr(call->fn);
     emit_call_args(call->args);
@@ -692,10 +777,36 @@ void CBackend::emit_build(DdcgAst::BuildExpr* b) {
         out() << "/*BUG: unknown schema*/((void)0)";
         return;
     }
-    out() << c_ctor_factory(sit->second, b->ctor) << "(ctx->arena";
-    for (auto* a : b->args) {
+    // asdl-c factories take `*` (sequence) fields as a (T**, int) pair.
+    // List-typed DSL args are emitted as ycdg_list_T_t structs; unpack
+    // to .data + .count when the constructor's matching field is a
+    // sequence so the factory call lines up.
+    const auto& schema = sit->second;
+    const Constructor* ctor = nullptr;
+    auto cit = schema.constructors.find(b->ctor);
+    if (cit != schema.constructors.end()) ctor = &cit->second;
+    out() << c_ctor_factory(schema, b->ctor) << "(ctx->arena";
+    for (size_t i = 0; i < b->args.size(); ++i) {
         out() << ", ";
-        emit_expr(a);
+        const Field* matched = nullptr;
+        if (ctor && i < ctor->fields.size()) matched = &ctor->fields[i];
+        bool seq_unpack = false;
+        if (matched && matched->flag == FieldFlag::Sequence) {
+            auto et = check_->expr_types.find(b->args[i]);
+            if (et != check_->expr_types.end() &&
+                et->second.kind == TypeKind::List) {
+                seq_unpack = true;
+            }
+        }
+        if (seq_unpack) {
+            out() << "(";
+            emit_expr(b->args[i]);
+            out() << ").data, (";
+            emit_expr(b->args[i]);
+            out() << ").count";
+        } else {
+            emit_expr(b->args[i]);
+        }
     }
     out() << ")";
 }
@@ -715,6 +826,10 @@ void CBackend::emit_match_expr(DdcgAst::MatchExpr* m) {
     const Schema* enum_schema = nullptr;
     std::string enum_sum_name;
     std::string enum_module;
+    const Schema* sum_schema = nullptr;     // non-enum schema sum
+    std::string sum_name;
+    std::string sum_import;
+    bool int_subject = false;
     auto sit = check_->expr_types.find(m->subject);
     if (sit != check_->expr_types.end()) {
         const Type& st = sit->second;
@@ -722,17 +837,24 @@ void CBackend::emit_match_expr(DdcgAst::MatchExpr* m) {
             dest_name = st.name;
         } else if (st.kind == TypeKind::Schema) {
             auto sk = schemas_->find(st.schema_import);
-            if (sk != schemas_->end() &&
-                sk->second.enum_sums.count(st.name)) {
-                enum_schema = &sk->second;
-                enum_sum_name = st.name;
-                enum_module = sk->second.module_name;
+            if (sk != schemas_->end()) {
+                if (sk->second.enum_sums.count(st.name)) {
+                    enum_schema = &sk->second;
+                    enum_sum_name = st.name;
+                    enum_module = sk->second.module_name;
+                } else if (sk->second.sum_names.count(st.name)) {
+                    sum_schema = &sk->second;
+                    sum_name = st.name;
+                    sum_import = st.schema_import;
+                }
             }
+        } else if (st.kind == TypeKind::Int) {
+            int_subject = true;
         }
     }
-    if (dest_name.empty() && !enum_schema) {
-        errors_->push_back("match: subject is not a dest tagged union "
-                            "or asdl enum");
+    if (dest_name.empty() && !enum_schema && !sum_schema && !int_subject) {
+        errors_->push_back("match: subject is not a dest tagged union, "
+                            "asdl enum, schema sum, or int");
         out() << "((void)0)";
         return;
     }
@@ -757,8 +879,13 @@ void CBackend::emit_match_expr(DdcgAst::MatchExpr* m) {
     out() << "({ ";
     if (!dest_name.empty()) {
         out() << dest_name + "_t " << m_var << " = ";
-    } else {
+    } else if (enum_schema) {
         out() << c_type_for(*enum_schema, enum_sum_name) << " " << m_var << " = ";
+    } else if (sum_schema) {
+        // Schema sum: subject is a tagged-union pointer (e.g. ast_expr_t*).
+        out() << c_type_for(*sum_schema, sum_name) << " " << m_var << " = ";
+    } else {
+        out() << "int " << m_var << " = ";
     }
     emit_expr(m->subject);
     out() << "; " << result_ty << " " << r_var << " = "
@@ -766,7 +893,11 @@ void CBackend::emit_match_expr(DdcgAst::MatchExpr* m) {
 
     if (!dest_name.empty()) {
         indent() << "    switch (" << m_var << ".tag) {\n";
+    } else if (sum_schema) {
+        // Schema sum: pointer-deref to read .tag.
+        indent() << "    switch (" << m_var << "->tag) {\n";
     } else {
+        // asdl enum or int: switch on the value directly.
         indent() << "    switch (" << m_var << ") {\n";
     }
     indent_depth_ += 2;
@@ -781,6 +912,10 @@ void CBackend::emit_match_expr(DdcgAst::MatchExpr* m) {
                 dn = dd->name; vs = dd->variants;
             } else if (auto* cd = dynamic_cast<DdcgAst::CtrlDest*>(d)) {
                 dn = cd->name; vs = cd->variants;
+            } else if (auto* ed = dynamic_cast<DdcgAst::EnvDest*>(d)) {
+                dn = ed->name; vs = ed->variants;
+            } else if (auto* sd = dynamic_cast<DdcgAst::Sum*>(d)) {
+                dn = sd->name; vs = sd->variants;
             }
             if (dn != dest_name) continue;
             for (auto* v : vs) if (v->name == nm) return v;
@@ -808,19 +943,60 @@ void CBackend::emit_match_expr(DdcgAst::MatchExpr* m) {
             out() << "case " << dest_upper << "_"
                   << camel_upper(cp->ctor) << ": {\n";
             indent_depth_++;
+            // Look up the variant to identify recursive fields — fields
+            // whose declared type is the dest type itself (e.g. ρ's
+            // `parent: rho`). Recursive fields are stored as `dest_t*`
+            // in the runtime struct (C structs can't recurse by value);
+            // ddcgc auto-derefs at bind time so the rule body sees a
+            // dest_t value matching the DSL-level type.
+            auto* variant = find_dest_variant(cp->ctor);
+            auto is_recursive_field = [variant, &dest_name](const std::string& fname) {
+                if (!variant) return false;
+                for (auto* f : variant->fields) {
+                    if (f->name != fname) continue;
+                    if (auto* tn = dynamic_cast<DdcgAst::TypeName*>(f->ty)) {
+                        return tn->module.empty() && tn->name == dest_name;
+                    }
+                    return false;
+                }
+                return false;
+            };
             for (auto* fp : cp->fields) {
                 if (auto* nf = dynamic_cast<DdcgAst::NamedFieldPat*>(fp)) {
                     if (auto* bp = dynamic_cast<DdcgAst::BindPat*>(nf->pat)) {
-                        indent() << "__typeof__(" << m_var << "."
-                                 << nf->name << ") " << bp->name
-                                 << " = " << m_var << "." << nf->name
-                                 << ";\n";
+                        bool recursive = is_recursive_field(nf->name);
+                        std::string field_expr = std::string(m_var) + "." + nf->name;
+                        std::string rhs = recursive ? "*" + field_expr : field_expr;
+                        indent() << "__typeof__(" << rhs << ") " << bp->name
+                                 << " = " << rhs << ";\n";
                         // Suppress -Werror=unused-variable when the
                         // arm body doesn't reference the bind.
                         indent() << "(void)" << bp->name << ";\n";
                     }
                 }
             }
+        } else if (auto* cp = dynamic_cast<DdcgAst::ConstructorPat*>(arm->pat);
+                   cp && sum_schema && cp->module == sum_import) {
+            // Schema sum match arm: case AST_X: { bind fields via
+            // _m->variant.field; ... }
+            out() << "case " << c_tag_value(sum_schema->module_name, cp->ctor)
+                  << ": {\n";
+            indent_depth_++;
+            std::string variant = c_variant_arm(cp->ctor);
+            for (auto* fp : cp->fields) {
+                if (auto* nf = dynamic_cast<DdcgAst::NamedFieldPat*>(fp)) {
+                    if (auto* bp = dynamic_cast<DdcgAst::BindPat*>(nf->pat)) {
+                        std::string field_expr = std::string(m_var) +
+                            "->" + variant + "." + safe_field_name(nf->name);
+                        indent() << "__typeof__(" << field_expr << ") "
+                                 << bp->name << " = " << field_expr << ";\n";
+                        indent() << "(void)" << bp->name << ";\n";
+                    }
+                }
+            }
+        } else if (auto* ip = dynamic_cast<DdcgAst::IntPat*>(arm->pat)) {
+            out() << "case " << ip->value << ": {\n";
+            indent_depth_++;
         } else if (dynamic_cast<DdcgAst::WildcardPat*>(arm->pat)) {
             out() << "default: {\n";
             indent_depth_++;
@@ -864,6 +1040,58 @@ void CBackend::emit_match_expr(DdcgAst::MatchExpr* m) {
     indent() << "    " << r_var << "; })";
 
     match_target_var_ = saved_target;
+}
+
+// FieldAccExpr on a sequence-typed schema field: AST stores it as
+// a flat (T**, int) pair; bind sites use _list_T_from_arr to wrap
+// the pair into a list_t struct. Same wrapping is needed at every
+// other access site (passing as fun arg, indexing, etc.) so the
+// expression has the list_t shape its inferred type promises.
+//
+// Returns false (let the default `base.field` emit run) when the
+// field isn't a sequence on a recognised schema base.
+bool CBackend::emit_seq_field_acc(DdcgAst::FieldAccExpr* fa) {
+    auto bt_it = check_->expr_types.find(fa->base);
+    if (bt_it == check_->expr_types.end()) return false;
+    if (bt_it->second.kind != TypeKind::Schema) return false;
+    auto sit = schemas_->find(bt_it->second.schema_import);
+    if (sit == schemas_->end()) return false;
+    const Schema& schema = sit->second;
+    const std::string& sname = bt_it->second.name;
+
+    // The schema name may be a constructor (Product) or a sum. For
+    // sums, resolve to the first/only constructor that has the named
+    // sequence field — this matches the asdl-c flattening for
+    // single-constructor sums and product types.
+    const Field* matched = nullptr;
+    auto cit = schema.constructors.find(sname);
+    if (cit != schema.constructors.end()) {
+        for (const auto& f : cit->second.fields) {
+            if (f.name == fa->field) { matched = &f; break; }
+        }
+    } else {
+        auto sci = schema.sum_constructors.find(sname);
+        if (sci == schema.sum_constructors.end()) return false;
+        for (const auto& cn : sci->second) {
+            auto cit2 = schema.constructors.find(cn);
+            if (cit2 == schema.constructors.end()) continue;
+            for (const auto& f : cit2->second.fields) {
+                if (f.name == fa->field) { matched = &f; break; }
+            }
+            if (matched) break;
+        }
+    }
+    if (!matched || matched->flag != FieldFlag::Sequence) return false;
+
+    std::string elem_c = c_for_field_elem(schema, *matched);
+    std::string fn = compiler_prefix() + "_list_" +
+                      sanitize_for_suffix(elem_c) + "_from_arr";
+    out() << fn << "(";
+    emit_expr(fa->base);
+    out() << "->" << fa->field << ", ";
+    emit_expr(fa->base);
+    out() << "->" << fa->field << "_count)";
+    return true;
 }
 
 void CBackend::emit_index_acc(DdcgAst::IndexAccExpr* ix) {
@@ -978,6 +1206,11 @@ void CBackend::emit_for_stmt(DdcgAst::ForStmt* f) {
     indent() << "for (int " << idx << " = 0; " << idx
              << " < (" << seq_str << ").count; ++" << idx << ") {\n";
     indent_depth_++;
+    if (f->iter_index.has_value()) {
+        if (auto* ib = dynamic_cast<DdcgAst::SimpleBind*>(*f->iter_index)) {
+            indent() << "int " << ib->name << " = " << idx << ";\n";
+        }
+    }
     if (auto* sb = dynamic_cast<DdcgAst::SimpleBind*>(f->iter)) {
         indent() << elem_ty << " " << sb->name
                  << " = (" << seq_str << ").data[" << idx << "];\n";
@@ -985,6 +1218,20 @@ void CBackend::emit_for_stmt(DdcgAst::ForStmt* f) {
     emit_stmts(f->body, /*tail=*/false);
     indent_depth_--;
     indent() << "}\n";
+}
+
+void CBackend::emit_dest_pattern(DdcgAst::DestPattern* dp) {
+    /* C-side dest constructor — `ctx` is prepended so the user
+     * runtime has access to compiler state (arena, etc.) wherever
+     * a constructor is called from a rule body. Recursive variants
+     * use it for arena-allocating their parent indirection; non-
+     * recursive constructors get an unused ctx arg. */
+    out() << dp->name << "(ctx";
+    for (auto* a : dp->args) {
+        out() << ", ";
+        emit_expr(a);
+    }
+    out() << ")";
 }
 
 void CBackend::emit_label_stmt(DdcgAst::LabelStmt* lb) {
@@ -1100,6 +1347,7 @@ int CBackend::emit_match(const Schema& schema,
                         indent() << ty << " " << bp->name << " = "
                                  << field_expr << ";\n";
                     }
+                    indent() << "(void)" << bp->name << ";\n";
                 }
             } else if (auto* sub_cp =
                            dynamic_cast<DdcgAst::ConstructorPat*>(nf->pat)) {
@@ -1135,6 +1383,7 @@ int CBackend::emit_match(const Schema& schema,
                 indent() << ty << " " << rf->name << " = "
                          << field_expr << ";\n";
             }
+            indent() << "(void)" << rf->name << ";\n";
         }
     }
 
@@ -1159,19 +1408,30 @@ int CBackend::emit_match(const Schema& schema,
 
 // ── Action-language funs ──────────────────────────────────────
 
-void CBackend::emit_fun(DdcgAst::Fun* f) {
-    out() << "\n";
-    indent() << "/* fun " << f->name << " */\n";
-    indent() << "static inline " << c_for_typeref(f->ret_ty) << " "
-             << compiler_prefix() << "_" << f->name
-             << "(" << ctx_type() << "* ctx";
+void CBackend::emit_fun_signature(DdcgAst::Fun* f) {
+    out() << c_for_typeref(f->ret_ty) << " "
+          << compiler_prefix() << "_" << f->name
+          << "(" << ctx_type() << "* ctx";
     for (size_t i = 0; i < f->params.size(); ++i) {
         out() << ", " << c_for_typeref(f->params[i]->ty)
               << " " << f->params[i]->name;
     }
-    out() << ") {\n";
+    out() << ")";
+}
+
+void CBackend::emit_fun(DdcgAst::Fun* f) {
+    out() << "\n";
+    indent() << "/* fun " << f->name << " */\n";
+    indent();
+    emit_fun_signature(f);
+    out() << " {\n";
     indent_depth_++;
     indent() << "(void)ctx;\n";
+    // Suppress unused-parameter warnings: every fun param gets a (void)
+    // cast at the top, since DSL bodies may legitimately ignore some.
+    for (auto* p : f->params) {
+        indent() << "(void)" << p->name << ";\n";
+    }
     for (size_t i = 0; i < f->body.size(); ++i) {
         bool is_last = (i + 1 == f->body.size());
         emit_stmt(f->body[i], is_last);
@@ -1190,8 +1450,8 @@ void CBackend::emit_file_preamble() {
     out() << " * MEMBERS hold consumer state (data fields ONLY — function defs\n";
     out() << " * fail the C compiler). Aux/pred functions are caller-supplied\n";
     out() << " * with `" << ctx_type() << "*` first parameter; ddcgc emits\n";
-    out() << " * forward decls. Dispatchers are free functions named\n";
-    out() << " * `" << compiler_prefix() << "_compile_<sum>`.\n";
+    out() << " * forward decls. Dispatchers and funs are defined in the\n";
+    out() << " * companion .c file; this header has only declarations.\n";
     out() << " */\n\n";
 
     for (auto* h : file_->headers) {
@@ -1201,6 +1461,34 @@ void CBackend::emit_file_preamble() {
     out() << "#include <stddef.h>\n";
     out() << "#include <stdbool.h>\n";
     out() << "#include <string.h>\n\n";
+}
+
+void CBackend::emit_source_preamble() {
+    out() << "/* Generated by ddcgc — do not edit */\n";
+    out() << "#include \"" << header_filename_ << "\"\n";
+    out() << "#include <stdlib.h>\n";
+    out() << "#include <string.h>\n\n";
+}
+
+void CBackend::emit_fun_forward_decls() {
+    if (file_->funs.empty()) return;
+    out() << "/* ─── fun forward decls (definitions in .c) ─── */\n";
+    for (auto* f : file_->funs) {
+        emit_fun_signature(f);
+        out() << ";\n";
+    }
+    out() << "\n";
+}
+
+void CBackend::emit_dispatcher_forward_decls() {
+    auto sums = source_sums_with_rules();
+    if (sums.empty()) return;
+    out() << "/* ─── Dispatcher forward decls (definitions in .c) ─── */\n";
+    for (const auto& s : sums) {
+        emit_dispatcher_signature(s);
+        out() << ";\n";
+    }
+    out() << "\n";
 }
 
 void CBackend::emit_ctx_struct() {
@@ -1337,23 +1625,37 @@ void CBackend::emit_dispatcher(const std::string& sum_name) {
 }
 
 bool CBackend::emit_body() {
+    if (!out_source_) {
+        errors_->push_back("C backend requires a separate source-output stream "
+                           "(use main's two-file -o convention)");
+        return false;
+    }
+
     // Walk the file once up-front so the helper block can emit every
     // list/tuple typedef + helper bundle BEFORE anything references
     // them. Aux/pred fwd decls and the ctx struct may both mention
     // these types via signature TypeRefs.
     run_discovery();
 
-    emit_file_preamble();
-    emit_helpers_block();
-    emit_ctx_struct();
-    emit_private_block();
-    emit_aux_forward_decls();
-
     auto sums = source_sums_with_rules();
     if (sums.empty()) {
         errors_->push_back("no rules dispatch on the source AST schema");
         return false;
     }
+
+    // ── HEADER ─────────────────────────────────────────────────
+    out_ = out_header_;
+    emit_file_preamble();
+    emit_helpers_block();
+    emit_ctx_struct();
+    emit_private_block();
+    emit_aux_forward_decls();
+    emit_fun_forward_decls();
+    emit_dispatcher_forward_decls();
+
+    // ── SOURCE ─────────────────────────────────────────────────
+    out_ = out_source_;
+    emit_source_preamble();
 
     if (!file_->funs.empty()) {
         out() << "/* ─── action-language funs ─── */\n";
@@ -1372,10 +1674,13 @@ bool CBackend::emit_body() {
 bool emit_c(const DdcgAst::File* file,
             const std::map<std::string, Schema>& schemas,
             const CheckResult& check,
-            std::ostream& out,
+            std::ostream& out_header,
+            std::ostream* out_source,
+            const std::string& header_filename,
             std::vector<std::string>& errors) {
     CBackend backend;
-    return backend.emit(file, schemas, check, out, errors);
+    return backend.emit(file, schemas, check,
+                        out_header, out_source, header_filename, errors);
 }
 
 std::unique_ptr<Backend> create_c_backend() {

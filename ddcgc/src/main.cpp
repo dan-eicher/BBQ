@@ -437,21 +437,52 @@ int main(int argc, char** argv) {
     }
     if (!check.ok()) return 1;
 
-    // 4. Emit C++
-    std::ostream* out = &std::cout;
-    std::ofstream out_file;
+    // 4. Emit. C++ writes to a single header (header-only library);
+    //    C splits into header (decls) and source (definitions). For
+    //    C the .c path is auto-derived from the .h: foo.h → foo.c.
+    std::ostream* out_header = &std::cout;
+    std::ofstream header_file;
+    std::ofstream source_file;
+    std::ostream* out_source = nullptr;
+    std::string header_basename;
     if (!output_file.empty()) {
-        out_file.open(output_file);
-        if (!out_file) {
+        header_file.open(output_file);
+        if (!header_file) {
             std::fprintf(stderr, "ddcgc: cannot write %s\n", output_file.c_str());
             return 1;
         }
-        out = &out_file;
+        out_header = &header_file;
+        header_basename = std::filesystem::path(output_file).filename().string();
+
+        if (lang == "c") {
+            // Derive the .c path. Recognized header suffixes get
+            // replaced; otherwise append .c.
+            std::filesystem::path src_path(output_file);
+            std::string ext = src_path.extension().string();
+            if (ext == ".h" || ext == ".hpp" || ext == ".hh") {
+                src_path.replace_extension(".c");
+            } else {
+                src_path += ".c";
+            }
+            source_file.open(src_path);
+            if (!source_file) {
+                std::fprintf(stderr, "ddcgc: cannot write %s\n",
+                             src_path.string().c_str());
+                return 1;
+            }
+            out_source = &source_file;
+        }
+    } else if (lang == "c") {
+        std::fprintf(stderr,
+            "ddcgc: -o is required for -lang c (header + source split)\n");
+        return 1;
     }
+
     auto backend = (lang == "c") ? ddcgc::create_c_backend()
                                   : ddcgc::create_cpp_backend();
     std::vector<std::string> emit_errs;
-    if (!backend->emit(file, schemas, check, *out, emit_errs)) {
+    if (!backend->emit(file, schemas, check,
+                        *out_header, out_source, header_basename, emit_errs)) {
         for (const auto& e : emit_errs) std::fprintf(stderr, "emit error: %s\n", e.c_str());
         return 1;
     }

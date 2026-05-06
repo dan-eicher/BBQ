@@ -1,0 +1,5 @@
+module ast {
+    expr = Lit(int n)
+         | Scope(int label, expr body)
+         | Lookup
+}

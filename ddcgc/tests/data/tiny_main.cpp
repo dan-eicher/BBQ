@@ -17,7 +17,7 @@ int main() {
     Add add_expr(&two, &three);
 
     Compiler compiler;
-    rho_t rho{0};
+    rho_t rho = frame(0);
     int result = compiler.compile_expr(&add_expr, rho, ac(), fail());
 
     if (result != 5) {

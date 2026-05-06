@@ -220,11 +220,29 @@
             {
               "flag": "sequence",
               "is_schema": true,
-              "name": "fields",
-              "type": "dest_field"
+              "name": "variants",
+              "type": "dest_variant"
             }
           ],
           "name": "EnvDest"
+        },
+        {
+          "base": "DestDecl",
+          "fields": [
+            {
+              "flag": "none",
+              "is_schema": false,
+              "name": "name",
+              "type": "identifier"
+            },
+            {
+              "flag": "sequence",
+              "is_schema": true,
+              "name": "variants",
+              "type": "dest_variant"
+            }
+          ],
+          "name": "Sum"
         }
       ]
     },
@@ -678,6 +696,12 @@
               "type": "bind"
             },
             {
+              "flag": "optional",
+              "is_schema": true,
+              "name": "iter_index",
+              "type": "bind"
+            },
+            {
               "flag": "none",
               "is_schema": true,
               "name": "seq",
@@ -691,6 +715,30 @@
             }
           ],
           "name": "ForStmt"
+        },
+        {
+          "base": "Stmt",
+          "fields": [
+            {
+              "flag": "none",
+              "is_schema": true,
+              "name": "cond",
+              "type": "expr"
+            },
+            {
+              "flag": "sequence",
+              "is_schema": true,
+              "name": "then_body",
+              "type": "stmt"
+            },
+            {
+              "flag": "sequence",
+              "is_schema": true,
+              "name": "else_body",
+              "type": "stmt"
+            }
+          ],
+          "name": "IfStmt"
         },
         {
           "base": "Stmt",
@@ -1005,6 +1053,18 @@
             }
           ],
           "name": "MatchExpr"
+        },
+        {
+          "base": "Expr",
+          "fields": [
+            {
+              "flag": "sequence",
+              "is_schema": true,
+              "name": "body",
+              "type": "stmt"
+            }
+          ],
+          "name": "BlockExpr"
         },
         {
           "base": "Expr",

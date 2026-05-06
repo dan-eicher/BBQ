@@ -157,6 +157,7 @@ add_custom_command(
 
 add_custom_command(
     OUTPUT ${DDCG_TEST_OUT}/kitchensink_compile.h
+           ${DDCG_TEST_OUT}/kitchensink_compile.c
     COMMAND ddcgc -lang c
                   -i ${DDCG_TEST_DATA}/kitchensink.ddcg
                   -ast ${DDCG_TEST_OUT}/kitchensink_ast.json
@@ -172,6 +173,7 @@ add_custom_command(
 
 add_executable(ddcgc_kitchensink_c_e2e
     ${DDCG_TEST_DATA}/kitchensink_main.c
+    ${DDCG_TEST_OUT}/kitchensink_compile.c
     ${DDCG_TEST_OUT}/kitchensink_compile.h)
 set_target_properties(ddcgc_kitchensink_c_e2e PROPERTIES
     C_STANDARD 11
@@ -183,6 +185,61 @@ target_include_directories(ddcgc_kitchensink_c_e2e PRIVATE
     ${DDCG_TEST_OUT})
 target_link_libraries(ddcgc_kitchensink_c_e2e PRIVATE bbq_crt)
 add_test(NAME ddcgc_kitchensink_c_e2e COMMAND ddcgc_kitchensink_c_e2e)
+
+# ── scoped — Phase 1 fixture for chained-rho-pangolin (recursive ρ). ──
+add_custom_command(
+    OUTPUT ${DDCG_TEST_OUT}/scoped_ast.json
+           ${DDCG_TEST_OUT}/scoped_target.json
+           ${DDCG_TEST_OUT}/scoped_ast.h
+           ${DDCG_TEST_OUT}/scoped_target.h
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${DDCG_TEST_OUT}
+    COMMAND asdl -lang c
+                 -i ${DDCG_TEST_DATA}/scoped_ast.asdl
+                 -t ${CMAKE_SOURCE_DIR}/asdl/templates/c.inja
+                 -o ${DDCG_TEST_OUT}/scoped_ast.h
+                 --json ${DDCG_TEST_OUT}/scoped_ast.json
+    COMMAND asdl -lang c
+                 -i ${DDCG_TEST_DATA}/scoped_target.asdl
+                 -t ${CMAKE_SOURCE_DIR}/asdl/templates/c.inja
+                 -o ${DDCG_TEST_OUT}/scoped_target.h
+                 --json ${DDCG_TEST_OUT}/scoped_target.json
+    DEPENDS asdl
+            ${DDCG_TEST_DATA}/scoped_ast.asdl
+            ${DDCG_TEST_DATA}/scoped_target.asdl
+            ${CMAKE_SOURCE_DIR}/asdl/templates/c.inja
+    COMMENT "Generating scoped schemas"
+    VERBATIM
+)
+
+add_custom_command(
+    OUTPUT ${DDCG_TEST_OUT}/scoped_compile.h
+           ${DDCG_TEST_OUT}/scoped_compile.c
+    COMMAND ddcgc -lang c
+                  -i ${DDCG_TEST_DATA}/scoped.ddcg
+                  -ast ${DDCG_TEST_OUT}/scoped_ast.json
+                  -ir  ${DDCG_TEST_OUT}/scoped_target.json
+                  -o   ${DDCG_TEST_OUT}/scoped_compile.h
+    DEPENDS ddcgc
+            ${DDCG_TEST_DATA}/scoped.ddcg
+            ${DDCG_TEST_OUT}/scoped_ast.json
+            ${DDCG_TEST_OUT}/scoped_target.json
+    COMMENT "Running ddcgc -lang c on tests/data/scoped.ddcg"
+    VERBATIM
+)
+
+add_executable(ddcgc_scoped_e2e
+    ${DDCG_TEST_DATA}/scoped_main.c
+    ${DDCG_TEST_OUT}/scoped_compile.c
+    ${DDCG_TEST_OUT}/scoped_compile.h)
+set_target_properties(ddcgc_scoped_e2e PROPERTIES
+    C_STANDARD 11
+    C_STANDARD_REQUIRED ON)
+target_compile_options(ddcgc_scoped_e2e PRIVATE -Wall -Wextra -Werror)
+target_include_directories(ddcgc_scoped_e2e PRIVATE
+    ${DDCG_TEST_DATA}
+    ${DDCG_TEST_OUT})
+target_link_libraries(ddcgc_scoped_e2e PRIVATE bbq_crt)
+add_test(NAME ddcgc_scoped_e2e COMMAND ddcgc_scoped_e2e)
 
 # ── "big" e2e — wider feature surface (nested patterns, predicate     ──
 # ── guard, for-accumulator, list concat, ternary, Sequence field).    ──

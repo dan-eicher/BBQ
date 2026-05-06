@@ -102,6 +102,11 @@ int kitchensink_tup_sum(kitchensink_ctx_t* ctx,
     return t._0 + t._1;
 }
 
+int kitchensink_inspect_node(kitchensink_ctx_t* ctx, ast_expr_t* n) {
+    trace_push(ctx, trace_fmt(ctx, "inspect_node:tag:%d", (int)n->tag));
+    return (int)n->tag;
+}
+
 bool kitchensink_is_zero(kitchensink_ctx_t* ctx, int n) {
     (void)ctx; return n == 0;
 }
@@ -226,7 +231,7 @@ int main(void) {
     kitchensink_ctx_t ctx = {0};
     ctx.arena = &arena;
     rho_t rho = {0};
-    int result = kitchensink_compile_expr(&ctx, root, rho, ac(), fail(), 0);
+    int result = kitchensink_compile_expr(&ctx, root, rho, ac(&ctx), fail(&ctx), 0);
 
     int rc = 0;
     for (int i = 0; i < kFeatureCount; ++i) {

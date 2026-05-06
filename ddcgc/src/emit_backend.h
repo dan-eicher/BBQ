@@ -41,7 +41,9 @@ public:
     bool emit(const DdcgAst::File* file,
               const std::map<std::string, Schema>& schemas,
               const CheckResult& check,
-              std::ostream& out,
+              std::ostream& out_header,
+              std::ostream* out_source,
+              const std::string& header_filename,
               std::vector<std::string>& errors) override;
 
 protected:
@@ -51,7 +53,13 @@ protected:
     const std::map<std::string, Schema>* schemas_ = nullptr;
     const CheckResult* check_ = nullptr;
     std::vector<std::string>* errors_ = nullptr;
+    // out_ is the *currently active* output stream — emit code calls
+    // out() / indent() and gets whichever stream is active. CBackend
+    // swaps between header_ and source_ across emit_body sections.
     std::ostream* out_ = nullptr;
+    std::ostream* out_header_ = nullptr;
+    std::ostream* out_source_ = nullptr;
+    std::string header_filename_;
     int indent_depth_ = 0;
 
     // Source-AST schema (the .ddcg's first import).
@@ -96,6 +104,13 @@ protected:
     void emit_stmt(DdcgAst::Stmt* s, bool is_tail);
     void emit_stmts(const std::vector<DdcgAst::Stmt*>& body,
                     bool body_is_tail_position);
+    void emit_block_expr(DdcgAst::BlockExpr* be);
+
+    // Per-language hook for dest-variant constructor calls. The C
+    // backend prepends `ctx` so recursive variants (parent: rho)
+    // can arena-allocate; the C++ backend treats constructors as
+    // bare free-fns (state lives on `this`).
+    virtual void emit_dest_pattern(DdcgAst::DestPattern* dp) = 0;
     void emit_call_args(const std::vector<DdcgAst::Expr*>& args);
     std::string emit_expr_to_string(DdcgAst::Expr* e);
 
@@ -125,6 +140,14 @@ protected:
     //
     // null literal — `nullptr` (C++) vs `NULL` (C).
     virtual std::string null_literal() const = 0;
+
+    // asdl enum-value reference (e.g. DSL `DtRef` from
+    // `datatype = DtByte | DtShort | DtInt | DtRef`). C emits the
+    // tag-constant macro `<MODULE>_<CTOR>`; C++ emits the
+    // `module::Type::Ctor` enum-class form.
+    virtual std::string emit_enum_value_ref(const std::string& module,
+                                            const std::string& sum_name,
+                                            const std::string& ctor) const = 0;
 
     // Aux/pred/fun call — mangling differs (method on `this` vs
     // `<prefix>_<name>(ctx, ...)` free function).
@@ -162,6 +185,12 @@ protected:
     // data pointer.
     virtual void emit_index_acc(DdcgAst::IndexAccExpr* ix) = 0;
 
+    // FieldAccExpr on a sequence-typed schema field. Default returns
+    // false → fall through to the generic `base.field` emission. C
+    // overrides to wrap the (T**, count) pair into a list_t helper
+    // so AST sequence fields are interchangeable with bind-list values.
+    virtual bool emit_seq_field_acc(DdcgAst::FieldAccExpr*) { return false; }
+
     // Per-Stmt hooks — let-simple, let-destructure, for, label
     // each have substantially different code shapes per language.
     virtual void emit_let_simple(DdcgAst::LetStmt* l,
@@ -193,6 +222,14 @@ protected:
     bool is_pred(const std::string& name) const;
     bool is_dest_variant(const std::string& name) const;
     bool is_zero_arg_dest_variant(const std::string& name) const;
+
+    // Resolve a bare ident to an asdl enum value across all imported
+    // schemas. Returns `false` if not found or ambiguous; the
+    // ambiguity case is caught earlier in typecheck. On success
+    // populates {module, sum_name}.
+    bool find_enum_value(const std::string& name,
+                         std::string* out_module,
+                         std::string* out_sum) const;
 
     // Collect the rules that match against the source schema's
     // (module, sum_name).

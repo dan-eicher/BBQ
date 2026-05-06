@@ -305,6 +305,16 @@ bool Parser::parse_DestEntry(std::vector<DdcgAst::DestDecl*>& dests, DdcgAst::Ty
         if ([&]() -> bool {
             skip();
             if (!match("data_dest")) return false;
+            {
+                auto _m1 = save();
+                bool _ok1 = [&]() -> bool {
+                    if (at_end() || !is_ident_continue(peek())) return false;
+                    advance();
+                    return true;
+                }();
+                restore(_m1);
+                if (_ok1) return false;
+            }
             skip();
             if (!ident(name_span)) return false;
             name = name_span.to_string();
@@ -323,6 +333,16 @@ bool Parser::parse_DestEntry(std::vector<DdcgAst::DestDecl*>& dests, DdcgAst::Ty
         if ([&]() -> bool {
             skip();
             if (!match("ctrl_dest")) return false;
+            {
+                auto _m2 = save();
+                bool _ok2 = [&]() -> bool {
+                    if (at_end() || !is_ident_continue(peek())) return false;
+                    advance();
+                    return true;
+                }();
+                restore(_m2);
+                if (_ok2) return false;
+            }
             skip();
             if (!ident(name_span)) return false;
             name = name_span.to_string();
@@ -341,32 +361,54 @@ bool Parser::parse_DestEntry(std::vector<DdcgAst::DestDecl*>& dests, DdcgAst::Ty
         if ([&]() -> bool {
             skip();
             if (!match("env_dest")) return false;
+            {
+                auto _m3 = save();
+                bool _ok3 = [&]() -> bool {
+                    if (at_end() || !is_ident_continue(peek())) return false;
+                    advance();
+                    return true;
+                }();
+                restore(_m3);
+                if (_ok3) return false;
+            }
             skip();
             if (!ident(name_span)) return false;
             name = name_span.to_string();
             skip();
             if (!match("{")) return false;
-            {
-                auto _m1 = save();
-                if (![&]() -> bool {
-                    skip();
-                    if (!parse_DestFieldDecl(fields)) return false;
-                    for (;;) {
-                        auto _m2 = save();
-                        if (![&]() -> bool {
-                            skip();
-                            if (!match(",")) return false;
-                            skip();
-                            if (!parse_DestFieldDecl(fields)) return false;
-                            return true;
-                        }()) { restore(_m2); break; }
-                    }
-                    return true;
-                }()) restore(_m1);
-            }
+            skip();
+            if (!parse_VariantList(variants)) return false;
             skip();
             if (!match("}")) return false;
-            auto* d = new DdcgAst::EnvDest(std::move(name), std::move(fields));
+            auto* d = new DdcgAst::EnvDest(std::move(name), std::move(variants));
+         d->loc = Loc();
+         dests.push_back(d);
+            return true;
+        }()) {} else {
+        restore(_m0);
+        if ([&]() -> bool {
+            skip();
+            if (!match("sum")) return false;
+            {
+                auto _m4 = save();
+                bool _ok4 = [&]() -> bool {
+                    if (at_end() || !is_ident_continue(peek())) return false;
+                    advance();
+                    return true;
+                }();
+                restore(_m4);
+                if (_ok4) return false;
+            }
+            skip();
+            if (!ident(name_span)) return false;
+            name = name_span.to_string();
+            skip();
+            if (!match("{")) return false;
+            skip();
+            if (!parse_VariantList(variants)) return false;
+            skip();
+            if (!match("}")) return false;
+            auto* d = new DdcgAst::Sum(std::move(name), std::move(variants));
          d->loc = Loc();
          dests.push_back(d);
             return true;
@@ -374,9 +416,20 @@ bool Parser::parse_DestEntry(std::vector<DdcgAst::DestDecl*>& dests, DdcgAst::Ty
         restore(_m0);
         skip();
         if (!match("ir_root")) return false;
+        {
+            auto _m5 = save();
+            bool _ok5 = [&]() -> bool {
+                if (at_end() || !is_ident_continue(peek())) return false;
+                advance();
+                return true;
+            }();
+            restore(_m5);
+            if (_ok5) return false;
+        }
         skip();
         if (!parse_TypeRef_(&ty)) return false;
         ir_root = ty;
+        }
         }
         }
         }
@@ -508,6 +561,16 @@ bool Parser::parse_PredicateDecl(std::vector<DdcgAst::Pred*>& predicates) {
     if (!match("->")) return false;
     skip();
     if (!match("bool")) return false;
+    {
+        auto _m1 = save();
+        bool _ok1 = [&]() -> bool {
+            if (at_end() || !is_ident_continue(peek())) return false;
+            advance();
+            return true;
+        }();
+        restore(_m1);
+        if (_ok1) return false;
+    }
     auto* p = new DdcgAst::Pred(std::move(name), std::move(params));
          p->loc = Loc();
          predicates.push_back(p);
@@ -521,28 +584,38 @@ bool Parser::parse_FunDecl(std::vector<DdcgAst::Fun*>& funs) {
        std::vector<DdcgAst::Stmt*> body;
     skip();
     if (!match("fun")) return false;
+    {
+        auto _m0 = save();
+        bool _ok0 = [&]() -> bool {
+            if (at_end() || !is_ident_continue(peek())) return false;
+            advance();
+            return true;
+        }();
+        restore(_m0);
+        if (_ok0) return false;
+    }
     skip();
     if (!ident(name_span)) return false;
     name = name_span.to_string();
     skip();
     if (!match("(")) return false;
     {
-        auto _m0 = save();
+        auto _m1 = save();
         if (![&]() -> bool {
             skip();
             if (!parse_FunParamDecl(params)) return false;
             for (;;) {
-                auto _m1 = save();
+                auto _m2 = save();
                 if (![&]() -> bool {
                     skip();
                     if (!match(",")) return false;
                     skip();
                     if (!parse_FunParamDecl(params)) return false;
                     return true;
-                }()) { restore(_m1); break; }
+                }()) { restore(_m2); break; }
             }
             return true;
-        }()) restore(_m0);
+        }()) restore(_m1);
     }
     skip();
     if (!match(")")) return false;
@@ -578,6 +651,16 @@ bool Parser::parse_LibraryImport(std::vector<DdcgAst::LibraryImport*>& libraries
     peg::Span path_span; std::string path;
     skip();
     if (!match("import")) return false;
+    {
+        auto _m0 = save();
+        bool _ok0 = [&]() -> bool {
+            if (at_end() || !is_ident_continue(peek())) return false;
+            advance();
+            return true;
+        }();
+        restore(_m0);
+        if (_ok0) return false;
+    }
     skip();
     if (!string_lit(path_span)) return false;
     path = peg::unescape_string_lit(path_span);
@@ -617,6 +700,16 @@ bool Parser::parse_TypeRef_(DdcgAst::TypeRef* * result) {
         if ([&]() -> bool {
             skip();
             if (!match("list")) return false;
+            {
+                auto _m1 = save();
+                bool _ok1 = [&]() -> bool {
+                    if (at_end() || !is_ident_continue(peek())) return false;
+                    advance();
+                    return true;
+                }();
+                restore(_m1);
+                if (_ok1) return false;
+            }
             skip();
             if (!match("<")) return false;
             skip();
@@ -632,13 +725,23 @@ bool Parser::parse_TypeRef_(DdcgAst::TypeRef* * result) {
         if ([&]() -> bool {
             skip();
             if (!match("tuple")) return false;
+            {
+                auto _m2 = save();
+                bool _ok2 = [&]() -> bool {
+                    if (at_end() || !is_ident_continue(peek())) return false;
+                    advance();
+                    return true;
+                }();
+                restore(_m2);
+                if (_ok2) return false;
+            }
             skip();
             if (!match("<")) return false;
             skip();
             if (!parse_TypeRef_(&inner)) return false;
             elems.push_back(inner);
             for (;;) {
-                auto _m1 = save();
+                auto _m3 = save();
                 if (![&]() -> bool {
                     skip();
                     if (!match(",")) return false;
@@ -646,7 +749,7 @@ bool Parser::parse_TypeRef_(DdcgAst::TypeRef* * result) {
                     if (!parse_TypeRef_(&inner)) return false;
                     elems.push_back(inner);
                     return true;
-                }()) { restore(_m1); break; }
+                }()) { restore(_m3); break; }
             }
             skip();
             if (!match(">")) return false;
@@ -660,7 +763,7 @@ bool Parser::parse_TypeRef_(DdcgAst::TypeRef* * result) {
         if (!ident(name_span)) return false;
         name = name_span.to_string();
         {
-            auto _m2 = save();
+            auto _m4 = save();
             if (![&]() -> bool {
                 skip();
                 if (!match(".")) return false;
@@ -669,16 +772,16 @@ bool Parser::parse_TypeRef_(DdcgAst::TypeRef* * result) {
                 mod = std::move(name);
                                      name = sub_span.to_string();
                 return true;
-            }()) restore(_m2);
+            }()) restore(_m4);
         }
         {
-            auto _m3 = save();
+            auto _m5 = save();
             if (![&]() -> bool {
                 skip();
                 if (!match("*")) return false;
                 is_ptr = true;
                 return true;
-            }()) restore(_m3);
+            }()) restore(_m5);
         }
         auto* t = new DdcgAst::TypeName(std::move(mod), std::move(name), is_ptr);
          t->loc = Loc();
@@ -697,6 +800,16 @@ bool Parser::parse_RuleDecl(std::vector<DdcgAst::Rule*>& rules) {
        std::vector<DdcgAst::Stmt*> body;
     skip();
     if (!match("rule")) return false;
+    {
+        auto _m0 = save();
+        bool _ok0 = [&]() -> bool {
+            if (at_end() || !is_ident_continue(peek())) return false;
+            advance();
+            return true;
+        }();
+        restore(_m0);
+        if (_ok0) return false;
+    }
     skip();
     if (!ident(name_span)) return false;
     name = name_span.to_string();
@@ -706,7 +819,7 @@ bool Parser::parse_RuleDecl(std::vector<DdcgAst::Rule*>& rules) {
     if (!parse_Pattern_(&p)) return false;
     heads.push_back(p);
     for (;;) {
-        auto _m0 = save();
+        auto _m1 = save();
         if (![&]() -> bool {
             skip();
             if (!match(",")) return false;
@@ -714,17 +827,27 @@ bool Parser::parse_RuleDecl(std::vector<DdcgAst::Rule*>& rules) {
             if (!parse_Pattern_(&p)) return false;
             heads.push_back(p);
             return true;
-        }()) { restore(_m0); break; }
+        }()) { restore(_m1); break; }
     }
     {
-        auto _m1 = save();
+        auto _m2 = save();
         if (![&]() -> bool {
             skip();
             if (!match("where")) return false;
+            {
+                auto _m3 = save();
+                bool _ok3 = [&]() -> bool {
+                    if (at_end() || !is_ident_continue(peek())) return false;
+                    advance();
+                    return true;
+                }();
+                restore(_m3);
+                if (_ok3) return false;
+            }
             skip();
             if (!parse_Expr_(&guard)) return false;
             return true;
-        }()) restore(_m1);
+        }()) restore(_m2);
     }
     skip();
     if (!parse_Block_(body)) return false;
@@ -941,8 +1064,10 @@ bool Parser::parse_Stmt_(std::vector<DdcgAst::Stmt*>& stmts) {
     peg::Span name_span; std::string name;
        std::vector<DdcgAst::Bind*> binds;
        DdcgAst::Bind* b = nullptr;
+       DdcgAst::Bind* idx_bind = nullptr;
        DdcgAst::Expr* e = nullptr;
        std::vector<DdcgAst::Stmt*> body;
+       std::vector<DdcgAst::Stmt*> else_body;
     {
         auto _m0 = save();
         if ([&]() -> bool {
@@ -950,6 +1075,16 @@ bool Parser::parse_Stmt_(std::vector<DdcgAst::Stmt*>& stmts) {
             if (!match("let")) return false;
             {
                 auto _m1 = save();
+                bool _ok1 = [&]() -> bool {
+                    if (at_end() || !is_ident_continue(peek())) return false;
+                    advance();
+                    return true;
+                }();
+                restore(_m1);
+                if (_ok1) return false;
+            }
+            {
+                auto _m2 = save();
                 if ([&]() -> bool {
                     skip();
                     if (!match("(")) return false;
@@ -957,7 +1092,7 @@ bool Parser::parse_Stmt_(std::vector<DdcgAst::Stmt*>& stmts) {
                     if (!parse_Bind_(&b)) return false;
                     binds.push_back(b);
                     for (;;) {
-                        auto _m2 = save();
+                        auto _m3 = save();
                         if (![&]() -> bool {
                             skip();
                             if (!match(",")) return false;
@@ -965,13 +1100,13 @@ bool Parser::parse_Stmt_(std::vector<DdcgAst::Stmt*>& stmts) {
                             if (!parse_Bind_(&b)) return false;
                             binds.push_back(b);
                             return true;
-                        }()) { restore(_m2); break; }
+                        }()) { restore(_m3); break; }
                     }
                     skip();
                     if (!match(")")) return false;
                     return true;
                 }()) {} else {
-                restore(_m1);
+                restore(_m2);
                 skip();
                 if (!parse_Bind_(&b)) return false;
                 binds.push_back(b);
@@ -992,15 +1127,98 @@ bool Parser::parse_Stmt_(std::vector<DdcgAst::Stmt*>& stmts) {
         if ([&]() -> bool {
             skip();
             if (!match("for")) return false;
-            skip();
-            if (!parse_Bind_(&b)) return false;
+            {
+                auto _m4 = save();
+                bool _ok4 = [&]() -> bool {
+                    if (at_end() || !is_ident_continue(peek())) return false;
+                    advance();
+                    return true;
+                }();
+                restore(_m4);
+                if (_ok4) return false;
+            }
+            {
+                auto _m5 = save();
+                if ([&]() -> bool {
+                    skip();
+                    if (!match("(")) return false;
+                    skip();
+                    if (!parse_Bind_(&idx_bind)) return false;
+                    skip();
+                    if (!match(",")) return false;
+                    skip();
+                    if (!parse_Bind_(&b)) return false;
+                    skip();
+                    if (!match(")")) return false;
+                    return true;
+                }()) {} else {
+                restore(_m5);
+                skip();
+                if (!parse_Bind_(&b)) return false;
+                }
+            }
             skip();
             if (!match("in")) return false;
+            {
+                auto _m6 = save();
+                bool _ok6 = [&]() -> bool {
+                    if (at_end() || !is_ident_continue(peek())) return false;
+                    advance();
+                    return true;
+                }();
+                restore(_m6);
+                if (_ok6) return false;
+            }
             skip();
             if (!parse_Expr_(&e)) return false;
             skip();
             if (!parse_Block_(body)) return false;
-            auto* s = new DdcgAst::ForStmt(b, e, std::move(body));
+            auto* s = new DdcgAst::ForStmt(b,
+             idx_bind ? std::optional<DdcgAst::Bind*>(idx_bind) : std::nullopt,
+             e, std::move(body));
+         s->loc = Loc();
+         stmts.push_back(s);
+            return true;
+        }()) {} else {
+        restore(_m0);
+        if ([&]() -> bool {
+            skip();
+            if (!match("if")) return false;
+            {
+                auto _m7 = save();
+                bool _ok7 = [&]() -> bool {
+                    if (at_end() || !is_ident_continue(peek())) return false;
+                    advance();
+                    return true;
+                }();
+                restore(_m7);
+                if (_ok7) return false;
+            }
+            skip();
+            if (!parse_Expr_(&e)) return false;
+            skip();
+            if (!parse_Block_(body)) return false;
+            {
+                auto _m8 = save();
+                if (![&]() -> bool {
+                    skip();
+                    if (!match("else")) return false;
+                    {
+                        auto _m9 = save();
+                        bool _ok9 = [&]() -> bool {
+                            if (at_end() || !is_ident_continue(peek())) return false;
+                            advance();
+                            return true;
+                        }();
+                        restore(_m9);
+                        if (_ok9) return false;
+                    }
+                    skip();
+                    if (!parse_Block_(else_body)) return false;
+                    return true;
+                }()) restore(_m8);
+            }
+            auto* s = new DdcgAst::IfStmt(e, std::move(body), std::move(else_body));
          s->loc = Loc();
          stmts.push_back(s);
             return true;
@@ -1009,6 +1227,16 @@ bool Parser::parse_Stmt_(std::vector<DdcgAst::Stmt*>& stmts) {
         if ([&]() -> bool {
             skip();
             if (!match("label")) return false;
+            {
+                auto _m10 = save();
+                bool _ok10 = [&]() -> bool {
+                    if (at_end() || !is_ident_continue(peek())) return false;
+                    advance();
+                    return true;
+                }();
+                restore(_m10);
+                if (_ok10) return false;
+            }
             skip();
             if (!ident(name_span)) return false;
             name = name_span.to_string();
@@ -1043,6 +1271,7 @@ bool Parser::parse_Stmt_(std::vector<DdcgAst::Stmt*>& stmts) {
         auto* s = new DdcgAst::ExprStmt(e);
          s->loc = Loc();
          stmts.push_back(s);
+        }
         }
         }
         }
@@ -1119,6 +1348,16 @@ bool Parser::parse_LogicalOr(DdcgAst::Expr* * result) {
         if (![&]() -> bool {
             skip();
             if (!match("or")) return false;
+            {
+                auto _m1 = save();
+                bool _ok1 = [&]() -> bool {
+                    if (at_end() || !is_ident_continue(peek())) return false;
+                    advance();
+                    return true;
+                }();
+                restore(_m1);
+                if (_ok1) return false;
+            }
             skip();
             if (!parse_LogicalAnd(&rhs)) return false;
             auto* b = new DdcgAst::BinOp("or", *result, rhs);
@@ -1139,6 +1378,16 @@ bool Parser::parse_LogicalAnd(DdcgAst::Expr* * result) {
         if (![&]() -> bool {
             skip();
             if (!match("and")) return false;
+            {
+                auto _m1 = save();
+                bool _ok1 = [&]() -> bool {
+                    if (at_end() || !is_ident_continue(peek())) return false;
+                    advance();
+                    return true;
+                }();
+                restore(_m1);
+                if (_ok1) return false;
+            }
             skip();
             if (!parse_Equality(&rhs)) return false;
             auto* b = new DdcgAst::BinOp("and", *result, rhs);
@@ -1305,6 +1554,16 @@ bool Parser::parse_Unary(DdcgAst::Expr* * result) {
         if ([&]() -> bool {
             skip();
             if (!match("not")) return false;
+            {
+                auto _m1 = save();
+                bool _ok1 = [&]() -> bool {
+                    if (at_end() || !is_ident_continue(peek())) return false;
+                    advance();
+                    return true;
+                }();
+                restore(_m1);
+                if (_ok1) return false;
+            }
             skip();
             if (!parse_Unary(&operand)) return false;
             auto* u = new DdcgAst::UnaryOp("not", operand);
@@ -1404,6 +1663,16 @@ bool Parser::parse_Postfix(DdcgAst::Expr* * result) {
                 restore(_m1);
                 skip();
                 if (!match("with")) return false;
+                {
+                    auto _m4 = save();
+                    bool _ok4 = [&]() -> bool {
+                        if (at_end() || !is_ident_continue(peek())) return false;
+                        advance();
+                        return true;
+                    }();
+                    restore(_m4);
+                    if (_ok4) return false;
+                }
                 skip();
                 if (!ident(field_span)) return false;
                 field = field_span.to_string();
@@ -1433,6 +1702,7 @@ bool Parser::parse_Primary(DdcgAst::Expr* * result) {
        DdcgAst::Expr* subj = nullptr;
        DdcgAst::Expr* arg = nullptr;
        std::vector<DdcgAst::Expr*> gen_args;
+       std::vector<DdcgAst::Stmt*> block_body;
        std::vector<DdcgAst::MatchArm*> arms;
        peg::Span schema_span; peg::Span ctor_span;
        std::string schema_name; std::string ctor_name;
@@ -1441,6 +1711,16 @@ bool Parser::parse_Primary(DdcgAst::Expr* * result) {
         if ([&]() -> bool {
             skip();
             if (!match("true")) return false;
+            {
+                auto _m1 = save();
+                bool _ok1 = [&]() -> bool {
+                    if (at_end() || !is_ident_continue(peek())) return false;
+                    advance();
+                    return true;
+                }();
+                restore(_m1);
+                if (_ok1) return false;
+            }
             auto* b = new DdcgAst::BoolLit(true);
          b->loc = Loc();
          *result = b;
@@ -1450,6 +1730,16 @@ bool Parser::parse_Primary(DdcgAst::Expr* * result) {
         if ([&]() -> bool {
             skip();
             if (!match("false")) return false;
+            {
+                auto _m2 = save();
+                bool _ok2 = [&]() -> bool {
+                    if (at_end() || !is_ident_continue(peek())) return false;
+                    advance();
+                    return true;
+                }();
+                restore(_m2);
+                if (_ok2) return false;
+            }
             auto* b = new DdcgAst::BoolLit(false);
          b->loc = Loc();
          *result = b;
@@ -1459,6 +1749,16 @@ bool Parser::parse_Primary(DdcgAst::Expr* * result) {
         if ([&]() -> bool {
             skip();
             if (!match("nil")) return false;
+            {
+                auto _m3 = save();
+                bool _ok3 = [&]() -> bool {
+                    if (at_end() || !is_ident_continue(peek())) return false;
+                    advance();
+                    return true;
+                }();
+                restore(_m3);
+                if (_ok3) return false;
+            }
             auto* n = new DdcgAst::NilLit();
          n->loc = Loc();
          *result = n;
@@ -1468,12 +1768,22 @@ bool Parser::parse_Primary(DdcgAst::Expr* * result) {
         if ([&]() -> bool {
             skip();
             if (!match("gen")) return false;
+            {
+                auto _m4 = save();
+                bool _ok4 = [&]() -> bool {
+                    if (at_end() || !is_ident_continue(peek())) return false;
+                    advance();
+                    return true;
+                }();
+                restore(_m4);
+                if (_ok4) return false;
+            }
             skip();
             if (!match("(")) return false;
             skip();
             if (!parse_Expr_(&subj)) return false;
             for (;;) {
-                auto _m1 = save();
+                auto _m5 = save();
                 if (![&]() -> bool {
                     skip();
                     if (!match(",")) return false;
@@ -1481,7 +1791,7 @@ bool Parser::parse_Primary(DdcgAst::Expr* * result) {
                     if (!parse_Expr_(&arg)) return false;
                     gen_args.push_back(arg);
                     return true;
-                }()) { restore(_m1); break; }
+                }()) { restore(_m5); break; }
             }
             skip();
             if (!match(")")) return false;
@@ -1494,6 +1804,16 @@ bool Parser::parse_Primary(DdcgAst::Expr* * result) {
         if ([&]() -> bool {
             skip();
             if (!match("match")) return false;
+            {
+                auto _m6 = save();
+                bool _ok6 = [&]() -> bool {
+                    if (at_end() || !is_ident_continue(peek())) return false;
+                    advance();
+                    return true;
+                }();
+                restore(_m6);
+                if (_ok6) return false;
+            }
             skip();
             if (!match("(")) return false;
             skip();
@@ -1505,14 +1825,14 @@ bool Parser::parse_Primary(DdcgAst::Expr* * result) {
             skip();
             if (!parse_MatchArm_(arms)) return false;
             for (;;) {
-                auto _m2 = save();
+                auto _m7 = save();
                 if (![&]() -> bool {
                     skip();
                     if (!match("|")) return false;
                     skip();
                     if (!parse_MatchArm_(arms)) return false;
                     return true;
-                }()) { restore(_m2); break; }
+                }()) { restore(_m7); break; }
             }
             skip();
             if (!match("}")) return false;
@@ -1525,6 +1845,16 @@ bool Parser::parse_Primary(DdcgAst::Expr* * result) {
         if ([&]() -> bool {
             skip();
             if (!match("build")) return false;
+            {
+                auto _m8 = save();
+                bool _ok8 = [&]() -> bool {
+                    if (at_end() || !is_ident_continue(peek())) return false;
+                    advance();
+                    return true;
+                }();
+                restore(_m8);
+                if (_ok8) return false;
+            }
             skip();
             if (!ident(schema_span)) return false;
             schema_name = schema_span.to_string();
@@ -1536,13 +1866,13 @@ bool Parser::parse_Primary(DdcgAst::Expr* * result) {
             skip();
             if (!match("(")) return false;
             {
-                auto _m3 = save();
+                auto _m9 = save();
                 if (![&]() -> bool {
                     skip();
                     if (!parse_Expr_(&elem)) return false;
                     elems.push_back(elem);
                     for (;;) {
-                        auto _m4 = save();
+                        auto _m10 = save();
                         if (![&]() -> bool {
                             skip();
                             if (!match(",")) return false;
@@ -1550,10 +1880,10 @@ bool Parser::parse_Primary(DdcgAst::Expr* * result) {
                             if (!parse_Expr_(&elem)) return false;
                             elems.push_back(elem);
                             return true;
-                        }()) { restore(_m4); break; }
+                        }()) { restore(_m10); break; }
                     }
                     return true;
-                }()) restore(_m3);
+                }()) restore(_m9);
             }
             skip();
             if (!match(")")) return false;
@@ -1588,13 +1918,13 @@ bool Parser::parse_Primary(DdcgAst::Expr* * result) {
             skip();
             if (!match("[")) return false;
             {
-                auto _m5 = save();
+                auto _m11 = save();
                 if (![&]() -> bool {
                     skip();
                     if (!parse_Expr_(&elem)) return false;
                     elems.push_back(elem);
                     for (;;) {
-                        auto _m6 = save();
+                        auto _m12 = save();
                         if (![&]() -> bool {
                             skip();
                             if (!match(",")) return false;
@@ -1602,16 +1932,25 @@ bool Parser::parse_Primary(DdcgAst::Expr* * result) {
                             if (!parse_Expr_(&elem)) return false;
                             elems.push_back(elem);
                             return true;
-                        }()) { restore(_m6); break; }
+                        }()) { restore(_m12); break; }
                     }
                     return true;
-                }()) restore(_m5);
+                }()) restore(_m11);
             }
             skip();
             if (!match("]")) return false;
             auto* l = new DdcgAst::ListLit(std::move(elems));
          l->loc = Loc();
          *result = l;
+            return true;
+        }()) {} else {
+        restore(_m0);
+        if ([&]() -> bool {
+            skip();
+            if (!parse_Block_(block_body)) return false;
+            auto* be = new DdcgAst::BlockExpr(std::move(block_body));
+         be->loc = Loc();
+         *result = be;
             return true;
         }()) {} else {
         restore(_m0);
@@ -1632,7 +1971,7 @@ bool Parser::parse_Primary(DdcgAst::Expr* * result) {
                 if (!parse_Expr_(&elem)) return false;
                 elems.push_back(inner); elems.push_back(elem);
                 for (;;) {
-                    auto _m7 = save();
+                    auto _m13 = save();
                     if (![&]() -> bool {
                         skip();
                         if (!match(",")) return false;
@@ -1640,7 +1979,7 @@ bool Parser::parse_Primary(DdcgAst::Expr* * result) {
                         if (!parse_Expr_(&elem)) return false;
                         elems.push_back(elem);
                         return true;
-                    }()) { restore(_m7); break; }
+                    }()) { restore(_m13); break; }
                 }
                 skip();
                 if (!match(")")) return false;
@@ -1657,6 +1996,7 @@ bool Parser::parse_Primary(DdcgAst::Expr* * result) {
         auto* id = new DdcgAst::IdentExpr(std::move(name));
          id->loc = Loc();
          *result = id;
+        }
         }
         }
         }

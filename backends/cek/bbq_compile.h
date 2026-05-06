@@ -59,8 +59,14 @@
    inline gamma_t pair(bbq::cek::StaticKont* Lt, bbq::cek::StaticKont* Lf)            { return {GammaTag::Pair, nullptr, Lt,      Lf}; }
    inline gamma_t ret()                                                                { return {GammaTag::Ret,  nullptr, nullptr, nullptr}; }
 
-   // ρ — paper environment. BBQ has no break label, so ρ is empty.
-   struct rho_t {};
+   // ρ — current-field scope. Field rules construct in_field(name)
+   // before recursing into the field body; the array element rule
+   // shadows it with anon() before recursing into the element type.
+   // intern_field_or_anon(r) reads the name out for kont emission.
+   enum class RhoTag : unsigned char { Anon, InField };
+   struct rho_t { RhoTag tag; const char* name; };
+   inline rho_t anon()                        { return {RhoTag::Anon, nullptr}; }
+   inline rho_t in_field(const char* n)       { return {RhoTag::InField, n}; }
 
    } // namespace bbq
 
@@ -115,7 +121,7 @@ public:
             auto* exit_kont = make_return_rule(halt);
             auto* exit_static = static_cast<bbq::cek::StaticKont*>(exit_kont);
 
-            ::bbq::rho_t rho{};
+            ::bbq::rho_t rho = ::bbq::anon();
             bbq::cek::StaticKont* body_head = nullptr;
             if (auto* st = dynamic_cast<BBQ::Struct*>(rule->body)) {
                 body_head = compile_fields(st->fields, exit_static);
@@ -189,11 +195,6 @@ private:
     // unknown name before we get here, so unresolved entries indicate
     // a Sema/compiler invariant violation and abort.
     std::vector<std::pair<bbq::cek::KontNode**, std::string>> pending_patches_;
-
-    // Currently-compiling field name — set by the Field rule before
-    // recursing into its body, read by Primitive/MatchBytes/Compute
-    // when they need to bind.
-    const char* current_field_name_ = nullptr;
 
     // ddcgc-generated dispatch threads `current_loc` from each AST
     // node it traverses (via `current_loc = node->loc`). Type matches
@@ -543,19 +544,16 @@ private:
         array_next->end_node = end_kont;
         array_next->body_entry = nullptr;  // patched below
 
-        // Array name comes from the enclosing field (e.g. "items" for
-        // `items: array<uint16>[n]`); the elements themselves are
-        // anonymous, so clear current_field_name_ before recursing
-        // into the element body. Restore after.
-        const char* array_name = current_field_name_;
-        current_field_name_ = nullptr;
+        // Array name comes from the enclosing field's ρ frame
+        // (e.g. "items" for `items: array<uint16>[n]`); the elements
+        // themselves are anonymous, so recurse with anon().
+        std::string array_name = intern_field_or_anon(r);
         bbq::cek::StaticKont* body_head = compile_type_expr(
-            element, r, ::bbq::effect(),
+            element, ::bbq::anon(), ::bbq::effect(),
             ::bbq::jump(array_next), array_next);
-        current_field_name_ = array_name;
         array_next->body_entry = body_head;
 
-        return make_begin_array(intern_field_or_anon(), mode,
+        return make_begin_array(array_name, mode,
                                 count_expr, end_kont, body_head);
     }
 
@@ -643,17 +641,19 @@ private:
                 // a defensive default.
                 length_expr = make_int_lit(0);
             }
-            return make_match_bytes(intern_field_or_anon(),
+            return make_match_bytes(intern_field_or_anon(r),
                                     length_expr, is_string, tail);
         }
 
         // Other primitives → MatchPrimitive.
         bbq::cek::PrimitiveInfo prim = to_prim_info(kind);
-        return make_match_primitive(intern_field_or_anon(), prim, tail);
+        return make_match_primitive(intern_field_or_anon(r), prim, tail);
     }
 
-    std::string intern_field_or_anon() {
-        return current_field_name_ ? std::string(current_field_name_) : std::string();
+    std::string intern_field_or_anon(::bbq::rho_t r) {
+        if (r.tag == ::bbq::RhoTag::InField && r.name)
+            return std::string(r.name);
+        return std::string();
     }
 
     bbq::cek::StaticKont* make_ref_or_builtin(const std::string& n) {
@@ -687,17 +687,15 @@ private:
     bbq::cek::StaticKont*
     compile_fields(std::vector<BBQ::Field*> fields, bbq::cek::StaticKont* tail) {
         // Compile fields in reverse so each field's `next` chains to
-        // the already-compiled tail. Each field's body uses the field
-        // name via current_field_name_; rho carries the same.
+        // the already-compiled tail. Each field body sees its own ρ
+        // frame in_field(name); recursion's lexical scope handles the
+        // implicit "restore" — no manual save/restore needed.
         bbq::cek::StaticKont* chain = tail;
         for (auto it = fields.rbegin(); it != fields.rend(); ++it) {
             BBQ::Field* f = *it;
-            const char* prev_name = current_field_name_;
-            current_field_name_ = f->name.c_str();
-            ::bbq::rho_t r{};
-            chain = compile_type_expr(f->body, r, ::bbq::effect(),
-                                      ::bbq::jump(chain), chain);
-            current_field_name_ = prev_name;
+            chain = compile_type_expr(
+                f->body, ::bbq::in_field(f->name.c_str()),
+                ::bbq::effect(), ::bbq::jump(chain), chain);
         }
         return chain;
     }
@@ -1109,7 +1107,7 @@ private:
             auto fs = _n0->fields;
             bbq_ir::StaticKont* end_kont = make_end_struct(Lnext);
             bbq_ir::StaticKont* fields_chain = compile_fields(fs, end_kont);
-            return cg_deliver(make_begin_struct(intern_field_or_anon(), fields_chain), delta, gamma, Lnext);
+            return cg_deliver(make_begin_struct(intern_field_or_anon(rho), fields_chain), delta, gamma, Lnext);
         }
         if (auto* _n0 = dynamic_cast<BBQ::Primitive*>(node)) {
             auto k = _n0->kind;
@@ -1121,16 +1119,16 @@ private:
             auto n = _n0->name;
             bbq_ir::StaticKont* end_st = make_end_struct(Lnext);
             bbq_ir::StaticKont* invoke = make_invoke_rule(n, end_st);
-            return cg_deliver(make_begin_struct(intern_field_or_anon(), invoke), delta, gamma, Lnext);
+            return cg_deliver(make_begin_struct(intern_field_or_anon(rho), invoke), delta, gamma, Lnext);
         }
         if (auto* _n0 = dynamic_cast<BBQ::Compute*>(node)) {
             auto e = _n0->expression;
             bbq_ir::StaticKont* expr_ir = compile_expr(e, rho, ac(), jump(Lnext), Lnext);
-            return cg_deliver(make_bind_compute(intern_field_or_anon(), expr_ir, Lnext), delta, gamma, Lnext);
+            return cg_deliver(make_bind_compute(intern_field_or_anon(rho), expr_ir, Lnext), delta, gamma, Lnext);
         }
         if (auto* _n0 = dynamic_cast<BBQ::Extern*>(node)) {
             auto f = _n0->func_name;
-            return cg_deliver(make_external_call(f, intern_field_or_anon(), Lnext), delta, gamma, Lnext);
+            return cg_deliver(make_external_call(f, intern_field_or_anon(rho), Lnext), delta, gamma, Lnext);
         }
         if (auto* _n0 = dynamic_cast<BBQ::EndianSwitch*>(node)) {
             auto e = _n0->endian_expr;

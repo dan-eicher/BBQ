@@ -135,7 +135,7 @@ DestEntry <. std::vector<DdcgAst::DestDecl*> &dests, DdcgAst::TypeRef* &ir_root 
        std::vector<DdcgAst::DestVariant*> variants;
        std::vector<DdcgAst::DestField*> fields;
        DdcgAst::TypeRef* ty = nullptr; .)
-    = "data_dest"
+    = "data_dest" !ident_continue
       ident<name_span>            (. name = name_span.to_string(); .)
       "{"
       VariantList<variants>
@@ -143,7 +143,7 @@ DestEntry <. std::vector<DdcgAst::DestDecl*> &dests, DdcgAst::TypeRef* &ir_root 
       (. auto* d = new DdcgAst::DataDest(std::move(name), std::move(variants));
          d->loc = Loc();
          dests.push_back(d); .)
-    | "ctrl_dest"
+    | "ctrl_dest" !ident_continue
       ident<name_span>            (. name = name_span.to_string(); .)
       "{"
       VariantList<variants>
@@ -151,17 +151,23 @@ DestEntry <. std::vector<DdcgAst::DestDecl*> &dests, DdcgAst::TypeRef* &ir_root 
       (. auto* d = new DdcgAst::CtrlDest(std::move(name), std::move(variants));
          d->loc = Loc();
          dests.push_back(d); .)
-    | "env_dest"
+    | "env_dest" !ident_continue
       ident<name_span>            (. name = name_span.to_string(); .)
       "{"
-      [ DestFieldDecl<fields>
-        { "," DestFieldDecl<fields> }
-      ]
+      VariantList<variants>
       "}"
-      (. auto* d = new DdcgAst::EnvDest(std::move(name), std::move(fields));
+      (. auto* d = new DdcgAst::EnvDest(std::move(name), std::move(variants));
          d->loc = Loc();
          dests.push_back(d); .)
-    | "ir_root"
+    | "sum" !ident_continue
+      ident<name_span>            (. name = name_span.to_string(); .)
+      "{"
+      VariantList<variants>
+      "}"
+      (. auto* d = new DdcgAst::Sum(std::move(name), std::move(variants));
+         d->loc = Loc();
+         dests.push_back(d); .)
+    | "ir_root" !ident_continue
       TypeRef_<&ty>
       (. ir_root = ty; .)
 .
@@ -226,7 +232,7 @@ PredicateDecl <. std::vector<DdcgAst::Pred*> &predicates .>
       [ TypeRefList<params> ]
       ")"
       "->"
-      "bool"
+      "bool" !ident_continue
       (. auto* p = new DdcgAst::Pred(std::move(name), std::move(params));
          p->loc = Loc();
          predicates.push_back(p); .)
@@ -248,7 +254,7 @@ FunDecl <. std::vector<DdcgAst::Fun*> &funs .>
        std::vector<DdcgAst::FunParam*> params;
        DdcgAst::TypeRef* ret = nullptr;
        std::vector<DdcgAst::Stmt*> body; .)
-    = "fun"
+    = "fun" !ident_continue
       ident<name_span>            (. name = name_span.to_string(); .)
       "("
       [ FunParamDecl<params>
@@ -279,7 +285,7 @@ FunParamDecl <. std::vector<DdcgAst::FunParam*> &params .>
 // parse; the AST just records the path as written.
 LibraryImport <. std::vector<DdcgAst::LibraryImport*> &libraries .>
     (. peg::Span path_span; std::string path; .)
-    = "import"
+    = "import" !ident_continue
       string_lit<path_span>       (. path = peg::unescape_string_lit(path_span); .)
       (. auto* l = new DdcgAst::LibraryImport(std::move(path));
          l->loc = Loc();
@@ -302,14 +308,14 @@ TypeRef_ <. DdcgAst::TypeRef* *result .>
        std::vector<DdcgAst::TypeRef*> elems;
        DdcgAst::TypeRef* inner = nullptr;
        bool is_ptr = false; .)
-    = "list"
+    = "list" !ident_continue
       "<"
       TypeRef_<&inner>
       ">"
       (. auto* t = new DdcgAst::TypeList(inner);
          t->loc = Loc();
          *result = t; .)
-    | "tuple"
+    | "tuple" !ident_continue
       "<"
       TypeRef_<&inner>            (. elems.push_back(inner); .)
       { "," TypeRef_<&inner>      (. elems.push_back(inner); .) }
@@ -338,12 +344,12 @@ RuleDecl <. std::vector<DdcgAst::Rule*> &rules .>
        DdcgAst::Pattern* p = nullptr;
        DdcgAst::Expr* guard = nullptr;
        std::vector<DdcgAst::Stmt*> body; .)
-    = "rule"
+    = "rule" !ident_continue
       ident<name_span>            (. name = name_span.to_string(); .)
       ":"
       Pattern_<&p>                (. heads.push_back(p); .)
       { "," Pattern_<&p>          (. heads.push_back(p); .) }
-      [ "where" Expr_<&guard> ]
+      [ "where" !ident_continue Expr_<&guard> ]
       Block_<body>
       (. auto* r = new DdcgAst::Rule(std::move(heads),
              guard ? std::optional<DdcgAst::Expr*>(guard) : std::nullopt,
@@ -467,9 +473,11 @@ Stmt_ <. std::vector<DdcgAst::Stmt*> &stmts .>
     (. peg::Span name_span; std::string name;
        std::vector<DdcgAst::Bind*> binds;
        DdcgAst::Bind* b = nullptr;
+       DdcgAst::Bind* idx_bind = nullptr;
        DdcgAst::Expr* e = nullptr;
-       std::vector<DdcgAst::Stmt*> body; .)
-    = "let"
+       std::vector<DdcgAst::Stmt*> body;
+       std::vector<DdcgAst::Stmt*> else_body; .)
+    = "let" !ident_continue
       ( "("
         Bind_<&b>                 (. binds.push_back(b); .)
         { "," Bind_<&b>           (. binds.push_back(b); .) }
@@ -482,15 +490,32 @@ Stmt_ <. std::vector<DdcgAst::Stmt*> &stmts .>
       (. auto* s = new DdcgAst::LetStmt(std::move(binds), e);
          s->loc = Loc();
          stmts.push_back(s); .)
-    | "for"
-      Bind_<&b>
-      "in"
+    | "for" !ident_continue
+      ( "("                                       // for (i, x) in xs — indexed
+        Bind_<&idx_bind>
+        ","
+        Bind_<&b>
+        ")"
+      | Bind_<&b>                                 // for x in xs — element only
+      )
+      "in" !ident_continue
       Expr_<&e>
       Block_<body>
-      (. auto* s = new DdcgAst::ForStmt(b, e, std::move(body));
+      (. auto* s = new DdcgAst::ForStmt(b,
+             idx_bind ? std::optional<DdcgAst::Bind*>(idx_bind) : std::nullopt,
+             e, std::move(body));
          s->loc = Loc();
          stmts.push_back(s); .)
-    | "label"
+    | "if" !ident_continue
+      Expr_<&e>
+      Block_<body>
+      [ "else" !ident_continue
+        Block_<else_body>
+      ]
+      (. auto* s = new DdcgAst::IfStmt(e, std::move(body), std::move(else_body));
+         s->loc = Loc();
+         stmts.push_back(s); .)
+    | "label" !ident_continue
       ident<name_span>            (. name = name_span.to_string(); .)
       ";"
       (. auto* s = new DdcgAst::LabelStmt(std::move(name));
@@ -555,7 +580,7 @@ TernaryExpr <. DdcgAst::Expr* *result .>
 LogicalOr <. DdcgAst::Expr* *result .>
     (. DdcgAst::Expr* rhs = nullptr; .)
     = LogicalAnd<result>
-      { "or"
+      { "or" !ident_continue
         LogicalAnd<&rhs>
         (. auto* b = new DdcgAst::BinOp("or", *result, rhs);
            b->loc = rhs->loc;
@@ -566,7 +591,7 @@ LogicalOr <. DdcgAst::Expr* *result .>
 LogicalAnd <. DdcgAst::Expr* *result .>
     (. DdcgAst::Expr* rhs = nullptr; .)
     = Equality<result>
-      { "and"
+      { "and" !ident_continue
         Equality<&rhs>
         (. auto* b = new DdcgAst::BinOp("and", *result, rhs);
            b->loc = rhs->loc;
@@ -655,7 +680,7 @@ Multiplicative <. DdcgAst::Expr* *result .>
 
 Unary <. DdcgAst::Expr* *result .>
     (. DdcgAst::Expr* operand = nullptr; .)
-    = "not"
+    = "not" !ident_continue
       Unary<&operand>
       (. auto* u = new DdcgAst::UnaryOp("not", operand);
          u->loc = operand->loc;
@@ -695,7 +720,7 @@ Postfix <. DdcgAst::Expr* *result .>
         (. auto* x = new DdcgAst::IndexAccExpr(*result, idx);
            x->loc = (*result)->loc;
            *result = x; .)
-      | "with"
+      | "with" !ident_continue
         ident<field_span>         (. field = field_span.to_string(); .)
         ":="
         Expr_<&with_val>
@@ -714,18 +739,19 @@ Primary <. DdcgAst::Expr* *result .>
        DdcgAst::Expr* subj = nullptr;
        DdcgAst::Expr* arg = nullptr;
        std::vector<DdcgAst::Expr*> gen_args;
+       std::vector<DdcgAst::Stmt*> block_body;
        std::vector<DdcgAst::MatchArm*> arms;
        peg::Span schema_span; peg::Span ctor_span;
        std::string schema_name; std::string ctor_name; .)
-    = "true"
+    = "true" !ident_continue
       (. auto* b = new DdcgAst::BoolLit(true);
          b->loc = Loc();
          *result = b; .)
-    | "false"
+    | "false" !ident_continue
       (. auto* b = new DdcgAst::BoolLit(false);
          b->loc = Loc();
          *result = b; .)
-    | "nil"
+    | "nil" !ident_continue
       (. auto* n = new DdcgAst::NilLit();
          n->loc = Loc();
          *result = n; .)
@@ -734,7 +760,7 @@ Primary <. DdcgAst::Expr* *result .>
     // implicit ctx; δ and γ are explicit. Both must be provided so
     // recursive calls can vary δ (e.g. paper's binop spilling sub-
     // expressions into the accumulator with δ = ac while γ inherits).
-    | "gen"
+    | "gen" !ident_continue
       "("
       Expr_<&subj>
       { "," Expr_<&arg>            (. gen_args.push_back(arg); .) }
@@ -745,7 +771,7 @@ Primary <. DdcgAst::Expr* *result .>
     // match (subject) { pat => body | pat => body | ... }
     // Body is a stmt block (same shape as fun/rule bodies); the
     // trailing ExprStmt produces the arm's value.
-    | "match"
+    | "match" !ident_continue
       "("
       Expr_<&subj>
       ")"
@@ -758,7 +784,7 @@ Primary <. DdcgAst::Expr* *result .>
          *result = m; .)
     // build Schema.Constructor(args) — construct a schema value.
     // Lowers to `new Namespace::Ctor(args)` in the C++ backend.
-    | "build"
+    | "build" !ident_continue
       ident<schema_span>          (. schema_name = schema_span.to_string(); .)
       "."
       ident<ctor_span>            (. ctor_name = ctor_span.to_string(); .)
@@ -789,6 +815,10 @@ Primary <. DdcgAst::Expr* *result .>
       (. auto* l = new DdcgAst::ListLit(std::move(elems));
          l->loc = Loc();
          *result = l; .)
+    | Block_<block_body>
+      (. auto* be = new DdcgAst::BlockExpr(std::move(block_body));
+         be->loc = Loc();
+         *result = be; .)
     | "("
       Expr_<&inner>
       ( ")"

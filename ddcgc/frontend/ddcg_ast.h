@@ -46,6 +46,7 @@ struct Import;
 struct DataDest;
 struct CtrlDest;
 struct EnvDest;
+struct Sum;
 struct DestVariant;
 struct DestField;
 struct Aux;
@@ -68,6 +69,7 @@ struct RestFieldPat;
 struct LetStmt;
 struct MutAssign;
 struct ForStmt;
+struct IfStmt;
 struct LabelStmt;
 struct ExprStmt;
 struct SimpleBind;
@@ -88,6 +90,7 @@ struct TupleLit;
 struct DestPattern;
 struct GenCall;
 struct MatchExpr;
+struct BlockExpr;
 struct BuildExpr;
 struct WithExpr;
 struct MatchArm;
@@ -168,6 +171,7 @@ struct ASTVisitor {
     virtual void visit(DataDest* node) {}
     virtual void visit(CtrlDest* node) {}
     virtual void visit(EnvDest* node) {}
+    virtual void visit(Sum* node) {}
     virtual void visit(DestVariant* node) {}
     virtual void visit(DestField* node) {}
     virtual void visit(Aux* node) {}
@@ -190,6 +194,7 @@ struct ASTVisitor {
     virtual void visit(LetStmt* node) {}
     virtual void visit(MutAssign* node) {}
     virtual void visit(ForStmt* node) {}
+    virtual void visit(IfStmt* node) {}
     virtual void visit(LabelStmt* node) {}
     virtual void visit(ExprStmt* node) {}
     virtual void visit(SimpleBind* node) {}
@@ -210,6 +215,7 @@ struct ASTVisitor {
     virtual void visit(DestPattern* node) {}
     virtual void visit(GenCall* node) {}
     virtual void visit(MatchExpr* node) {}
+    virtual void visit(BlockExpr* node) {}
     virtual void visit(BuildExpr* node) {}
     virtual void visit(WithExpr* node) {}
     virtual void visit(MatchArm* node) {}
@@ -331,14 +337,27 @@ struct CtrlDest : public DestDecl {
 struct EnvDest : public DestDecl {
     EnvDest(
         std::string name,
-        std::vector<DestField*> fields
+        std::vector<DestVariant*> variants
     )
-        : name(name), fields(std::move(fields)){}
+        : name(name), variants(std::move(variants)){}
 
     void accept(ASTVisitor& visitor) override { visitor.visit(this); }
 
     std::string name;
-    std::vector<DestField*> fields;
+    std::vector<DestVariant*> variants;
+};
+
+struct Sum : public DestDecl {
+    Sum(
+        std::string name,
+        std::vector<DestVariant*> variants
+    )
+        : name(name), variants(std::move(variants)){}
+
+    void accept(ASTVisitor& visitor) override { visitor.visit(this); }
+
+    std::string name;
+    std::vector<DestVariant*> variants;
 };
 
 struct DestVariant : public ASTNode {
@@ -621,16 +640,33 @@ struct MutAssign : public Stmt {
 struct ForStmt : public Stmt {
     ForStmt(
         Bind* iter,
+        std::optional<Bind*> iter_index,
         Expr* seq,
         std::vector<Stmt*> body
     )
-        : iter(iter), seq(seq), body(std::move(body)){}
+        : iter(iter), iter_index(std::move(iter_index)), seq(seq), body(std::move(body)){}
 
     void accept(ASTVisitor& visitor) override { visitor.visit(this); }
 
     Bind* iter;
+    std::optional<Bind*> iter_index;
     Expr* seq;
     std::vector<Stmt*> body;
+};
+
+struct IfStmt : public Stmt {
+    IfStmt(
+        Expr* cond,
+        std::vector<Stmt*> then_body,
+        std::vector<Stmt*> else_body
+    )
+        : cond(cond), then_body(std::move(then_body)), else_body(std::move(else_body)){}
+
+    void accept(ASTVisitor& visitor) override { visitor.visit(this); }
+
+    Expr* cond;
+    std::vector<Stmt*> then_body;
+    std::vector<Stmt*> else_body;
 };
 
 struct LabelStmt : public Stmt {
@@ -875,6 +911,17 @@ struct MatchExpr : public Expr {
 
     Expr* subject;
     std::vector<MatchArm*> arms;
+};
+
+struct BlockExpr : public Expr {
+    BlockExpr(
+        std::vector<Stmt*> body
+    )
+        : body(std::move(body)){}
+
+    void accept(ASTVisitor& visitor) override { visitor.visit(this); }
+
+    std::vector<Stmt*> body;
 };
 
 struct BuildExpr : public Expr {

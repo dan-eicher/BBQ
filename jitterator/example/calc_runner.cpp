@@ -299,7 +299,7 @@ calc_ir::Node* calc_compile(const char* input, int* main_frame_size) {
     // spine-rooted Loop — all handled uniformly by cg_deliver.
     for (auto* fn : program->functions) {
         compiler.reset_next_local(norm.function_frame_sizes[fn->name]);
-        calc::rho_t fn_rho{nullptr};
+        calc::rho_t fn_rho = calc::frame(nullptr);
         calc_ir::Node* fn_root = compiler.compile_expr(
             fn->body, fn_rho, calc::ac(), calc::ret(), nullptr);
         compiler.patch_kont(entry_nops[fn->name], fn_root);
@@ -310,7 +310,7 @@ calc_ir::Node* calc_compile(const char* input, int* main_frame_size) {
     // (which is stencil-identical to Halt — both `ret`); program
     // terminates and ctx.ac holds the result for the C-side reader.
     compiler.reset_next_local(norm.main_frame_size);
-    calc::rho_t rho{nullptr};
+    calc::rho_t rho = calc::frame(nullptr);
     calc_ir::Node* root = compiler.compile_expr(
         program->body, rho, calc::ac(), calc::ret(), nullptr);
     // Final next_local includes any case-4 spills allocated during

@@ -116,6 +116,21 @@ protected:
 
     // Per-form hooks — language-specific rule-body emission.
     std::string null_literal() const override { return "nullptr"; }
+    std::string emit_enum_value_ref(const std::string& module,
+                                    const std::string& sum,
+                                    const std::string& ctor) const override {
+        // <module>::<CamelSum>::<ctor>. Sum gets PascalCase; ctor
+        // is already in source form (asdl ctors are PascalCase by
+        // convention, no further transformation needed).
+        std::string camel_sum;
+        bool up = true;
+        for (char ch : sum) {
+            if (ch == '_') { up = true; continue; }
+            camel_sum += up ? (char)std::toupper((unsigned char)ch) : ch;
+            up = false;
+        }
+        return module + "::" + camel_sum + "::" + ctor;
+    }
     void emit_call(DdcgAst::CallExpr* c) override;
     void emit_list_concat(DdcgAst::Expr* parent,
                           DdcgAst::Expr* left,
@@ -132,6 +147,7 @@ protected:
     void emit_let_destructure(DdcgAst::LetStmt* l) override;
     void emit_for_stmt(DdcgAst::ForStmt* f) override;
     void emit_label_stmt(DdcgAst::LabelStmt* lb) override;
+    void emit_dest_pattern(DdcgAst::DestPattern* dp) override;
     int emit_match(const Schema& schema,
                    DdcgAst::ConstructorPat* cp,
                    const std::string& value_expr,
@@ -225,7 +241,8 @@ std::string CppBackend::cpp_for_typeref(DdcgAst::TypeRef* tr) {
         if (n == "ident" || n == "identifier")   return "std::string";
         if (n == "label")                        return "label_t";
         if (n == "void")                         return "void";
-        // Destination type → <name>_t (data_dest, ctrl_dest, or env_dest)
+        // Destination or user sum type → <name>_t (data_dest, ctrl_dest,
+        // env_dest, or sum decl).
         for (auto* d : file_->destinations) {
             if (auto* dd = dynamic_cast<DdcgAst::DataDest*>(d)) {
                 if (dd->name == n) return n + "_t";
@@ -233,6 +250,8 @@ std::string CppBackend::cpp_for_typeref(DdcgAst::TypeRef* tr) {
                 if (cd->name == n) return n + "_t";
             } else if (auto* ed = dynamic_cast<DdcgAst::EnvDest*>(d)) {
                 if (ed->name == n) return n + "_t";
+            } else if (auto* sd = dynamic_cast<DdcgAst::Sum*>(d)) {
+                if (sd->name == n) return n + "_t";
             }
         }
         // Schema sum/ctor — search loaded schemas. Multiple schemas
@@ -361,12 +380,14 @@ void CppBackend::emit_match_expr(DdcgAst::MatchExpr* m) {
         return r;
     };
 
-    // Subject must be a dest tagged-union (switch on .tag) or an
-    // asdl enum sum (switch on the value directly).
+    // Subject is a dest tagged-union (switch on .tag), an asdl enum
+    // sum (switch on the value directly), or a plain int (switch on
+    // the value).
     std::string dest_name;
     std::string enum_cpp;
     const Schema* enum_schema = nullptr;
     std::string enum_sum_name;
+    bool int_subject = false;
     auto it = check_->expr_types.find(m->subject);
     if (it != check_->expr_types.end()) {
         const Type& st = it->second;
@@ -380,11 +401,13 @@ void CppBackend::emit_match_expr(DdcgAst::MatchExpr* m) {
                 enum_sum_name = st.name;
                 enum_cpp = cpp_class_name(*enum_schema, st.name);
             }
+        } else if (st.kind == TypeKind::Int) {
+            int_subject = true;
         }
     }
-    if (dest_name.empty() && enum_cpp.empty()) {
-        errors_->push_back("match: subject is not a dest tagged union "
-                            "or asdl enum");
+    if (dest_name.empty() && enum_cpp.empty() && !int_subject) {
+        errors_->push_back("match: subject is not a dest tagged union, "
+                            "asdl enum, or int");
         out() << "({})";
         return;
     }
@@ -400,7 +423,7 @@ void CppBackend::emit_match_expr(DdcgAst::MatchExpr* m) {
     indent() << "auto _m = ";
     emit_expr(m->subject);
     out() << ";\n";
-    if (!enum_cpp.empty()) {
+    if (!enum_cpp.empty() || int_subject) {
         indent() << "switch (_m) {\n";
     } else {
         indent() << "switch (_m.tag) {\n";
@@ -413,6 +436,10 @@ void CppBackend::emit_match_expr(DdcgAst::MatchExpr* m) {
                 dn = dd->name; vs = dd->variants;
             } else if (auto* cd = dynamic_cast<DdcgAst::CtrlDest*>(d)) {
                 dn = cd->name; vs = cd->variants;
+            } else if (auto* ed = dynamic_cast<DdcgAst::EnvDest*>(d)) {
+                dn = ed->name; vs = ed->variants;
+            } else if (auto* sd = dynamic_cast<DdcgAst::Sum*>(d)) {
+                dn = sd->name; vs = sd->variants;
             }
             if (dn != dest_name) continue;
             for (auto* v : vs) {
@@ -431,7 +458,10 @@ void CppBackend::emit_match_expr(DdcgAst::MatchExpr* m) {
 
     for (auto* arm : m->arms) {
         indent();
-        if (auto* cp = dynamic_cast<DdcgAst::ConstructorPat*>(arm->pat);
+        if (auto* ip = dynamic_cast<DdcgAst::IntPat*>(arm->pat)) {
+            out() << "case " << ip->value << ": {\n";
+            indent_depth_++;
+        } else if (auto* cp = dynamic_cast<DdcgAst::ConstructorPat*>(arm->pat);
             cp && cp->module.empty()) {
             out() << "case " << tag_class << "::" << camel(cp->ctor) << ": {\n";
             indent_depth_++;
@@ -539,6 +569,28 @@ void CppBackend::emit_let_destructure(DdcgAst::LetStmt* l) {
 }
 
 void CppBackend::emit_for_stmt(DdcgAst::ForStmt* f) {
+    if (f->iter_index.has_value()) {
+        // Indexed C++ for: walk by index so we can bind both i and elem.
+        // Uses .size() (works for std::vector / span / array adapters).
+        std::string idx = "_i_" + std::to_string((uintptr_t)f % 100000);
+        indent() << "for (size_t " << idx << " = 0; " << idx
+                 << " < (";
+        emit_expr(f->seq);
+        out() << ").size(); ++" << idx << ") {\n";
+        indent_depth_++;
+        if (auto* ib = dynamic_cast<DdcgAst::SimpleBind*>(*f->iter_index)) {
+            indent() << "int " << ib->name << " = (int)" << idx << ";\n";
+        }
+        if (auto* sb = dynamic_cast<DdcgAst::SimpleBind*>(f->iter)) {
+            indent() << "auto& " << sb->name << " = (";
+            emit_expr(f->seq);
+            out() << ")[" << idx << "];\n";
+        }
+        emit_stmts(f->body, /*tail=*/false);
+        indent_depth_--;
+        indent() << "}\n";
+        return;
+    }
     indent() << "for (auto& ";
     if (auto* sb = dynamic_cast<DdcgAst::SimpleBind*>(f->iter)) {
         out() << sb->name;
@@ -552,6 +604,15 @@ void CppBackend::emit_for_stmt(DdcgAst::ForStmt* f) {
     emit_stmts(f->body, /*tail=*/false);
     indent_depth_--;
     indent() << "}\n";
+}
+
+void CppBackend::emit_dest_pattern(DdcgAst::DestPattern* dp) {
+    /* C++ dest constructors are member methods on the Compiler
+     * class — `this` carries ctx implicitly, so we emit a bare
+     * call. The user's runtime has full access to compiler state
+     * via the enclosing method. */
+    out() << dp->name;
+    emit_call_args(dp->args);
 }
 
 void CppBackend::emit_label_stmt(DdcgAst::LabelStmt* lb) {
@@ -907,7 +968,10 @@ bool emit_cpp(const DdcgAst::File* file,
               std::ostream& out,
               std::vector<std::string>& errors) {
     CppBackend backend;
-    return backend.emit(file, schemas, check, out, errors);
+    return backend.emit(file, schemas, check, out,
+                        /*out_source=*/nullptr,
+                        /*header_filename=*/std::string{},
+                        errors);
 }
 
 std::unique_ptr<Backend> create_cpp_backend() {

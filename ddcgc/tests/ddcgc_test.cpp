@@ -394,6 +394,75 @@ rule lit : ast.Lit(n: x) {cg_x(x); }
     EXPECT_TRUE(has_err_substring(r, "no rule covers constructor 'ast.Add'"));
 }
 
+TEST(TypeCheck, GuardPurityRejectsAuxCall) {
+    // Where-guards must be pure (PRED calls + pure operators only).
+    // Calling an AUX from a guard is rejected — AUXes can have side
+    // effects (state mutation, allocation) that would fire on every
+    // rule-try regardless of whether the rule wins dispatch. Almost
+    // always a bug.
+    static const char* src = R"(
+COMPILER hello
+IMPORTS
+  ast = "ast.json"
+DESTINATIONS
+  data_dest delta { effect }
+  ctrl_dest gamma { fail }
+  ir_root int
+AUXILIARIES
+  cg_x       : (int) -> int
+  side_effecting_aux : (int) -> bool
+RULES
+rule lit_bad : ast.Lit(n: x) where side_effecting_aux(x) { cg_x(x); }
+rule lit     : ast.Lit(n: x) { cg_x(x); }
+rule add     : ast.Add(left: l, right: r) {
+    let lk = gen(l, effect, fail);
+    cg_x(lk);
+}
+)";
+    auto* file = parse_ddcg(src);
+    ASSERT_NE(file, nullptr);
+    std::map<std::string, Schema> schemas{{"ast", make_tiny_schema()}};
+    auto r = check_file(file, schemas);
+    EXPECT_FALSE(r.ok());
+    bool found = false;
+    for (const auto& e : r.errors) {
+        if (e.message.find("where-guard expression must be pure") != std::string::npos) {
+            found = true; break;
+        }
+    }
+    EXPECT_TRUE(found) << "expected purity error mentioning where-guard";
+}
+
+TEST(TypeCheck, GuardPurityAcceptsPredCall) {
+    // PRED calls + pure operators are the entire allowed surface.
+    static const char* src = R"(
+COMPILER hello
+IMPORTS
+  ast = "ast.json"
+DESTINATIONS
+  data_dest delta { effect }
+  ctrl_dest gamma { fail }
+  ir_root int
+AUXILIARIES
+  cg_x : (int) -> int
+PREDICATES
+  is_zero : (int) -> bool
+RULES
+rule lit_zero : ast.Lit(n: x) where is_zero(x) { cg_x(x); }
+rule lit      : ast.Lit(n: x) { cg_x(x); }
+rule add      : ast.Add(left: l, right: r) {
+    let lk = gen(l, effect, fail);
+    cg_x(lk);
+}
+)";
+    auto* file = parse_ddcg(src);
+    ASSERT_NE(file, nullptr);
+    std::map<std::string, Schema> schemas{{"ast", make_tiny_schema()}};
+    auto r = check_file(file, schemas);
+    EXPECT_TRUE(r.ok());
+    for (const auto& e : r.errors) ADD_FAILURE() << e.message;
+}
+
 TEST(TypeCheck, OverlapWithGuardAndFallback) {
     // A guarded specialisation + an unguarded fallback for the same
     // head is the canonical overlap pattern: the warning reminds the

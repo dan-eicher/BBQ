@@ -85,7 +85,7 @@ int main() {
     ast::Add add(&lit2, &lit3);
 
     Compiler compiler;
-    rho_t rho{nullptr};
+    rho_t rho = paper_consumer::frame(nullptr);
 
     // Top-level call: paper says ρ_init, δ=ac, γ=ret. Driver compiles
     // body with γ=jump(Lnext) where Lnext is a sentinel — the peephole

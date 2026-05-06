@@ -31,19 +31,57 @@ typedef int label_t;
 typedef ast_srcloc SourceLoc;
 
 // ─── data_dest delta — paper's δ ───────────────────────────────
+//
+// Constructors take `ctx` as first arg (ddcgc's calling convention
+// for dest variants — see chained-rho-pangolin Phase 1). ctx is
+// unused here; recursive variants in real consumers use it for
+// arena allocation.
+struct kitchensink_ctx;
 typedef enum { DELTA_EFFECT, DELTA_AC, DELTA_SPILL } delta_tag_t;
 typedef struct { delta_tag_t tag; int slot; } delta_t;
-static inline delta_t effect(void)     { return (delta_t){DELTA_EFFECT, 0}; }
-static inline delta_t ac(void)         { return (delta_t){DELTA_AC, 0}; }
-static inline delta_t spill(int s)     { return (delta_t){DELTA_SPILL, s}; }
+static inline delta_t effect(struct kitchensink_ctx* ctx) {
+    (void)ctx; return (delta_t){DELTA_EFFECT, 0};
+}
+static inline delta_t ac(struct kitchensink_ctx* ctx) {
+    (void)ctx; return (delta_t){DELTA_AC, 0};
+}
+static inline delta_t spill(struct kitchensink_ctx* ctx, int s) {
+    (void)ctx; return (delta_t){DELTA_SPILL, s};
+}
 
 // ─── ctrl_dest gamma — paper's γ ───────────────────────────────
 typedef enum { GAMMA_FAIL, GAMMA_JUMP } gamma_tag_t;
 typedef struct { gamma_tag_t tag; label_t target; } gamma_t;
-static inline gamma_t fail(void)         { return (gamma_t){GAMMA_FAIL, 0}; }
-static inline gamma_t jump(label_t L)    { return (gamma_t){GAMMA_JUMP, L}; }
+static inline gamma_t fail(struct kitchensink_ctx* ctx) {
+    (void)ctx; return (gamma_t){GAMMA_FAIL, 0};
+}
+static inline gamma_t jump(struct kitchensink_ctx* ctx, label_t L) {
+    (void)ctx; return (gamma_t){GAMMA_JUMP, L};
+}
 
 // ─── env_dest rho — paper's ρ ──────────────────────────────────
-typedef struct { int depth; } rho_t;
+typedef enum { RHO_FRAME, RHO_SCOPED } rho_tag_t;
+typedef struct { rho_tag_t tag; int depth; int label; } rho_t;
+static inline rho_t frame(struct kitchensink_ctx* ctx, int d) {
+    (void)ctx; return (rho_t){RHO_FRAME, d, 0};
+}
+static inline rho_t scoped(struct kitchensink_ctx* ctx, int d, int l) {
+    (void)ctx; return (rho_t){RHO_SCOPED, d, l};
+}
+
+// ─── sum demo_op — exercises user-defined sum support ──────────
+typedef enum {
+    DEMO_OP_OPNOP, DEMO_OP_OPSTEP, DEMO_OP_OPRANGE
+} demo_op_tag_t;
+typedef struct { demo_op_tag_t tag; int delta; int lo; int hi; } demo_op_t;
+static inline demo_op_t OpNop(struct kitchensink_ctx* ctx) {
+    (void)ctx; return (demo_op_t){DEMO_OP_OPNOP, 0, 0, 0};
+}
+static inline demo_op_t OpStep(struct kitchensink_ctx* ctx, int d) {
+    (void)ctx; return (demo_op_t){DEMO_OP_OPSTEP, d, 0, 0};
+}
+static inline demo_op_t OpRange(struct kitchensink_ctx* ctx, int lo, int hi) {
+    (void)ctx; return (demo_op_t){DEMO_OP_OPRANGE, 0, lo, hi};
+}
 
 #endif

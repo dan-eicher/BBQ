@@ -54,7 +54,9 @@ COMPILER calc
    inline gamma_t ret()                                         { return {GammaTag::Ret,  nullptr, nullptr, nullptr}; }
 
    // ρ — paper environment, break-label only (locals are positional).
-   struct rho_t { calc_ir::Node* L_break; };
+   enum class RhoTag : unsigned char { Frame };
+   struct rho_t { RhoTag tag; calc_ir::Node* L_break; };
+   inline rho_t frame(calc_ir::Node* L)  { return {RhoTag::Frame, L}; }
 
    } // namespace calc
 .)

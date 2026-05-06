@@ -10,7 +10,10 @@ DESTINATIONS
   // ρ tracks recursion depth — threaded through every gen() call.
   // big_imports.ddcg supplies delta + gamma; ρ is local to big.ddcg
   // because big_imports.ddcg's funs are pure (don't touch ρ).
-  env_dest rho { depth: int }
+  // Multi-variant ρ: frame is the basic env, scoped extends it with a
+  // label. Both share `depth` so existing field-access / with-update
+  // paths in feature_demo continue to work via the common-field rule.
+  env_dest rho { frame(depth: int) | scoped(depth: int, label: int) }
   ir_root int
 
 // big_imports.ddcg supplies `delta`, `gamma`, and `trace_fire` —
@@ -28,6 +31,9 @@ AUXILIARIES
   // TupleLit constructor, and tuple-typed aux argument.
   bool_demo  : (bool) -> int
   tup_sum    : (tuple<int, int>) -> int
+
+  // Takes the matched AST node via the `node` binding.
+  inspect_node : (ast.expr) -> int
 
 PREDICATES
   is_zero       : (int) -> bool
@@ -82,6 +88,17 @@ MEMBERS (.
                         ":" + std::to_string(std::get<1>(t)));
         return std::get<0>(t) + std::get<1>(t);
     }
+    int inspect_node(big::Expr* n) {
+        // Real consumers would do sema-sidecar lookup here; we just
+        // log the runtime type tag (via dynamic_cast) to confirm we
+        // got the actual node, not just its fields.
+        const char* kind = "unknown";
+        if (dynamic_cast<big::Lit*>(n))   kind = "Lit";
+        else if (dynamic_cast<big::Add*>(n)) kind = "Add";
+        else if (dynamic_cast<big::Pair*>(n)) kind = "Pair";
+        trace.push_back(std::string("inspect_node:") + kind);
+        return 0;
+    }
 
     int log_value(target::Value* v) {
         // 0=Imm, 1=Slot — see target::Value::kind_tag().
@@ -121,6 +138,15 @@ fun delta_default(d : delta) -> int {
     };
 }
 
+// Match on multi-variant env_dest with field bindings. The scoped
+// arm uses shorthand to bind `label` and leaves `depth` unmentioned.
+fun describe_rho(r : rho) -> int {
+    match (r) {
+        frame         => trace_fire("rho_frame")
+      | scoped(label) => label
+    };
+}
+
 // One fun per untested DSL form bundled into a single sink — UnaryOp,
 // ListLit + IndexAccExpr, WithExpr, FieldAccExpr on a Dest value,
 // BoolLit, TupleLit constructor.
@@ -157,6 +183,11 @@ rule lit_zero : ast.Lit(n: x) where is_zero(x) {
 rule lit : ast.Lit(n: x) {
     trace_fire("lit");
     let _ = feature_demo(rho, x);
+    // Pass the matched AST node to an aux that needs it.
+    let _ = inspect_node(node);
+    // Exercise both rho variants: frame via feature_demo above (rho
+    // is frame(0) from main), scoped via this constructed value.
+    let _ = describe_rho(scoped(0, x));
     let _ = delta_default(spill(7));
     let (lo, hi) = cg_split(x > 100 ? 100 : x);
     cg_pick(lo, hi);

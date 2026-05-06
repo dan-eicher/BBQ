@@ -168,8 +168,11 @@ inline gamma_t pair(ir::Expr* Lt, ir::Expr* Lf)     { return {GammaTag::Pair, nu
 inline gamma_t ret()                                { return {GammaTag::Ret, nullptr, nullptr, nullptr}; }
 
 // ── env_dest rho ───────────────────────────────────────────────────
+enum class RhoTag : unsigned char { Frame };
 struct rho_t {
+    RhoTag tag;
     ir::Expr* L_break;
 };
+inline rho_t frame(ir::Expr* L)  { return {RhoTag::Frame, L}; }
 
 } // namespace paper_consumer

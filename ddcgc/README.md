@@ -86,6 +86,7 @@ IMPORTS
 DESTINATIONS
   data_dest delta { effect | ac | stack(slot: int) }   // δ — required
   ctrl_dest gamma { fail | jump(target: label) }       // γ — required
+  env_dest  rho   { anon | in_scope(name: ident) }     // ρ — optional
   ir_root   <T>                                        // primary aux return type
 
 AUXILIARIES
@@ -199,17 +200,31 @@ the second unreachable).
 
 ## DESTINATIONS
 
-ddcgc requires exactly one `data_dest` and one `ctrl_dest`. Each is a
-named tagged union; variants may be zero-arg (`effect`, `ac`, `fail`)
-or carry typed payloads (`stack(slot: int)`, `restore(save: int)`,
-`jump(target: label)`). The runtime author provides `<dest>_t` and one
-constructor function per variant at namespace scope; ddcgc emits
-zero-arg references as constructor calls (`effect()`) and typed-payload
-references as the obvious call (`stack(0)`).
+ddcgc requires exactly one `data_dest` and one `ctrl_dest`. An
+`env_dest` (paper's ρ) is optional. All three are named tagged
+unions with the same shape: variants may be zero-arg (`effect`,
+`ac`, `fail`, `anon`) or carry typed payloads (`stack(slot: int)`,
+`restore(save: int)`, `jump(target: label)`, `in_scope(name: ident)`).
 
-The `gen(subject, δ, γ, [Lnext])` call type-checks δ against the
-declared `data_dest` and γ against the declared `ctrl_dest`. The
-optional fourth argument is the paper's `Lnext` — the next-statement
+The runtime author provides `<dest>_t` and one constructor function
+per variant at namespace scope; ddcgc emits zero-arg references as
+constructor calls (`effect()`) and typed-payload references as the
+obvious call (`stack(0)`).
+
+`env_dest` carries compilation-context state (paper's ρ — variable
+scope, current-field name, loop/finally frames, etc.). Save/restore
+patterns the consumer would otherwise maintain via mutable MEMBERS
+state are expressed by extending ρ at the recursive-call site:
+```
+chain = compile(body, in_scope(field_name), δ, γ, Lnext);
+```
+The previous ρ at the call site is unchanged when the recursion
+returns — recursion's lexical scope handles the implicit "restore."
+Rule bodies and funs read scope state by matching on ρ.
+
+The `gen(subject, ρ, δ, γ, [Lnext])` call type-checks δ against the
+declared `data_dest`, γ against `ctrl_dest`, and ρ against `env_dest`.
+The optional fifth argument is the paper's `Lnext` — the next-statement
 fall-through label for redundant-jump elimination — passed verbatim
 to the recursive dispatch.
 

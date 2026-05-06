@@ -12,7 +12,7 @@
 //   COMPILER name
 //   (. headers .)            -- zero or more verbatim code blocks
 //   IMPORTS                  -- name = "path/to/schema.json"
-//   DESTINATIONS             -- data_dest, ctrl_dest declarations + ir_root
+//   DESTINATIONS             -- data_dest, ctrl_dest, env_dest decls + ir_root
 //   AUXILIARIES              -- cg_* runtime function signatures
 //   PREDICATES (optional)    -- bool-returning user functions for `where` guards
 //   RULES                    -- rule decls: pattern + optional guard + body
@@ -42,13 +42,18 @@ module DdcgAst {
     // Imports: schema bindings — `source = "..."`, `target = "..."`
     import = Import(identifier name, string path)
 
-    // Destinations: tagged-union declarations (data_dest, ctrl_dest)
-    // or flat record (env_dest, paper's ρ — no variants, just fields
-    // accessed directly). The consumer's runtime implements each as
-    // a `<name>_t` C++ type.
+    // Destinations & user sums: closed tagged-union declarations.
+    // data_dest / ctrl_dest / env_dest are the paper's δ / γ / ρ —
+    // they're privileged because rule dispatchers receive them as
+    // signature parameters. `Sum` is the user-facing variant: any
+    // closed sum the consumer wants to defunctionalise pattern-
+    // dispatch through. All four share the variant/field shape and
+    // the C/C++ tagged-union emit; the difference is purely whether
+    // the type slots into the dispatcher signature or not.
     dest_decl = DataDest(identifier name, dest_variant* variants)
               | CtrlDest(identifier name, dest_variant* variants)
-              | EnvDest(identifier name, dest_field* fields)
+              | EnvDest(identifier name, dest_variant* variants)
+              | Sum(identifier name, dest_variant* variants)
 
     dest_variant = DestVariant(identifier name, dest_field* fields)
     dest_field   = DestField(identifier name, type_ref ty)
@@ -102,7 +107,9 @@ module DdcgAst {
     // Statements inside a rule body
     stmt = LetStmt(bind* binds, expr value)                      // let x = ... | let (a, b) = ...
          | MutAssign(identifier name, expr value)                // v := expr (rebind)
-         | ForStmt(bind iter, expr seq, stmt* body)              // for v in xs: ...
+         | ForStmt(bind iter, bind? iter_index, expr seq, stmt* body)
+                                                                 // for v in xs | for (i, v) in xs
+         | IfStmt(expr cond, stmt* then_body, stmt* else_body)   // if cond {…} [else {…}]
          | LabelStmt(identifier name)                            // label L
          | ExprStmt(expr value)                                  // tail or discarded expression
 
@@ -132,6 +139,7 @@ module DdcgAst {
                                                                  // declared, or `[ρ, δ, γ, Lnext?]` when one is. Typecheck
                                                                  // disambiguates by file's destinations + args.size().
          | MatchExpr(expr subject, match_arm* arms)              // match v { pat => body | ... }
+         | BlockExpr(stmt* body)                                 // { let x = ...; tail_expr; }
          | BuildExpr(identifier schema, identifier ctor, expr* args)
                                                                  // build Schema.Ctor(args) — construct an asdl-schema value
          | WithExpr(expr base, identifier field, expr value)

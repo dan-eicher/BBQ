@@ -92,7 +92,10 @@ inline gamma_t fail()         { return {GammaTag::Fail, 0}; }
 inline gamma_t jump(int L)    { return {GammaTag::Jump, L}; }
 
 // ── env_dest rho — paper's ρ ──
-struct rho_t { int depth; };
+enum class RhoTag : unsigned char { Frame, Scoped };
+struct rho_t { RhoTag tag; int depth; int label; };
+inline rho_t frame(int d)              { return {RhoTag::Frame, d, 0}; }
+inline rho_t scoped(int d, int l)      { return {RhoTag::Scoped, d, l}; }
 
 } // namespace big
 

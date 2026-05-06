@@ -25,12 +25,19 @@ class Backend {
 public:
     virtual ~Backend() = default;
 
-    // Emit source for `file` to `out`. Returns false on emission
-    // error; appends human-readable messages to `errors`.
+    // Emit source for `file`. The C++ backend writes everything to
+    // `out_header` (header-only library: class with inline methods).
+    // The C backend writes types + extern decls + static-inline helpers
+    // to `out_header` and function definitions to `out_source`. C++
+    // callers may pass `nullptr` for out_source; C requires it non-null.
+    // Returns false on emission error; appends human-readable messages
+    // to `errors`.
     virtual bool emit(const DdcgAst::File* file,
                       const std::map<std::string, Schema>& schemas,
                       const CheckResult& check,
-                      std::ostream& out,
+                      std::ostream& out_header,
+                      std::ostream* out_source,
+                      const std::string& header_filename,
                       std::vector<std::string>& errors) = 0;
 };
 

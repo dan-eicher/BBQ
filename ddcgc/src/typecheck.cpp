@@ -264,7 +264,13 @@ Type type_from_dsl_typeref(Ctx& c, DdcgAst::TypeRef* tr) {
         if (n == "label")      return Type::label();
         if (n == "void")       return Type::voidty();
 
-        // Destination type? (data_dest, ctrl_dest, or env_dest)
+        // Closed-sum tagged-union type? (data_dest / ctrl_dest /
+        // env_dest are δ/γ/ρ; user `sum` decls are arbitrary closed
+        // sums declared in the DESTINATIONS section. All four share
+        // the Type::Dest representation — the name disambiguates and
+        // the only thing the dispatcher signature sees specially is
+        // the file-level data_dest_name / ctrl_dest_name / env_dest_
+        // name strings.)
         for (auto* d : c.file->destinations) {
             if (auto* dd = dynamic_cast<DdcgAst::DataDest*>(d)) {
                 if (dd->name == n) return Type::dest(dd->name);
@@ -272,6 +278,8 @@ Type type_from_dsl_typeref(Ctx& c, DdcgAst::TypeRef* tr) {
                 if (cd->name == n) return Type::dest(cd->name);
             } else if (auto* ed = dynamic_cast<DdcgAst::EnvDest*>(d)) {
                 if (ed->name == n) return Type::dest(ed->name);
+            } else if (auto* sd = dynamic_cast<DdcgAst::Sum*>(d)) {
+                if (sd->name == n) return Type::dest(sd->name);
             }
         }
         // Schema sum/ctor — search loaded schemas. Multiple schemas
@@ -335,6 +343,8 @@ void check_pattern(Ctx& c, DdcgAst::Pattern* pat, const Type& expected) {
                 std::vector<DdcgAst::DestVariant*> vs;
                 if (auto* dd = dynamic_cast<DdcgAst::DataDest*>(d)) vs = dd->variants;
                 else if (auto* cd = dynamic_cast<DdcgAst::CtrlDest*>(d)) vs = cd->variants;
+                else if (auto* ed = dynamic_cast<DdcgAst::EnvDest*>(d)) vs = ed->variants;
+                else if (auto* sd = dynamic_cast<DdcgAst::Sum*>(d)) vs = sd->variants;
                 for (auto* v : vs) if (v->name == cp->ctor) { variant = v; break; }
                 if (variant) break;
             }
@@ -473,6 +483,53 @@ void check_stmt(Ctx& c, DdcgAst::Stmt* s, const Type& tail_expected, bool is_tai
 void check_block(Ctx& c, const std::vector<DdcgAst::Stmt*>& body,
                   const Type& tail_expected);
 
+// Bidirectional refinement: walk expr e and re-record any
+// polymorphic empty-list literals (`[]` → list<unknown>) with the
+// concrete `expected` type. Recurses through Ternary and BlockExpr
+// since those just forward their tail's type — the empty-list site
+// is what needs the concrete element type for codegen. Stops at
+// any expression that already has a concrete type or is a
+// non-forwarding form (calls, lookups, etc.).
+inline void refine_polymorphic(Ctx& c, DdcgAst::Expr* e, const Type& expected) {
+    if (!e) return;
+    if (expected.kind != TypeKind::List) return;
+    if (expected.elems.empty() || expected.elems[0].is_unknown()) return;
+
+    // Always descend into forwarding forms (ternary/block) — their
+    // outer type may already be concrete from the other branch while
+    // an inner ListLit is still polymorphic.
+    if (auto* t = dynamic_cast<DdcgAst::TernaryExpr*>(e)) {
+        auto it = c.result->expr_types.find(e);
+        if (it != c.result->expr_types.end() && it->second.kind == TypeKind::List &&
+            (it->second.elems.empty() || it->second.elems[0].is_unknown())) {
+            it->second = expected;
+        }
+        refine_polymorphic(c, t->then_, expected);
+        refine_polymorphic(c, t->else_, expected);
+        return;
+    }
+    if (auto* be = dynamic_cast<DdcgAst::BlockExpr*>(e)) {
+        auto it = c.result->expr_types.find(e);
+        if (it != c.result->expr_types.end() && it->second.kind == TypeKind::List &&
+            (it->second.elems.empty() || it->second.elems[0].is_unknown())) {
+            it->second = expected;
+        }
+        if (!be->body.empty()) {
+            if (auto* es = dynamic_cast<DdcgAst::ExprStmt*>(be->body.back()))
+                refine_polymorphic(c, es->value, expected);
+        }
+        return;
+    }
+    auto it = c.result->expr_types.find(e);
+    if (it == c.result->expr_types.end()) return;
+    Type& cur = it->second;
+    if (cur.kind != TypeKind::List) return;
+    if (!cur.elems.empty() && !cur.elems[0].is_unknown()) return;
+    if (dynamic_cast<DdcgAst::ListLit*>(e)) {
+        cur = expected;
+    }
+}
+
 void record(Ctx& c, DdcgAst::Expr* e, Type t) {
     c.result->expr_types[e] = t;
 }
@@ -593,8 +650,37 @@ Type infer_expr(Ctx& c, DdcgAst::Expr* e) {
                 " arg(s), got 0 (use call form, e.g. " + id->name + "(...))");
             ret = Type::unknown();
         } else {
-            err(c, id->loc, "unknown name: " + id->name);
-            ret = Type::unknown();
+            // Last fallback: maybe it's an asdl enum-sum value (e.g.,
+            // DtRef from `datatype = DtByte | DtShort | DtInt | DtRef`).
+            // Walk all schemas; if exactly one enum sum has a matching
+            // ctor, type as that sum.
+            std::vector<std::pair<std::string, std::string>> matches;
+            for (const auto& [imp, schema] : *c.schemas) {
+                for (const auto& enum_sum : schema.enum_sums) {
+                    auto cit = schema.sum_constructors.find(enum_sum);
+                    if (cit == schema.sum_constructors.end()) continue;
+                    for (const auto& cn : cit->second) {
+                        if (cn == id->name) {
+                            matches.emplace_back(imp, enum_sum);
+                            break;
+                        }
+                    }
+                }
+            }
+            if (matches.size() == 1) {
+                ret = Type::schema(matches[0].first, matches[0].second);
+            } else if (matches.size() > 1) {
+                std::string msg = "ambiguous enum value '" + id->name + "': ";
+                for (size_t i = 0; i < matches.size(); ++i) {
+                    if (i) msg += ", ";
+                    msg += matches[i].first + "." + matches[i].second;
+                }
+                err(c, id->loc, msg + " (qualify with module.Name)");
+                ret = Type::unknown();
+            } else {
+                err(c, id->loc, "unknown name: " + id->name);
+                ret = Type::unknown();
+            }
         }
     }
     else if (auto* t = dynamic_cast<DdcgAst::TernaryExpr*>(e)) {
@@ -604,11 +690,27 @@ Type infer_expr(Ctx& c, DdcgAst::Expr* e) {
         }
         Type tt = infer_expr(c, t->then_);
         Type ft = infer_expr(c, t->else_);
-        if (!assignable(tt, ft, c.schemas) && !assignable(ft, tt, c.schemas)) {
+        // Sibling-constructor widening: two distinct constructors of
+        // the same asdl sum (e.g. `ir.LoadConst` vs `ir.GetStatic`)
+        // are both assignable to the parent sum (`ir.node`); the
+        // ternary's result type is that parent.
+        std::string common_sum = common_schema_sum(c, tt, ft);
+        if (!assignable(tt, ft, c.schemas) && !assignable(ft, tt, c.schemas) &&
+            common_sum.empty()) {
             err(c, e->loc, "ternary branches have incompatible types: " +
                            tt.display() + " vs " + ft.display());
         }
-        ret = tt.is_unknown() ? ft : tt;
+        if (!common_sum.empty() && tt.name != ft.name) {
+            ret = Type::schema(tt.schema_import, common_sum);
+        } else {
+            // Pick the more-concrete branch type. NilLit and empty-elem
+            // List (e.g. `[]`) are polymorphic — they widen to whichever
+            // branch carries a real type.
+            bool tt_concrete = !tt.is_unknown() && tt.kind != TypeKind::NilLit
+                && !(tt.kind == TypeKind::List && (tt.elems.empty() ||
+                                                    tt.elems[0].is_unknown()));
+            ret = tt_concrete ? tt : ft;
+        }
     }
     else if (auto* b = dynamic_cast<DdcgAst::BinOp*>(e)) {
         Type lt = infer_expr(c, b->left);
@@ -672,16 +774,54 @@ Type infer_expr(Ctx& c, DdcgAst::Expr* e) {
         ret = infer_call(c, call);
     }
     else if (auto* fa = dynamic_cast<DdcgAst::FieldAccExpr*>(e)) {
+        // Module-qualified enum-sum value: parser produces FieldAccExpr
+        // for `module.Name`. When the base IdentExpr binds to a schema
+        // import (NameKind::SchemaModule) and Name is one of that
+        // schema's enum-sum constructors, resolve as that sum's value
+        // (e.g. `ir.Eq` → ir.cmpop.Eq). The base is purely a namespace
+        // marker, so we don't go through infer_expr on it.
+        if (auto* base_id = dynamic_cast<DdcgAst::IdentExpr*>(fa->base)) {
+            const auto* b = c.lookup(base_id->name);
+            if (b && b->kind == NameKind::SchemaModule) {
+                auto sit = c.schemas->find(base_id->name);
+                if (sit != c.schemas->end()) {
+                    const Schema& schema = sit->second;
+                    for (const auto& enum_sum : schema.enum_sums) {
+                        auto cit = schema.sum_constructors.find(enum_sum);
+                        if (cit == schema.sum_constructors.end()) continue;
+                        for (const auto& cn : cit->second) {
+                            if (cn == fa->field) {
+                                ret = Type::schema(base_id->name, enum_sum);
+                                record(c, e, ret);
+                                return ret;
+                            }
+                        }
+                    }
+                    err(c, fa->loc, "module '" + base_id->name +
+                        "' has no enum-sum value '" + fa->field + "'");
+                    ret = Type::unknown();
+                    record(c, e, ret);
+                    return ret;
+                }
+            }
+        }
         Type bt = infer_expr(c, fa->base);
+        if (bt.kind == TypeKind::List && fa->field == "count") {
+            // List intrinsic: lists are emitted as { T* data; int count; ...}
+            // structs (C) or std::vector (C++); both have a `count`/`size`
+            // accessor. The backend remaps the field name as needed.
+            ret = Type::int_();
+            record(c, e, ret);
+            return ret;
+        }
         if (bt.kind == TypeKind::Dest) {
-            // Field access on a destination (paper's δ/γ/ρ).
-            //   data_dest / ctrl_dest are tagged unions: a field is
-            //   reachable when it appears on at least one variant; if
-            //   multiple variants name the same field they must agree
-            //   on type. Variant tag isn't checked statically — runtime
-            //   correctness (e.g. only access γ.Lf when γ is `pair`) is
-            //   the rule body's concern, typically via a `where` predicate.
-            //   env_dest is a flat record: the field lookup is direct.
+            // Field access on a destination (paper's δ/γ/ρ). All three
+            // are tagged unions: a field is reachable when it appears
+            // on at least one variant; if multiple variants name the
+            // same field they must agree on type. Variant tag isn't
+            // checked statically — runtime correctness (e.g. only
+            // access γ.Lf when γ is `pair`) is the rule body's concern,
+            // typically by destructuring via match.
             Type common; bool found = false; bool conflict = false;
             for (auto* d : c.file->destinations) {
                 if (auto* dd = dynamic_cast<DdcgAst::DataDest*>(d)) {
@@ -706,11 +846,23 @@ Type infer_expr(Ctx& c, DdcgAst::Expr* e) {
                     break;
                 } else if (auto* ed = dynamic_cast<DdcgAst::EnvDest*>(d)) {
                     if (ed->name != bt.name) continue;
-                    for (auto* f : ed->fields)
-                        if (f->name == fa->field) {
-                            common = type_from_dsl_typeref(c, f->ty);
-                            found = true;
-                        }
+                    for (auto* v : ed->variants)
+                        for (auto* f : v->fields)
+                            if (f->name == fa->field) {
+                                Type t = type_from_dsl_typeref(c, f->ty);
+                                if (!found) { common = t; found = true; }
+                                else if (!(common == t)) conflict = true;
+                            }
+                    break;
+                } else if (auto* sd = dynamic_cast<DdcgAst::Sum*>(d)) {
+                    if (sd->name != bt.name) continue;
+                    for (auto* v : sd->variants)
+                        for (auto* f : v->fields)
+                            if (f->name == fa->field) {
+                                Type t = type_from_dsl_typeref(c, f->ty);
+                                if (!found) { common = t; found = true; }
+                                else if (!(common == t)) conflict = true;
+                            }
                     break;
                 }
             }
@@ -924,17 +1076,28 @@ Type infer_expr(Ctx& c, DdcgAst::Expr* e) {
                 ret = Type::unknown();
             } else {
                 DdcgAst::DestField* field = nullptr;
-                for (auto* f : env->fields) {
-                    if (f->name == w->field) { field = f; break; }
+                bool conflict = false;
+                Type field_t;
+                for (auto* v : env->variants) {
+                    for (auto* f : v->fields) {
+                        if (f->name == w->field) {
+                            Type t = type_from_dsl_typeref(c, f->ty);
+                            if (!field) { field = f; field_t = t; }
+                            else if (!(field_t == t)) conflict = true;
+                        }
+                    }
                 }
                 if (!field) {
                     err(c, w->loc, "env_dest '" + bt.name + "' has no field '" + w->field + "'");
                     ret = bt;  // best-effort: result keeps base type
+                } else if (conflict) {
+                    err(c, w->loc, "with-update field '" + w->field +
+                        "' has conflicting types across variants of '" + bt.name + "'");
+                    ret = bt;
                 } else {
-                    Type ft = type_from_dsl_typeref(c, field->ty);
-                    if (!assignable(ft, vt, c.schemas)) {
+                    if (!assignable(field_t, vt, c.schemas)) {
                         err(c, w->value->loc, "with-update of '" + w->field +
-                            "': expected " + ft.display() + ", got " + vt.display());
+                            "': expected " + field_t.display() + ", got " + vt.display());
                     }
                     ret = bt;  // result is same env type as base
                 }
@@ -984,6 +1147,28 @@ Type infer_expr(Ctx& c, DdcgAst::Expr* e) {
                 ret = Type::schema(b->schema, b->ctor);
             }
         }
+    }
+    else if (auto* be = dynamic_cast<DdcgAst::BlockExpr*>(e)) {
+        // `{ stmts; tail_expr; }` evaluates the stmts in sequence and
+        // yields the trailing ExprStmt's value. Same shape as a
+        // match arm body or a fun body. Push a scope so let-bindings
+        // inside don't leak out.
+        c.push_scope();
+        check_block(c, be->body, /*tail_expected=*/Type::unknown());
+        Type ret_t = Type::unknown();
+        if (!be->body.empty()) {
+            if (auto* es = dynamic_cast<DdcgAst::ExprStmt*>(be->body.back())) {
+                auto it = c.result->expr_types.find(es->value);
+                if (it != c.result->expr_types.end()) ret_t = it->second;
+            } else {
+                err(c, be->loc, "block expression must end in an expression "
+                                "(found a non-tail statement)");
+            }
+        } else {
+            err(c, be->loc, "empty block expression has no value");
+        }
+        c.pop_scope();
+        ret = ret_t;
     }
     else if (auto* m = dynamic_cast<DdcgAst::MatchExpr*>(e)) {
         Type st = infer_expr(c, m->subject);
@@ -1047,6 +1232,10 @@ Type infer_expr(Ctx& c, DdcgAst::Expr* e) {
                     dname = dd->name; variants = dd->variants;
                 } else if (auto* cd = dynamic_cast<DdcgAst::CtrlDest*>(d)) {
                     dname = cd->name; variants = cd->variants;
+                } else if (auto* ed = dynamic_cast<DdcgAst::EnvDest*>(d)) {
+                    dname = ed->name; variants = ed->variants;
+                } else if (auto* sd = dynamic_cast<DdcgAst::Sum*>(d)) {
+                    dname = sd->name; variants = sd->variants;
                 }
                 if (dname != st.name) continue;
                 for (auto* v : variants) {
@@ -1085,6 +1274,14 @@ Type infer_expr(Ctx& c, DdcgAst::Expr* e) {
                     if (it != c.result->expr_types.end()) {
                         const Type& at = it->second;
                         if (result_t.is_unknown()) {
+                            result_t = at;
+                        } else if (result_t.kind == TypeKind::NilLit &&
+                                   at.kind != TypeKind::NilLit) {
+                            // First arm yielded `nil`, this one is
+                            // concrete — widen to the concrete type.
+                            // (`nil` is the polymorphic bottom for
+                            // schema/dest values, so the join is
+                            // always the non-nil arm's type.)
                             result_t = at;
                         } else if (assignable(result_t, at, c.schemas)) {
                             // arm fits running join — keep result_t.
@@ -1141,10 +1338,8 @@ void check_stmt(Ctx& c, DdcgAst::Stmt* s,
                 // literal `[]` produces `list<?>`; if the bind annotates
                 // a concrete list type, contextualise the RHS type so
                 // the codegen has enough info to emit `std::vector<T>{}`.
-                if (sb->ty.has_value() && bt.kind == TypeKind::List &&
-                    vt.kind == TypeKind::List &&
-                    !vt.elems.empty() && vt.elems[0].is_unknown()) {
-                    c.result->expr_types[let->value] = bt;
+                if (sb->ty.has_value()) {
+                    refine_polymorphic(c, let->value, bt);
                 }
                 c.bind(sb->name, NameKind::LetBind, sb->ty.has_value() ? bt : vt);
             }
@@ -1198,10 +1393,28 @@ void check_stmt(Ctx& c, DdcgAst::Stmt* s,
             err(c, f->loc, "for-loop sequence must be a list, got " + st.display());
         }
         c.push_scope();
+        if (f->iter_index.has_value()) {
+            if (auto* ib = dynamic_cast<DdcgAst::SimpleBind*>(*f->iter_index)) {
+                c.bind(ib->name, NameKind::ForIter, Type::int_());
+            }
+        }
         if (auto* sb = dynamic_cast<DdcgAst::SimpleBind*>(f->iter)) {
             c.bind(sb->name, NameKind::ForIter, elem_t);
         }
         check_block(c, f->body, /*tail_expected=*/Type::voidty());
+        c.pop_scope();
+        return;
+    }
+    if (auto* ifs = dynamic_cast<DdcgAst::IfStmt*>(s)) {
+        Type ct = infer_expr(c, ifs->cond);
+        if (!ct.is_unknown() && ct.kind != TypeKind::Bool) {
+            err(c, ifs->loc, "if condition must be bool, got " + ct.display());
+        }
+        c.push_scope();
+        check_block(c, ifs->then_body, /*tail_expected=*/Type::voidty());
+        c.pop_scope();
+        c.push_scope();
+        check_block(c, ifs->else_body, /*tail_expected=*/Type::voidty());
         c.pop_scope();
         return;
     }
@@ -1215,6 +1428,9 @@ void check_stmt(Ctx& c, DdcgAst::Stmt* s,
             !assignable(tail_expected, vt, c.schemas)) {
             err(c, es->loc, "tail expression: expected " + tail_expected.display() +
                             ", got " + vt.display());
+        }
+        if (is_tail && tail_expected.kind != TypeKind::Void) {
+            refine_polymorphic(c, es->value, tail_expected);
         }
         return;
     }
@@ -1467,14 +1683,20 @@ void seed_context(Ctx& c) {
                 c.ctrl_dest_name = dname;
             }
         } else if (auto* ed = dynamic_cast<DdcgAst::EnvDest*>(d)) {
+            dname = ed->name; variants = ed->variants;
             if (!c.env_dest_name.empty()) {
                 err(c, c.file->loc,
                     "multiple env_dest declarations: '" + c.env_dest_name +
-                    "' and '" + ed->name + "' (ρ is a single record)");
+                    "' and '" + dname + "' (ρ is a single tagged union)");
             } else {
-                c.env_dest_name = ed->name;
+                c.env_dest_name = dname;
             }
-            // env_dest has no variants — no entries in dest_variants.
+        } else if (auto* sd = dynamic_cast<DdcgAst::Sum*>(d)) {
+            // User sum: arbitrary closed tagged union, not a δ/γ/ρ.
+            // No uniqueness constraint — any number of sums can co-
+            // exist. Just register the variants for ctor lookup +
+            // match dispatch, same machinery as the dests.
+            dname = sd->name; variants = sd->variants;
         }
         (void)is_data;
         for (auto* v : variants) {
@@ -1548,6 +1770,106 @@ void seed_context(Ctx& c) {
 // Type-check one action-language fun body. Pushes a scope with the
 // fun's parameters bound, walks the body stmts requiring the trailing
 // expression to match the declared return type.
+// ── Where-guard purity ──────────────────────────────────────
+//
+// A `where <expr>` clause runs during dispatch try — once per rule
+// attempt, at every site that pattern-matches the rule's head shape.
+// Side effects in a guard (e.g. an AUX call that allocates a SIR
+// temp, mutates ctx state, or records a try-region) fire on every
+// rule-try regardless of whether the rule eventually wins, producing
+// silent slot leaks, misordered allocations, or duplicate accumulator
+// entries. The DSL distinguishes PREDICATES (`pred`, bool-returning,
+// declared pure) from AUXILIARIES (arbitrary side-effecting); the
+// purity rule below enforces that the guard expression uses only
+// PRED calls + pure operators on bound variables / literals.
+//
+// Allowed:
+//   - literals (Int/String/Bool/Nil)
+//   - IdentExpr (refers to a let-bind / fun-param / pattern-bind /
+//     `node` / loaded schema module — never side-effecting)
+//   - BinOp / UnaryOp / TernaryExpr (operators have no side effects)
+//   - CallExpr where fn is a PRED (declared pure by signature)
+//   - DestPattern (constructs a δ/γ/ρ value — pure construction)
+//   - FieldAccExpr / IndexAccExpr (field / index access on already-
+//     bound values)
+//   - TupleLit / ListLit (collecting pure values)
+//
+// Rejected:
+//   - CallExpr to an AUX or FUN (could side-effect)
+//   - GenCall (recursive cg always emits SIR — large side effect)
+//   - BuildExpr (constructs SIR via arena alloc — side effect)
+//   - WithExpr (functional update — semantically pure but only
+//     useful in spine construction; rejecting flags as a likely bug)
+//   - MatchExpr (arm bodies are stmt blocks; analysing them recursively
+//     is fine in principle but rejecting as a guard form is the
+//     conservative choice — guards should be flat boolean predicates)
+//   - BlockExpr (contains stmts — likely side-effecting)
+bool is_pure_guard_expr(Ctx& c, DdcgAst::Expr* e);
+
+bool is_pure_guard_expr(Ctx& c, DdcgAst::Expr* e) {
+    if (!e) return true;
+    if (dynamic_cast<DdcgAst::IntLit*>(e)) return true;
+    if (dynamic_cast<DdcgAst::StringLit*>(e)) return true;
+    if (dynamic_cast<DdcgAst::BoolLit*>(e)) return true;
+    if (dynamic_cast<DdcgAst::NilLit*>(e)) return true;
+    if (dynamic_cast<DdcgAst::IdentExpr*>(e)) return true;
+    if (auto* t = dynamic_cast<DdcgAst::TernaryExpr*>(e)) {
+        return is_pure_guard_expr(c, t->cond) &&
+               is_pure_guard_expr(c, t->then_) &&
+               is_pure_guard_expr(c, t->else_);
+    }
+    if (auto* b = dynamic_cast<DdcgAst::BinOp*>(e)) {
+        return is_pure_guard_expr(c, b->left) &&
+               is_pure_guard_expr(c, b->right);
+    }
+    if (auto* u = dynamic_cast<DdcgAst::UnaryOp*>(e)) {
+        return is_pure_guard_expr(c, u->operand);
+    }
+    if (auto* call = dynamic_cast<DdcgAst::CallExpr*>(e)) {
+        // Only PRED calls are accepted. AUX / FUN calls may have
+        // side effects and must not appear in a guard.
+        auto* fn_id = dynamic_cast<DdcgAst::IdentExpr*>(call->fn);
+        if (!fn_id) return false;
+        if (c.preds.find(fn_id->name) == c.preds.end()) return false;
+        for (auto* arg : call->args) {
+            if (!is_pure_guard_expr(c, arg)) return false;
+        }
+        return true;
+    }
+    if (auto* fa = dynamic_cast<DdcgAst::FieldAccExpr*>(e)) {
+        return is_pure_guard_expr(c, fa->base);
+    }
+    if (auto* ix = dynamic_cast<DdcgAst::IndexAccExpr*>(e)) {
+        return is_pure_guard_expr(c, ix->base) &&
+               is_pure_guard_expr(c, ix->index);
+    }
+    if (auto* tu = dynamic_cast<DdcgAst::TupleLit*>(e)) {
+        for (auto* el : tu->elems) if (!is_pure_guard_expr(c, el)) return false;
+        return true;
+    }
+    if (auto* l = dynamic_cast<DdcgAst::ListLit*>(e)) {
+        for (auto* el : l->elems) if (!is_pure_guard_expr(c, el)) return false;
+        return true;
+    }
+    if (auto* dp = dynamic_cast<DdcgAst::DestPattern*>(e)) {
+        for (auto* arg : dp->args) if (!is_pure_guard_expr(c, arg)) return false;
+        return true;
+    }
+    return false;
+}
+
+void check_guard_purity(Ctx& c, DdcgAst::Expr* guard) {
+    if (!is_pure_guard_expr(c, guard)) {
+        err(c, guard->loc,
+            "where-guard expression must be pure (only PREDICATE calls, "
+            "pure operators, bound idents, and literals allowed). AUX or "
+            "FUN calls may have side effects that fire on every rule-try, "
+            "regardless of whether the rule wins dispatch — and that's "
+            "almost always a bug. Move the side-effecting work into the "
+            "rule body.");
+    }
+}
+
 void check_fun(Ctx& c, DdcgAst::Fun* f) {
     auto sig_it = c.funs.find(f->name);
     if (sig_it == c.funs.end()) return;  // already errored at decl time
@@ -1641,10 +1963,36 @@ void check_rule(Ctx& c, const DdcgAst::Rule* r) {
         c.bind("Lnext", NameKind::PatternBind,
                type_from_dsl_typeref(c, c.file->ir_root));
     }
+    // Bind `node` to the rule head's owning sum type so rule bodies
+    // can pass the matched AST node to AUXes that need it (sema
+    // sidecar lookups keyed by node pointer, etc.). Multi-pattern
+    // rules dispatch on a single sum, so `node`'s type is well-
+    // defined; mismatched sums are flagged at the gather_head_binds
+    // pass.
+    {
+        std::string node_module, node_sum;
+        for (auto* h : r->heads) {
+            if (auto* cp = dynamic_cast<DdcgAst::ConstructorPat*>(h)) {
+                auto sit = c.schemas->find(cp->module);
+                if (sit == c.schemas->end()) continue;
+                auto cit = sit->second.constructors.find(cp->ctor);
+                if (cit == sit->second.constructors.end()) continue;
+                if (node_sum.empty()) {
+                    node_module = cp->module;
+                    node_sum = cit->second.sum_name;
+                }
+            }
+        }
+        if (!node_sum.empty()) {
+            c.bind("node", NameKind::PatternBind,
+                   Type::schema(node_module, node_sum));
+        }
+    }
     if (r->guard.has_value()) {
         Type gt = infer_expr(c, *r->guard);
         if (!gt.is_unknown() && gt.kind != TypeKind::Bool)
             err(c, (*r->guard)->loc, "where-guard must be bool, got " + gt.display());
+        check_guard_purity(c, *r->guard);
     }
     Type ir_root_t = type_from_dsl_typeref(c, c.file->ir_root);
     check_block(c, r->body, ir_root_t);

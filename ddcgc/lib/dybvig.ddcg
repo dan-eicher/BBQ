@@ -50,7 +50,7 @@ DESTINATIONS
 
   // ρ: paper's environment. Carries the break-label only — locals are
   // consumer-specific.
-  env_dest  rho   { L_break: ir_root }
+  env_dest  rho   { frame(L_break: ir_root) }
 
 AUXILIARIES
   // Required hook — consumers must implement. Called by lib helpers

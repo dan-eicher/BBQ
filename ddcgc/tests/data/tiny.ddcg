@@ -12,7 +12,7 @@ DESTINATIONS
   // ρ: paper's environment. depth tracks recursion depth (used here
   // only to prove typed ρ threads through the dispatcher signature
   // and recursive gen() calls; rule bodies pass it unchanged).
-  env_dest  rho   { depth: int }
+  env_dest  rho   { frame(depth: int) }
   ir_root int
 
 AUXILIARIES

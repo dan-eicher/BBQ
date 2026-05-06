@@ -60,13 +60,18 @@ DestNames extract_dest_names(const DdcgAst::File* file,
 bool EmitBackend::emit(const DdcgAst::File* file,
                        const std::map<std::string, Schema>& schemas,
                        const CheckResult& check,
-                       std::ostream& out,
+                       std::ostream& out_header,
+                       std::ostream* out_source,
+                       const std::string& header_filename,
                        std::vector<std::string>& errors) {
     file_ = file;
     schemas_ = &schemas;
     check_ = &check;
     errors_ = &errors;
-    out_ = &out;
+    out_header_ = &out_header;
+    out_source_ = out_source;
+    header_filename_ = header_filename;
+    out_ = &out_header;     // backends without a split write everything here
     indent_depth_ = 0;
 
     // Resolve ir_root.
@@ -173,6 +178,33 @@ bool EmitBackend::is_dest_variant(const std::string& name) const {
             for (auto* v : dd->variants) if (v->name == name) return true;
         } else if (auto* cd = dynamic_cast<DdcgAst::CtrlDest*>(d)) {
             for (auto* v : cd->variants) if (v->name == name) return true;
+        } else if (auto* ed = dynamic_cast<DdcgAst::EnvDest*>(d)) {
+            for (auto* v : ed->variants) if (v->name == name) return true;
+        } else if (auto* sd = dynamic_cast<DdcgAst::Sum*>(d)) {
+            for (auto* v : sd->variants) if (v->name == name) return true;
+        }
+    }
+    return false;
+}
+
+bool EmitBackend::find_enum_value(const std::string& name,
+                                   std::string* out_module,
+                                   std::string* out_sum) const {
+    for (const auto& [imp, schema] : *schemas_) {
+        (void)imp;
+        for (const auto& enum_sum : schema.enum_sums) {
+            auto cit = schema.sum_constructors.find(enum_sum);
+            if (cit == schema.sum_constructors.end()) continue;
+            for (const auto& cn : cit->second) {
+                if (cn == name) {
+                    // Return the asdl module_name (e.g. "sir"), not the
+                    // DSL import alias (e.g. "ir"). c_tag_value /
+                    // cpp_class_name and friends key on module_name.
+                    if (out_module) *out_module = schema.module_name;
+                    if (out_sum)    *out_sum = enum_sum;
+                    return true;
+                }
+            }
         }
     }
     return false;
@@ -183,6 +215,8 @@ bool EmitBackend::is_zero_arg_dest_variant(const std::string& name) const {
         std::vector<DdcgAst::DestVariant*> vs;
         if (auto* dd = dynamic_cast<DdcgAst::DataDest*>(d)) vs = dd->variants;
         else if (auto* cd = dynamic_cast<DdcgAst::CtrlDest*>(d)) vs = cd->variants;
+        else if (auto* ed = dynamic_cast<DdcgAst::EnvDest*>(d)) vs = ed->variants;
+        else if (auto* sd = dynamic_cast<DdcgAst::Sum*>(d)) vs = sd->variants;
         for (auto* v : vs) if (v->name == name) return v->fields.empty();
     }
     return false;
@@ -276,11 +310,54 @@ void EmitBackend::emit_expr(DdcgAst::Expr* e) {
         return;
     }
     if (auto* id = dynamic_cast<DdcgAst::IdentExpr*>(e)) {
-        if (is_zero_arg_dest_variant(id->name)) {
-            out() << id->name << "()";
-        } else {
-            out() << id->name;
+        // Check shadowing first: if a let-bind or fun param of the
+        // same name is in scope, the typechecker recorded the
+        // IdentExpr's resolved type as something OTHER than a Dest.
+        // Without this check, `let effect = ...` shadowed by the
+        // 0-arg `effect` dest variant emits as `effect(ctx)` at the
+        // use site instead of the let-bound local.
+        bool shadowed_dest = false;
+        {
+            auto sit = check_->expr_types.find(id);
+            if (sit != check_->expr_types.end() &&
+                sit->second.kind != TypeKind::Dest) {
+                shadowed_dest = true;
+            }
         }
+        if (!shadowed_dest && is_zero_arg_dest_variant(id->name)) {
+            // Zero-arg dest variants written bare in DSL still emit
+            // as a constructor call. Route through emit_dest_pattern
+            // so C/C++ backends apply the same ctx-prepending
+            // convention they use for parenthesized calls.
+            DdcgAst::DestPattern dp(id->name, {});
+            emit_dest_pattern(&dp);
+            return;
+        }
+        // typecheck resolved this IdentExpr to a Schema(import, sum)
+        // where `sum` is in the schema's enum_sums and the ctor list
+        // contains id->name iff this is an asdl enum value reference
+        // (and not a scope-bound name with coincidentally-overlapping
+        // enum value name elsewhere).
+        auto tit = check_->expr_types.find(id);
+        if (tit != check_->expr_types.end() &&
+            tit->second.kind == TypeKind::Schema) {
+            auto sit = schemas_->find(tit->second.schema_import);
+            if (sit != schemas_->end() &&
+                sit->second.enum_sums.count(tit->second.name)) {
+                auto cit = sit->second.sum_constructors.find(tit->second.name);
+                if (cit != sit->second.sum_constructors.end()) {
+                    for (const auto& cn : cit->second) {
+                        if (cn == id->name) {
+                            out() << emit_enum_value_ref(
+                                sit->second.module_name,
+                                tit->second.name, id->name);
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+        out() << id->name;
         return;
     }
     if (auto* t = dynamic_cast<DdcgAst::TernaryExpr*>(e)) {
@@ -306,6 +383,34 @@ void EmitBackend::emit_expr(DdcgAst::Expr* e) {
                 return;
             }
         }
+        // String/ident equality must use strcmp — C/C++ pointer
+        // compare on `const char*` is undefined for distinct
+        // literal-typed pointers and silently wrong for runtime
+        // strings. Both languages have <string.h>'s strcmp.
+        if (op == "==" || op == "!=") {
+            auto lt = check_->expr_types.find(b->left);
+            auto rt = check_->expr_types.find(b->right);
+            bool both_strings =
+                lt != check_->expr_types.end() &&
+                rt != check_->expr_types.end() &&
+                (lt->second.kind == TypeKind::String ||
+                 lt->second.kind == TypeKind::Ident) &&
+                (rt->second.kind == TypeKind::String ||
+                 rt->second.kind == TypeKind::Ident);
+            if (both_strings) {
+                // Null-safe string compare: optional-ident fields
+                // (e.g. Break.label) may be NULL. Pointer-equality
+                // covers same-pointer / both-NULL; strcmp only runs
+                // when both sides are non-NULL.
+                std::string l = emit_expr_to_string(b->left);
+                std::string r = emit_expr_to_string(b->right);
+                std::string base = "(((" + l + ") == (" + r + ")) || "
+                                   "((" + l + ") && (" + r + ") && "
+                                   "strcmp((" + l + "), (" + r + ")) == 0))";
+                out() << (op == "==" ? base : "(!" + base + ")");
+                return;
+            }
+        }
         out() << "(";
         emit_expr(b->left);
         out() << " " << op << " ";
@@ -326,6 +431,29 @@ void EmitBackend::emit_expr(DdcgAst::Expr* e) {
         return;
     }
     if (auto* fa = dynamic_cast<DdcgAst::FieldAccExpr*>(e)) {
+        // Module-qualified enum-sum value: typecheck stamps the
+        // FieldAccExpr's type as the sum's schema. Detect by the base
+        // IdentExpr's name being a loaded schema module (purely a
+        // namespace marker, not a value). Emit via the per-language
+        // enum_value_ref hook (e.g. C: SIR_EQ). The hook expects the
+        // asdl `module_name` (used for tag prefixes), not the import
+        // alias the consumer wrote.
+        if (auto* base_id = dynamic_cast<DdcgAst::IdentExpr*>(fa->base)) {
+            if (schemas_) {
+                auto sit = schemas_->find(base_id->name);
+                if (sit != schemas_->end()) {
+                    auto self_it = check_->expr_types.find(e);
+                    if (self_it != check_->expr_types.end() &&
+                        self_it->second.kind == TypeKind::Schema) {
+                        out() << emit_enum_value_ref(sit->second.module_name,
+                                                      self_it->second.name,
+                                                      fa->field);
+                        return;
+                    }
+                }
+            }
+        }
+        if (emit_seq_field_acc(fa)) return;
         emit_expr(fa->base);
         // Pointer-typed bases use ->; value-typed use .  Mapping is
         // language-agnostic — both backends use the same Type→sep
@@ -342,6 +470,7 @@ void EmitBackend::emit_expr(DdcgAst::Expr* e) {
                 case TypeKind::Ident:
                 case TypeKind::Label:
                 case TypeKind::Tuple:
+                case TypeKind::List:
                     sep = ".";
                     break;
                 default: break;
@@ -363,10 +492,7 @@ void EmitBackend::emit_expr(DdcgAst::Expr* e) {
         return;
     }
     if (auto* dp = dynamic_cast<DdcgAst::DestPattern*>(e)) {
-        // Dest-variant constructor — bare free-fn call in both
-        // languages (consumer-supplied via runtime header).
-        out() << dp->name;
-        emit_call_args(dp->args);
+        emit_dest_pattern(dp);
         return;
     }
     if (auto* w = dynamic_cast<DdcgAst::WithExpr*>(e)) {
@@ -381,10 +507,40 @@ void EmitBackend::emit_expr(DdcgAst::Expr* e) {
         emit_match_expr(m);
         return;
     }
+    if (auto* be = dynamic_cast<DdcgAst::BlockExpr*>(e)) {
+        emit_block_expr(be);
+        return;
+    }
     if (auto* g = dynamic_cast<DdcgAst::GenCall*>(e)) {
         emit_gen_call(g);
         return;
     }
+}
+
+void EmitBackend::emit_block_expr(DdcgAst::BlockExpr* be) {
+    // GCC statement-expression `({ stmts; tail_expr; })`. Both the
+    // C and C++ backends are GCC/clang only, so the extension is
+    // available on both. The trailing ExprStmt's value is the
+    // block's value; preceding stmts run for their side effects.
+    out() << "({\n";
+    indent_depth_++;
+    for (size_t i = 0; i + 1 < be->body.size(); ++i) {
+        emit_stmt(be->body[i], /*is_tail=*/false);
+    }
+    if (!be->body.empty()) {
+        if (auto* es = dynamic_cast<DdcgAst::ExprStmt*>(be->body.back())) {
+            indent();
+            emit_expr(es->value);
+            out() << ";\n";
+        } else {
+            // Caught by typecheck; emit a placeholder.
+            indent() << "0;\n";
+        }
+    } else {
+        indent() << "0;\n";
+    }
+    indent_depth_--;
+    indent() << "})";
 }
 
 void EmitBackend::emit_stmt(DdcgAst::Stmt* s, bool is_tail) {
@@ -411,6 +567,22 @@ void EmitBackend::emit_stmt(DdcgAst::Stmt* s, bool is_tail) {
     }
     if (auto* f = dynamic_cast<DdcgAst::ForStmt*>(s)) {
         emit_for_stmt(f);
+        return;
+    }
+    if (auto* ifs = dynamic_cast<DdcgAst::IfStmt*>(s)) {
+        indent() << "if (";
+        emit_expr(ifs->cond);
+        out() << ") {\n";
+        indent_depth_++;
+        emit_stmts(ifs->then_body, /*tail=*/false);
+        indent_depth_--;
+        if (!ifs->else_body.empty()) {
+            indent() << "} else {\n";
+            indent_depth_++;
+            emit_stmts(ifs->else_body, /*tail=*/false);
+            indent_depth_--;
+        }
+        indent() << "}\n";
         return;
     }
     if (auto* lb = dynamic_cast<DdcgAst::LabelStmt*>(s)) {

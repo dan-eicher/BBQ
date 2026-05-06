@@ -120,7 +120,7 @@ int main() {
     });
 
     Compiler compiler;
-    rho_t rho{0};
+    rho_t rho = frame(0);
     int result = compiler.compile_expr(&root, rho, ac(), fail());
 
     // Verify every catalogued feature fired.

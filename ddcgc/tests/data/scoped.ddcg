@@ -1,0 +1,71 @@
+// scoped.ddcg — Phase 1 fixture for chained-rho-pangolin.
+//
+// Validates recursive env_dest variants end-to-end:
+// - declaration with `parent: rho` self-reference
+// - constructor calls in rule bodies that wrap caller's ρ with a
+//   new variant (the "push" of legacy push/pop, but as a value)
+// - match arms that bind the parent field and recurse via `gen()`
+//   or fun calls — this is the "pop" via lexical scoping
+// - ρ scope chain walking for label-based lookup
+//
+// AST: Lit(n), Scope(label, body), Lookup. Scope wraps body's ρ
+// with in_scope(label, parent: ρ); Lookup walks the chain
+// and yields the depth at which a matching label was found, or -1.
+
+COMPILER scoped
+
+(. #include "scoped_runtime.h" .)
+
+IMPORTS
+  ast    = "scoped_ast.json"
+  target = "scoped_target.json"
+
+DESTINATIONS
+  data_dest delta { sink }
+  ctrl_dest gamma { halt }
+  // Recursive env_dest — `parent: rho` chains scopes lexically. No
+  // MEMBERS state, no push/pop AUX surface; the recursion's own
+  // call stack carries the scope, structurally preventing the
+  // forgot-to-pop bug class.
+  env_dest  rho   { top
+                  | in_scope(label: int, parent: rho) }
+  ir_root int
+
+AUXILIARIES
+  panic_unreachable : (string) -> int
+
+MEMBERS (.
+    ast_srcloc current_loc;
+.)
+
+// Walk the chain looking for `target_label`. Returns depth (0-based)
+// or -1 if not found. This is the shape break/continue use to find
+// their target loop frame, just simplified here for testing.
+fun chain_depth_for(r: rho, target_label: int, depth: int) -> int {
+    match (r) {
+        top => 0 - 1
+      | in_scope(label: l, parent: p) =>
+            l == target_label
+              ? depth
+              : chain_depth_for(p, target_label, depth + 1)
+    };
+}
+
+RULES
+
+rule lit : ast.Lit(n: x) {
+    x;
+}
+
+// Scope wraps body's ρ with a fresh in_scope variant. Parent ρ
+// flows through `rho` (the rule body's ρ binding) — it's the
+// caller's ρ, preserved on the host C call stack across the gen()
+// recursion. No mutation; no push/pop.
+rule scope : ast.Scope(label: lbl, body: b) {
+    gen(b, in_scope(lbl, rho), delta, gamma);
+}
+
+// Lookup walks the ρ chain. Test driver checks the returned depth.
+rule lookup : ast.Lookup() {
+    chain_depth_for(rho, 7, 0);
+}

@@ -631,10 +631,24 @@ void EmitBackend::emit_rule_branch(const Schema& schema,
         out() << ") {\n";
         indent_depth_++;
         emit_stmts(rule->body, /*tail=*/true);
+        if (tail_break_after_guard_match_) {
+            indent() << "break;\n";
+        }
         indent_depth_--;
         indent() << "}\n";
     } else {
         emit_stmts(rule->body, /*tail=*/true);
+        // When the rule lives inside a switch case (c_backend) and the
+        // pattern carries field constraints (enum-value matches like
+        // `op: Pos`), emit_match has opened a leaf-check `if (combined)`
+        // block around this body. The body sets the result via
+        // match_target_var_, so without a break the next per-case rule
+        // block runs and overwrites it. The break also covers the
+        // unconditional-fallthrough rule: it just exits the case one
+        // statement earlier than the case-end break, which is harmless.
+        if (tail_break_after_guard_match_) {
+            indent() << "break;\n";
+        }
     }
 
     while (blocks_open--) {

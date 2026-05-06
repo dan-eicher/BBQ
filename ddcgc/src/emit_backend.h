@@ -95,6 +95,14 @@ protected:
     // named variable instead of returning from the enclosing function.
     std::string match_target_var_;
 
+    // Set by c_backend's per-case dispatcher loop: when a rule's guard
+    // matches, the body's tail-position assigns to match_target_var_,
+    // and then needs to `break` out of the enclosing switch case so the
+    // following per-case rule blocks (including the no-guard fallthrough)
+    // don't overwrite the result. cpp_backend leaves this false because
+    // its tail emits `return X;` which already exits the function.
+    bool tail_break_after_guard_match_ = false;
+
     // ── Shared walks (dispatch chains) ───────────────────────────
     // The per-AST-type dispatch chains live here so all backends
     // share the visitor logic. Each branch either emits directly

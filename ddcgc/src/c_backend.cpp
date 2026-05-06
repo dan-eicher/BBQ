@@ -1569,6 +1569,25 @@ void CBackend::emit_dispatcher(const std::string& sum_name) {
     }
     indent() << "ctx->current_loc = node->loc;\n";
 
+    // Optional consumer hook: if the .ddcg declares an AUX named
+    // `on_dispatch_result : (ir_root) -> ir_root`, BBQ wraps every
+    // rule's returned spine head through it before the dispatcher
+    // returns. This is the right intervention point for consumer-
+    // specific post-processing (e.g. yoctojc stamps a source loc
+    // on the spine head from ctx->current_loc, mirroring the
+    // legacy compiler's per-dispatch wrapper). Consumers that don't
+    // declare the AUX get the raw result with zero overhead.
+    bool has_on_dispatch = false;
+    for (auto* a : file_->auxiliaries) {
+        if (a->name == "on_dispatch_result") { has_on_dispatch = true; break; }
+    }
+    std::string saved_match_target = match_target_var_;
+    if (has_on_dispatch) {
+        indent() << ir_root_type_ << " _result = "
+                 << c_zero_for(ir_root_type_) << ";\n";
+        match_target_var_ = "_result";
+    }
+
     // Group rules by constructor (= tag), preserving source order of
     // first appearance. Each case dispatches all rules for its tag in
     // the order they were declared.
@@ -1589,6 +1608,14 @@ void CBackend::emit_dispatcher(const std::string& sum_name) {
         }
     }
 
+    // Per-case rule splits: when multiple rules share a ctor with
+    // mutually-exclusive where-guards (and an optional unguarded
+    // fallthrough), each guarded rule's body needs a `break;` after
+    // its tail-position assignment so subsequent rule blocks under
+    // the same case don't run and overwrite the result. emit_rule_branch
+    // honours tail_break_after_guard_match_ to inject that break.
+    bool saved_tail_break = tail_break_after_guard_match_;
+    tail_break_after_guard_match_ = true;
     indent() << "switch (node->tag) {\n";
     for (const auto& ctor : ctor_order) {
         indent() << "case "
@@ -1617,9 +1644,16 @@ void CBackend::emit_dispatcher(const std::string& sum_name) {
         indent_depth_--;
         indent() << "}\n";
     }
+    tail_break_after_guard_match_ = saved_tail_break;
     indent() << "default: break;\n";
     indent() << "}\n";
-    indent() << "return " << c_zero_for(ir_root_type_) << ";\n";
+    if (has_on_dispatch) {
+        match_target_var_ = saved_match_target;
+        indent() << "return " << compiler_prefix()
+                 << "_on_dispatch_result(ctx, _result);\n";
+    } else {
+        indent() << "return " << c_zero_for(ir_root_type_) << ";\n";
+    }
     indent_depth_--;
     indent() << "}\n";
 }

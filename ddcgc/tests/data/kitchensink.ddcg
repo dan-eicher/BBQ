@@ -41,6 +41,17 @@ AUXILIARIES
   // keyed by node pointer.
   inspect_node : (ast.expr) -> int
 
+  // Optional consumer hook: every dispatcher wraps the rule's
+  // returned ir_root through this aux before returning. Two things
+  // get exercised by declaring it: (1) the wrap call is emitted, and
+  // (2) per-case rule splits with where-guards / nested-pattern
+  // specialisations correctly `break;` after a match instead of
+  // letting the unguarded fallthrough rule overwrite the result.
+  // Without the break, declaring this hook would make the existing
+  // result-sum assertion fail because the fallthrough `lit` /
+  // `add` / `sym` rules would run on top of their guarded siblings.
+  on_dispatch_result : (int) -> int
+
 PREDICATES
   is_zero       : (int) -> bool
   is_short_name : (string) -> bool
@@ -55,7 +66,7 @@ MEMBERS (.
     bbq_arena* arena;
     SourceLoc current_loc;
     int next_label;
-    const char* trace_entries[128];
+    const char* trace_entries[256];
     int trace_count;
 .)
 

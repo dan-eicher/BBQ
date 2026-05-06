@@ -107,6 +107,11 @@ int kitchensink_inspect_node(kitchensink_ctx_t* ctx, ast_expr_t* n) {
     return (int)n->tag;
 }
 
+int kitchensink_on_dispatch_result(kitchensink_ctx_t* ctx, int v) {
+    trace_push(ctx, "dispatch_hook");
+    return v;
+}
+
 bool kitchensink_is_zero(kitchensink_ctx_t* ctx, int n) {
     (void)ctx; return n == 0;
 }
@@ -152,6 +157,7 @@ static const struct entry kActionMarkers[] = {
     {"rule:import_demo",   "fun-from-fun trace propagation (mirrors import)"},
     {"bool_demo:true",     "BoolLit `true` literal in expression"},
     {"tup_sum:50:-50",     "TupleLit `(a, b)` constructor + tuple-typed aux arg"},
+    {"dispatch_hook",      "on_dispatch_result wrap fires per dispatcher return"},
 };
 static const int kActionCount =
     sizeof(kActionMarkers) / sizeof(kActionMarkers[0]);

@@ -181,12 +181,6 @@ private:
     std::set<std::string> charset_names_;
     std::set<std::string> token_names_;
 
-    // Built-in token-matching methods on the pegc runtime cursor
-    // (PegRuntime.h). RuleCalls to these are legal even though they
-    // aren't declared in the grammar; calls to anything else are
-    // typos and produce an error.
-    static bool is_builtin(const std::string& name);
-
     AnalysisResult result_;
 };
 

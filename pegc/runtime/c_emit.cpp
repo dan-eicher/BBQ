@@ -251,10 +251,9 @@ void cg_literal(Ctx* ctx, Literal* lit, std::ostream& out, int indent) {
 // ── Rule call: parse_Foo(p, args) ──────────────────────────
 //
 // Args are an opaque raw string — whatever the user wrote between
-// `<...>` (or `<. ... .>`) flows verbatim into the call. This means
-// the .peg author is responsible for matching the C signature
-// (including `&` prefix on pointer-output params for built-ins like
-// `peg_ident`); pegc no longer auto-prefixes.
+// `<...>` (or `<. ... .>`) flows verbatim into the call. The .peg
+// author is responsible for matching the C signature, including
+// `&` prefix on pointer-output params.
 void cg_rule_call(Ctx* ctx, RuleCall* rc, std::ostream& out, int indent) {
     std::string ind = indent_str(indent);
 
@@ -272,10 +271,9 @@ void cg_rule_call(Ctx* ctx, RuleCall* rc, std::ostream& out, int indent) {
     std::string fn_name;
     if (ctx->production_names.count(rc->name)) {
         fn_name = ctx->prefix + "parse_" + to_snake_case(rc->name);
-    } else if (ctx->token_names.count(rc->name)) {
-        fn_name = ctx->prefix + rc->name;
     } else {
-        fn_name = "peg_" + rc->name;
+        // Must be a TOKEN — analysis rejects anything else.
+        fn_name = ctx->prefix + rc->name;
     }
 
     if (!ctx->in_lex_mode) out << ind << "peg_skip(p);\n";

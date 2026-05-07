@@ -8,26 +8,6 @@ using namespace PegGrammar;
 namespace pegc {
 
 // ═══════════════════════════════════════════════════════════════
-// Built-in token methods on the pegc runtime cursor.
-// RuleCalls to any of these are legal even without a declaration
-// in the grammar — they map to PegRuntime.h methods. Anything else
-// is a typo.
-// ═══════════════════════════════════════════════════════════════
-
-bool PegAnalysis::is_builtin(const std::string& name) {
-    static const std::set<std::string> builtins = {
-        "at_end", "match", "match_charset",
-        "peek_at", "peek_charset",
-        "keyword", "peek_keyword",
-        "ident", "qualified_ident",
-        "integer", "floating",
-        "string_lit", "char_lit",
-        "scan_to",
-    };
-    return builtins.count(name) > 0;
-}
-
-// ═══════════════════════════════════════════════════════════════
 // Main entry point
 // ═══════════════════════════════════════════════════════════════
 
@@ -54,8 +34,7 @@ AnalysisResult PegAnalysis::analyze(Grammar* grammar,
             if (auto* rc = dynamic_cast<PegGrammar::RuleCall*>(expr)) {
                 if (!charset_names_.count(rc->name) &&
                     !token_names_.count(rc->name) &&
-                    !result_.productions.count(rc->name) &&
-                    !is_builtin(rc->name)) {
+                    !result_.productions.count(rc->name)) {
                     result_.errors.push_back(
                         "undeclared identifier '" + rc->name + "' in production " + prod_name);
                 }
@@ -289,9 +268,6 @@ bool PegAnalysis::nullable_of(PegExpr* expr) {
             return false;
         auto it = result_.productions.find(rc->name);
         if (it != result_.productions.end()) return it->second.nullable;
-        if (is_builtin(rc->name)) return false;  // built-in tokens consume input
-        // Otherwise unknown — collect_calls should have errored.
-        // Conservative for nullable: assume not nullable.
         return false;
     }
     if (auto* seq = dynamic_cast<Sequence*>(expr)) {
@@ -328,16 +304,9 @@ std::vector<FirstElement> PegAnalysis::first_of(PegExpr* expr) {
             if (it != result_.productions.end()) {
                 // Read from the table — no recursion across productions.
                 result = it->second.first_set;
-            } else if (is_builtin(rc->name)) {
-                // Built-in pegc-runtime token method (ident, integer,
-                // qualified_ident, scan_to, etc.). Opaque to FIRST
-                // analysis; treat as a Token-kind element keyed on
-                // the method name so callers don't show empty FIRST.
-                result.push_back({FirstElement::Token, rc->name});
             }
             // else: undeclared identifier — collect_calls reports the
-            // error; FIRST stays empty here, which is correct
-            // (production can't match anything via this call).
+            // error; FIRST stays empty here.
         }
     } else if (auto* seq = dynamic_cast<Sequence*>(expr)) {
         // Walk the sequence consuming nullable prefix.

@@ -135,6 +135,9 @@ std::string c_ctor_factory(const Schema& schema, const std::string& ctor) {
 
 class CBackend : public EmitBackend {
 public:
+    bool string_eq_via_strcmp() const override { return true; }
+    bool c_style_list_count() const override { return true; }
+public:
     bool emit_body() override;
 
 protected:
@@ -185,6 +188,9 @@ private:
     // Type-checker Type → C type spelling. Empty when caller should
     // fall back to `__typeof__`.
     std::string c_for_type(const Type& t);
+    std::string ternary_branch_cast(const Type& t) override {
+        return c_for_type(t);
+    }
 
     // DSL TypeRef → C type spelling. Used for aux/pred/fun signatures.
     std::string c_for_typeref(DdcgAst::TypeRef* tr);

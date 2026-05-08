@@ -9,13 +9,14 @@ DDCGC(1)             DDCG Compiler-Compiler              DDCGC(1)
 ## SYNOPSIS
 
 ```
-ddcgc -i spec.ddcg -ast ast.json -ir ir.json [-o out.h]
+ddcgc -i spec.ddcg -ast ast.json -ir ir.json
+      [-lang c|c++] [-L libdir]... [-o out.h]
 ```
 
 ## DESCRIPTION
 
-ddcgc compiles `.ddcg` specifications into class-wrapped C++
-dispatchers that walk a typed source AST and produce a target IR.
+ddcgc compiles `.ddcg` specifications into C or C++ dispatchers
+that walk a typed source AST and produce a target IR.
 The technique is Dybvig, Hieb & Butler's *Destination-Driven Code
 Generation* (Indiana CS TR-302, 1990): each AST node is compiled
 under an explicit data destination δ (where the value goes) and
@@ -32,7 +33,7 @@ rules with disjoint `where` guards, never as imperative control flow
 inside a rule body. Branching at runtime lives in the consumer's
 interpretation of γ (jump, branch, restore, return, etc.).
 
-Generated shape:
+Generated shape (C++ mode):
 
 ```
 namespace <COMPILER name> {
@@ -47,10 +48,17 @@ namespace <COMPILER name> {
 }
 ```
 
+C mode emits a `<COMPILER>_ctx_t` struct holding MEMBERS data plus
+free functions taking `<COMPILER>_ctx_t* ctx` as their first
+parameter; aux/pred bodies live in a separate `.c` file the
+consumer ships, signature-matched against the AUXILIARIES /
+PREDICATES declarations.
+
 The runtime author defines `<delta>_t`, `<gamma>_t`, their variant
 constructor functions, and the source/target schemas at namespace
 scope; everything else (per-compile state, aux/pred bodies,
-`fresh_label()`, `current_loc`) lives in the user's MEMBERS block.
+`fresh_label()`, `current_loc`) lives in the user's MEMBERS block
+(C++) or split across MEMBERS-as-data + a sibling `.c` (C).
 
 ## OPTIONS
 
@@ -64,6 +72,22 @@ scope; everything else (per-compile state, aux/pred bodies,
 **-ir** *file*.json
 : ASDL JSON sidecar for the target IR schema. Matched against the
   second IMPORTS entry. Required.
+
+**-lang** `c`|`c++`
+: Output language. Default `c++`. C++ mode produces a class-wrapped
+  emit (`class Compiler`) where MEMBERS holds both data fields and
+  aux/pred bodies. C mode produces a `BurgContext`-style struct +
+  static functions taking `BurgContext* ctx`; aux/pred bodies live
+  in a separate `.c` file the consumer ships, and MEMBERS is data
+  fields only. Both modes share frontend, typecheck, and rule
+  emission via the EmitBackend Template Method base.
+
+**-L** *dir*
+: Add a library search path for `import "...ddcg"` clauses.
+  Repeatable; directories are searched in declaration order after
+  the importing file's own directory. Used by consumers that pull
+  shared destination/aux declarations from `ddcgc/lib/` (e.g.
+  `dybvig.ddcg`).
 
 **-o** *file*
 : Output file (typically `.h` since the emit is class-wrapped with
@@ -86,19 +110,31 @@ IMPORTS
 DESTINATIONS
   data_dest delta { effect | ac | stack(slot: int) }   // δ — required
   ctrl_dest gamma { fail | jump(target: label) }       // γ — required
-  env_dest  rho   { anon | in_scope(name: ident) }     // ρ — optional
-  ir_root   <T>                                        // primary aux return type
+  env_dest  rho   { top                                // ρ — optional
+                  | in_scope(label: int, parent: rho)  //   may self-reference
+                  }                                    //   (recursive ρ)
+  sum demo_op { OpNop | OpStep(delta: int) }   // user-defined closed sum;
+                                               //   same machinery as δ/γ/ρ
+                                               //   but doesn't enter the
+                                               //   dispatcher signature
+  ir_root   <T>                                // primary aux return type
 
 AUXILIARIES
   cg_x : (int, ...) -> <T>                     // typed signatures only;
   ...                                          //   bodies live in MEMBERS
+  on_dispatch_result : (int) -> int            // optional hook: every
+                                               //   dispatcher wraps its
+                                               //   result through this aux
 
 PREDICATES                                     // optional; bool-return only
   is_zero : (int) -> bool
 
 MEMBERS (.
-    // verbatim C++; everything callable from rule bodies must be
-    // declared in AUXILIARIES or PREDICATES with matching signature
+    // C++ mode: verbatim C++; everything callable from rule bodies
+    // must be declared in AUXILIARIES or PREDICATES with matching
+    // signature. C mode: data fields only — aux/pred bodies live
+    // in the consumer's `.c` file as free functions taking the
+    // emitted `<COMPILER>_ctx_t* ctx` first arg.
     using label_t = int;
     SourceLoc current_loc;
     int next_label = 0;
@@ -106,6 +142,20 @@ MEMBERS (.
     int cg_x(int n) { ... return ...; }
     bool is_zero(int n) { return n == 0; }
 .)
+
+import "lib.ddcg"              // optional; splices a library's
+                               //   DESTINATIONS / AUXILIARIES /
+                               //   funs into this file (resolved
+                               //   via the importing file's
+                               //   directory then `-L` paths)
+
+// Action-language funs — pure typed helpers callable from rule
+// bodies and other funs. Body is statements terminated by a tail
+// expression whose type matches the declared return type.
+fun helper(arg : int) -> int {
+    let doubled = arg + arg;
+    doubled;
+}
 
 DESUGARED                      // optional; exempts source
   CtorA, CtorB                                  //   constructors from the
@@ -150,6 +200,8 @@ declared `ir_root`.
 | `let (a, b) = expr;` | tuple destructuring |
 | `v := expr;` | mutate a previously `let`-bound variable |
 | `for v in xs { ... }` | iterate a list-typed expression |
+| `for (i, v) in xs { ... }` | indexed iteration; `i` is a fresh int bound to the position |
+| `if cond { ... } else { ... }` | conditional statement; both branches scope locally |
 | `label L;` | bind a fresh label via `fresh_label()` |
 | `expr;` | expression statement; in tail position becomes `return expr;` |
 
@@ -157,11 +209,25 @@ declared `ir_root`.
 
 Standard precedence cascade: ternary, `or`/`and`, `==`/`!=`,
 `<`/`>`/`<=`/`>=`, `+`/`-`, `*`/`/`/`%`, unary `not`/`-`, postfix
-calls/`.field`/`[i]`. Plus list literals `[a, b, c]`, tuple
-literals `(a, b)`, `nil`, dest-variant calls (e.g. `restore(0)`,
-or bare `effect` for zero-payload variants), and `gen(subject, δ,
-γ, [Lnext])` — the recursive code-generation call. `+` between two
-list-typed operands lowers to a generated `_ddcgc_concat` helper.
+calls/`.field`/`[i]`. Plus:
+
+| Form | Notes |
+|---|---|
+| `[a, b, c]` | list literal; element type is the join of arm types (sibling schema-ctors widen to their parent sum) |
+| `(a, b)` | tuple literal |
+| `nil` | matches an unset optional schema field; in `build` to an Optional field emits `std::nullopt` |
+| `restore(0)`, `effect` | dest-variant calls (typed or zero-arg) |
+| `xs.count` | list size (lowers to `xs.size()` in C++, `xs.count` in C) |
+| `xs[i]` | list element access |
+| `e.field` | schema field / tuple field access |
+| `match (e) { Pat => arm | ... }` | match-as-expression; subject can be a dest tagged union, asdl enum, int, or non-enum schema sum |
+| `cond ? a : b` | ternary; arm types widen via sibling-ctor → parent-sum |
+| `{ stmts; tail; }` | block expression; lowers to a stmt-expr (C) or IIFE (C++) |
+| `build module.Ctor(args...)` | construct a target IR value via the schema's factory |
+| `gen(subject, ρ, δ, γ, [Lnext])` | recursive code-generation call into the auto-generated dispatcher |
+
+`+` between two list-typed operands lowers to a generated
+`_ddcgc_concat` helper.
 
 ## ANALYSIS
 
@@ -173,8 +239,31 @@ Pattern field types come from the asdl JSON; aux/pred return types
 must match where they are used. Aux/pred call arity and arg types
 are checked. Dest-variant calls validate against the declared
 variant payload shape. List/tuple element types propagate
-structurally; an empty list literal bound to a typed variable picks
-up the annotation's element type.
+structurally; an empty list literal picks up its element type from
+either an explicit `let` annotation or from the expected type at a
+`build`/aux call site (whichever fires first via the
+`refine_polymorphic` pass).
+
+### Sibling-constructor widening
+
+Two distinct constructors of the same asdl sum widen to the parent
+sum at join points: ternary branches (`cond ? build mod.A(...) :
+build mod.B(...)` types as `mod.parent`), match-arm result types,
+and list literal element types (`[build mod.A(...), build
+mod.B(...)]` types as `list<mod.parent>`). The codegen emits
+explicit upcasts on each ternary arm so C++ compiles without
+manual `static_cast`s.
+
+### Where-guard purity (always)
+
+`where` expressions must be side-effect-free. The body may use
+PREDICATES (declared pure by signature), pure operators, literals,
+let/pattern/fun-param-bound idents, dest-pattern construction,
+field/index access, and tuple/list collection of pure values.
+AUXILIARIES and `fun` calls are rejected — guards run on every
+rule-try regardless of whether the rule wins, so an aux that
+allocates or mutates state would fire spuriously. Two `gtest`
+fixtures cover the positive and negative paths.
 
 ### Coverage (always)
 
@@ -201,15 +290,20 @@ the second unreachable).
 ## DESTINATIONS
 
 ddcgc requires exactly one `data_dest` and one `ctrl_dest`. An
-`env_dest` (paper's ρ) is optional. All three are named tagged
-unions with the same shape: variants may be zero-arg (`effect`,
-`ac`, `fail`, `anon`) or carry typed payloads (`stack(slot: int)`,
-`restore(save: int)`, `jump(target: label)`, `in_scope(name: ident)`).
+`env_dest` (paper's ρ) and any number of user-defined `sum`s are
+optional. All four are named tagged unions with the same shape:
+variants may be zero-arg (`effect`, `ac`, `fail`, `anon`) or carry
+typed payloads (`stack(slot: int)`, `restore(save: int)`,
+`jump(target: label)`, `in_scope(name: ident)`).
 
 The runtime author provides `<dest>_t` and one constructor function
 per variant at namespace scope; ddcgc emits zero-arg references as
 constructor calls (`effect()`) and typed-payload references as the
-obvious call (`stack(0)`).
+obvious call (`stack(0)`). User `sum`s share this machinery — same
+match dispatch and constructor-call shape — but their type doesn't
+appear in the dispatcher signature, so they're useful for
+defunctionalising a finite "what to do" tag set inside rule bodies
+without touching the δ/γ/ρ contract.
 
 `env_dest` carries compilation-context state (paper's ρ — variable
 scope, current-field name, loop/finally frames, etc.). Save/restore
@@ -222,11 +316,47 @@ The previous ρ at the call site is unchanged when the recursion
 returns — recursion's lexical scope handles the implicit "restore."
 Rule bodies and funs read scope state by matching on ρ.
 
+### Recursive env_dest (chained scopes)
+
+A variant of `env_dest` may carry a self-typed field
+(`parent: rho`); ddcgc treats that as a recursive type. The C
+backend arena-allocates the parent pointer so the recursion's
+lifetime survives the call chain; match arms binding the parent
+field auto-deref to a `rho_t*`. Walking the chain is just
+recursive matching — no MEMBERS-side stack push/pop, no forgot-to-
+pop bug class. The `scoped` test fixture
+(`tests/data/scoped.{ddcg,...}`) is the ground-check for this
+shape end-to-end.
+
 The `gen(subject, ρ, δ, γ, [Lnext])` call type-checks δ against the
 declared `data_dest`, γ against `ctrl_dest`, and ρ against `env_dest`.
 The optional fifth argument is the paper's `Lnext` — the next-statement
 fall-through label for redundant-jump elimination — passed verbatim
 to the recursive dispatch.
+
+## BACKENDS
+
+The `EmitBackend` Template Method base owns the shared visitor
+(emit_expr / emit_stmt / emit_rule_branch and helpers) plus the
+language-agnostic pre-emit setup. `CppBackend` and `CBackend` each
+implement ~12 per-form hooks where the two languages diverge:
+
+| Concern | C++ | C |
+|---|---|---|
+| Class | `class Compiler { ... }` with MEMBERS | `<comp>_ctx_t` struct + free fns taking `<comp>_ctx_t*` |
+| Aux/pred bodies | inline in MEMBERS | free fns in user's `.c` |
+| Container types | `std::vector<T>`, `std::optional<T>` | per-shape struct helpers (`<elem>_list_t`) emitted by a discovery pass |
+| Match dispatch | `dynamic_cast<T*>` chain (C++) | `switch (n->tag)` against the asdl-c tagged union |
+| Match-as-expr | IIFE lambda | stmt-expr + result var |
+| Block expr | IIFE | GCC stmt-expr |
+| String equality | `==` (std::string overload) | null-safe pointer-eq + `strcmp` |
+| `list.count` | `.size()` | `.count` field |
+| asdl factories | `new T(args)` | asdl-c `<mod>_<ctor>(arena, args)` |
+
+A new AST form is one dispatch case in `emit_backend` plus the two
+per-language hooks. Adding a third C-family backend would be the
+same pattern: subclass `EmitBackend`, override the hooks, factory
+into `main.cpp`.
 
 ## EXAMPLES
 
@@ -238,12 +368,20 @@ asdl  -i ir.asdl  --json ir.json
 ddcgc -i mylang.ddcg -ast src.json -ir ir.json -o MyCompiler.h
 ```
 
-Use the generated class:
+Use the generated class (C++):
 
 ```
 #include "MyCompiler.h"
 mylang::Compiler compiler;
 auto result = compiler.compile_expr(&root, mylang::ac(), mylang::fail());
+```
+
+C-mode emit + asdl-c-emitted schemas + per-arena state:
+
+```
+asdl  -i src.asdl --json src.json -lang c -o src_ast.h
+asdl  -i ir.asdl  --json ir.json  -lang c -o ir_ast.h
+ddcgc -i mylang.ddcg -ast src.json -ir ir.json -lang c -o mylang_compile.h
 ```
 
 ## FILES
@@ -260,22 +398,40 @@ ddcgc/
   frontend/
     Parser.h, Parser.cpp      Generated parser (from ddcg.peg)
     ddcg_ast.h                Generated DSL AST (from ddcg.asdl)
+  lib/
+    dybvig.ddcg               Reusable destinations + auxes for the
+                              paper-direct DDCG shape; consumers
+                              `import` it via `-L ddcgc/lib`
   src/
     schema.h, .cpp            asdl JSON loader
     typecheck.h, .cpp         Type system + coverage + overlap + duplicate
-    backend.h                 Pluggable backend interface (one of two
-                              planned; C deferred)
-    cpp_backend.h, .cpp       C++ class-wrapped emitter
+                              + sibling-ctor widening + where-guard
+                              purity + polymorphic refinement
+    backend.h                 Pluggable backend interface
+    emit_backend.h, .cpp      Template Method base — shared visitor
+                              (emit_expr / emit_stmt / emit_rule_branch)
+                              + per-language hooks
+    cpp_backend.cpp           C++ subclass — class-wrapped emitter
+    c_backend.cpp             C subclass — context-struct + free
+                              functions; uses asdl-c factories
     main.cpp                  CLI driver
   tests/
     ddcgc_test.cpp            Unit tests (parser, schema, typecheck,
-                              codegen, destinations, patterns)
+                              codegen, destinations, patterns,
+                              guard purity)
     data/
       tiny.ddcg               Minimal end-to-end fixture
-      big.ddcg                Self-reporting integration probe; each
-                              rule calls trace_fire("name") and the
-                              driver verifies every catalogued feature
-                              fires
+      big.ddcg                C++ self-reporting integration probe;
+                              each rule calls trace_fire("name") and
+                              the driver verifies every catalogued
+                              feature fires
+      kitchensink.ddcg        C-mode integration probe — exercises
+                              every emitter form against asdl-c
+                              factories
+      scoped.ddcg             Recursive env_dest fixture (chained
+                              scopes via `parent: rho` self-reference)
+      paper_consumer.ddcg     Imports `dybvig.ddcg` to validate the
+                              shared-library import path
 ```
 
 ## SEE ALSO

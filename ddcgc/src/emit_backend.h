@@ -149,6 +149,24 @@ protected:
     // null literal — `nullptr` (C++) vs `NULL` (C).
     virtual std::string null_literal() const = 0;
 
+    // Whether string equality should be emitted as `strcmp` (C, where
+    // strings flow as `const char*`) or via the language's overloaded
+    // `==` operator (C++ `std::string`). Default false → use `==`;
+    // override true in the C backend.
+    virtual bool string_eq_via_strcmp() const { return false; }
+
+    // Whether `list.count` should be emitted as a struct-field access
+    // (C: `xs.count`) or the standard-library size accessor (C++:
+    // `xs.size()`). Default false → C++; override true in the C
+    // backend.
+    virtual bool c_style_list_count() const { return false; }
+
+    // The cast expression used to coerce one ternary arm to the
+    // widened parent-sum type when the arms are sibling schema-ctors.
+    // C++: `cpp::Foo*` (just a pointer cast). C: the typedef name
+    // resolved to. Hook so each backend formats its own.
+    virtual std::string ternary_branch_cast(const Type& result_ty) = 0;
+
     // asdl enum-value reference (e.g. DSL `DtRef` from
     // `datatype = DtByte | DtShort | DtInt | DtRef`). C emits the
     // tag-constant macro `<MODULE>_<CTOR>`; C++ emits the

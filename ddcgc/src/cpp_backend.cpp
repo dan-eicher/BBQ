@@ -163,6 +163,9 @@ private:
     }
     std::string cpp_for_type(const Type& t);
     std::string cpp_for_typeref(DdcgAst::TypeRef* tr);
+    std::string ternary_branch_cast(const Type& t) override {
+        return cpp_for_type(t);
+    }
 
     std::string let_decl_for(DdcgAst::Expr* rhs);
     std::string field_check_expr(DdcgAst::Pattern* sub,
@@ -358,10 +361,24 @@ void CppBackend::emit_build(DdcgAst::BuildExpr* b) {
         out() << "/*BUG: unknown schema*/(void)0";
         return;
     }
+    // Resolve the target ctor's field list so we can specialise
+    // arg emission per field shape (e.g. nil → std::nullopt for an
+    // Optional schema field, not nullptr — the latter would build
+    // a present-but-null std::optional<T*>, causing has_value() to
+    // return true and crashing downstream consumers).
+    auto ci = sit->second.constructors.find(b->ctor);
     out() << "new " << cpp_class_name(sit->second, b->ctor) << "(";
     for (size_t i = 0; i < b->args.size(); ++i) {
         if (i) out() << ", ";
-        emit_expr(b->args[i]);
+        bool emitted = false;
+        if (ci != sit->second.constructors.end() &&
+            i < ci->second.fields.size() &&
+            ci->second.fields[i].flag == FieldFlag::Optional &&
+            dynamic_cast<DdcgAst::NilLit*>(b->args[i])) {
+            out() << "std::nullopt";
+            emitted = true;
+        }
+        if (!emitted) emit_expr(b->args[i]);
     }
     out() << ")";
 }
@@ -388,6 +405,10 @@ void CppBackend::emit_match_expr(DdcgAst::MatchExpr* m) {
     const Schema* enum_schema = nullptr;
     std::string enum_sum_name;
     bool int_subject = false;
+    // Non-enum schema sum (e.g. asdl `type_body = Product(...) | Sum(...)`)
+    // — emit a dynamic_cast chain instead of a switch.
+    const Schema* schema_subject = nullptr;
+    std::string schema_sum_name;
     auto it = check_->expr_types.find(m->subject);
     if (it != check_->expr_types.end()) {
         const Type& st = it->second;
@@ -395,20 +416,57 @@ void CppBackend::emit_match_expr(DdcgAst::MatchExpr* m) {
             dest_name = st.name;
         } else if (st.kind == TypeKind::Schema) {
             auto sit = schemas_->find(st.schema_import);
-            if (sit != schemas_->end() &&
-                sit->second.enum_sums.count(st.name)) {
-                enum_schema = &sit->second;
-                enum_sum_name = st.name;
-                enum_cpp = cpp_class_name(*enum_schema, st.name);
+            if (sit != schemas_->end()) {
+                if (sit->second.enum_sums.count(st.name)) {
+                    enum_schema = &sit->second;
+                    enum_sum_name = st.name;
+                    enum_cpp = cpp_class_name(*enum_schema, st.name);
+                } else if (sit->second.sum_names.count(st.name)) {
+                    schema_subject = &sit->second;
+                    schema_sum_name = st.name;
+                }
             }
         } else if (st.kind == TypeKind::Int) {
             int_subject = true;
         }
     }
-    if (dest_name.empty() && enum_cpp.empty() && !int_subject) {
+    if (dest_name.empty() && enum_cpp.empty() && !int_subject &&
+        !schema_subject) {
         errors_->push_back("match: subject is not a dest tagged union, "
-                            "asdl enum, or int");
+                            "asdl enum, schema sum, or int");
         out() << "({})";
+        return;
+    }
+    // Schema-sum subject: emit `[&]() -> ret { auto _m = subj; if (auto* _n = dynamic_cast<Ctor*>(_m)) {...} ... return {}; }()`.
+    if (schema_subject) {
+        std::string match_ret = "auto";
+        auto rti = check_->expr_types.find(m);
+        if (rti != check_->expr_types.end()) {
+            match_ret = cpp_for_type(rti->second);
+        }
+        out() << "([&]() -> " << match_ret << " {\n";
+        indent_depth_++;
+        indent() << "auto _m = ";
+        emit_expr(m->subject);
+        out() << ";\n";
+        int name_ctr = 0;
+        for (auto* arm : m->arms) {
+            auto* cp = dynamic_cast<DdcgAst::ConstructorPat*>(arm->pat);
+            if (!cp || cp->module.empty()) {
+                errors_->push_back(
+                    "match on schema sum: arm must be `module.Ctor(...)`");
+                continue;
+            }
+            int blocks_open = emit_match(*schema_subject, cp, "_m", name_ctr);
+            emit_stmts(arm->body, /*tail=*/true);
+            while (blocks_open--) {
+                indent_depth_--;
+                indent() << "}\n";
+            }
+        }
+        indent() << "return {};\n";
+        indent_depth_--;
+        indent() << "})()";
         return;
     }
     std::string tag_class = camel(dest_name) + "Tag";

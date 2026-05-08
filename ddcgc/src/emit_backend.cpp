@@ -361,11 +361,30 @@ void EmitBackend::emit_expr(DdcgAst::Expr* e) {
         return;
     }
     if (auto* t = dynamic_cast<DdcgAst::TernaryExpr*>(e)) {
+        // When branches are sibling schema-ctors that widen to a
+        // common parent sum (per typecheck.cpp's
+        // common_schema_sum), C++ won't auto-upcast distinct pointer
+        // types in a ternary — emit an explicit cast on each branch
+        // to the result type so `(cond ? new A() : new B())` compiles.
+        std::string result_ty;
+        auto rti = check_->expr_types.find(e);
+        auto thi = check_->expr_types.find(t->then_);
+        auto eli = check_->expr_types.find(t->else_);
+        if (rti != check_->expr_types.end() &&
+            thi != check_->expr_types.end() &&
+            eli != check_->expr_types.end() &&
+            rti->second.kind == TypeKind::Schema &&
+            !(thi->second == rti->second &&
+              eli->second == rti->second)) {
+            result_ty = ternary_branch_cast(rti->second);
+        }
         out() << "(";
         emit_expr(t->cond);
         out() << " ? ";
+        if (!result_ty.empty()) out() << "(" << result_ty << ")";
         emit_expr(t->then_);
         out() << " : ";
+        if (!result_ty.empty()) out() << "(" << result_ty << ")";
         emit_expr(t->else_);
         out() << ")";
         return;
@@ -383,11 +402,13 @@ void EmitBackend::emit_expr(DdcgAst::Expr* e) {
                 return;
             }
         }
-        // String/ident equality must use strcmp — C/C++ pointer
-        // compare on `const char*` is undefined for distinct
-        // literal-typed pointers and silently wrong for runtime
-        // strings. Both languages have <string.h>'s strcmp.
-        if (op == "==" || op == "!=") {
+        // String/ident equality. In C strings flow as `const char*`
+        // and `==` is pointer-compare — must dispatch through strcmp
+        // (with a null-safe pointer-equality short-circuit). In C++
+        // `std::string` has the right `==` operator natively. The
+        // backend tells us which language we're in via the
+        // string_eq_via_strcmp() hook.
+        if ((op == "==" || op == "!=") && string_eq_via_strcmp()) {
             auto lt = check_->expr_types.find(b->left);
             auto rt = check_->expr_types.find(b->right);
             bool both_strings =
@@ -460,6 +481,7 @@ void EmitBackend::emit_expr(DdcgAst::Expr* e) {
         // rule. (TypeKind::Schema is by-pointer; primitives, Dest,
         // and Tuple are by-value.)
         const char* sep = "->";
+        bool base_is_list = false;
         auto it = check_->expr_types.find(fa->base);
         if (it != check_->expr_types.end()) {
             switch (it->second.kind) {
@@ -475,8 +497,16 @@ void EmitBackend::emit_expr(DdcgAst::Expr* e) {
                     break;
                 default: break;
             }
+            if (it->second.kind == TypeKind::List) base_is_list = true;
         }
-        out() << sep << fa->field;
+        // List intrinsic: `.count` is the length accessor in the
+        // .ddcg DSL. C lists carry it as a struct field; std::vector
+        // exposes it via .size(). Remap on the emit side.
+        if (base_is_list && fa->field == "count" && !c_style_list_count()) {
+            out() << sep << "size()";
+        } else {
+            out() << sep << fa->field;
+        }
         return;
     }
     if (auto* ix = dynamic_cast<DdcgAst::IndexAccExpr*>(e)) {

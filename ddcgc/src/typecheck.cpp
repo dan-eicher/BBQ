@@ -61,6 +61,14 @@ bool assignable(const Type& expected, const Type& value,
     if (expected.is_unknown() || value.is_unknown()) return true;
     if (value.kind == TypeKind::NilLit && expected.kind == TypeKind::Schema) return true;
     if (expected.kind == TypeKind::NilLit && value.kind == TypeKind::Schema) return true;
+    // identifier and string are nominally distinct in asdl but both
+    // lower to `std::string` at the C++ level. Allow either direction
+    // so downstream codegen tools (asdl_to_cpp, peg_to_cpp, …) can
+    // pass identifier-typed schema fields through string-typed
+    // parameters and vice versa without ceremony.
+    if ((expected.kind == TypeKind::String && value.kind == TypeKind::Ident) ||
+        (expected.kind == TypeKind::Ident  && value.kind == TypeKind::String))
+        return true;
     // Structural compatibility through containers: an Unknown element
     // type matches any concrete one (used for empty list literals,
     // `[]` typed as `list<?>`, vs a concrete `list<int>`).
@@ -950,16 +958,29 @@ Type infer_expr(Ctx& c, DdcgAst::Expr* e) {
         if (l->elems.empty()) {
             ret = Type::list_(Type::unknown());  // contextualised later
         } else {
-            Type first = infer_expr(c, l->elems[0]);
+            // Widen sibling constructors of the same asdl sum to the
+            // parent sum — same rule the ternary join uses, applied
+            // here so `[ build mod.A(...), build mod.B(...) ]` types
+            // as `list<mod.parent>` when A and B share a parent sum.
+            Type acc = infer_expr(c, l->elems[0]);
             for (size_t i = 1; i < l->elems.size(); ++i) {
                 Type t = infer_expr(c, l->elems[i]);
-                if (!assignable(first, t, c.schemas) && !assignable(t, first, c.schemas)) {
-                    err(c, l->elems[i]->loc,
-                        "list element type mismatch: expected " + first.display() +
-                        ", got " + t.display());
+                if (assignable(acc, t, c.schemas)) {
+                    // t fits the running join — keep acc.
+                } else if (assignable(t, acc, c.schemas)) {
+                    acc = t;  // running join widens to t.
+                } else {
+                    std::string common = common_schema_sum(c, acc, t);
+                    if (!common.empty()) {
+                        acc = Type::schema(acc.schema_import, common);
+                    } else {
+                        err(c, l->elems[i]->loc,
+                            "list element type mismatch: expected " + acc.display() +
+                            ", got " + t.display());
+                    }
                 }
             }
-            ret = Type::list_(first);
+            ret = Type::list_(acc);
         }
     }
     else if (auto* tu = dynamic_cast<DdcgAst::TupleLit*>(e)) {
@@ -1141,6 +1162,11 @@ Type infer_expr(Ctx& c, DdcgAst::Expr* e) {
                             ctor.fields[i].name + "'): expected " +
                             ft.display() + ", got " + at.display());
                     }
+                    // Push the expected element type back down into
+                    // polymorphic arg expressions (empty list literal,
+                    // ternary with one nil branch, …) so the codegen
+                    // sees a concrete element type rather than Unknown.
+                    refine_polymorphic(c, b->args[i], ft);
                 }
                 // Type-check any extra args so cached expr_types are populated.
                 for (size_t i = n; i < b->args.size(); ++i) infer_expr(c, b->args[i]);

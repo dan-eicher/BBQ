@@ -260,9 +260,13 @@ TEST(PegKildall, UndeclaredIdentifierIsError) {
     EXPECT_TRUE(found);
 }
 
-TEST(PegKildall, BuiltinCallsAreAccepted) {
-    // ident, integer, qualified_ident are pegc-runtime built-ins —
-    // legal to call without grammar declarations.
+TEST(PegKildall, BuiltinNamesGetNoSpecialTreatment) {
+    // The is_builtin allowlist (ident, integer, keyword, ...) was
+    // dropped: those names must now be declared as TOKENS (or whatever
+    // kind) in the grammar like any other identifier. This test is
+    // the regression guard against re-introducing the allowlist —
+    // calling `ident<s>` without a grammar declaration is the same
+    // undeclared-identifier error any other typo would produce.
     auto* g = parse(
         "COMPILER Test\n"
         "PRODUCTIONS\n"
@@ -271,8 +275,12 @@ TEST(PegKildall, BuiltinCallsAreAccepted) {
         "END Test.\n");
     ASSERT_NE(g, nullptr);
     auto r = analyze_default(g);
-    EXPECT_TRUE(r.ok()) << "first error: " <<
-        (r.errors.empty() ? "(none)" : r.errors[0]);
+    EXPECT_FALSE(r.ok());
+    bool found_ident = false;
+    for (auto& e : r.errors)
+        if (e.find("undeclared identifier") != std::string::npos &&
+            e.find("ident") != std::string::npos) found_ident = true;
+    EXPECT_TRUE(found_ident);
 }
 
 // ═══════════════════════════════════════════════════════════════

@@ -73,6 +73,8 @@ struct EvalConstraintNode;
 struct BindComputeNode;
 struct InvokeRuleNode;
 struct ReturnRuleNode;
+struct OnFailKont;
+struct AbortRuleKont;
 struct BeginChoiceNode;
 struct CommitChoiceNode;
 struct BeginOptionalNode;
@@ -80,6 +82,7 @@ struct EndOptionalNode;
 struct BeginArrayNode;
 struct ArrayNextNode;
 struct EndArrayNode;
+struct ResyncKont;
 struct SwitchDispatchNode;
 struct BitfieldReadNode;
 struct SetEndianNode;
@@ -306,6 +309,7 @@ private:
 struct InvokeRuleNode : public StaticKont {
     const char* rule_name{};
     KontNode* entry{};
+    KontNode* caller_fail_target{};
     KontNode* next{};
 
 private:
@@ -319,9 +323,23 @@ private:
     void invoke(CEKMachine* m) const override;
 };
 
+struct OnFailKont : public StaticKont {
+    KontNode* target{};
+    KontNode* next_on_fail{};
+    bool pop_frame{};
+
+private:
+    void invoke(CEKMachine* m) const override;
+};
+
+struct AbortRuleKont : public StaticKont {
+
+private:
+    void invoke(CEKMachine* m) const override;
+};
+
 struct BeginChoiceNode : public StaticKont {
-    KontNode** alternatives = nullptr;
-    int alternatives_count = 0;
+    KontNode* on_fail_target{};
     KontNode* next{};
 
 private:
@@ -336,6 +354,7 @@ private:
 };
 
 struct BeginOptionalNode : public StaticKont {
+    KontNode* on_fail_target{};
     KontNode* inner{};
     KontNode* next{};
 
@@ -355,6 +374,7 @@ struct BeginArrayNode : public StaticKont {
     ArrayMode mode{};
     KontNode* count_expr{};
     KontNode* end_node{};
+    KontNode* resync_target{};
     KontNode* next{};
 
 private:
@@ -367,13 +387,23 @@ struct ArrayNextNode : public StaticKont {
     KontNode* until_expr{};
     KontNode* end_node{};
     KontNode* body_entry{};
+    bool resync{};
 
 private:
     void invoke(CEKMachine* m) const override;
 };
 
 struct EndArrayNode : public StaticKont {
+    bool resync{};
     KontNode* next{};
+
+private:
+    void invoke(CEKMachine* m) const override;
+};
+
+struct ResyncKont : public StaticKont {
+    KontNode* body_entry{};
+    KontNode* end_node{};
 
 private:
     void invoke(CEKMachine* m) const override;
@@ -946,6 +976,7 @@ struct BeginArrayWithLimitKont : public DynamicKont {
     const char* array_name{};
     ArrayMode mode{};
     KontNode* end_node{};
+    KontNode* resync_target{};
     KontNode* next{};
 
 private:

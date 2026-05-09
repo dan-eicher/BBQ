@@ -1,20 +1,21 @@
 # CEK Machine Design for BBQ
 
-An interpretive backend for BBQ that compiles format specifications into
-typed continuation graphs and executes them against byte buffers, producing
-zero-copy capture metadata.
+The interpretive backend for BBQ. Compiles format specifications into typed
+continuation graphs and executes them against byte buffers, producing zero-
+copy capture metadata.
 
 The architecture is the canonical CEK machine of Felleisen & Friedman 1987 —
 state transitions `(C, E, K) → (C', E', K')` driven by syntactic
 decomposition of the current continuation, plus a typed accumulator register
 holding values in flight. Expression evaluation is defunctionalized per
 Reynolds 1972 and Ager-Biernacki-Danvy-Midtgaard 2003: every continuation
-that would sit on the host stack in a recursive interpreter becomes an
-explicit data constructor on the runtime K stack.
+that would sit on the host stack in a recursive interpreter is an explicit
+data constructor on the runtime K stack.
 
-The design draws on three working implementations: AiPL's 70-continuation
-production VM, the calc compiler in `jitterator/example/`, and the original
-IPG design docs in `/home/dan/Source/IPG/`.
+This document describes what the CEK backend does today. Variant catalogs
+and rule bodies live in their generator input files (referenced in §4 and
+§5); this document sits above them, naming categories and the architectural
+discipline they realize.
 
 ---
 
@@ -63,19 +64,16 @@ No bytes are copied; the metadata IS the parse result.
 **Toolchain at a glance.** The compiler and IR are themselves generated from
 declarative inputs:
 
-- `backends/cek/bbq_ir.asdl` declares the IR variants (typed value sum +
-  static/dynamic kont sums under a shared root). The `asdl` tool generates
-  the C++ headers via the `bbq_ir.inja` template.
+- `backends/cek/bbq_ir.asdl` declares the IR variants — typed value sum
+  plus static/dynamic kont sums under a shared root. The `asdl` tool
+  generates the C++ headers via `templates/bbq_ir.inja`.
 - `backends/cek/bbq.ddcg` declares the AST→IR compilation rules using
   Destination-Driven Code Generation. The `ddcgc` tool, with the
-  `dybvig.ddcg` primitive library, generates the compiler.
-- `backends/cek/Machine.cpp` and friends are hand-written runtime: the
-  trampoline, backtracking, capture builder, error tracking, external
-  parser dispatch.
-
-The design doc names what each input file is FOR and the architectural
-discipline they collectively realize. Variant catalogs and rule bodies
-themselves live in those files.
+  `dybvig.ddcg` primitive library, generates the `bbq::Compiler` class.
+- `backends/cek/Machine.cpp`, `Frame.h`, `Capture.h`, `Environment.h`,
+  `ParseArena.h`, `StringPool.h` are hand-written runtime: the trampoline,
+  the failure path, the capture builder, error tracking, external parser
+  dispatch.
 
 ### Why both backends?
 
@@ -289,42 +287,28 @@ struct Environment {
 
 Lookup walks the parent chain via interned-pointer comparison.
 
-**Frame stack.** Three frame types cover all saved-state needs.
+**Frame stack.** Three frame types — `ReturnFrame`, `Savepoint`, `LoopFrame`
+— cover all saved-state needs. See `backends/cek/Frame.h` for exact field
+layouts. Their roles:
 
-```cpp
-struct Frame {
-    FrameType type;          // Return | Alternative | Loop
-    Frame* prev;
-};
+- **`ReturnFrame`** is pushed by `InvokeRule` and popped by `ReturnRule`.
+  Carries the caller's return-to kont, saved environment, the start
+  position, and a capture mark. Cross-rule failure walks past these
+  transparently.
 
-struct ReturnFrame : Frame {
-    KontNode* return_to;
-    Environment* saved_env;
-    size_t start_pos;
-    CaptureBuilder::Mark capture_mark;
-};
+- **`Savepoint`** is pushed by `BeginChoice`, `BeginOptional`, and (in
+  resync mode) `BeginArray` for backtrack scopes. Captures `pos`, `env`,
+  `little_endian`, the K-stack depth, and a capture mark. Carries one
+  additional pointer — `on_fail_target` — that names the static
+  `OnFailKont` to dispatch on failure (§7.2). `CommitChoice` /
+  `EndOptional` / `EndArray` pop it on success.
 
-struct AlternativeFrame : Frame {
-    KontNode** remaining;
-    int remaining_count;
-    KontNode* join;          // nullptr for Choice; skip-target for Optional
-    Environment* saved_env;
-    size_t saved_pos;
-    bool saved_endian;
-    size_t saved_kont_size;  // K-stack truncation point
-    CaptureBuilder::Mark capture_mark;
-};
-
-struct LoopFrame : Frame {
-    int64_t counter;
-    int64_t limit;
-    KontNode* body_entry;
-    KontNode* loop_end;
-    Environment* body_env;
-    CaptureBuilder::Mark capture_mark;
-    // … plus terminator/separator/element-interval data per array mode
-};
-```
+- **`LoopFrame`** is pushed by `BeginArray` for every array. Holds the
+  iteration counter, the limit (or −1 for EOF/until-bounded arrays), the
+  array's `EndArrayNode`, and the outer environment to restore when the
+  array ends. In resync mode the per-iteration `Savepoint` sits on top of
+  the `LoopFrame`; in standard mode there is no `Savepoint` for the
+  array.
 
 **Capture metadata.** The output structure.
 
@@ -385,6 +369,23 @@ the grammar arena, immutable across parses.
 
 - **Structural** — struct/array/choice/optional/switch/bitfield/extern/
   invoke-rule/return-rule/halt and the transition konts between them.
+- **Failure-handler chains** — `OnFailKont` links built at compile time
+  by `compile_alternatives` / `compile_optional`. Each link is reachable
+  via two paths that converge on the same value: as a runtime
+  `Savepoint::on_fail_target` (set at BeginChoice/BeginOptional push,
+  mutated through the chain as arms try-and-fail) and as a static
+  `in_alt::next_arm` / `in_optional::skip` in ρ (so where-checks can
+  dispatch directly via on_false without a frame walk). See §7.2.
+- **Cross-rule failure** — `AbortRuleKont` is the on_false target when
+  a where-check at a rule's top level has no in-rule backtrack scope.
+  It walks `ReturnFrame`s for the nearest `rule_fail_target` (baked at
+  the matching InvokeRule emit site via `find_backtrack_target` over
+  the caller's ρ) and dispatches there.
+- **Resync recovery** — `ResyncKont` is the static failure handler for
+  per-iteration savepoints inside `array<T> ... resync` (§7.4). It's
+  carried both as `Savepoint::on_fail_target` (runtime byte-fail
+  dispatch) and as `in_array_elem::skip` in ρ (compile-time on_false
+  resolution).
 - **Expression leaves** — integer/float/string/bool literals; refs;
   position queries (`pos`, `remaining`, `at_end`, `eoi`); the loop
   counter `i`.
@@ -398,7 +399,7 @@ kont's `invoke()` fires. Live in the per-parse arena, freed at parse end.
 - **Apply variants** paired 1:1 with operator variants. Each apply carries
   the slot eval-left writes the saved right operand into, and dispatches
   on the (left, right) type pair to produce the result.
-- **Site-consumer variants** for the seven structural sites that take an
+- **Site-consumer variants** for the structural sites that take an
   expression: `EvalConstraintCheck`, `SwitchSelect`, `BindComputeStore`,
   `BeginArrayWithLimit`, `ArrayCountCheck`, `ArrayUntilCheck`,
   `MatchBytesApply`, `SetEndianApply`.
@@ -464,12 +465,34 @@ DDCG parameterizes each rule by three destinations:
   level. `pair(Lt, Lf)` short-circuits boolean expressions in test
   position — a worthwhile follow-up but excluded by default in favor of
   the explicit `EvalConstraintCheck` runtime kont. `ret` is unused.
-- **ρ (rho)** — loop-break label. BBQ has no `break` in the BBQ source
-  language, so ρ is unit (an empty struct).
+- **ρ (rho)** — lexical scope chain consumed at compile time. BBQ's
+  ρ is a recursive sum tracking the surrounding backtrackable scope:
+  `root | in_field(name, parent) | in_alt(next_arm, parent) |
+  in_optional(skip, parent) | in_array_elem(skip, parent)`. ρ never
+  escapes into the emitted kont graph — purely a compile-time
+  threading parameter — but it carries pointers into the kont graph
+  so compile-time walks can resolve runtime targets statically.
 
-The narrow δ/γ usage is what keeps BBQ rules paper-strict. Rules pass ρ
-through unchanged. The single γ form means rules never branch on which
-γ they got.
+The narrow δ/γ usage is what keeps BBQ rules paper-strict. The single
+γ form means rules never branch on which γ they got. ρ as a recursive
+sum is consumed by two compile-time walkers:
+
+- `intern_field_or_anon(rho)` walks to the innermost `in_field` for
+  capture metadata names. `in_alt` and `in_optional` are transparent
+  (a where-check inside an arm still belongs to the enclosing field);
+  `in_array_elem` is a name barrier (elements are anonymous).
+- `find_backtrack_target(rho)` walks to the innermost backtrackable
+  scope's static failure target. `in_alt.next_arm`, `in_optional.skip`,
+  and `in_array_elem.skip` (when non-null) each point to an
+  `OnFailKont` link that the runtime would otherwise reach via frame-
+  walking. Used by `compile_primitive` to resolve a where-check's
+  `on_false` and by `make_invoke_rule` to bake `caller_fail_target`
+  on the InvokeRuleNode at compile time.
+
+The yoctojc lineage: this is the same compile-time-walks-ρ pattern
+yoctojc uses for `break`/`continue`/`finally` resolution. BBQ adapts
+it to backtrack-on-failure scopes, which are the analog in a
+parser.
 
 ### 5.3 The eval-and-apply emission pattern
 
@@ -559,7 +582,7 @@ whatever type the field declares) and writing that to ac.
 same typed-data discipline as everything else. There is no reinterpret-
 cast through int64.
 
-### 6.4 The seven structural sites
+### 6.4 The structural sites that consume expressions
 
 Each of the following AST sites carries an expression IR sub-tree; the
 structural kont's `invoke()` pushes a runtime consumer kont onto K, then
@@ -568,13 +591,23 @@ typed Value in ac; the consumer reads ac and acts:
 
 | Site | Consumer | Reads from ac |
 |---|---|---|
-| `where` constraint | `EvalConstraintCheck` | Bool (or coerced) |
+| `where` constraint | `EvalConstraintCheck` | Bool (or coerced); on false pushes `on_false` (compile-time-baked failure target) |
 | `switch` discriminator | `SwitchSelect` | Int or String |
 | `compute(name : T = expr)` | `BindComputeStore` | Typed Value |
 | Array `count(N)` | `BeginArrayWithLimit` / `ArrayCountCheck` | Int |
 | Array `until(cond)` | `ArrayUntilCheck` | Bool (or coerced) |
 | `bytes[length]` / `string[length]` | `MatchBytesApply` | Int |
 | `@endian: expr` | `SetEndianApply` | Bool (or coerced) |
+
+`EvalConstraintCheck` carries an `on_false` pointer set at compile
+time by `compile_primitive` via `find_backtrack_target(rho)`. On false
+the kont pushes `on_false` directly — no frame walk. The `on_false`
+target is the same `OnFailKont` link the surrounding `Savepoint`
+carries as `on_fail_target`, so the static path and the runtime
+byte-fail path converge on the same handler. When ρ bottoms out at
+root with no backtrackable frame, `compile_primitive` substitutes
+`AbortRuleKont` so the failure crosses the rule boundary into the
+caller's chain (§7.2).
 
 ---
 
@@ -602,49 +635,135 @@ advanced via `control->next`.
 
 ### 7.2 Backtracking
 
-When any kont detects failure (bounds check, constraint violation, type
-error, match failure), it calls `m->fail()`. The failure path searches
-the frame stack for an `AlternativeFrame` and restores from it.
+Backtracking has two convergent paths — a static path resolved at
+compile time via ρ, and a runtime path via `m->fail()` walking the
+frame stack. Both converge on the same `OnFailKont` link, so the
+behavior is identical regardless of which path the failure came from.
 
-Restoration sets:
+**The static path — where-check failure.** `EvalConstraintCheckKont`
+carries an `on_false` field set at compile time by `compile_primitive`
+via `find_backtrack_target(rho)`. The walker descends ρ to the
+innermost backtrackable scope and returns its statically-baked
+failure handler:
 
-- `pos` ← saved position
-- `env` ← saved environment pointer
-- `little_endian` ← saved endian flag
-- `builder` ← saved capture mark
-- `kont_stack` ← truncated to saved K size
+- `in_alt(next_arm, …)` — returns `next_arm` (the OnFailKont link to
+  the next arm).
+- `in_optional(skip, …)` — returns `skip` (the OnFailKont link that
+  pops + skips past the optional).
+- `in_array_elem(skip, …)` — returns `skip` when non-null (the
+  ResyncKont for resync arrays); otherwise transparent.
+- `in_field(_, parent)` — transparent.
+- `root` — returns null. `compile_primitive` substitutes
+  `AbortRuleKont` (§cross-rule).
 
-The per-parse arena is **monotonic within a parse**. Speculative
-allocations (Values, dynamic konts allocated during the failed branch)
-are not freed; they live until the arena is reset at parse end. This is
-sound because everything that survives backtracking points only at
-non-speculative allocations.
+When the where-check fails, it pushes `on_false` directly onto K. No
+frame walk.
 
-**Choice vs Optional frame semantics** are encoded in
-`AlternativeFrame::join`. Choice (`join = nullptr`) treats exhaustion as
-real failure and propagates upward. Optional (`join = skip_target`)
-treats exhaustion as "absent" and resumes at the skip target. Successful
-choice alternatives must run a `CommitChoice` kont to pop the
-`AlternativeFrame`; otherwise a later failure could backtrack into the
-already-committed choice. This is the PEG VM `OP_CHOICE`/`OP_COMMIT`
-pattern (Medeiros & Ierusalimschy).
+**The runtime path — byte-fails and other implicit failures.**
+Bounds checks, type errors, external parser failures, and the like
+call `m->fail()`. `fail()` walks `frame_top` for the innermost
+`Savepoint` whose `on_fail_target` is non-null and pushes that
+target. Non-Savepoint frames (ReturnFrame, LoopFrame) are walked
+past; Savepoints with null `on_fail_target` (exhausted scopes) are
+popped and walking continues outward.
 
-### 7.3 PEG VM optimization patterns
+The runtime path's target is the same `OnFailKont` link the static
+path resolves to, because `compile_alternatives` /
+`compile_optional` / `compile_array(resync)` set the Savepoint's
+`on_fail_target` to the same link they put in ρ as the corresponding
+`next_arm`/`skip`. The two paths name the same kont in two ways.
 
-Three optimizations from PEG operational semantics are applicable:
+**OnFailKont semantics** (the link both paths reach):
 
-- **PartialCommit** — array iteration updates the saved state in place
-  rather than push/popping `AlternativeFrame`s per element. Saves N
-  frame allocations on an N-element array.
+1. Restore from the topmost Savepoint:
+   - `pos` ← saved position
+   - `env` ← saved environment
+   - `little_endian` ← saved endian flag
+   - `builder` ← saved capture mark
+   - `kont_stack` ← truncated to saved K size
+2. If `target` is null (scope exhausted) — pop the Savepoint and
+   re-fail outward.
+3. If `pop_frame` is set (optional skip, last-arm cleanup) — pop the
+   Savepoint.
+4. Otherwise — mutate `Savepoint::on_fail_target` to `next_on_fail`
+   so the next failure in this scope advances along the chain.
+5. Push `target` onto K.
+
+The per-parse arena is **monotonic within a parse**: speculative
+allocations from a failed branch are not freed but become unreachable
+when K is truncated and `env` is reset.
+
+**Choice and Optional chain shapes.** `compile_alternatives` builds
+the chain right-to-left so each link knows the next arm's entry: head
+→ `OnFailKont(target=arm1, next=…)` → … → `OnFailKont(target=null,
+pop_frame=true)`. Each non-last arm's compile uses `in_alt(link, …)`
+as ρ so where-checks inside the arm find that link via
+`find_backtrack_target`. `compile_optional` builds a single
+`OnFailKont(target=Lnext, pop_frame=true)` and the inner body
+compiles with `in_optional(link, …)` as ρ. Successful arms run
+`CommitChoice` to pop the Savepoint and prevent later failures from
+re-entering the committed choice (PEG VM `OP_CHOICE` / `OP_COMMIT`,
+Medeiros & Ierusalimschy).
+
+**Cross-rule failure.** Each `InvokeRuleNode` carries
+`caller_fail_target` set at the call site by
+`make_invoke_rule(name, find_backtrack_target(rho), next)`. At
+runtime `InvokeRuleNode::invoke` copies it into the new ReturnFrame's
+`rule_fail_target`. When a where-check at a rule's top level has no
+in-rule backtrack scope, `compile_primitive` emits `AbortRuleKont` as
+the `on_false`. `AbortRuleKont::invoke` walks ReturnFrames for the
+innermost `rule_fail_target` and dispatches there — the caller's
+chain takes over. The runtime path (`m->fail()` for byte-fails)
+reaches the caller's Savepoint via the same frame walk, so cross-rule
+failure also converges.
+
+If neither path finds a target — no in-rule scope, no caller scope,
+nothing — the parse fails.
+
+### 7.3 Optimization patterns
+
+PEG-machine optimization patterns from Medeiros & Ierusalimschy:
+
+- **PartialCommit** — savepoint state is mutated in place per iteration
+  rather than push/popping per element. The CEK backend uses this for
+  resync arrays (§7.4): `BeginArray` pushes one Savepoint, `ArrayNext`
+  refreshes it on every successful iteration, `EndArray` pops it once.
 - **Head-fail** — when alternatives have known distinct first bytes,
-  test the discriminator before pushing an `AlternativeFrame`. Effectively
-  a switch on the first byte.
+  test the discriminator before pushing a Savepoint. Effectively a
+  switch on the first byte. **Not implemented**; would be a
+  compile-time analysis pass.
 - **Tail-call** — when the last action in a rule is `InvokeRule`, reuse
   the current `ReturnFrame` rather than pushing a new one. Bounds the
-  frame stack for recursive grammars.
+  frame stack for recursive grammars. **Not implemented**.
 
-These are optimization opportunities, not required for correctness. They
-preserve the design invariants in §13.
+### 7.4 Resync arrays
+
+`array<T> ... resync` is the per-element-skip parsing mode. When a
+record fails to parse at the current position, the array advances by
+one byte and retries the same element type from the new position.
+Useful for forensic and exploratory parsing of corrupted streams.
+
+Sema rejects `resync` combined with `until`: the two have contradictory
+semantics around per-element termination.
+
+The compiler emits a `ResyncKont` and threads it as the
+`resync_target` of `BeginArray`. At runtime:
+
+- `BeginArray` pushes a `LoopFrame` and, in resync mode, a `Savepoint`
+  with `on_fail_target = ResyncKont`.
+- `ArrayNext` refreshes the Savepoint's saved state at the start of
+  each new iteration, then drives the loop's termination check (count,
+  until, eof).
+- `ResyncKont::invoke` restores from the Savepoint, advances `pos` by
+  one (or pops the savepoint and exits via `end_node` on EOF), refreshes
+  the savepoint to the new attempt position, and pushes the body entry.
+- `EndArray` pops the Savepoint (if any) and the LoopFrame, finalizes
+  the array's capture group.
+
+The Savepoint is the per-iteration backtrack point: a successful
+element advances `pos` past the parsed bytes, then `ArrayNext` updates
+the savepoint to the new `pos` so the next failure recovers from
+*there*, not from the array's start.
 
 ---
 
@@ -739,13 +858,19 @@ break/continue/return/throw — BBQ parsing has no such concepts.
 
 | Failure | Source | Recovery |
 |---|---|---|
-| Match failure | Unexpected bytes | Backtrack |
-| Constraint violation | `where` clause false | Backtrack or report |
-| End of input | Reading past buffer end | Backtrack or report |
-| External parser failure | User function returned false | Backtrack or report |
+| Match failure | Unexpected bytes | Backtrack via Savepoint chain (§7.2) |
+| Constraint violation | `where` clause false | Same |
+| End of input | Reading past buffer end | Same |
+| External parser failure | User function returned false | Same |
+| Per-element parse failure | Inside `array<T> ... resync` | Skip one byte, retry (§7.4) |
 | Switch miss | No case matches, no default | Fatal |
 | Type error | Value-channel type mismatch | Fatal |
 | Expression error | Division by zero, undefined ref | Fatal |
+
+"Backtrack" here means the topmost `Savepoint`'s `on_fail_target`
+chain dispatches to the next arm or skip target. If no Savepoint with
+a non-null target is in scope, the failure is reported as the parse
+result.
 
 ### 10.2 Best-error tracking
 
@@ -806,46 +931,53 @@ the bottleneck, and no JIT is in scope.
 
 ## 13. Design Invariants
 
-These are forbidden patterns. Any code matching them indicates weasel
-structure to be removed.
+Forbidden patterns. Any code matching them is weasel structure to remove.
 
 **No third state component beyond C/E/K + ac.** Workspace lives in ac;
 bindings live in E. A separate evaluation stack would be neither — it
-has nowhere to fit in the channel split (§3.2). Any design including
-`eval_stack[N]` is wrong.
+has nowhere to fit in the channel split (§3.2).
 
 **No chain-following advance.** `control` is loaded from K's top each
 trampoline iteration. The field is private with `friend class
-CEKMachine`; only the trampoline writes it. Any kont `invoke()` body
-that tries `m->control = X` or `m->control = m->control->next` is a
-compile error. Konts schedule successors via `m->push_kont(next)`
-(public accessor for K append), never by writing to control. The
-weasel pattern from the old VM (`m->control = next; next->invoke(m)`)
-doesn't compile against the new machine.
+CEKMachine`; only the trampoline writes it. Konts schedule successors
+via `m->push_kont(next)`, never by assigning `control` or chasing
+`control->next`.
 
 **No `reinterpret_cast` of values through `int64`.** Typed Values flow
 through ac. Path navigation goes through `FieldCaptureValue` as a real
-Value variant. Any code that smuggles a `FieldCapture*` through an int64
-slot is wrong.
+Value variant.
 
 **No `CompiledExpr` and no recursive `eval()` tree-walker.** Expression
-evaluation is K push/pop only. Any function with signature `int64_t
-eval(CompiledExpr*)` is wrong.
+evaluation is K push/pop only.
 
 **No γ=ret or γ=pair fallbacks in DDCG rules.** The driver wraps γ at
 the top with `jump(Halt)`; rules emit `cg_deliver(_, δ, γ, Lnext)` and
-trust their parameters. Any rule body that branches on γ.tag and
-synthesizes a Halt or a pair-target is wrong.
+trust their parameters. Rule bodies do not branch on γ.tag.
 
 **No mid-rule Halt or Return invention.** Program exit is the driver's
-responsibility (§5.4). A DDCG rule that allocates `HaltKont` is wrong.
+responsibility (§5.4). DDCG rules do not allocate `HaltKont`.
 
 **No shared mutable apply-kont slots.** Apply konts are allocated fresh
-per evaluation. Pre-allocated apply nodes with mutable `saved_right`
-slots are wrong — they break re-evaluation in arrays.
+per evaluation. Pre-allocated apply nodes with reusable `saved_right`
+slots break re-evaluation in arrays.
 
 **No silent type coercion.** Type errors fail loudly. Float-truncate-to-
 int, string-zero-fallback, cross-type-implicit-promotion are all wrong.
+
+**No runtime arm enumeration for backtracking.** Arm sequencing is
+encoded statically in the `OnFailKont` chain built at compile time.
+The Savepoint's `on_fail_target` advances through the chain by
+mutation as arms try-and-fail; there is no `remaining[]` array of
+arms to scan and no runtime reconstruction of arm order. A frame that
+holds an explicit arm-list to scan at fail time is a regression.
+
+**ρ is compile-time only and never escapes into the kont graph.**
+`rho_t` is threaded through `compile_*` as a value parameter and
+discarded at compile end. The kont graph that comes out of
+compilation has all its `on_false` / `on_fail_target` /
+`caller_fail_target` pointers resolved to plain `KontNode*`. Any
+field on a kont that holds a `rho_t` or attempts to do compile-time
+walks at runtime is wrong.
 
 ---
 
@@ -992,38 +1124,68 @@ POP ApplyEqKont:
 
 POP EvalConstraintCheck:
   Read ac, coerce to bool.
-  If true: push next. If false: push on_false (or fail).
+  If true: push next.
+  If false: push on_false (an OnFailKont link or AbortRuleKont,
+            resolved at compile time via find_backtrack_target(ρ)).
 ```
 
 ### B.3 Backtracking K-trace
 
-A `Choice` with two alternatives, first one fails after consuming bytes.
+A `Choice` with three alternatives — `Item = A | B | C`. The first
+arm fails after consuming bytes. At compile time `compile_alternatives`
+builds the chain:
 
 ```
-Initial: K=[…rule body…], frame_top=…
-EnterChoice → push AlternativeFrame{
-    saved_pos=10, saved_env=E0, saved_kont_size=K.size, saved_endian=…,
-    capture_mark=M0, remaining=[alt2], join=nullptr
+exhausted = OnFailKont(target=null,    next=null,        pop_frame=true)
+linkB     = OnFailKont(target=C.entry, next=exhausted,   pop_frame=false)
+linkA     = OnFailKont(target=B.entry, next=linkB,       pop_frame=false)
+BeginChoice.on_fail_target = linkA
+BeginChoice.next            = A.entry  (first arm, no failure setup)
+```
+
+At runtime:
+
+```
+Initial:  K=[…BeginChoice…], frame_top=…outer…
+
+BeginChoice → push Savepoint{
+    saved_pos=10, saved_env=E0, saved_endian=…,
+    saved_kont_size=K.size, capture_mark=M0,
+    on_fail_target=linkA
 } onto frame_top.
+                push K: A.entry
 
-Alt1 starts. K grows: [alt1_node1, alt1_node2, …, …rest of body…].
-pos advances to 14. Some Values + dynamic konts allocated in arena.
+Arm A starts. K grows with A's body konts; pos advances to 14.
+Some Values + dynamic konts allocated in arena.
 
-alt1_node3 fails: m->fail("...") called.
-  Walk frame_top → find AlternativeFrame.
-  remaining_count > 0 → restore:
+A's third kont fails: m->fail("...") called.
+  Walk frame_top → topmost Savepoint, on_fail_target=linkA.
+  Push K: linkA.
+
+POP linkA:
+  Find topmost Savepoint. Restore:
     pos        ← 10
     env        ← E0
     endian     ← saved_endian
-    builder    ← M0 (drops captures added during alt1)
-    K.resize(saved_kont_size) → drops all alt1 entries
-  Move alt2 into K. remaining_count → 0.
-  Return; trampoline continues with alt2 on top.
+    builder    ← M0  (drops captures added during arm A)
+    K.resize(saved_kont_size) → drops all arm A entries
+  linkA.target = B.entry, pop_frame = false:
+    Savepoint.on_fail_target ← linkB  (mutate for next failure)
+  Push K: B.entry
 
-Speculatively-allocated Values + dynamic konts from alt1 are unreachable
-but still occupy arena. They live until parse end. Sound: nothing
-restored points at them.
+Arm B runs. If it fails, linkB fires next: restores, mutates
+on_fail_target ← exhausted, pushes C.entry. If C also fails,
+exhausted fires: target is null → pop the Savepoint and re-fail
+outward, walking frame_top for the next enclosing scope.
+
+Speculatively-allocated Values + dynamic konts from failed arms are
+unreachable but still occupy arena. They live until parse end. Sound:
+nothing restored points at them.
 ```
+
+For an `optional<T>` the chain is just `linkA = OnFailKont(target=Lnext,
+next=null, pop_frame=true)` — single link, pops the Savepoint
+immediately on the failed inner.
 
 ---
 

@@ -147,8 +147,14 @@ struct CEKMachine {
     void push_kont(KontNode* k) { kont_stack.push_back(k); }
 
     // Read-only accessor for the current K size — needed when pushing
-    // an AlternativeFrame so backtracking can restore K to this point.
+    // a Savepoint so backtracking can restore K to this point.
     size_t kont_stack_size() const { return kont_stack.size(); }
+
+    // Truncate the kont stack to a previously captured depth. Only
+    // legal call site is OnFailKont::invoke when restoring from a
+    // Savepoint — the captured size is exactly the savepoint's
+    // saved_kont_size. fail() also uses this on cross-savepoint walks.
+    void truncate_kont_stack(size_t n) { kont_stack.resize(n); }
 
     // ── expect<T> helper ────────────────────────────────────
     // Type-checked Value* downcast. Returns T* on tag match;

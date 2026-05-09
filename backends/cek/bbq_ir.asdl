@@ -70,15 +70,47 @@ module bbq_ir {
         | EndStructNode(kont_node next)
         | EvalConstraintNode(kont_node constraint_expr, kont_node on_false, kont_node next)
         | BindComputeNode(interned field_name, kont_node compute_expr, kont_node next)
-        | InvokeRuleNode(interned rule_name, kont_node entry, kont_node next)
+        // caller_fail_target — the caller's static failure
+        // destination, captured at emit time via
+        // find_backtrack_target(rho) and copied into ReturnFrame at
+        // runtime so AbortRuleKont can reach it. Null when the call
+        // sits at the rule's top level with no enclosing backtrack
+        // scope.
+        | InvokeRuleNode(interned rule_name, kont_node entry, kont_node caller_fail_target, kont_node next)
         | ReturnRuleNode(kont_node next)
-        | BeginChoiceNode(kont_node* alternatives, kont_node next)
+        // Failure-handler link. compile_alternatives / compile_optional
+        // build a chain at compile time; BeginChoice / BeginOptional
+        // sets Savepoint.on_fail_target to the chain head, and each
+        // arm's compile-time ρ carries the same link as in_alt's
+        // next_arm so where-checks can dispatch via on_false directly.
+        // On invoke: restore from the topmost Savepoint, mutate its
+        // on_fail_target to next_on_fail (or pop the Savepoint if
+        // pop_frame is set), and jump to target. A null target means
+        // "scope exhausted — pop the Savepoint and re-fail outward."
+        | OnFailKont(kont_node target, kont_node next_on_fail, bool pop_frame)
+        // Cross-rule failure handler. Used as the on_false target
+        // (and as a stand-in for find_backtrack_target's null result)
+        // when a where-check at a rule's top level has no in-rule
+        // backtrack frame. Walks ReturnFrames to the nearest
+        // rule_fail_target and dispatches there; the caller's chain
+        // takes over.
+        | AbortRuleKont
+        // BeginChoice / BeginOptional push a Savepoint with
+        // on_fail_target set to the chain head; arm sequencing is
+        // entirely encoded in the static OnFailKont chain.
+        | BeginChoiceNode(kont_node on_fail_target, kont_node next)
         | CommitChoiceNode(kont_node next)
-        | BeginOptionalNode(kont_node inner, kont_node next)
+        | BeginOptionalNode(kont_node on_fail_target, kont_node inner, kont_node next)
         | EndOptionalNode(kont_node next)
-        | BeginArrayNode(interned array_name, array_mode mode, kont_node count_expr, kont_node end_node, kont_node next)
-        | ArrayNextNode(array_mode mode, kont_node count_expr, kont_node until_expr, kont_node end_node, kont_node body_entry)
-        | EndArrayNode(kont_node next)
+        // resync_target: non-null when the array is in resync mode
+        // (BBQ `array<T> ... resync`). BeginArray pushes a Savepoint
+        // with on_fail_target = resync_target, ArrayNext refreshes its
+        // saved state per iteration, EndArray pops it. Per-element
+        // failure routes through ResyncKont (advance pos, retry body).
+        | BeginArrayNode(interned array_name, array_mode mode, kont_node count_expr, kont_node end_node, kont_node resync_target, kont_node next)
+        | ArrayNextNode(array_mode mode, kont_node count_expr, kont_node until_expr, kont_node end_node, kont_node body_entry, bool resync)
+        | EndArrayNode(bool resync, kont_node next)
+        | ResyncKont(kont_node body_entry, kont_node end_node)
         | SwitchDispatchNode(kont_node discriminator_expr, switch_case* cases, kont_node default_target)
         | BitfieldReadNode(primitive_info container, bitfield_entry* entries, kont_node next)
         | SetEndianNode(kont_node endian_expr, kont_node next)
@@ -196,7 +228,7 @@ module bbq_ir {
         | EvalConstraintCheckKont(kont_node on_false, kont_node next)
         | SwitchSelectKont(switch_case* cases, kont_node default_target)
         | BindComputeStoreKont(interned field_name, kont_node next)
-        | BeginArrayWithLimitKont(interned array_name, array_mode mode, kont_node end_node, kont_node next)
+        | BeginArrayWithLimitKont(interned array_name, array_mode mode, kont_node end_node, kont_node resync_target, kont_node next)
         | ArrayCountCheckKont(kont_node end_node, kont_node body_entry)
         | ArrayUntilCheckKont(kont_node end_node, kont_node body_entry)
         | MatchBytesApplyKont(interned field_name, bool is_string, kont_node next)

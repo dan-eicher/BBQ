@@ -587,6 +587,7 @@ bool Parser::parse_ArrayBody(TypeExpr* * result) {
        Expr* constr = nullptr;
        Interval* iv = nullptr;
        Interval* elem_iv = nullptr;
+       bool resync = false;
        SourceLoc loc = Loc();
     skip();
     if (!match("<")) return false;
@@ -600,32 +601,52 @@ bool Parser::parse_ArrayBody(TypeExpr* * result) {
         auto _m0 = save();
         if (![&]() -> bool {
             skip();
-            if (!parse_ConstraintBlock(&constr)) return false;
+            if (!match("resync")) return false;
+            {
+                auto _m1 = save();
+                bool _ok1 = [&]() -> bool {
+                    if (at_end() || !is_ident_continue(peek())) return false;
+                    advance();
+                    return true;
+                }();
+                restore(_m1);
+                if (_ok1) return false;
+            }
+            resync = true;
             return true;
         }()) restore(_m0);
     }
     {
-        auto _m1 = save();
+        auto _m2 = save();
+        if (![&]() -> bool {
+            skip();
+            if (!parse_ConstraintBlock(&constr)) return false;
+            return true;
+        }()) restore(_m2);
+    }
+    {
+        auto _m3 = save();
         if (![&]() -> bool {
             skip();
             if (!parse_IntervalSpec(&iv)) return false;
             return true;
-        }()) restore(_m1);
+        }()) restore(_m3);
     }
     {
-        auto _m2 = save();
+        auto _m4 = save();
         if (![&]() -> bool {
             skip();
             if (!match("@")) return false;
             skip();
             if (!parse_ElementIntervalSpec(&elem_iv)) return false;
             return true;
-        }()) restore(_m2);
+        }()) restore(_m4);
     }
     *result = new Array(elem, spec,
            constr ? std::optional<Expr*>(constr) : std::nullopt,
            iv     ? std::optional<Interval*>(iv) : std::nullopt,
-           elem_iv ? std::optional<Interval*>(elem_iv) : std::nullopt);
+           elem_iv ? std::optional<Interval*>(elem_iv) : std::nullopt,
+           resync);
        (*result)->loc = loc;
     return true;
 }

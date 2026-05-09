@@ -1223,6 +1223,108 @@ TEST(CEKLayer3, RuleAlternatives) {
     delete r.grammar;
 }
 
+TEST(CEKLayer3, ThreeArmAlternativesChainAdvance) {
+    // Three arms: each guarded by a where-check on the same byte.
+    // Tests OnFailKont chain advancement — arm 0 fails (where mismatch),
+    // chain advances to arm 1's RestoreThenJump link, arm 1 also fails,
+    // chain advances to arm 2's link, arm 2 finally succeeds.
+    auto r = layer3_compile_and_run(
+        "Item = struct { a: uint8 where a == 0x10 }\n"
+        "      | struct { b: uint8 where b == 0x20 }\n"
+        "      | struct { c: uint8 where c == 0x30 }",
+        "Item",
+        {0x30});  // matches only the third arm
+    ASSERT_TRUE(r.compiled) << r.error;
+    ASSERT_TRUE(r.success) << r.error;
+    EXPECT_EQ(r.meta.bytes_consumed, 1u);
+    delete r.grammar;
+}
+
+TEST(CEKLayer3, CrossRuleWhereFailBacktracksToCallerArm) {
+    // A where-check inside Inner's top level fails. Inner is invoked
+    // from Outer's first alt arm. Failure should cross the rule
+    // boundary (via AbortRuleKont reading ReturnFrame.rule_fail_target,
+    // which was baked at the InvokeRule emit site) and dispatch to the
+    // caller's chain — Outer should successfully fall back to its
+    // second arm.
+    auto r = layer3_compile_and_run(
+        "Inner = struct { magic: uint8 where magic == 0x42 }\n"
+        "Outer = struct { hdr: Inner }\n"
+        "      | struct { other: uint8 }",
+        "Outer",
+        {0x99});  // doesn't match Inner's magic; falls back to second alt
+    ASSERT_TRUE(r.compiled) << r.error;
+    ASSERT_TRUE(r.success) << r.error;
+    EXPECT_EQ(r.meta.bytes_consumed, 1u);
+    delete r.grammar;
+}
+
+TEST(CEKLayer3, ThreeArmAlternativesAllFail) {
+    // Same shape as above, but the input doesn't match any arm.
+    // After the chain exhausts, the savepoint pops and the failure
+    // propagates outward — at the rule's top level there's no
+    // enclosing scope, so parse fails.
+    auto r = layer3_compile_and_run(
+        "Item = struct { a: uint8 where a == 0x10 }\n"
+        "      | struct { b: uint8 where b == 0x20 }\n"
+        "      | struct { c: uint8 where c == 0x30 }",
+        "Item",
+        {0xFF});
+    ASSERT_TRUE(r.compiled) << r.error;
+    EXPECT_FALSE(r.success);
+    delete r.grammar;
+}
+
+TEST(CEKLayer3, ResyncArrayScansThroughCorruption) {
+    // `array<T> resync` recovers from per-element parse failure by
+    // advancing pos one byte and retrying. Element here demands a
+    // 0x42 magic; the input has three valid records sandwiched
+    // between corrupted bytes, so all three should be captured.
+    auto r = layer3_compile_and_run(
+        "Item = struct { magic: uint8 where magic == 0x42, val: uint8 }\n"
+        "Doc  = array<Item> (none, eof) resync",
+        "Doc",
+        {0xFF, 0x42, 0x01,        // junk, then record (0x42 0x01)
+         0xAA, 0xBB,              // junk
+         0x42, 0x02,              // record (0x42 0x02)
+         0x99,                    // junk
+         0x42, 0x03});            // record (0x42 0x03)
+    ASSERT_TRUE(r.compiled) << r.error;
+    ASSERT_TRUE(r.success) << r.error;
+    auto& arr = r.meta.root->children[0];
+    EXPECT_EQ(arr.type, CaptureType::Array);
+    EXPECT_EQ(arr.child_count, 3);
+    delete r.grammar;
+}
+
+TEST(CEKLayer3, ResyncArrayEmptyOnAllJunk) {
+    // No bytes match the where-check; resync skips through everything,
+    // exits at EOF, and the array ends with zero records.
+    auto r = layer3_compile_and_run(
+        "Item = struct { magic: uint8 where magic == 0x42 }\n"
+        "Doc  = array<Item> (none, eof) resync",
+        "Doc",
+        {0xAA, 0xBB, 0xCC, 0xDD});
+    ASSERT_TRUE(r.compiled) << r.error;
+    ASSERT_TRUE(r.success) << r.error;
+    auto& arr = r.meta.root->children[0];
+    EXPECT_EQ(arr.type, CaptureType::Array);
+    EXPECT_EQ(arr.child_count, 0);
+    delete r.grammar;
+}
+
+TEST(CEKLayer3, ResyncWithUntilIsRejected) {
+    // Sema rejects `resync` combined with `until` — the two have
+    // contradictory roles around per-element semantics.
+    auto r = layer3_compile_and_run(
+        "Item = struct { x: uint8 }\n"
+        "Doc  = array<Item> (none, until(false)) resync",
+        "Doc",
+        {0x00});
+    EXPECT_FALSE(r.compiled);
+    if (r.grammar) delete r.grammar;
+}
+
 TEST(CEKLayer3, BytesWithLength) {
     auto r = layer3_compile_and_run(
         "TLV = struct {\n"

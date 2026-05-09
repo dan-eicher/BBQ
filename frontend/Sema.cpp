@@ -121,9 +121,17 @@ void Sema::validate_type(TypeExpr* type, const std::string& ctx, bool guarded) {
                 validate_type(ts->sep_type, ctx, guarded);
             if (auto* ct = dynamic_cast<CountTerm*>(st->term))
                 validate_expr(ct->count, ctx);
-            else if (auto* ut = dynamic_cast<UntilTerm*>(st->term))
+            else if (auto* ut = dynamic_cast<UntilTerm*>(st->term)) {
                 validate_expr(ut->condition, ctx);
-            else if (auto* tt = dynamic_cast<BBQ::TypeTerm*>(st->term))
+                if (arr->resync) {
+                    errors_.error(arr->loc,
+                        "`resync` is incompatible with `until` — until "
+                        "evaluates the condition between iterations, and "
+                        "resync recovers from per-element parse failure; "
+                        "combining them produces ambiguous termination "
+                        "semantics");
+                }
+            } else if (auto* tt = dynamic_cast<BBQ::TypeTerm*>(st->term))
                 validate_type(tt->term_type, ctx, guarded);
         }
         if (arr->constraint)

@@ -523,11 +523,43 @@ void CppBackend::emit_match_expr(DdcgAst::MatchExpr* m) {
             cp && cp->module.empty()) {
             out() << "case " << tag_class << "::" << camel(cp->ctor) << ": {\n";
             indent_depth_++;
+            // Look up the variant to identify recursive fields — fields
+            // whose declared type is the dest type itself (e.g. ρ's
+            // `parent: rho` self-reference). Recursive fields are
+            // stored as `dest_t*` in the runtime struct (the layout
+            // can't recurse by value); ddcgc auto-derefs at bind time
+            // so the rule body sees a `dest_t` value matching the
+            // DSL-level type. Mirrors the C backend's handling.
+            DdcgAst::DestVariant* variant = nullptr;
+            for (auto* d : file_->destinations) {
+                std::vector<DdcgAst::DestVariant*> vs;
+                if (auto* dd = dynamic_cast<DdcgAst::DataDest*>(d)) vs = dd->variants;
+                else if (auto* cd = dynamic_cast<DdcgAst::CtrlDest*>(d)) vs = cd->variants;
+                else if (auto* ed = dynamic_cast<DdcgAst::EnvDest*>(d)) vs = ed->variants;
+                else if (auto* sd = dynamic_cast<DdcgAst::Sum*>(d)) vs = sd->variants;
+                for (auto* v : vs) {
+                    if (v->name == cp->ctor) { variant = v; break; }
+                }
+                if (variant) break;
+            }
+            auto is_recursive_field = [variant, &dest_name](const std::string& fname) {
+                if (!variant) return false;
+                for (auto* f : variant->fields) {
+                    if (f->name != fname) continue;
+                    if (auto* tn = dynamic_cast<DdcgAst::TypeName*>(f->ty)) {
+                        return tn->module.empty() && tn->name == dest_name;
+                    }
+                    return false;
+                }
+                return false;
+            };
             for (auto* fp : cp->fields) {
                 if (auto* nf = dynamic_cast<DdcgAst::NamedFieldPat*>(fp)) {
                     if (auto* bp = dynamic_cast<DdcgAst::BindPat*>(nf->pat)) {
+                        bool recursive = is_recursive_field(nf->name);
+                        const char* deref = recursive ? "*" : "";
                         indent() << "auto " << bp->name
-                                      << " = _m." << nf->name << ";\n";
+                                      << " = " << deref << "_m." << nf->name << ";\n";
                     }
                 }
             }

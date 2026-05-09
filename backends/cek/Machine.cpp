@@ -131,44 +131,24 @@ void CEKMachine::fail(const char* message) {
         best_error_msg = message;
     }
 
-    // Walk frame_top searching for an AlternativeFrame with state to
-    // restore from. Frames that aren't AlternativeFrames (ReturnFrame,
-    // LoopFrame) get popped — failure unwinds through them.
+    // Walk frame_top for the innermost Savepoint that still has an
+    // on_fail_target. Non-Savepoint frames (ReturnFrame, LoopFrame)
+    // and exhausted Savepoints are popped — failure unwinds through
+    // them. The savepoint's on_fail_target is a static OnFailKont
+    // chain link built at compile time; pushing it dispatches to the
+    // correct next-arm or skip target.
     while (frame_top != nullptr) {
-        if (frame_top->type == FrameType::Alternative) {
-            auto* alt = static_cast<AlternativeFrame*>(frame_top);
-            if (alt->remaining_count > 0) {
-                // Restore state and try next alternative
-                pos = alt->saved_pos;
-                env = alt->saved_env;
-                little_endian = alt->saved_endian;
-                builder.restore(alt->capture_mark);
-                kont_stack.resize(alt->saved_kont_size);
-                KontNode* next_alt = alt->remaining[0];
-                alt->remaining++;
-                alt->remaining_count--;
-                kont_stack.push_back(next_alt);
-                return;
-            }
-            // Frame with 0 remaining alternatives:
-            //   join != nullptr → optional (restore + skip to join)
-            //   join == nullptr → choice exhausted (keep searching)
-            if (alt->join != nullptr) {
-                pos = alt->saved_pos;
-                env = alt->saved_env;
-                little_endian = alt->saved_endian;
-                builder.restore(alt->capture_mark);
-                kont_stack.resize(alt->saved_kont_size);
-                frame_top = alt->prev;
-                kont_stack.push_back(alt->join);
+        if (frame_top->type == FrameType::Savepoint) {
+            auto* sp = static_cast<Savepoint*>(frame_top);
+            if (sp->on_fail_target) {
+                kont_stack.push_back(sp->on_fail_target);
                 return;
             }
         }
-        // Pop the frame (non-Alternative, or exhausted Choice)
         frame_top = frame_top->prev;
     }
 
-    // No alternative remains — parse fails
+    // No savepoint with a fail target remains — parse fails.
     failed = true;
 }
 
@@ -929,8 +909,15 @@ void EvalConstraintCheckKont::invoke(CEKMachine* m) const {
     if (b) {
         m->push_kont(this->next);
     } else if (this->on_false) {
+        // Compile-time-baked failure handler. compile_primitive
+        // resolves on_false via find_backtrack_target(rho); the
+        // result is the same OnFailKont link the surrounding
+        // Savepoint carries as on_fail_target, so static dispatch
+        // here reaches the same place fail() would after walking.
         m->push_kont(this->on_false);
     } else {
+        // No on_false plumbed (defensive — compile_primitive should
+        // always wire one, falling back to AbortRuleKont at root).
         m->fail("constraint failed");
     }
 }
@@ -1050,6 +1037,24 @@ void SwitchSelectKont::invoke(CEKMachine* m) const {
 
 // ── Array spine (begin / next / end + count/until checks) ──
 
+// Push a Savepoint anchored to the array's resync target. ArrayNext
+// refreshes its saved state per iteration; ResyncKont restores from
+// it on element-fail. EndArray pops it. Caller passes nullptr in
+// non-resync mode and this is a no-op.
+static void push_resync_savepoint(CEKMachine* m, KontNode* resync_target) {
+    if (!resync_target) return;
+    auto* sp = m->arena->alloc<Savepoint>();
+    sp->type = FrameType::Savepoint;
+    sp->saved_env = m->env;
+    sp->saved_pos = m->pos;
+    sp->saved_endian = m->little_endian;
+    sp->saved_kont_size = m->kont_stack_size();
+    sp->capture_mark = m->builder.mark();
+    sp->on_fail_target = resync_target;
+    sp->prev = m->frame_top;
+    m->frame_top = sp;
+}
+
 void BeginArrayNode::invoke(CEKMachine* m) const {
     if (this->mode == ArrayMode::FixedCount || this->mode == ArrayMode::Count) {
         // count_expr is non-null; evaluate it then site-consumer sets up frame.
@@ -1057,6 +1062,7 @@ void BeginArrayNode::invoke(CEKMachine* m) const {
         check->array_name = this->array_name;
         check->mode = this->mode;
         check->end_node = this->end_node;
+        check->resync_target = this->resync_target;
         check->next = this->next;
         m->push_kont(check);
         m->push_kont(this->count_expr);
@@ -1077,6 +1083,8 @@ void BeginArrayNode::invoke(CEKMachine* m) const {
     lf->capture_mark = m->builder.mark();
     lf->prev = m->frame_top;
     m->frame_top = lf;
+
+    push_resync_savepoint(m, this->resync_target);
 
     if (this->mode == ArrayMode::EOF_ && m->pos >= m->input_length) {
         m->push_kont(this->end_node);
@@ -1108,15 +1116,35 @@ void BeginArrayWithLimitKont::invoke(CEKMachine* m) const {
     lf->prev = m->frame_top;
     m->frame_top = lf;
 
+    if (limit > 0) {
+        push_resync_savepoint(m, this->resync_target);
+    }
     m->push_kont(limit <= 0 ? this->end_node : this->next);
 }
 
 void ArrayNextNode::invoke(CEKMachine* m) const {
-    if (m->frame_top == nullptr || m->frame_top->type != FrameType::Loop) {
+    // In resync mode, the topmost frame is the per-iteration Savepoint;
+    // refresh its captured state for the next iteration before falling
+    // through to the LoopFrame check.
+    if (this->resync) {
+        if (m->frame_top == nullptr ||
+            m->frame_top->type != FrameType::Savepoint) {
+            m->fail("ArrayNext (resync) missing Savepoint");
+            return;
+        }
+        auto* sp = static_cast<Savepoint*>(m->frame_top);
+        sp->saved_env = m->env;
+        sp->saved_pos = m->pos;
+        sp->saved_endian = m->little_endian;
+        sp->saved_kont_size = m->kont_stack_size();
+        sp->capture_mark = m->builder.mark();
+    }
+    Frame* loop_frame = this->resync ? m->frame_top->prev : m->frame_top;
+    if (loop_frame == nullptr || loop_frame->type != FrameType::Loop) {
         m->fail("ArrayNext without LoopFrame");
         return;
     }
-    auto* lf = static_cast<LoopFrame*>(m->frame_top);
+    auto* lf = static_cast<LoopFrame*>(loop_frame);
     lf->counter++;
 
     switch (this->mode) {
@@ -1168,6 +1196,16 @@ void ArrayUntilCheckKont::invoke(CEKMachine* m) const {
 }
 
 void EndArrayNode::invoke(CEKMachine* m) const {
+    // In resync mode, the topmost frame is the per-iteration
+    // Savepoint sitting on top of the LoopFrame. Pop it first.
+    if (this->resync) {
+        if (m->frame_top != nullptr &&
+            m->frame_top->type == FrameType::Savepoint) {
+            m->frame_top = m->frame_top->prev;
+        }
+        // ResyncKont's EOF path skips the savepoint pop and jumps
+        // straight here, so the savepoint may already be gone.
+    }
     if (m->frame_top == nullptr || m->frame_top->type != FrameType::Loop) {
         m->fail("EndArray without LoopFrame");
         return;
@@ -1178,6 +1216,44 @@ void EndArrayNode::invoke(CEKMachine* m) const {
     // Per-element env extensions don't escape the array.
     m->env = lf->outer_env;
     m->push_kont(this->next);
+}
+
+// Per-element-failure recovery for `array<T> ... resync`. Reached via
+// the per-iteration Savepoint's on_fail_target. Restores from the
+// Savepoint, advances pos by one byte, and retries the element body.
+// On EOF, terminates the array gracefully via end_node.
+void ResyncKont::invoke(CEKMachine* m) const {
+    auto* frame = m->frame_top;
+    while (frame && frame->type != FrameType::Savepoint) {
+        frame = frame->prev;
+    }
+    if (!frame) { m->fail("ResyncKont: no Savepoint in scope"); return; }
+    auto* sp = static_cast<Savepoint*>(frame);
+    m->pos = sp->saved_pos;
+    m->env = sp->saved_env;
+    m->little_endian = sp->saved_endian;
+    m->builder.restore(sp->capture_mark);
+    m->truncate_kont_stack(sp->saved_kont_size);
+
+    // Advance one byte past the failed element start.
+    if (m->pos >= m->input_length) {
+        // No bytes left to scan — pop the Savepoint and exit the
+        // array. EndArray then pops the LoopFrame.
+        m->frame_top = sp->prev;
+        m->push_kont(this->end_node);
+        return;
+    }
+    m->pos += 1;
+
+    // Refresh savepoint state for the new attempt position so a
+    // subsequent failure re-enters at the next byte.
+    sp->saved_pos = m->pos;
+    sp->saved_env = m->env;
+    sp->saved_endian = m->little_endian;
+    sp->saved_kont_size = m->kont_stack_size();
+    sp->capture_mark = m->builder.mark();
+
+    m->push_kont(this->body_entry);
 }
 
 // ── Bitfield ──────────────────────────────────────────────
@@ -1275,10 +1351,75 @@ void InvokeRuleNode::invoke(CEKMachine* m) const {
     frame->saved_env = m->env;
     frame->start_pos = m->pos;
     frame->capture_mark = m->builder.mark();
+    frame->rule_fail_target = this->caller_fail_target;
     frame->prev = m->frame_top;
     m->frame_top = frame;
 
     m->push_kont(this->entry);
+}
+
+// AbortRuleKont — cross-rule failure handler. Emitted as the on_false
+// target of where-checks at a rule's top level when no in-rule scope
+// can recover. Walks ReturnFrames until one with a non-null
+// rule_fail_target is found, pops it (and everything above it in the
+// frame chain), and dispatches to the caller's failure handler.
+//
+// If no ReturnFrame in the chain carries a rule_fail_target, the
+// failure has nowhere to go — hard parse-fail.
+void AbortRuleKont::invoke(CEKMachine* m) const {
+    auto* frame = m->frame_top;
+    while (frame) {
+        if (frame->type == FrameType::Return) {
+            auto* rf = static_cast<ReturnFrame*>(frame);
+            if (rf->rule_fail_target) {
+                m->frame_top = rf->prev;
+                m->push_kont(rf->rule_fail_target);
+                return;
+            }
+        }
+        frame = frame->prev;
+    }
+    m->fail("rule abort with no caller backtrack scope");
+}
+
+// Failure-handler link in a static OnFailKont chain.
+// 1. Find the topmost Savepoint and restore machine state.
+// 2. Mutate the savepoint's on_fail_target to next_on_fail (so the
+//    next failure in this scope walks to the following arm).
+// 3. If pop_frame is set or next_on_fail is null, pop the savepoint
+//    (no further retries possible in this scope).
+// 4. Dispatch to target — either the next arm's entry, or, when
+//    target is null (= scope exhausted), re-fail outward.
+void OnFailKont::invoke(CEKMachine* m) const {
+    auto* frame = m->frame_top;
+    while (frame && frame->type != FrameType::Savepoint) {
+        frame = frame->prev;
+    }
+    if (!frame) {
+        m->fail("OnFailKont with no Savepoint in scope");
+        return;
+    }
+    auto* sp = static_cast<Savepoint*>(frame);
+    m->pos = sp->saved_pos;
+    m->env = sp->saved_env;
+    m->little_endian = sp->saved_endian;
+    m->builder.restore(sp->capture_mark);
+    m->truncate_kont_stack(sp->saved_kont_size);
+
+    if (this->target == nullptr) {
+        // Scope exhausted: drop the savepoint and propagate failure
+        // outward via fail()'s walk to the next enclosing scope.
+        m->frame_top = sp->prev;
+        m->fail("alt exhausted");
+        return;
+    }
+
+    if (this->pop_frame) {
+        m->frame_top = sp->prev;
+    } else {
+        sp->on_fail_target = this->next_on_fail;
+    }
+    m->push_kont(this->target);
 }
 
 void ReturnRuleNode::invoke(CEKMachine* m) const {
@@ -1381,60 +1522,50 @@ void EndStructNode::invoke(CEKMachine* m) const {
 // --- Backtracking spine konts ---
 
 void BeginChoiceNode::invoke(CEKMachine* m) const {
-    // Push an AlternativeFrame holding the untried alternatives. On
-    // failure, fail() restores the saved state and tries the next.
-    // join=nullptr means "exhaustion = real failure" (vs Optional which
-    // sets join to the skip target).
-    auto* frame = m->arena->alloc<AlternativeFrame>();
-    frame->type = FrameType::Alternative;
-    frame->remaining = this->alternatives;
-    frame->remaining_count = this->alternatives_count;
-    frame->join = nullptr;
-    frame->saved_env = m->env;
-    frame->saved_pos = m->pos;
-    frame->saved_endian = m->little_endian;
-    frame->saved_kont_size = m->kont_stack_size();
-    frame->capture_mark = m->builder.mark();
-    frame->prev = m->frame_top;
-    m->frame_top = frame;
+    // Push a Savepoint with on_fail_target = head of the OnFailKont
+    // chain. Failure inside any arm walks frame_top to this Savepoint,
+    // pushes its on_fail_target, which restores state and dispatches
+    // to the next arm (mutating on_fail_target to the next link).
+    auto* sp = m->arena->alloc<Savepoint>();
+    sp->type = FrameType::Savepoint;
+    sp->saved_env = m->env;
+    sp->saved_pos = m->pos;
+    sp->saved_endian = m->little_endian;
+    sp->saved_kont_size = m->kont_stack_size();
+    sp->capture_mark = m->builder.mark();
+    sp->on_fail_target = this->on_fail_target;
+    sp->prev = m->frame_top;
+    m->frame_top = sp;
 
-    // Try the first alternative (next = first alternative chain head).
     m->push_kont(this->next);
 }
 
 void CommitChoiceNode::invoke(CEKMachine* m) const {
-    // The chosen alternative succeeded — pop the AlternativeFrame so a
-    // later failure can't backtrack into the already-committed choice.
-    if (m->frame_top != nullptr && m->frame_top->type == FrameType::Alternative) {
+    // The chosen arm succeeded — pop the Savepoint so subsequent
+    // failures don't backtrack into the already-committed choice.
+    if (m->frame_top != nullptr && m->frame_top->type == FrameType::Savepoint) {
         m->frame_top = m->frame_top->prev;
     }
     m->push_kont(this->next);
 }
 
 void BeginOptionalNode::invoke(CEKMachine* m) const {
-    // Push an AlternativeFrame with zero alternatives but a non-null
-    // join target — failure of the optional body restores state and
-    // skips to next (the optional is "absent").
-    auto* frame = m->arena->alloc<AlternativeFrame>();
-    frame->type = FrameType::Alternative;
-    frame->remaining = nullptr;
-    frame->remaining_count = 0;
-    frame->join = this->next;
-    frame->saved_env = m->env;
-    frame->saved_pos = m->pos;
-    frame->saved_endian = m->little_endian;
-    frame->saved_kont_size = m->kont_stack_size();
-    frame->capture_mark = m->builder.mark();
-    frame->prev = m->frame_top;
-    m->frame_top = frame;
+    auto* sp = m->arena->alloc<Savepoint>();
+    sp->type = FrameType::Savepoint;
+    sp->saved_env = m->env;
+    sp->saved_pos = m->pos;
+    sp->saved_endian = m->little_endian;
+    sp->saved_kont_size = m->kont_stack_size();
+    sp->capture_mark = m->builder.mark();
+    sp->on_fail_target = this->on_fail_target;
+    sp->prev = m->frame_top;
+    m->frame_top = sp;
 
     m->push_kont(this->inner);
 }
 
 void EndOptionalNode::invoke(CEKMachine* m) const {
-    // Optional body succeeded — pop the frame so subsequent failures
-    // don't accidentally treat this as backtrackable.
-    if (m->frame_top != nullptr && m->frame_top->type == FrameType::Alternative) {
+    if (m->frame_top != nullptr && m->frame_top->type == FrameType::Savepoint) {
         m->frame_top = m->frame_top->prev;
     }
     m->push_kont(this->next);

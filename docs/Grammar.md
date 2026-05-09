@@ -126,7 +126,7 @@ Message = union {
 Repeated elements with either a fixed count or a separator/terminator specification.
 
 ```
-array_body   = "<" type_body ">" array_spec
+array_body   = "<" type_body ">" array_spec [ "resync" ]
                [ "where" expr ] [ interval ]
                [ "@" element_interval ]
 
@@ -159,6 +159,27 @@ computed byte range using the loop variable `i`:
 ```bbq
 entries: array<Entry>[num] @ [off + i * sz, off + (i + 1) * sz]
 ```
+
+**Resync mode** lets the array recover from a per-element parse failure by
+advancing one byte and retrying the same element type. Useful for forensic
+parsing of corrupted streams or scanning for known record shapes in mixed
+data.
+
+```bbq
+Records = array<Record> (none, eof) resync
+```
+
+When an element fails to parse at the current position (bytes-out-of-range,
+where-check false, etc.), the parser restores to the start of the failed
+attempt, advances `pos` by one, and tries again from the new position. On
+EOF the array terminates with the records gathered so far.
+
+`resync` is rejected by sema when combined with `until` — the two have
+contradictory semantics around per-element termination. Compatible with
+`[count]`, `count(N)`, and `eof` terminators.
+
+`resync` is supported by the **CEK VM backend only**. The static C++
+generator does not currently emit resync-mode parsers.
 
 ### 4.4 Optional
 

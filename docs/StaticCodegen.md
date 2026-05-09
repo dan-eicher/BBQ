@@ -270,6 +270,13 @@ Entries = array<Entry>[header.count]
 using Entries = std::vector<Entry>;
 ```
 
+**Note:** the `resync` array modifier (per-element-skip recovery; see
+[Grammar.md §4.3](Grammar.md)) is **not supported by this backend**. The
+static C++ generator emits straight-line read sequences without per-
+iteration savepoints, and adding resync would require a parallel emission
+path with explicit pos-rewind + retry loops. Use the CEK VM backend (the
+Python module wraps it) for grammars that need `resync`.
+
 ### optional → std::optional
 
 ```

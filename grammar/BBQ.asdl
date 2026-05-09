@@ -34,7 +34,8 @@ module BBQ {
                   | Union(variant* variants)
                   | Array(type_expr element, array_spec spec,
                           expr? constraint, interval? interval,
-                          interval? element_interval)
+                          interval? element_interval,
+                          bool resync)
                   | Optional(type_expr element,
                              expr? constraint, interval? interval)
                   | Switch(expr discriminator, switch_case* cases,

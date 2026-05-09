@@ -10,7 +10,7 @@ namespace bbq::cek {
 
 enum class FrameType : uint8_t {
     Return,
-    Alternative,
+    Savepoint,
     Loop,
 };
 
@@ -27,21 +27,31 @@ struct ReturnFrame : Frame {
     Environment* saved_env = nullptr;
     size_t start_pos = 0;
     CaptureBuilder::Mark capture_mark{};
+    // Caller's static failure target — copied from the InvokeRuleNode
+    // at push time. Non-null when the call sits inside an alt /
+    // optional / array-resync scope; null at top-level call sites.
+    // Consumed by AbortRuleKont when a where-check walks ρ to root
+    // and needs to cross the rule boundary into the caller's scope.
+    KontNode* rule_fail_target = nullptr;
 
     ReturnFrame() { type = FrameType::Return; }
 };
 
-struct AlternativeFrame : Frame {
-    KontNode** remaining = nullptr;     // Array of untried alternative entry points
-    int remaining_count = 0;
-    KontNode* join = nullptr;           // Where to continue after success
+// Backtrack savepoint pushed by BeginChoice / BeginOptional. Captures
+// machine state so a failure inside a backtrackable scope can roll
+// back. The compile-time OnFailKont chain attached via on_fail_target
+// statically encodes the alt-arm sequence; each link mutates this
+// pointer to advance to the next arm. Null on_fail_target = scope
+// exhausted, fail() pops the frame and propagates outward.
+struct Savepoint : Frame {
     Environment* saved_env = nullptr;
     size_t saved_pos = 0;
     bool saved_endian = true;
-    size_t saved_kont_size = 0;         // Truncate kont_stack to this on restore
+    size_t saved_kont_size = 0;
     CaptureBuilder::Mark capture_mark{};
+    KontNode* on_fail_target = nullptr;
 
-    AlternativeFrame() { type = FrameType::Alternative; }
+    Savepoint() { type = FrameType::Savepoint; }
 };
 
 struct LoopFrame : Frame {

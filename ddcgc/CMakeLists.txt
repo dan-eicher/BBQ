@@ -241,6 +241,58 @@ target_include_directories(ddcgc_scoped_e2e PRIVATE
 target_link_libraries(ddcgc_scoped_e2e PRIVATE bbq_crt)
 add_test(NAME ddcgc_scoped_e2e COMMAND ddcgc_scoped_e2e)
 
+# ── scoped_cpp — same shape, C++-mode emit. Verifies the C++   ──
+# ── backend supports recursive env_dest (`parent: rho` self-   ──
+# ── reference) — the `parent: rho` chain is stored as `rho_t*` ──
+# ── and ddcgc auto-derefs at match-arm bind time. The C        ──
+# ── backend has had this since e1c3666 / 80f48e3; the C++ side ──
+# ── was a silent gap caught during the 2026-05-08 audit.       ──
+add_custom_command(
+    OUTPUT ${DDCG_TEST_OUT}/scoped_cpp_ast.json
+           ${DDCG_TEST_OUT}/scoped_cpp_target.json
+           ${DDCG_TEST_OUT}/scoped_cpp_ast.h
+           ${DDCG_TEST_OUT}/scoped_cpp_target.h
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${DDCG_TEST_OUT}
+    COMMAND asdl -i ${DDCG_TEST_DATA}/scoped_cpp_ast.asdl
+                 -t ${CMAKE_SOURCE_DIR}/grammar/templates/bbq_ast.inja
+                 -o ${DDCG_TEST_OUT}/scoped_cpp_ast.h
+                 --json ${DDCG_TEST_OUT}/scoped_cpp_ast.json
+    COMMAND asdl -i ${DDCG_TEST_DATA}/scoped_cpp_target.asdl
+                 -t ${CMAKE_SOURCE_DIR}/grammar/templates/bbq_ast.inja
+                 -o ${DDCG_TEST_OUT}/scoped_cpp_target.h
+                 --json ${DDCG_TEST_OUT}/scoped_cpp_target.json
+    DEPENDS asdl
+            ${DDCG_TEST_DATA}/scoped_cpp_ast.asdl
+            ${DDCG_TEST_DATA}/scoped_cpp_target.asdl
+            ${CMAKE_SOURCE_DIR}/grammar/templates/bbq_ast.inja
+    COMMENT "Generating scoped_cpp schemas (C++)"
+    VERBATIM
+)
+
+add_custom_command(
+    OUTPUT ${DDCG_TEST_OUT}/scoped_cpp_compile.h
+    COMMAND ddcgc -i ${DDCG_TEST_DATA}/scoped_cpp.ddcg
+                  -ast ${DDCG_TEST_OUT}/scoped_cpp_ast.json
+                  -ir  ${DDCG_TEST_OUT}/scoped_cpp_target.json
+                  -o   ${DDCG_TEST_OUT}/scoped_cpp_compile.h
+    DEPENDS ddcgc
+            ${DDCG_TEST_DATA}/scoped_cpp.ddcg
+            ${DDCG_TEST_OUT}/scoped_cpp_ast.json
+            ${DDCG_TEST_OUT}/scoped_cpp_target.json
+    COMMENT "Running ddcgc on tests/data/scoped_cpp.ddcg"
+    VERBATIM
+)
+
+add_executable(ddcgc_scoped_cpp_e2e
+    ${DDCG_TEST_DATA}/scoped_cpp_main.cpp
+    ${DDCG_TEST_OUT}/scoped_cpp_compile.h
+    ${DDCG_TEST_OUT}/scoped_cpp_ast.h
+    ${DDCG_TEST_OUT}/scoped_cpp_target.h)
+target_include_directories(ddcgc_scoped_cpp_e2e PRIVATE
+    ${DDCG_TEST_DATA}
+    ${DDCG_TEST_OUT})
+add_test(NAME ddcgc_scoped_cpp_e2e COMMAND ddcgc_scoped_cpp_e2e)
+
 # ── "big" e2e — wider feature surface (nested patterns, predicate     ──
 # ── guard, for-accumulator, list concat, ternary, Sequence field).    ──
 add_custom_command(

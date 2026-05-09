@@ -59,14 +59,44 @@
    inline gamma_t pair(bbq::cek::StaticKont* Lt, bbq::cek::StaticKont* Lf)            { return {GammaTag::Pair, nullptr, Lt,      Lf}; }
    inline gamma_t ret()                                                                { return {GammaTag::Ret,  nullptr, nullptr, nullptr}; }
 
-   // ρ — current-field scope. Field rules construct in_field(name)
-   // before recursing into the field body; the array element rule
-   // shadows it with anon() before recursing into the element type.
-   // intern_field_or_anon(r) reads the name out for kont emission.
-   enum class RhoTag : unsigned char { Anon, InField };
-   struct rho_t { RhoTag tag; const char* name; };
-   inline rho_t anon()                        { return {RhoTag::Anon, nullptr}; }
-   inline rho_t in_field(const char* n)       { return {RhoTag::InField, n}; }
+   // ρ — lexical-scope chain consumed at compile time only. The
+   // yoctojc pattern: each backtrackable scope wraps the caller's ρ
+   // with a frame carrying the static failure target for inner
+   // where-checks. find_backtrack_target walks ρ at compile time to
+   // resolve the on_false destination; intern_field_or_anon walks to
+   // the innermost in_field for capture naming.
+   //
+   //   in_field      — current field name, for capture metadata.
+   //                   intern_field_or_anon walks to it.
+   //   in_alt        — non-last arm of an alt; next_arm is the
+   //                   compile-time-baked OnFailKont link that
+   //                   restores the savepoint and dispatches to the
+   //                   next arm.
+   //   in_optional   — optional inner; skip is the OnFailKont link
+   //                   that restores + pops + jumps past the optional.
+   //   in_array_elem — array-element scope. Acts as a name barrier
+   //                   for intern_field_or_anon. skip is non-null only
+   //                   in resync mode (= the ResyncKont); otherwise
+   //                   find_backtrack_target walks past transparently.
+   //
+   // The struct is a POD; `parent` is a pointer because C++ structs
+   // can't recurse by value. Constructors are Compiler member methods
+   // (see PRIVATE block) so parent allocation goes through arena_;
+   // ddcgc-emitted calls resolve to `this->ctor(...)` via bare-name
+   // lookup in dispatcher methods.
+   enum class RhoTag : unsigned char {
+       Root,
+       InField,
+       InAlt,
+       InOptional,
+       InArrayElem,
+   };
+   struct rho_t {
+       RhoTag tag;
+       const char* name;                  // InField only
+       bbq::cek::StaticKont* fail_target; // InAlt.next_arm / InOptional.skip / InArrayElem.skip
+       rho_t* parent;                     // every non-Root variant
+   };
 
    } // namespace bbq
 
@@ -121,10 +151,10 @@ public:
             auto* exit_kont = make_return_rule(halt);
             auto* exit_static = static_cast<bbq::cek::StaticKont*>(exit_kont);
 
-            ::bbq::rho_t rho = ::bbq::anon();
+            ::bbq::rho_t rho = root();
             bbq::cek::StaticKont* body_head = nullptr;
             if (auto* st = dynamic_cast<BBQ::Struct*>(rule->body)) {
-                body_head = compile_fields(st->fields, exit_static);
+                body_head = compile_fields(st->fields, rho, exit_static);
             } else {
                 body_head = compile_type_expr(
                     rule->body, rho, ::bbq::effect(),
@@ -202,6 +232,45 @@ private:
     // but keeping it correct so generated code compiles.
     BBQ::SourceLoc current_loc{};
 
+    // ── ρ constructors (member methods so parent allocation hits arena_) ──
+    //
+    // The C++ ddcg backend calls these as `this->ctor(...)` via bare-
+    // name lookup in dispatcher methods (per emit_backend.h:118-120
+    // design intent). All non-Root variants arena-copy parent so the
+    // resulting rho_t is self-contained; ρ chains live as long as the
+    // ParseArena, which is the right scope (ρ is throwaway after
+    // compile_grammar but the arena is per-CompiledGrammar anyway).
+    //
+    // ρ frames are POD-copied from `parent_val` into a fresh arena slot
+    // via placement-new; arena_->alloc<rho_t>() returns aligned storage.
+    ::bbq::rho_t* arena_rho(::bbq::rho_t parent_val) {
+        auto* p = arena_->alloc<::bbq::rho_t>();
+        *p = parent_val;
+        return p;
+    }
+
+    ::bbq::rho_t root() {
+        return ::bbq::rho_t{::bbq::RhoTag::Root, nullptr, nullptr, nullptr};
+    }
+    ::bbq::rho_t in_field(const std::string& name, ::bbq::rho_t parent_val) {
+        const char* n = name.empty() ? nullptr : strings_->intern(name);
+        return ::bbq::rho_t{::bbq::RhoTag::InField, n,
+                            nullptr, arena_rho(parent_val)};
+    }
+    ::bbq::rho_t in_alt(bbq::cek::StaticKont* next_arm, ::bbq::rho_t parent_val) {
+        return ::bbq::rho_t{::bbq::RhoTag::InAlt, nullptr,
+                            next_arm, arena_rho(parent_val)};
+    }
+    ::bbq::rho_t in_optional(bbq::cek::StaticKont* skip, ::bbq::rho_t parent_val) {
+        return ::bbq::rho_t{::bbq::RhoTag::InOptional, nullptr,
+                            skip, arena_rho(parent_val)};
+    }
+    ::bbq::rho_t in_array_elem(bbq::cek::StaticKont* skip,
+                               ::bbq::rho_t parent_val) {
+        return ::bbq::rho_t{::bbq::RhoTag::InArrayElem, nullptr,
+                            skip, arena_rho(parent_val)};
+    }
+
     // ── make_X allocators ─────────────────────────────────────
 
     bbq::cek::StaticKont* make_match_primitive(const std::string& nm, bbq::cek::PrimitiveInfo p, bbq::cek::StaticKont* nx) {
@@ -219,7 +288,9 @@ private:
         k->next = nx;
         return k;
     }
-    bbq::cek::StaticKont* make_eval_constraint(bbq::cek::StaticKont* e, bbq::cek::StaticKont* on_false, bbq::cek::StaticKont* nx) {
+    bbq::cek::StaticKont* make_eval_constraint(bbq::cek::StaticKont* e,
+                                               bbq::cek::StaticKont* on_false,
+                                               bbq::cek::StaticKont* nx) {
         auto* k = arena_->alloc<bbq::cek::EvalConstraintNode>();
         k->constraint_expr = e; k->on_false = on_false; k->next = nx;
         return k;
@@ -229,31 +300,38 @@ private:
         k->field_name = nm.empty() ? nullptr : strings_->intern(nm); k->compute_expr = e; k->next = nx;
         return k;
     }
-    bbq::cek::StaticKont* make_invoke_rule(const std::string& nm, bbq::cek::StaticKont* nx) {
+    bbq::cek::StaticKont* make_invoke_rule(const std::string& nm,
+                                           bbq::cek::StaticKont* caller_fail_target,
+                                           bbq::cek::StaticKont* nx) {
         auto* k = arena_->alloc<bbq::cek::InvokeRuleNode>();
         k->rule_name = strings_->intern(nm);
         k->entry = nullptr;
+        k->caller_fail_target = caller_fail_target;
         k->next = nx;
         pending_patches_.emplace_back(&k->entry, nm);
         return k;
+    }
+    bbq::cek::StaticKont* make_on_fail(bbq::cek::StaticKont* target,
+                                       bbq::cek::StaticKont* next_on_fail,
+                                       bool pop_frame) {
+        auto* k = arena_->alloc<bbq::cek::OnFailKont>();
+        k->target = target;
+        k->next_on_fail = next_on_fail;
+        k->pop_frame = pop_frame;
+        return k;
+    }
+    bbq::cek::StaticKont* make_abort_rule() {
+        return arena_->alloc<bbq::cek::AbortRuleKont>();
     }
     bbq::cek::StaticKont* make_return_rule(bbq::cek::StaticKont* nx) {
         auto* k = arena_->alloc<bbq::cek::ReturnRuleNode>();
         k->next = nx;
         return k;
     }
-    bbq::cek::StaticKont* make_begin_choice(std::vector<bbq::cek::StaticKont*> alts, bbq::cek::StaticKont* first) {
+    bbq::cek::StaticKont* make_begin_choice(bbq::cek::StaticKont* on_fail_target,
+                                            bbq::cek::StaticKont* first) {
         auto* k = arena_->alloc<bbq::cek::BeginChoiceNode>();
-        // Allocate alternatives buffer as KontNode** (the asdl-declared
-        // field type) — each StaticKont* upcasts implicitly to KontNode*.
-        if (!alts.empty()) {
-            auto** buf = static_cast<bbq::cek::KontNode**>(
-                arena_->allocate(alts.size() * sizeof(bbq::cek::KontNode*),
-                                 alignof(bbq::cek::KontNode*)));
-            for (size_t i = 0; i < alts.size(); ++i) buf[i] = alts[i];
-            k->alternatives = buf;
-            k->alternatives_count = static_cast<int>(alts.size());
-        }
+        k->on_fail_target = on_fail_target;
         k->next = first;
         return k;
     }
@@ -262,9 +340,13 @@ private:
         k->next = nx;
         return k;
     }
-    bbq::cek::StaticKont* make_begin_optional(bbq::cek::StaticKont* inner, bbq::cek::StaticKont* nx) {
+    bbq::cek::StaticKont* make_begin_optional(bbq::cek::StaticKont* on_fail_target,
+                                              bbq::cek::StaticKont* inner,
+                                              bbq::cek::StaticKont* nx) {
         auto* k = arena_->alloc<bbq::cek::BeginOptionalNode>();
-        k->inner = inner; k->next = nx;
+        k->on_fail_target = on_fail_target;
+        k->inner = inner;
+        k->next = nx;
         return k;
     }
     bbq::cek::StaticKont* make_end_optional(bbq::cek::StaticKont* nx) {
@@ -275,26 +357,38 @@ private:
     bbq::cek::StaticKont* make_begin_array(const std::string& nm, bbq::cek::ArrayMode mode,
                                          bbq::cek::StaticKont* count_expr,
                                          bbq::cek::StaticKont* end_node,
+                                         bbq::cek::StaticKont* resync_target,
                                          bbq::cek::StaticKont* nx) {
         auto* k = arena_->alloc<bbq::cek::BeginArrayNode>();
         k->array_name = strings_->intern(nm); k->mode = mode;
-        k->count_expr = count_expr; k->end_node = end_node; k->next = nx;
+        k->count_expr = count_expr; k->end_node = end_node;
+        k->resync_target = resync_target; k->next = nx;
         return k;
     }
     bbq::cek::StaticKont* make_array_next(bbq::cek::ArrayMode mode,
                                         bbq::cek::StaticKont* count_expr,
                                         bbq::cek::StaticKont* until_expr,
                                         bbq::cek::StaticKont* end_node,
-                                        bbq::cek::StaticKont* body_entry) {
+                                        bbq::cek::StaticKont* body_entry,
+                                        bool resync) {
         auto* k = arena_->alloc<bbq::cek::ArrayNextNode>();
         k->mode = mode;
         k->count_expr = count_expr; k->until_expr = until_expr;
         k->end_node = end_node; k->body_entry = body_entry;
+        k->resync = resync;
         return k;
     }
-    bbq::cek::StaticKont* make_end_array(bbq::cek::StaticKont* nx) {
+    bbq::cek::StaticKont* make_end_array(bool resync, bbq::cek::StaticKont* nx) {
         auto* k = arena_->alloc<bbq::cek::EndArrayNode>();
+        k->resync = resync;
         k->next = nx;
+        return k;
+    }
+    bbq::cek::StaticKont* make_resync(bbq::cek::StaticKont* body_entry,
+                                      bbq::cek::StaticKont* end_node) {
+        auto* k = arena_->alloc<bbq::cek::ResyncKont>();
+        k->body_entry = body_entry;
+        k->end_node = end_node;
         return k;
     }
     bbq::cek::StaticKont* make_switch_dispatch(bbq::cek::StaticKont* disc,
@@ -503,6 +597,7 @@ private:
     bbq::cek::StaticKont*
     compile_array(BBQ::TypeExpr* element,
                   BBQ::ArraySpec* spec,
+                  bool resync,
                   ::bbq::rho_t r,
                   bbq::cek::StaticKont* Lnext) {
         // Determine mode + count/until exprs from the AST spec.
@@ -515,12 +610,8 @@ private:
             count_expr = compile_expr(fc->count, r, ::bbq::ac(),
                                       ::bbq::jump(Lnext), Lnext);
         } else if (auto* st = dynamic_cast<BBQ::SepTerm*>(spec)) {
-            // SepTerm shapes — pick the terminator that drives the loop.
-            // Separator handling is a Layer 4 follow-up; for now we
-            // drive the loop by the terminator alone.
-            if (auto* eof_term = dynamic_cast<BBQ::EofTerm*>(st->term)) {
+            if (dynamic_cast<BBQ::EofTerm*>(st->term)) {
                 mode = bbq::cek::ArrayMode::EOF_;
-                (void)eof_term;
             } else if (auto* count_term = dynamic_cast<BBQ::CountTerm*>(st->term)) {
                 mode = bbq::cek::ArrayMode::Count;
                 count_expr = compile_expr(count_term->count, r, ::bbq::ac(),
@@ -532,29 +623,49 @@ private:
             }
         }
 
-        // Tail: EndArray pops the LoopFrame and chains into Lnext.
-        bbq::cek::StaticKont* end_kont = make_end_array(Lnext);
+        // EndArray pops the LoopFrame (and the resync Savepoint, if
+        // any) and chains into Lnext.
+        bbq::cek::StaticKont* end_kont = make_end_array(resync, Lnext);
 
         // Allocate ArrayNext with body_entry=null; patch after body
-        // compilation to break the cycle.
+        // compilation to break the cycle. ArrayNext refreshes the
+        // resync savepoint (if any) per iteration.
         auto* array_next = arena_->alloc<bbq::cek::ArrayNextNode>();
         array_next->mode = mode;
         array_next->count_expr = count_expr;
         array_next->until_expr = until_expr;
         array_next->end_node = end_kont;
-        array_next->body_entry = nullptr;  // patched below
+        array_next->body_entry = nullptr;
+        array_next->resync = resync;
 
-        // Array name comes from the enclosing field's ρ frame
-        // (e.g. "items" for `items: array<uint16>[n]`); the elements
-        // themselves are anonymous, so recurse with anon().
+        // resync_target — allocated up front when in resync mode so
+        // both the runtime Savepoint and the compile-time
+        // in_array_elem.skip can carry the same ResyncKont.
+        // body_entry is patched after element compile (cycle break,
+        // same pattern as ArrayNext.body_entry).
+        bbq::cek::ResyncKont* resync_kont = nullptr;
+        if (resync) {
+            resync_kont = arena_->alloc<bbq::cek::ResyncKont>();
+            resync_kont->body_entry = nullptr;
+            resync_kont->end_node = end_kont;
+        }
+
+        // Compile element body with ρ pushed for the array element
+        // scope. in_array_elem is a name barrier (elements are
+        // anonymous), and in resync mode it carries the ResyncKont
+        // so where-checks inside the element body dispatch to it via
+        // on_false — the same target the runtime Savepoint uses.
         std::string array_name = intern_field_or_anon(r);
+        ::bbq::rho_t elem_rho = in_array_elem(resync_kont, r);
         bbq::cek::StaticKont* body_head = compile_type_expr(
-            element, ::bbq::anon(), ::bbq::effect(),
+            element, elem_rho, ::bbq::effect(),
             ::bbq::jump(array_next), array_next);
         array_next->body_entry = body_head;
+        if (resync_kont) resync_kont->body_entry = body_head;
 
         return make_begin_array(array_name, mode,
-                                count_expr, end_kont, body_head);
+                                count_expr, end_kont,
+                                resync_kont, body_head);
     }
 
     bbq::cek::StaticKont*
@@ -567,29 +678,47 @@ private:
             return compile_type_expr(alts[0], r, ::bbq::effect(),
                                      ::bbq::jump(Lnext), Lnext);
         }
-        // commit chains all alternatives EXCEPT the last to a
-        // CommitChoice → Lnext sequence. The last alt has Lnext directly
-        // (per the OP_CHOICE/OP_COMMIT pattern in the design doc).
+        // Each non-last arm's success path threads through CommitChoice
+        // (pops the Savepoint and chains to Lnext). The last arm
+        // chains directly to Lnext — the Savepoint pops via the
+        // "exhausted" OnFailKont if the last arm itself fails.
         auto* commit = make_commit_choice(Lnext);
 
-        // Build alt2..altN-1 chains (each ends with CommitChoice).
-        // Last alt (altN) chains directly to Lnext.
-        std::vector<bbq::cek::StaticKont*> rest_alts;
-        rest_alts.reserve(alts.size() - 1);
-        for (size_t i = 1; i + 1 < alts.size(); ++i) {
-            rest_alts.push_back(
-                compile_type_expr(alts[i], r, ::bbq::effect(),
-                                  ::bbq::jump(commit), commit));
+        // Compile arms right-to-left so each link in the OnFailKont
+        // chain knows the next arm's entry. The same link serves as
+        // (a) the runtime Savepoint.on_fail_target for byte-fails and
+        // (b) the static in_alt.next_arm for where-fails routed via
+        // on_false. Both paths converge on the same OnFailKont.
+        bbq::cek::StaticKont* exhausted =
+            make_on_fail(nullptr, nullptr, /*pop_frame=*/true);
+        bbq::cek::StaticKont* last_entry = compile_type_expr(
+            alts.back(), r, ::bbq::effect(),
+            ::bbq::jump(Lnext), Lnext);
+        bbq::cek::StaticKont* next_link = exhausted;
+        bbq::cek::StaticKont* next_target = last_entry;
+        // Walk N-2..1 (skip 0; first arm is BeginChoice.next).
+        for (size_t i = alts.size() - 1; i-- > 1; ) {
+            bbq::cek::StaticKont* link =
+                make_on_fail(next_target, next_link, /*pop_frame=*/false);
+            // Push in_alt with this arm's failure target so any
+            // where-check inside the arm body resolves on_false to
+            // `link` via find_backtrack_target.
+            ::bbq::rho_t arm_rho = in_alt(link, r);
+            bbq::cek::StaticKont* arm_entry = compile_type_expr(
+                alts[i], arm_rho, ::bbq::effect(),
+                ::bbq::jump(commit), commit);
+            next_link = link;
+            next_target = arm_entry;
         }
-        // Last alternative — no commit needed.
-        rest_alts.push_back(
-            compile_type_expr(alts.back(), r, ::bbq::effect(),
-                              ::bbq::jump(Lnext), Lnext));
-
-        // First alt is the BeginChoice's `next`; it also commits on success.
-        auto* first = compile_type_expr(alts[0], r, ::bbq::effect(),
-                                        ::bbq::jump(commit), commit);
-        return make_begin_choice(rest_alts, first);
+        // Arm 0's failure target = head link of the chain. The arm
+        // sees in_alt(head_link, parent) as its ρ.
+        bbq::cek::StaticKont* head_link =
+            make_on_fail(next_target, next_link, /*pop_frame=*/false);
+        ::bbq::rho_t arm0_rho = in_alt(head_link, r);
+        bbq::cek::StaticKont* first = compile_type_expr(
+            alts[0], arm0_rho, ::bbq::effect(),
+            ::bbq::jump(commit), commit);
+        return make_begin_choice(head_link, first);
     }
 
     bbq::cek::StaticKont*
@@ -615,9 +744,16 @@ private:
         if (constraint.has_value() && constraint.value()) {
             auto* expr_ir = compile_expr(constraint.value(), r,
                                          ::bbq::ac(), ::bbq::jump(Lnext), Lnext);
-            // EvalConstraintNode reads ac, branches to on_false (null
-            // → fail) or next (= Lnext on success).
-            tail = make_eval_constraint(expr_ir, nullptr, Lnext);
+            // on_false is the static failure target for this where-
+            // check, resolved from ρ at compile time. find_backtrack_
+            // target walks ρ to the innermost in_alt / in_optional /
+            // in_array_elem(skip!=null) and returns that scope's
+            // failure handler. If ρ bottoms out at root with no
+            // backtrackable frame in scope, AbortRuleKont takes over
+            // and crosses the rule boundary into the caller's chain.
+            bbq::cek::StaticKont* on_false = find_backtrack_target(r);
+            if (!on_false) on_false = make_abort_rule();
+            tail = make_eval_constraint(expr_ir, on_false, Lnext);
         }
 
         // Bytes/String → MatchBytes with the interval-derived length.
@@ -650,10 +786,63 @@ private:
         return make_match_primitive(intern_field_or_anon(r), prim, tail);
     }
 
+    // Walk ρ to the innermost in_field, returning its name.
+    // in_alt and in_optional are transparent — a where-fail inside
+    // an alternative arm or optional inner still wants the enclosing
+    // field's name for its capture. in_array_elem is a name barrier:
+    // array elements are anonymous regardless of the enclosing array's
+    // name, so the walk stops there and returns empty. Empty when no
+    // in_field is in scope (rule body level, anonymous capture).
     std::string intern_field_or_anon(::bbq::rho_t r) {
-        if (r.tag == ::bbq::RhoTag::InField && r.name)
-            return std::string(r.name);
+        const ::bbq::rho_t* p = &r;
+        while (p) {
+            switch (p->tag) {
+                case ::bbq::RhoTag::InField:
+                    return p->name ? std::string(p->name) : std::string();
+                case ::bbq::RhoTag::InArrayElem:
+                case ::bbq::RhoTag::Root:
+                    return std::string();
+                case ::bbq::RhoTag::InAlt:
+                case ::bbq::RhoTag::InOptional:
+                    p = p->parent;
+                    continue;
+            }
+        }
         return std::string();
+    }
+
+    // Walk ρ to find the static failure target for the innermost
+    // backtrackable scope. Returns nullptr when ρ bottoms out at root
+    // with no backtrack frame in scope — caller substitutes
+    // AbortRuleKont so the failure crosses the rule boundary into the
+    // caller's nearest scope (via ReturnFrame::rule_fail_target).
+    //
+    // in_field is transparent (a where-check inside a named field
+    // still backtracks to whatever the surrounding scope provides).
+    // in_array_elem is transparent unless `skip` is set — non-null
+    // skip means resync mode, so element-fail goes to the resync
+    // handler; null skip means the array doesn't recover from element
+    // failure and the walk continues outward.
+    bbq::cek::StaticKont* find_backtrack_target(::bbq::rho_t r) {
+        const ::bbq::rho_t* p = &r;
+        while (p) {
+            switch (p->tag) {
+                case ::bbq::RhoTag::Root:
+                    return nullptr;
+                case ::bbq::RhoTag::InAlt:
+                    return p->fail_target;
+                case ::bbq::RhoTag::InOptional:
+                    return p->fail_target;
+                case ::bbq::RhoTag::InArrayElem:
+                    if (p->fail_target) return p->fail_target;
+                    p = p->parent;
+                    continue;
+                case ::bbq::RhoTag::InField:
+                    p = p->parent;
+                    continue;
+            }
+        }
+        return nullptr;
     }
 
     bbq::cek::StaticKont* make_ref_or_builtin(const std::string& n) {
@@ -685,16 +874,17 @@ private:
     }
 
     bbq::cek::StaticKont*
-    compile_fields(std::vector<BBQ::Field*> fields, bbq::cek::StaticKont* tail) {
+    compile_fields(std::vector<BBQ::Field*> fields, ::bbq::rho_t r,
+                   bbq::cek::StaticKont* tail) {
         // Compile fields in reverse so each field's `next` chains to
         // the already-compiled tail. Each field body sees its own ρ
-        // frame in_field(name); recursion's lexical scope handles the
-        // implicit "restore" — no manual save/restore needed.
+        // frame in_field(name, parent=r); the parent link preserves any
+        // backtrack frame visible at struct entry.
         bbq::cek::StaticKont* chain = tail;
         for (auto it = fields.rbegin(); it != fields.rend(); ++it) {
             BBQ::Field* f = *it;
             chain = compile_type_expr(
-                f->body, ::bbq::in_field(f->name.c_str()),
+                f->body, in_field(f->name, r),
                 ::bbq::effect(), ::bbq::jump(chain), chain);
         }
         return chain;
@@ -780,7 +970,9 @@ private:
             return then_capture ? make_capture_value(step) : step;
         }
         if (auto* ia = dynamic_cast<BBQ::IndexAcc*>(path)) {
-            ::bbq::rho_t r{};
+            // Index expressions are pure value-producers — no
+            // backtrackable scope to inherit. Compile with ρ=root.
+            ::bbq::rho_t r = root();
             auto* idx = compile_expr(ia->index, r, ::bbq::ac(),
                                      ::bbq::jump(nullptr), nullptr);
             auto* base = compile_ref_path(ia->base, "", false);
@@ -1106,7 +1298,7 @@ private:
         if (auto* _n0 = dynamic_cast<BBQ::Struct*>(node)) {
             auto fs = _n0->fields;
             bbq_ir::StaticKont* end_kont = make_end_struct(Lnext);
-            bbq_ir::StaticKont* fields_chain = compile_fields(fs, end_kont);
+            bbq_ir::StaticKont* fields_chain = compile_fields(fs, rho, end_kont);
             return cg_deliver(make_begin_struct(intern_field_or_anon(rho), fields_chain), delta, gamma, Lnext);
         }
         if (auto* _n0 = dynamic_cast<BBQ::Primitive*>(node)) {
@@ -1118,7 +1310,7 @@ private:
         if (auto* _n0 = dynamic_cast<BBQ::RuleRef*>(node)) {
             auto n = _n0->name;
             bbq_ir::StaticKont* end_st = make_end_struct(Lnext);
-            bbq_ir::StaticKont* invoke = make_invoke_rule(n, end_st);
+            bbq_ir::StaticKont* invoke = make_invoke_rule(n, find_backtrack_target(rho), end_st);
             return cg_deliver(make_begin_struct(intern_field_or_anon(rho), invoke), delta, gamma, Lnext);
         }
         if (auto* _n0 = dynamic_cast<BBQ::Compute*>(node)) {
@@ -1145,8 +1337,9 @@ private:
         if (auto* _n0 = dynamic_cast<BBQ::Optional*>(node)) {
             auto e = _n0->element;
             bbq_ir::StaticKont* end = make_end_optional(Lnext);
-            bbq_ir::StaticKont* inner = compile_type_expr(e, rho, effect(), jump(end), end);
-            return cg_deliver(make_begin_optional(inner, Lnext), delta, gamma, Lnext);
+            bbq_ir::StaticKont* skip = make_on_fail(Lnext, nullptr, true);
+            bbq_ir::StaticKont* inner = compile_type_expr(e, in_optional(skip, rho), effect(), jump(end), end);
+            return cg_deliver(make_begin_optional(skip, inner, Lnext), delta, gamma, Lnext);
         }
         if (auto* _n0 = dynamic_cast<BBQ::Switch*>(node)) {
             auto d = _n0->discriminator;
@@ -1168,7 +1361,8 @@ private:
         if (auto* _n0 = dynamic_cast<BBQ::Array*>(node)) {
             auto e = _n0->element;
             auto s = _n0->spec;
-            return cg_deliver(compile_array(e, s, rho, Lnext), delta, gamma, Lnext);
+            auto rs = _n0->resync;
+            return cg_deliver(compile_array(e, s, rs, rho, Lnext), delta, gamma, Lnext);
         }
         return {};
     }

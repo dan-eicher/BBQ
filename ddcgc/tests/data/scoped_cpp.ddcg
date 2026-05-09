@@ -1,0 +1,60 @@
+// scoped_cpp.ddcg — C++-mode mirror of scoped.ddcg.
+//
+// Validates that the C++ backend handles recursive env_dest variants
+// (`parent: rho` self-reference) end-to-end. Same logic as scoped.ddcg
+// — Scope wraps body's ρ with in_scope(label, parent: ρ), Lookup
+// walks the chain and yields the first matching depth — but
+// generated as a C++ Compiler class.
+
+COMPILER scoped_cpp
+
+(. #include "scoped_cpp_runtime.h" .)
+
+IMPORTS
+  ast    = "scoped_cpp_ast.json"
+  target = "scoped_cpp_target.json"
+
+DESTINATIONS
+  data_dest delta { sink }
+  ctrl_dest gamma { halt }
+  env_dest  rho   { top
+                  | in_scope(label: int, parent: rho) }
+  ir_root int
+
+AUXILIARIES
+  panic_unreachable : (string) -> int
+
+MEMBERS (.
+    SourceLoc current_loc;
+
+    int panic_unreachable(std::string m) {
+        std::fprintf(stderr, "panic_unreachable: %s\n", m.c_str());
+        std::abort();
+    }
+.)
+
+// Walk the chain looking for `target_label`. Returns depth (0-based)
+// or -1 if not found.
+fun chain_depth_for(r: rho, target_label: int, depth: int) -> int {
+    match (r) {
+        top => 0 - 1
+      | in_scope(label: l, parent: p) =>
+            l == target_label
+              ? depth
+              : chain_depth_for(p, target_label, depth + 1)
+    };
+}
+
+RULES
+
+rule lit : ast.Lit(n: x) {
+    x;
+}
+
+rule scope : ast.Scope(label: lbl, body: b) {
+    gen(b, in_scope(lbl, rho), delta, gamma);
+}
+
+rule lookup : ast.Lookup() {
+    chain_depth_for(rho, 7, 0);
+}

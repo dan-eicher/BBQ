@@ -34,7 +34,7 @@ True
 - **Types**: struct, union, array, optional, switch, compute, extern, bitfield
 - **Constraints**: `where` clauses validated during parsing
 - **Intervals**: `[length]` and `[start, end]` for variable-size fields
-- **Arrays**: fixed count, separator/terminator, eof-terminated
+- **Arrays**: fixed count, separator/terminator, eof-terminated, `resync` mode for per-element-skip recovery
 - **Endianness**: `@endian big|little` directive, per-type overrides (`uint32be`)
 - **Zero-copy**: mmap-backed file parsing, lazy value materialization
 - **Python protocols**: comparison, format, dict, buffer, iteration, tab-completion
@@ -109,9 +109,6 @@ asdl/               ASDL code generator (in-tree)
 ## Running Tests
 
 ```sh
-# C++ tests (512 tests)
+# Full suite (C++ via ctest, Python via pytest hook): 642 + 146 tests
 ctest --test-dir build --output-on-failure
-
-# Python tests (136 tests)
-PYTHONPATH=build python -m pytest test/test_bbq_python.py -v
 ```

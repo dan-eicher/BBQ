@@ -365,9 +365,10 @@ struct Array : public TypeExpr {
         ArraySpec* spec,
         std::optional<Expr*> constraint,
         std::optional<Interval*> interval,
-        std::optional<Interval*> element_interval
+        std::optional<Interval*> element_interval,
+        bool resync
     )
-        : element(element), spec(spec), constraint(std::move(constraint)), interval(std::move(interval)), element_interval(std::move(element_interval)) {}
+        : element(element), spec(spec), constraint(std::move(constraint)), interval(std::move(interval)), element_interval(std::move(element_interval)), resync(resync) {}
 
     void accept(ASTVisitor& visitor) override { visitor.visit(this); }
 
@@ -376,6 +377,7 @@ struct Array : public TypeExpr {
     std::optional<Expr*> constraint;
     std::optional<Interval*> interval;
     std::optional<Interval*> element_interval;
+    bool resync;
 };
 
 struct Optional : public TypeExpr {

@@ -1,0 +1,3 @@
+module scoped_cpp_target {
+    value = Imm(int v)
+}

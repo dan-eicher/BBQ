@@ -209,16 +209,19 @@ ArrayBody <. TypeExpr* *result .>
        Expr* constr = nullptr;
        Interval* iv = nullptr;
        Interval* elem_iv = nullptr;
+       bool resync = false;
        SourceLoc loc = Loc(); .)
     = "<" TypeBody<&elem> ">"
       ArraySpecRule<&spec>
+      [ "resync" !ident_continue (. resync = true; .) ]
       [ ConstraintBlock<&constr> ]
       [ IntervalSpec<&iv> ]
       [ "@" ElementIntervalSpec<&elem_iv> ]
     (. *result = new Array(elem, spec,
            constr ? std::optional<Expr*>(constr) : std::nullopt,
            iv     ? std::optional<Interval*>(iv) : std::nullopt,
-           elem_iv ? std::optional<Interval*>(elem_iv) : std::nullopt);
+           elem_iv ? std::optional<Interval*>(elem_iv) : std::nullopt,
+           resync);
        (*result)->loc = loc; .)
 .
 

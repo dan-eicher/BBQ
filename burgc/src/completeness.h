@@ -50,6 +50,14 @@ struct AnalysisConfig {
     // constructed.
     bool emit_coverage_warnings = false;
 
+    // Skip the tree-automaton build and the dead-rule analysis.
+    // Duplicate-rule detection still runs (cheap, no automaton).
+    // The automaton's worklist re-enumeration is `|states|^arity` per
+    // round and dominates burgc runtime on large grammars, so routine
+    // regenerations skip it. Opt back in with --coverage for the CI
+    // gate.
+    bool skip_dead_rule_analysis = true;
+
     // Optional ASDL schema. When present and a TERM's pattern arity
     // matches its constructor's node-field count, the position-demand
     // filter uses the constructor's node-typed field types; otherwise

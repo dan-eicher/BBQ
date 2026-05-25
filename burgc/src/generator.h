@@ -16,6 +16,7 @@ struct ChainRule {
     int64_t cost;
     std::string from_nt;  // RHS nonterminal
     std::string to_nt;    // LHS nonterminal
+    std::string guard;    // where-clause predicate (empty if none)
 };
 
 struct BurgAnalysis {

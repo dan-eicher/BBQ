@@ -33,7 +33,7 @@ namespace {
 // Bit i (0-indexed) corresponds to nonterm at a_->nonterms[i] —
 // 1-based nonterm_index value minus 1.
 using NontermBits = uint64_t;
-constexpr int MAX_NONTERMS = 20;  // matches the bail threshold in plan
+constexpr int MAX_NONTERMS = 64;  // matches the NontermBits = uint64_t width
 
 inline NontermBits bit(int nt_index_1based) {
     return NontermBits{1} << (nt_index_1based - 1);
@@ -159,6 +159,16 @@ bool rule_matches(const BurgAnalysis& a,
 // Apply chain-rule closure to a (bits, contributors) pair until
 // fixed point. Done inside the transition before interning so
 // equivalent states merge.
+//
+// Chain rules are recorded as contributors whenever their from_nt
+// is set at the state, regardless of whether to_nt was already set
+// by an earlier chain. Speculative-guard automaton building merges
+// states that would be distinct at runtime (e.g. a LookupK whose
+// guards select only one element-typed nonterm), so a chain that
+// looks redundant in the merged state is the runtime's only path
+// to its to_nt in the narrower state. Crediting all such chains is
+// strictly conservative for the dead-rule warning: it can only
+// suppress false positives, never introduce false negatives.
 void chain_close(const BurgAnalysis& a,
                   NontermBits& bits,
                   std::map<int, std::set<int>>& contributors) {
@@ -172,9 +182,10 @@ void chain_close(const BurgAnalysis& a,
                 to_it == a.nonterm_index.end()) continue;
             int from_idx = (int)from_it->second;
             int to_idx = (int)to_it->second;
-            if ((bits & bit(from_idx)) && !(bits & bit(to_idx))) {
+            if (!(bits & bit(from_idx))) continue;
+            contributors[to_idx].insert((int)cr.rule_number);
+            if (!(bits & bit(to_idx))) {
                 bits |= bit(to_idx);
-                contributors[to_idx].insert((int)cr.rule_number);
                 changed = true;
             }
         }
@@ -652,14 +663,21 @@ AnalysisReport run_completeness_analysis(const BurgAnalysis& a,
     // 1. Duplicate rules — error. Cheap, no automaton needed.
     check_duplicate_rules(a, report.errors);
 
+    // Bail before the expensive automaton build if the caller has
+    // explicitly opted out. Routine codegen-only runs use this; the
+    // final CI gate runs without it.
+    if (cfg.skip_dead_rule_analysis)
+        return report;
+
     // 2. Tree automaton — needed for both missing-rule and dead-rule
     // checks. Schema-aware filter when cfg.asdl is supplied;
     // heuristic otherwise.
     Automaton aut;
     if (!build_automaton(a, cfg.asdl, aut)) {
         report.warnings.push_back(
-            "grammar has more than 20 nonterminals — "
-            "completeness analysis skipped");
+            "grammar exceeds NontermBits width (MAX_NONTERMS=" +
+            std::to_string(MAX_NONTERMS) +
+            ") — completeness analysis skipped");
         return report;
     }
 
@@ -672,7 +690,7 @@ AnalysisReport run_completeness_analysis(const BurgAnalysis& a,
 
     // Dead-rule warnings are precise (they only require the
     // contributors map, no shape-enumeration noise) and useful even
-    // without ASDL. Always on.
+    // without ASDL. Always on (unless skip_dead_rule_analysis above).
     report_dead_rules(a, aut, report.warnings);
 
     return report;

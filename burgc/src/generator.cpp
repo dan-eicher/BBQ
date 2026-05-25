@@ -70,7 +70,8 @@ void BurgGenerator::classify_rules() {
         if (rule->pattern->is_leaf() && !a.term_names.count(rule->pattern->name)) {
             a.chain_rules.push_back({
                 rule->rule_number, rule->cost,
-                rule->pattern->name, rule->nonterm
+                rule->pattern->name, rule->nonterm,
+                rule->guard
             });
         }
     }
@@ -361,28 +362,48 @@ void BurgBackend::emit_closures(std::ostream& out, int indent,
     for (auto& cr : const_cast<std::vector<ChainRule>&>(a_->chain_rules))
         chains_to[cr.from_nt].push_back(&cr);
 
+    // Closures take `node` because where-clause guards on chain rules
+    // may reference it. Backends that never guard chain rules emit
+    // `(void)node;` to suppress the unused-parameter warning.
     if (fwd_decls) {
         for (auto& [nt, _] : chains_to) {
             pad(out, indent);
-            out << prefix << "void closure_" << nt << "(" << state_type() << "* p, int c);\n";
+            out << prefix << "void closure_" << nt << "(" << state_type()
+                << "* p, int c, BURG_NODE_TYPE node);\n";
         }
         if (!chains_to.empty()) out << "\n";
     }
 
     for (auto& [nt, chains] : chains_to) {
         pad(out, indent);
-        out << prefix << "void closure_" << nt << "(" << state_type() << "* p, int c) {\n";
+        out << prefix << "void closure_" << nt << "(" << state_type()
+            << "* p, int c, BURG_NODE_TYPE node) {\n";
+        // Suppress unused-`node` warnings when no chain rule on this
+        // closure or any reachable from it carries a where-clause.
+        bool any_guard = false;
+        for (auto* cr : chains)
+            if (!trim(cr->guard).empty()) { any_guard = true; break; }
+        if (!any_guard) {
+            pad(out, indent + 1); out << "(void)node;\n";
+        }
         for (auto* cr : chains) {
             int64_t nt_idx = a_->nonterm_index.at(cr->to_nt);
+            std::string trimmed_guard = trim(cr->guard);
             pad(out, indent + 1);
-            out << "if (c + " << cr->cost << " < p->cost[" << nt_idx << "]) {\n";
+            if (trimmed_guard.empty()) {
+                out << "if (c + " << cr->cost << " < p->cost[" << nt_idx << "]) {\n";
+            } else {
+                out << "if ((" << trimmed_guard << ") && c + " << cr->cost
+                    << " < p->cost[" << nt_idx << "]) {\n";
+            }
             pad(out, indent + 2);
             out << "p->cost[" << nt_idx << "] = c + " << cr->cost << ";\n";
             pad(out, indent + 2);
             out << "p->rule[" << nt_idx << "] = " << cr->rule_number << ";\n";
             if (chains_to.count(cr->to_nt)) {
                 pad(out, indent + 2);
-                out << "closure_" << cr->to_nt << "(p, c + " << cr->cost << ");\n";
+                out << "closure_" << cr->to_nt << "(p, c + " << cr->cost
+                    << ", node);\n";
             }
             pad(out, indent + 1); out << "}\n";
         }
@@ -421,7 +442,7 @@ void BurgBackend::emit_label_dp_switch(std::ostream& out, int indent) {
                 pad(out, indent + 3); out << "p->rule[" << nt_idx << "] = " << rule->rule_number << ";\n";
                 if (chains_to.count(rule->nonterm)) {
                     pad(out, indent + 3);
-                    out << "closure_" << rule->nonterm << "(p, c);\n";
+                    out << "closure_" << rule->nonterm << "(p, c, node);\n";
                 }
                 pad(out, indent + 2); out << "}\n";
                 pad(out, indent + 1); out << "}\n";
@@ -438,7 +459,7 @@ void BurgBackend::emit_label_dp_switch(std::ostream& out, int indent) {
                 pad(out, indent + 3); out << "p->rule[" << nt_idx << "] = " << rule->rule_number << ";\n";
                 if (chains_to.count(rule->nonterm)) {
                     pad(out, indent + 3);
-                    out << "closure_" << rule->nonterm << "(p, c);\n";
+                    out << "closure_" << rule->nonterm << "(p, c, node);\n";
                 }
                 pad(out, indent + 2); out << "}\n";
                 pad(out, indent + 1); out << "}\n";

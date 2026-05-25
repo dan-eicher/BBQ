@@ -18,8 +18,14 @@ static void usage() {
         "                     demand from the IR's constructor schema instead of\n"
         "                     the heuristic derived from rule patterns alone.\n"
         "  --strict           Treat warnings as errors (CI gating).\n"
-        "  --coverage         Enable shape-enumeration warnings for uncovered\n"
-        "                     tree shapes.\n");
+        "  --coverage         Run the full tree-automaton analysis: dead-rule\n"
+        "                     warnings plus shape-enumeration warnings for\n"
+        "                     uncovered tree shapes. Off by default — automaton\n"
+        "                     construction is |states|^arity per round and\n"
+        "                     dominates burgc runtime on large grammars.\n"
+        "                     Reserve for a final CI gate; routine regenerations\n"
+        "                     run codegen-only (duplicate-rule detection still\n"
+        "                     runs without the automaton).\n");
 }
 
 int main(int argc, char** argv) {
@@ -64,6 +70,7 @@ int main(int argc, char** argv) {
     BurgGenerator gen;
     AnalysisConfig acfg;
     acfg.emit_coverage_warnings = coverage;
+    acfg.skip_dead_rule_analysis = !coverage;
 
     AsdlSchema schema;
     if (!asdl_file.empty()) {

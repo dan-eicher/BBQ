@@ -227,6 +227,7 @@ TEST(BurgAnalysis, ReportsUncoverableTreeShapeWithCoverage) {
         BurgGenerator gen;
         AnalysisConfig cfg;
         cfg.emit_coverage_warnings = true;
+        cfg.skip_dead_rule_analysis = false;
         gen.set_completeness_config(cfg);
         EXPECT_TRUE(gen.analyze(parser.ast));
         bool found_add = false;
@@ -281,6 +282,7 @@ TEST(BurgAnalysis, AsdlSchemaTightensDemandFilter) {
         BurgGenerator gen;
         AnalysisConfig cfg;
         cfg.emit_coverage_warnings = true;
+        cfg.skip_dead_rule_analysis = false;
         gen.set_completeness_config(cfg);
         EXPECT_TRUE(gen.analyze(parser.ast));
         EXPECT_EQ(count_add_uncovered(gen.warnings()), 0);
@@ -291,6 +293,7 @@ TEST(BurgAnalysis, AsdlSchemaTightensDemandFilter) {
         BurgGenerator gen;
         AnalysisConfig cfg;
         cfg.emit_coverage_warnings = true;
+        cfg.skip_dead_rule_analysis = false;
         cfg.asdl = &schema;
         gen.set_completeness_config(cfg);
         EXPECT_TRUE(gen.analyze(parser.ast));
@@ -358,6 +361,9 @@ TEST(BurgAnalysis, ReportsDeadRule) {
     parser.init(input, (int)strlen(input));
     ASSERT_TRUE(parser.parse());
     BurgGenerator gen;
+    AnalysisConfig cfg;
+    cfg.skip_dead_rule_analysis = false;
+    gen.set_completeness_config(cfg);
     EXPECT_TRUE(gen.analyze(parser.ast));
     bool found_dead = false;
     for (auto& w : gen.warnings()) {

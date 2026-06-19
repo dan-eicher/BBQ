@@ -368,9 +368,18 @@ spine: BeginArrayNode = 1 (. BeginArrayNode* ba = (BeginArrayNode*)node;
                     {"msg", an + ": alloc failed"}});
         } else {
             const char* mode = ba->mode == bbq::cek::ArrayMode::EOF_ ? "eof" : "until";
-            E.node(node, "array_begin_grow", {{"field", fld}, {"mode", mode},
+            json begin = {{"field", fld}, {"mode", mode},
                     {"body", E.next_id(node->succ(2))}, {"end", E.next_id(node->succ(0))},
-                    {"msg", an + ": alloc failed"}});
+                    {"msg", an + ": alloc failed"}};
+            // until: tile the predicate so begin can pre-test it before the first element —
+            // an empty array is the terminator true at the start (what the CEK does, the
+            // dual of the eof cursor pre-test). cond = !(until) is the "read another" guard.
+            if (ba->mode == bbq::cek::ArrayMode::Until && ba->until_expr) {
+                BurgState* us = burg_label_tree((bbq::cek::KontNode*)ba->until_expr);
+                burg_reduce((bbq::cek::KontNode*)ba->until_expr, us, expr_NT);
+                begin["cond"] = json{{"e","un"},{"op","!"},{"x", E.epop()}};
+            }
+            E.node(node, "array_begin_grow", begin);
         }
         E.array_fields.push_back(fld); .);
 spine: ArrayNextNode      = 1 (. ArrayNextNode* an = (ArrayNextNode*)node;

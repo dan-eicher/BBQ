@@ -1136,6 +1136,7 @@ struct BeginArrayNode : public StaticKont {
     const char* array_name{};
     ArrayMode mode{};
     KontNode* count_expr{};
+    KontNode* until_expr{};
     KontNode* end_node{};
     KontNode* resync_target{};
     KontNode* next{};

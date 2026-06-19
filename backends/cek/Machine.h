@@ -108,14 +108,15 @@ struct CEKMachine {
     size_t pos = 0;
 
     // ── Interval bounds ─────────────────────────────────────
-    // A stack of end offsets for `@[start,end]` / `@[length]` regions. Reads are
+    // A stack of [start,end) offsets for `@[start,end]` / `@[length]` regions. Reads are
     // bounded by effective_end() (the innermost bound, or input_length), not by
     // input_length directly — this is what enforces intervals. Seek/PushInterval/
     // PopInterval konts maintain it; Savepoints snapshot interval_depth so a
-    // backtrack unwinds it. The same bound-stack model as the C runtime.
-    static constexpr int MAX_INTERVAL_DEPTH = 64;
-    size_t interval_starts[MAX_INTERVAL_DEPTH];
-    size_t interval_ends[MAX_INTERVAL_DEPTH];
+    // backtrack unwinds it. The same bound-stack model as the C runtime: the vectors are
+    // the backing store and grow on demand (no fixed nesting cap), interval_depth is the
+    // live height — slots at/above it are stale and reused on the next push.
+    std::vector<size_t> interval_starts;
+    std::vector<size_t> interval_ends;
     int interval_depth = 0;
     // The active window [effective_start, effective_end). Per the IPG semantics a
     // nonterminal/terminal may inspect ONLY its interval's slice, so reads are

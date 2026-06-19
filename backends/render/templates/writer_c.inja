@@ -27,7 +27,7 @@ static bool {{ fn.kpfx }}_w{{ o.id }}(bbq_write_ctx_t* ctx, const {{ fn.type }}*
 {% if existsIn(o, "rest_reserve") %}
     bbq_w_push_rest(ctx);  // @rest size: computed from the rest's bytes at pop, not stored
 {% else if existsIn(o, "count_reserve") %}
-    if (!bbq_w_reserve_count(ctx, {{ o.count_id }}, {{ o.prim.w }})) return false;  // count: array length, not stored
+    if (!bbq_w_reserve_count(ctx, {{ o.count_id }}, {{ o.prim.w }}, {% if o.prim.enc == "uleb" %}true{% else %}false{% endif %})) return false;  // count: array length, not stored
 {% else %}
     if (!{{ write_fn(o.prim) }}(ctx, {{ o.target }})) return false;
 {% endif %}
@@ -120,7 +120,7 @@ static bool {{ fn.kpfx }}_w{{ o.id }}(bbq_write_ctx_t* ctx, const {{ fn.type }}*
     }
 {% else if o.op == "array_begin" or o.op == "array_begin_grow" %}
 {% if existsIn(o, "count_patch") %}
-    if (!bbq_w_patch_count(ctx, {{ o.count_id }}, (uint64_t)({{ o.field }}.count), {{ o.count_prim.w }}, {% if o.count_prim.be %}false{% else %}true{% endif %})) return false;
+    if (!bbq_w_patch_count(ctx, {{ o.count_id }}, (uint64_t)({{ o.field }}.count), {{ o.count_prim.w }}, {% if o.count_prim.enc == "uleb" %}true{% else %}false{% endif %}, {% if o.count_prim.be %}false{% else %}true{% endif %})) return false;
 {% endif %}
     { size_t _n = (size_t)({{ o.field }}.count);
       if (_n == 0) { BBQ_MUSTTAIL return {{ fn.kpfx }}_w{{ o.end }}(ctx, in); }
@@ -139,7 +139,7 @@ static bool {{ fn.kpfx }}_w{{ o.id }}(bbq_write_ctx_t* ctx, const {{ fn.type }}*
     // resync element bodies terminate in array_elem_done (return true), so the loop is
     // driven here (sub-call per element) rather than tail-cycled through array_next.
 {% if existsIn(o, "count_patch") %}
-    if (!bbq_w_patch_count(ctx, {{ o.count_id }}, (uint64_t)({{ o.field }}.count), {{ o.count_prim.w }}, {% if o.count_prim.be %}false{% else %}true{% endif %})) return false;
+    if (!bbq_w_patch_count(ctx, {{ o.count_id }}, (uint64_t)({{ o.field }}.count), {{ o.count_prim.w }}, {% if o.count_prim.enc == "uleb" %}true{% else %}false{% endif %}, {% if o.count_prim.be %}false{% else %}true{% endif %})) return false;
 {% endif %}
     { size_t _n = (size_t)({{ o.field }}.count);
       bbq_w_push_loop_n(ctx, (int64_t)_n);

@@ -194,6 +194,7 @@ set(CALC_VM_INCS
     -I${CMAKE_CURRENT_SOURCE_DIR}/example
     -I${CMAKE_CURRENT_SOURCE_DIR}/example/frontend
     -I${CMAKE_SOURCE_DIR}/backends/c/runtime
+    -I${CMAKE_SOURCE_DIR}/crt                          # bbq_vec.h — the reader's growable parse stacks
     -I${CMAKE_SOURCE_DIR}/opgen/runtime
     -I${CMAKE_CURRENT_SOURCE_DIR}/runtime
     -I${CMAKE_SOURCE_DIR}/pegc/runtime

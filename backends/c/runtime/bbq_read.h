@@ -22,6 +22,8 @@
 #include <string.h>
 #include <stdio.h>
 
+#include "bbq_vec.h"   /* crt growable arrays — the parse stacks grow on demand, no cap */
+
 /* ── Byte/string field types (owning bytes copies live in bbq_runtime.h) ── */
 
 typedef struct {
@@ -67,10 +69,13 @@ static inline bool bbq_host_is_little_endian(void) {
 
 /* ── Read context ───────────────────────────────────────── */
 
-#define BBQ_MAX_SCOPES 16
-#define BBQ_MAX_LOOPS  8
 #define BBQ_ERROR_LEN  256
 
+/* The parse stacks below are crt bbq_vec (a typed pointer with a hidden len/cap header;
+ * NULL is a valid empty vector). They grow on demand — nesting depth is unbounded, never
+ * a fixed cap — and a zero-initialized ctx (bbq_ctx_init memsets to 0) starts them empty.
+ * The matching `_depth` int is the live logical height; the vec is the backing store (its
+ * own len is unused). Release with bbq_ctx_free. */
 typedef struct {
     const uint8_t* data;
     size_t length;
@@ -80,26 +85,26 @@ typedef struct {
     char error[BBQ_ERROR_LEN];
     bool has_error;
     /* Scope stack (for cross-rule references) */
-    void* scopes[BBQ_MAX_SCOPES];
+    void** scopes;
     int scope_depth;
-    /* Loop index stack */
-    int64_t loop_indices[BBQ_MAX_LOOPS];
-    int64_t loop_limits[BBQ_MAX_LOOPS];
+    /* Loop index stack (loop_indices / loop_limits / loop_caps grow in lockstep) */
+    int64_t* loop_indices;
+    int64_t* loop_limits;
     /* Backing-store capacity per loop, for unbounded (eof/until) arrays whose count
      * is unknown up front and grown as elements are parsed. Counted arrays pre-size
      * and never grow (cap == limit). */
-    size_t loop_caps[BBQ_MAX_LOOPS];
+    size_t* loop_caps;
     int loop_depth;
     /* Per-rule loop base: the loop_depth at a rule's entry (pushed at each invoke),
      * so an array's own index is loop_indices[base + nesting_level] — its own frame,
      * mirroring the CEK's per-LoopFrame counter rather than "innermost". */
-    int loop_bases[BBQ_MAX_SCOPES];
+    int* loop_bases;
     int loop_base_depth;
     /* Interval stack. IPG confinement is bidirectional: a nested window must fall
      * entirely within its parent, so we track BOTH edges (the CEK keeps
      * interval_starts/interval_ends and effective_start/effective_end). */
-    size_t interval_starts[BBQ_MAX_SCOPES];
-    size_t interval_ends[BBQ_MAX_SCOPES];
+    size_t* interval_starts;
+    size_t* interval_ends;
     int interval_depth;
     /* The endian register is seeded from the grammar default once at parse start
      * (the CEK seeds little_endian at machine init); this latch makes the outermost
@@ -112,6 +117,20 @@ static inline void bbq_ctx_init(bbq_ctx_t* ctx, const uint8_t* data, size_t len)
     memset(ctx, 0, sizeof(*ctx));
     ctx->data = data;
     ctx->length = len;
+}
+
+/* Release the growable parse stacks (loop / scope / interval backing stores). The input
+ * `data` is borrowed, so it is untouched. Safe on a zero-initialized ctx (all stacks NULL)
+ * and idempotent — bbq_vec_free nulls each pointer. A bare cursor that never pushed a frame
+ * carries no allocation, so this is a no-op there. */
+static inline void bbq_ctx_free(bbq_ctx_t* ctx) {
+    bbq_vec_free(ctx->scopes);
+    bbq_vec_free(ctx->loop_indices);
+    bbq_vec_free(ctx->loop_limits);
+    bbq_vec_free(ctx->loop_caps);
+    bbq_vec_free(ctx->loop_bases);
+    bbq_vec_free(ctx->interval_starts);
+    bbq_vec_free(ctx->interval_ends);
 }
 
 static inline size_t bbq_pos(const bbq_ctx_t* ctx) { return ctx->pos; }
@@ -193,10 +212,17 @@ static inline void bbq_restore(bbq_ctx_t* ctx, bbq_checkpoint_t cp) {
     ctx->error[0] = '\0';
 }
 
+/* Grow a bbq_vec backing store to hold at least `depth+1` slots (doubling). The parse
+ * stacks index by their own `_depth` counter, not the vec's len, so this only ensures
+ * capacity — the caller assigns `v[depth]` and bumps the counter. */
+#define BBQ__STACK_ENSURE(v, depth) \
+    do { if ((depth) >= bbq_vec_cap(v)) \
+            bbq_vec_reserve(v, bbq_vec_cap(v) ? bbq_vec_cap(v) * 2 : 8); } while (0)
+
 /* Scope stack */
 static inline void bbq_push_scope(bbq_ctx_t* ctx, void* ptr) {
-    if (ctx->scope_depth < BBQ_MAX_SCOPES)
-        ctx->scopes[ctx->scope_depth++] = ptr;
+    BBQ__STACK_ENSURE(ctx->scopes, ctx->scope_depth);
+    ctx->scopes[ctx->scope_depth++] = ptr;
 }
 
 static inline void bbq_pop_scope(bbq_ctx_t* ctx) {
@@ -208,10 +234,19 @@ static inline void* bbq_scope_ptr(const bbq_ctx_t* ctx, int levels_up) {
     return (idx >= 0) ? ctx->scopes[idx] : NULL;
 }
 
-/* Loop index stack */
+/* Loop index stack. The three parallel arrays (indices / limits / caps) grow in lockstep
+ * so every live slot is valid in all three. */
+static inline void bbq__loop_ensure(bbq_ctx_t* ctx) {
+    BBQ__STACK_ENSURE(ctx->loop_indices, ctx->loop_depth);
+    BBQ__STACK_ENSURE(ctx->loop_limits, ctx->loop_depth);
+    BBQ__STACK_ENSURE(ctx->loop_caps, ctx->loop_depth);
+}
 static inline void bbq_push_loop(bbq_ctx_t* ctx) {
-    if (ctx->loop_depth < BBQ_MAX_LOOPS)
-        ctx->loop_indices[ctx->loop_depth++] = 0;
+    bbq__loop_ensure(ctx);
+    ctx->loop_indices[ctx->loop_depth] = 0;
+    ctx->loop_limits[ctx->loop_depth] = 0;
+    ctx->loop_caps[ctx->loop_depth] = 0;
+    ctx->loop_depth++;
 }
 
 static inline void bbq_pop_loop(bbq_ctx_t* ctx) {
@@ -220,24 +255,22 @@ static inline void bbq_pop_loop(bbq_ctx_t* ctx) {
 
 // Counted-array loop: push with the iteration limit (the CEK's LoopFrame.limit).
 static inline void bbq_push_loop_n(bbq_ctx_t* ctx, int64_t limit) {
-    if (ctx->loop_depth < BBQ_MAX_LOOPS) {
-        ctx->loop_indices[ctx->loop_depth] = 0;
-        ctx->loop_limits[ctx->loop_depth] = limit;
-        ctx->loop_caps[ctx->loop_depth] = (size_t)(limit > 0 ? limit : 0);
-        ctx->loop_depth++;
-    }
+    bbq__loop_ensure(ctx);
+    ctx->loop_indices[ctx->loop_depth] = 0;
+    ctx->loop_limits[ctx->loop_depth] = limit;
+    ctx->loop_caps[ctx->loop_depth] = (size_t)(limit > 0 ? limit : 0);
+    ctx->loop_depth++;
 }
 
 // Unbounded-array loop (eof/until): no fixed limit; the count is discovered as
 // elements are parsed, so the backing store grows (cap starts 0). Mirrors the
 // CEK's LoopFrame with limit = -1.
 static inline void bbq_push_loop_unbounded(bbq_ctx_t* ctx) {
-    if (ctx->loop_depth < BBQ_MAX_LOOPS) {
-        ctx->loop_indices[ctx->loop_depth] = 0;
-        ctx->loop_limits[ctx->loop_depth] = -1;
-        ctx->loop_caps[ctx->loop_depth] = 0;
-        ctx->loop_depth++;
-    }
+    bbq__loop_ensure(ctx);
+    ctx->loop_indices[ctx->loop_depth] = 0;
+    ctx->loop_limits[ctx->loop_depth] = -1;
+    ctx->loop_caps[ctx->loop_depth] = 0;
+    ctx->loop_depth++;
 }
 
 // Advance the innermost loop's counter without a limit test (the eof/until loops
@@ -272,7 +305,8 @@ static inline int64_t bbq_loop_index_at(const bbq_ctx_t* ctx, int depth) {
 // Per-rule loop base (loop_depth at the rule's entry). Pushed at each invoke; the
 // top rule's base is 0 (empty stack). Array slots index by base + nesting level.
 static inline void bbq_push_loop_base(bbq_ctx_t* ctx, int base) {
-    if (ctx->loop_base_depth < BBQ_MAX_SCOPES) ctx->loop_bases[ctx->loop_base_depth++] = base;
+    BBQ__STACK_ENSURE(ctx->loop_bases, ctx->loop_base_depth);
+    ctx->loop_bases[ctx->loop_base_depth++] = base;
 }
 static inline void bbq_pop_loop_base(bbq_ctx_t* ctx) {
     if (ctx->loop_base_depth > 0) ctx->loop_base_depth--;
@@ -300,8 +334,8 @@ static inline bool bbq_push_interval_checked(bbq_ctx_t* ctx, size_t end) {
      * formed (start <= end). Mirrors the CEK's PushIntervalApplyKont. */
     if (start > end || start < bbq_effective_start(ctx) || end > bbq_effective_end(ctx))
         return bbq_fail(ctx, "interval out of range");
-    if (ctx->interval_depth >= BBQ_MAX_SCOPES)
-        return bbq_fail(ctx, "interval: nesting too deep");
+    BBQ__STACK_ENSURE(ctx->interval_starts, ctx->interval_depth);
+    BBQ__STACK_ENSURE(ctx->interval_ends, ctx->interval_depth);
     ctx->interval_starts[ctx->interval_depth] = start;
     ctx->interval_ends[ctx->interval_depth] = end;
     ctx->interval_depth++;

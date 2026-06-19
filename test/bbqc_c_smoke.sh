@@ -57,7 +57,7 @@ int main(void) {
 }
 EOF
 
-cc -Wall -Wextra -Werror -std=c11 -I"$WORK" -I"$SRC/backends/c/runtime" \
+cc -Wall -Wextra -Werror -std=c11 -I"$WORK" -I"$SRC/backends/c/runtime" -I"$SRC/crt" \
     "$WORK/smk_reader.c" "$WORK/smk_writer.c" "$WORK/main.c" -o "$WORK/smoke"
 "$WORK/smoke"
 echo "bbqc C smoke OK"

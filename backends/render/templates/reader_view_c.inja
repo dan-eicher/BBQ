@@ -144,6 +144,9 @@ static bool {{ fn.kpfx }}_k{{ o.id }}(bbq_view_ctx_t* ctx) {
     bbq_cap_begin_array(&ctx->builder, "{{ o.field }}", ctx->cur.pos);
 {% if o.mode == "eof" %}
     if (ctx->cur.pos >= bbq_effective_end(&ctx->cur)) { BBQ_MUSTTAIL return {{ fn.kpfx }}_k{{ o.end }}(ctx); }
+{% else if o.mode == "until" %}
+    // Empty array: terminator true before the first element (cond = !(until)) — what the CEK does.
+    if (!({{ o.cond }})) { BBQ_MUSTTAIL return {{ fn.kpfx }}_k{{ o.end }}(ctx); }
 {% endif %}
     bbq_push_loop_unbounded(&ctx->cur);
     BBQ_MUSTTAIL return {{ fn.kpfx }}_k{{ o.body }}(ctx);

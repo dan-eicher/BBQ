@@ -151,7 +151,7 @@ module bbq_ir {
         // with on_fail_target = resync_target, ArrayNext refreshes its
         // saved state per iteration, EndArray pops it. Per-element
         // failure routes through ResyncKont (advance pos, retry body).
-        | BeginArrayNode(interned array_name, array_mode mode, kont_expr count_expr, kont_node end_node, kont_node resync_target, kont_node next)
+        | BeginArrayNode(interned array_name, array_mode mode, kont_expr count_expr, kont_ref until_expr, kont_node end_node, kont_node resync_target, kont_node next)
         // count_expr/until_expr are kont_ref: the loop's bound is reconstructed
         // from BeginArray by the codegen, so burg neither tiles nor traverses
         // ArrayNext's operands (until_expr is null in Count mode). The CEK reads

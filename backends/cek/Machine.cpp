@@ -1181,6 +1181,16 @@ void BeginArrayNode::invoke(CEKMachine* m) const {
 
     if (this->mode == ArrayMode::EOF_ && m->pos >= m->effective_end()) {
         m->push_kont(this->end_node);
+    } else if (this->mode == ArrayMode::Until) {
+        // Pre-test the until predicate before the first element, so an empty array
+        // (terminator true at the start) reads zero elements — the dual of the EOF
+        // pre-test above and the Count limit<=0 check. The element body loops back
+        // through ArrayNext, which re-tests for every subsequent element.
+        auto* check = m->arena->alloc<ArrayUntilCheckKont>();
+        check->end_node = this->end_node;
+        check->body_entry = this->next;
+        m->push_kont(check);
+        m->push_kont(this->until_expr);
     } else {
         m->push_kont(this->next);
     }
@@ -1739,12 +1749,15 @@ void PushIntervalApplyKont::invoke(CEKMachine* m) const {
         m->fail("interval out of range");
         return;
     }
-    if (m->interval_depth >= CEKMachine::MAX_INTERVAL_DEPTH) {
-        m->fail("interval nesting too deep");
-        return;
+    // Grow the backing store to hold this depth (no fixed cap); depth <= size always, so
+    // a slot at index == size is a fresh push, below it is a reused (post-backtrack) slot.
+    if ((size_t)m->interval_depth == m->interval_starts.size()) {
+        m->interval_starts.push_back(start);
+        m->interval_ends.push_back(end);
+    } else {
+        m->interval_starts[m->interval_depth] = start;
+        m->interval_ends[m->interval_depth] = end;
     }
-    m->interval_starts[m->interval_depth] = start;
-    m->interval_ends[m->interval_depth] = end;
     m->interval_depth++;
     m->push_kont(this->next);
 }

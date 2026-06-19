@@ -198,6 +198,7 @@ void bbq_view_build_free(bbq_view_ctx_t* c) {
     bbq_vec_free(c->builder.fields);
     bbq_vec_free(c->builder.scopes);
     bbq_vec_free(c->builder.child_buf);
+    bbq_ctx_free(&c->cur);   /* the cursor's growable parse stacks */
 }
 
 bbq_capture_metadata bbq_view_finish(bbq_view_ctx_t* c, bool ok) {

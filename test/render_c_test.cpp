@@ -69,7 +69,8 @@ bool run(const std::string& spec, const std::string& type_name, const std::strin
         f << "  return 0;\n}\n";
     }
     std::string rt = std::string(SOURCE_DIR) + "/backends/c/runtime";
-    std::string cc = "cc -Wall -Wextra -Werror -std=c11 -I" + dir + " -I" + rt + " " +
+    std::string crt = std::string(SOURCE_DIR) + "/crt";
+    std::string cc = "cc -Wall -Wextra -Werror -std=c11 -I" + dir + " -I" + rt + " -I" + crt + " " +
                      dir + "/test.c -o " + dir + "/bin 2>&1";
     FILE* p = popen(cc.c_str(), "r");
     char buf[8192] = {}; if (p) fread(buf, 1, sizeof buf - 1, p);

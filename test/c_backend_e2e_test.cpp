@@ -90,8 +90,9 @@ static bool run_c_e2e(const char* bbq_spec,
 
     // Compile
     std::string runtime_dir = std::string(SOURCE_DIR) + "/backends/c/runtime";
+    std::string crt_dir = std::string(SOURCE_DIR) + "/crt";
     std::string compile_cmd = "cc -Wall -Wextra -Werror -std=c11 -g "
-        "-I" + tmpdir + " -I" + runtime_dir + " "
+        "-I" + tmpdir + " -I" + runtime_dir + " -I" + crt_dir + " "
         + tmpdir + "/testReader.c "
         + tmpdir + "/testWriter.c "
         + tmpdir + "/harness.c "
@@ -287,6 +288,187 @@ int main(int argc, char** argv) {
         0x00, 0x02,               // items[1].val = 2
         0x00, 0x03                // items[2].val = 3
     };
+    std::string err;
+    ASSERT_TRUE(run_c_e2e(spec, harness, data, sizeof(data), &err)) << err;
+}
+
+// ── uleb128 count prefixing an array ──
+// Regression: a derived array length whose count field is `uleb128` must serialize as
+// LEB128, not a fixed-width slot. The writer's reserve/patch-count path emitted the
+// recomputed length as a fixed 4-byte word, corrupting every vec on write-back.
+
+TEST(CBackendE2E, UlebCountArrayRoundTrip) {
+    const char* spec =
+        "Item = struct { val: uint8 }\n"
+        "List = struct { count: uleb128, items: array<Item>[count] }";
+
+    const char* harness = R"(
+#include "testReader.h"
+#include "testWriter.h"
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <assert.h>
+
+int main(int argc, char** argv) {
+    (void)argc;
+    FILE* f = fopen(argv[1], "rb");
+    fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
+    uint8_t buf[256]; fread(buf, 1, sz, f); fclose(f);
+
+    bbq_ctx_t ctx;
+    bbq_ctx_init(&ctx, buf, sz);
+    list_t list;
+    assert(list_read(&ctx, &list));
+    assert(list.count == 3);
+    assert(list.items.count == 3);
+
+    uint8_t out[256];
+    bbq_write_ctx_t wctx;
+    bbq_write_ctx_init(&wctx, out, sizeof(out));
+    assert(list_write(&wctx, &list));
+    assert(wctx.pos == (size_t)sz);   // a fixed-width count would overshoot by 3 bytes
+    assert(memcmp(buf, out, sz) == 0);
+
+    free(list.items.items);
+    bbq_ctx_free(&ctx);
+    bbq_write_ctx_free(&wctx);
+    printf("OK: uleb count array round-trip (%ld bytes)\n", sz);
+    return 0;
+}
+)";
+
+    uint8_t data[] = {
+        0x03,                     // count = 3 (uleb128, one byte)
+        0x0A, 0x0B, 0x0C          // three items
+    };
+    std::string err;
+    ASSERT_TRUE(run_c_e2e(spec, harness, data, sizeof(data), &err)) << err;
+}
+
+// ── Nested predicate-terminated (until) arrays ──
+// The WASM block/expr shape: a `array<T>(none, until(peek()==TERM))` whose element T can
+// itself contain another such array (a block nested in an instruction stream). The flat
+// case round-trips; the nested case is the one that was never exercised.
+
+TEST(CBackendE2E, NestedUntilArrayRoundTrip) {
+    const char* spec =
+        "Leaf = struct { val: uint8 }\n"
+        "Block = struct {\n"
+        "    items: array<Node>(none, until(peek() == 0x00)),\n"
+        "    end: uint8 where end == 0x00\n"
+        "}\n"
+        "Node = struct {\n"
+        "    tag: uint8,\n"
+        "    body: switch(tag) {\n"
+        "        0x01: Leaf;\n"
+        "        0x02: Block;\n"
+        "        default: reject;\n"
+        "    }\n"
+        "}\n"
+        "Root = struct {\n"
+        "    items: array<Node>(none, until(peek() == 0x00)),\n"
+        "    end: uint8 where end == 0x00\n"
+        "}";
+
+    const char* harness = R"(
+#include "testReader.h"
+#include "testWriter.h"
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <assert.h>
+
+int main(int argc, char** argv) {
+    (void)argc;
+    FILE* f = fopen(argv[1], "rb");
+    fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
+    uint8_t buf[256]; fread(buf, 1, sz, f); fclose(f);
+
+    bbq_ctx_t ctx;
+    bbq_ctx_init(&ctx, buf, sz);
+    root_t root;
+    assert(root_read(&ctx, &root));
+    assert(root.items.count == 2);            // a Block, then a Leaf
+    assert(root.items.items[0].tag == 0x02);  // the nested Block
+    assert(root.items.items[1].tag == 0x01);  // the trailing Leaf
+
+    uint8_t out[256];
+    bbq_write_ctx_t wctx;
+    bbq_write_ctx_init(&wctx, out, sizeof(out));
+    assert(root_write(&wctx, &root));
+    assert(wctx.pos == (size_t)sz);
+    assert(memcmp(buf, out, sz) == 0);
+
+    bbq_ctx_free(&ctx);
+    bbq_write_ctx_free(&wctx);
+    printf("OK: nested until-array round-trip (%ld bytes)\n", sz);
+    return 0;
+}
+)";
+
+    // Root: [ Block{ [ Leaf(0xAA) ] }, Leaf(0xBB) ]
+    uint8_t data[] = {
+        0x02,                     // Node.tag = Block
+          0x01, 0xAA,             //   Block.items: Node.tag=Leaf, val=0xAA
+          0x00,                   //   Block.end
+        0x01, 0xBB,               // Node.tag=Leaf, val=0xBB
+        0x00                      // Root.end
+    };
+    std::string err;
+    ASSERT_TRUE(run_c_e2e(spec, harness, data, sizeof(data), &err)) << err;
+}
+
+// ── Empty predicate-terminated (until) array ──
+// The actual WASM bug: an EMPTY `until`-array — the terminator is true on the very first
+// peek, so the array has zero elements (e.g. an empty block body `0x02 0x40 0x0B`). The
+// generated reader read one element unconditionally and tested the terminator only after,
+// so it consumed a bogus element and misparsed every empty block/loop/if/expr.
+
+TEST(CBackendE2E, EmptyUntilArrayRoundTrip) {
+    const char* spec =
+        "Leaf = struct { val: uint8 }\n"
+        "Root = struct {\n"
+        "    items: array<Leaf>(none, until(peek() == 0x00)),\n"
+        "    end: uint8 where end == 0x00\n"
+        "}";
+
+    const char* harness = R"(
+#include "testReader.h"
+#include "testWriter.h"
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <assert.h>
+
+int main(int argc, char** argv) {
+    (void)argc;
+    FILE* f = fopen(argv[1], "rb");
+    fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
+    uint8_t buf[256]; fread(buf, 1, sz, f); fclose(f);
+
+    bbq_ctx_t ctx;
+    bbq_ctx_init(&ctx, buf, sz);
+    root_t root;
+    assert(root_read(&ctx, &root));
+    assert(root.items.count == 0);   // empty: terminator true on the first peek
+    assert(root.end == 0x00);
+
+    uint8_t out[256];
+    bbq_write_ctx_t wctx;
+    bbq_write_ctx_init(&wctx, out, sizeof(out));
+    assert(root_write(&wctx, &root));
+    assert(wctx.pos == (size_t)sz);
+    assert(memcmp(buf, out, sz) == 0);
+
+    bbq_ctx_free(&ctx);
+    bbq_write_ctx_free(&wctx);
+    printf("OK: empty until-array round-trip (%ld bytes)\n", sz);
+    return 0;
+}
+)";
+
+    uint8_t data[] = { 0x00 };   // zero elements, then the 0x00 terminator/end
     std::string err;
     ASSERT_TRUE(run_c_e2e(spec, harness, data, sizeof(data), &err)) << err;
 }

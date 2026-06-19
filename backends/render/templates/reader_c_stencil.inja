@@ -120,6 +120,10 @@ static bool {{ fn.kpfx }}_k{{ o.id }}(bbq_ctx_t* ctx, {{ fn.type }}* out, size_t
     bbq_push_loop_unbounded(ctx);
 {% if o.mode == "eof" %}
     if (bbq_pos(ctx) >= bbq_effective_end(ctx)) { bbq_pop_loop(ctx); BBQ_MUSTTAIL return {{ fn.kpfx }}_k{{ o.end }}(ctx, out, _struct_start); }
+{% else if o.mode == "until" %}
+    // Pre-test the terminator before the first element: an empty array is the terminator
+    // true at the start (cond = !(until) is the read-another guard) — what the CEK does.
+    if (!({{ o.cond }})) { bbq_pop_loop(ctx); BBQ_MUSTTAIL return {{ fn.kpfx }}_k{{ o.end }}(ctx, out, _struct_start); }
 {% endif %}
     {{ o.field }}.items = bbq_array_grow(ctx, {{ o.field }}.items, sizeof(*{{ o.field }}.items));
     if (!{{ o.field }}.items) return bbq_fail(ctx, "{{ o.msg }}");

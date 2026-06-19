@@ -470,12 +470,13 @@ private:
     }
     bbq::cek::StaticKont* make_begin_array(const std::string& nm, bbq::cek::ArrayMode mode,
                                          bbq::cek::StaticKont* count_expr,
+                                         bbq::cek::StaticKont* until_expr,
                                          bbq::cek::StaticKont* end_node,
                                          bbq::cek::StaticKont* resync_target,
                                          bbq::cek::StaticKont* nx) {
         auto* k = arena_->alloc<bbq::cek::BeginArrayNode>();
         k->array_name = strings_->intern(nm); k->mode = mode;
-        k->count_expr = count_expr; k->end_node = end_node;
+        k->count_expr = count_expr; k->until_expr = until_expr; k->end_node = end_node;
         k->resync_target = resync_target; k->next = nx;
         return k;
     }
@@ -864,7 +865,7 @@ private:
         if (resync_kont) resync_kont->body_entry = loop_entry;
 
         return make_begin_array(array_name, mode,
-                                count_expr, end_kont,
+                                count_expr, until_expr, end_kont,
                                 resync_kont, body_head);
     }
 

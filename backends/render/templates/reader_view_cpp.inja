@@ -151,6 +151,9 @@ static bool {{ fn.kpfx }}_k{{ o.id }}(bbq::reader& r) {
     r.begin_array("{{ o.field }}");
 {% if o.mode == "eof" %}
     if (r.pos >= r.effective_end()) return {{ fn.kpfx }}_k{{ o.end }}(r);
+{% else if o.mode == "until" %}
+    // Empty array: terminator true before the first element (cond = !(until)) — what the CEK does.
+    if (!({{ o.cond }})) return {{ fn.kpfx }}_k{{ o.end }}(r);
 {% endif %}
     r.push_loop_unbounded();
     return {{ fn.kpfx }}_k{{ o.body }}(r);

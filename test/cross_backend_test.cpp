@@ -210,7 +210,8 @@ CRoundtrip build_c_roundtrip(const std::vector<std::string>& rules) {
     // adversarial bytes through this binary, and ASan/UBSan turn any out-of-bounds access
     // (the bitcoins surface) into a hard abort the test catches — not a silent corruption.
     rt.sanitized = sanitizer_cc().sanitized;
-    std::string cc = sanitizer_cc().cmd + " -I" + dir + " -I" + rtdir + " " + dir + "/r.c " +
+    std::string cc = sanitizer_cc().cmd + " -I" + dir + " -I" + rtdir +
+                     " -I" + std::string(SOURCE_DIR) + "/crt " + dir + "/r.c " +
                      dir + "/w.c " + dir + "/h.c -o " + dir + "/bin 2>&1";
     FILE* p = popen(cc.c_str(), "r");
     char buf[8192] = {}; if (p) fread(buf, 1, sizeof buf - 1, p);
@@ -940,7 +941,8 @@ TEST(CrossBackend, RestSizeRecomputedOnModify) {
            "  fwrite(wc.data,1,wc.pos,stdout); fflush(stdout); return 0; }\n";
     }
     std::string rtdir = std::string(SOURCE_DIR) + "/backends/c/runtime";
-    std::string cc = sanitizer_cc().cmd + " -I" + dir + " -I" + rtdir + " " + dir + "/r.c " +
+    std::string cc = sanitizer_cc().cmd + " -I" + dir + " -I" + rtdir +
+                     " -I" + std::string(SOURCE_DIR) + "/crt " + dir + "/r.c " +
                      dir + "/w.c " + dir + "/h.c -o " + dir + "/bin 2>&1";
     FILE* cp = popen(cc.c_str(), "r");
     char cb[4096] = {}; if (cp) fread(cb, 1, sizeof cb - 1, cp);
@@ -992,7 +994,8 @@ TEST(CrossBackend, CountPrefixRecomputedOnModify) {
            "  fwrite(wc.data,1,wc.pos,stdout); fflush(stdout); return 0; }\n";
     }
     std::string rtdir = std::string(SOURCE_DIR) + "/backends/c/runtime";
-    std::string cc = sanitizer_cc().cmd + " -I" + dir + " -I" + rtdir + " " + dir + "/r.c " +
+    std::string cc = sanitizer_cc().cmd + " -I" + dir + " -I" + rtdir +
+                     " -I" + std::string(SOURCE_DIR) + "/crt " + dir + "/r.c " +
                      dir + "/w.c " + dir + "/h.c -o " + dir + "/bin 2>&1";
     FILE* cp = popen(cc.c_str(), "r");
     char cb[4096] = {}; if (cp) fread(cb, 1, sizeof cb - 1, cp);
@@ -1043,7 +1046,8 @@ TEST(CrossBackend, PathCountRecomputedOnModify) {
            "  fwrite(wc.data,1,wc.pos,stdout); fflush(stdout); return 0; }\n";
     }
     std::string rtdir = std::string(SOURCE_DIR) + "/backends/c/runtime";
-    std::string cc = sanitizer_cc().cmd + " -I" + dir + " -I" + rtdir + " " + dir + "/r.c " +
+    std::string cc = sanitizer_cc().cmd + " -I" + dir + " -I" + rtdir +
+                     " -I" + std::string(SOURCE_DIR) + "/crt " + dir + "/r.c " +
                      dir + "/w.c " + dir + "/h.c -o " + dir + "/bin 2>&1";
     FILE* cp = popen(cc.c_str(), "r");
     char cb[4096] = {}; if (cp) fread(cb, 1, sizeof cb - 1, cp);

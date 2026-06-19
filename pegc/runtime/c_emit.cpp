@@ -101,7 +101,28 @@ void cg_choice(Ctx* ctx, Choice* ch, std::ostream& out, int indent) {
         }
     }
 
-    if (all_literal_starts && n <= 8) {
+    // The head-fail optimization peeks each alternative's first literal and commits
+    // to the first whose literal is present, never backtracking to the others. That
+    // is sound ONLY when the heads are pairwise prefix-disjoint: peg_peek_at(L) is
+    // true whenever the input starts with L, so if one head is a prefix of another
+    // (e.g. two alternatives both starting "(") the peek cannot tell them apart and
+    // would wrongly commit to the earlier alternative — when it then fails deeper,
+    // PEG ordered-choice requires falling through to the rest, which predictive
+    // dispatch cannot do. In that case fall back to the general backtracking choice.
+    bool prefix_disjoint = all_literal_starts && n <= 8;
+    for (int i = 0; i < n && prefix_disjoint; i++) {
+        const std::string& a = first_literal(ch->alternatives[i])->value;
+        for (int j = 0; j < n; j++) {
+            if (i == j) continue;
+            const std::string& b = first_literal(ch->alternatives[j])->value;
+            if (a.size() <= b.size() && b.compare(0, a.size(), a) == 0) {
+                prefix_disjoint = false;
+                break;
+            }
+        }
+    }
+
+    if (prefix_disjoint) {
         if (!ctx->in_lex_mode) out << ind << "peg_skip(p);\n";
         for (int i = 0; i < n; i++) {
             auto* alt = ch->alternatives[i];

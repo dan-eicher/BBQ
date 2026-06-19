@@ -9,12 +9,42 @@
 
 #include "Machine.h"
 #include "CompiledGrammar.h"
+#include "CaptureDecode.h"   // decode_int/decode_float — a path leaf re-decodes its span
 
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
 
 namespace bbq::cek {
+
+// --- Computed-value boundary (machine IR <-> neutral index runtime) ---
+// The index runtime stores a neutral ComputedValue (no dependency on the machine
+// Value hierarchy). The machine lowers its scalar Value into that when building a
+// capture, and lifts it back when an eval reads a computed/bound field.
+
+static ComputedValue* lower_computed(ParseArena& arena, Value* v) {
+    auto* cv = arena.alloc<ComputedValue>();
+    if (!v) { cv->kind = ComputedValue::Kind::Int; cv->i = 0; return cv; }
+    switch (v->tag) {
+        case ValueTag::IntValue:    cv->kind = ComputedValue::Kind::Int;    cv->i = static_cast<IntValue*>(v)->v; break;
+        case ValueTag::FloatValue:  cv->kind = ComputedValue::Kind::Float;  cv->f = static_cast<FloatValue*>(v)->v; break;
+        case ValueTag::BoolValue:   cv->kind = ComputedValue::Kind::Bool;   cv->b = static_cast<BoolValue*>(v)->v; break;
+        case ValueTag::StringValue: cv->kind = ComputedValue::Kind::String; cv->s = static_cast<StringValue*>(v)->v; break;
+        default:                    cv->kind = ComputedValue::Kind::Int;    cv->i = 0; break;
+    }
+    return cv;
+}
+
+static Value* lift_computed(ParseArena& arena, const ComputedValue* cv) {
+    if (!cv) return nullptr;
+    switch (cv->kind) {
+        case ComputedValue::Kind::Int:    { auto* v = arena.alloc<IntValue>();    v->v = cv->i; return v; }
+        case ComputedValue::Kind::Float:  { auto* v = arena.alloc<FloatValue>();  v->v = cv->f; return v; }
+        case ComputedValue::Kind::Bool:   { auto* v = arena.alloc<BoolValue>();   v->v = cv->b; return v; }
+        case ComputedValue::Kind::String: { auto* v = arena.alloc<StringValue>(); v->v = cv->s; return v; }
+    }
+    return nullptr;
+}
 
 // --- Byte swap helpers ---
 
@@ -163,6 +193,7 @@ CaptureMetadata CEKMachine::execute_from(KontNode* entry,
     input = data;
     input_length = length;
     pos = 0;
+    interval_depth = 0;
     little_endian = default_little_endian;
     result = nullptr;
     failed = false;
@@ -246,19 +277,40 @@ void PosKont::invoke(CEKMachine* m) const {
 
 void RemainingKont::invoke(CEKMachine* m) const {
     auto* iv = m->arena->alloc<IntValue>();
-    iv->v = static_cast<int64_t>(m->input_length - m->pos);
+    iv->v = static_cast<int64_t>(m->effective_end() - m->pos);
     m->result = iv;
-}
-
-void AtEndKont::invoke(CEKMachine* m) const {
-    auto* bv = m->arena->alloc<BoolValue>();
-    bv->v = (m->pos >= m->input_length);
-    m->result = bv;
 }
 
 void EOIKont::invoke(CEKMachine* m) const {
     auto* iv = m->arena->alloc<IntValue>();
     iv->v = static_cast<int64_t>(m->input_length);
+    m->result = iv;
+}
+
+void BufferKont::invoke(CEKMachine* m) const {
+    // `@buffer`: the enclosing construct's consumed byte interval [start, pos), as a
+    // FieldCaptureValue a verification function reads over (m->input[start..end)).
+    // start = the innermost open capture scope, or 0 for an inlined top-level struct.
+    auto* cap = m->arena->alloc<FieldCapture>();
+    cap->start_offset = m->builder.current_scope_start();
+    cap->end_offset = m->pos;
+    cap->type = CaptureType::Bytes;
+    auto* fcv = m->arena->alloc<FieldCaptureValue>();
+    fcv->capture = cap;
+    m->result = fcv;
+}
+
+void StartKont::invoke(CEKMachine* m) const {
+    // `@start`: entry offset of the enclosing construct (the open capture scope).
+    auto* iv = m->arena->alloc<IntValue>();
+    iv->v = static_cast<int64_t>(m->builder.current_scope_start());
+    m->result = iv;
+}
+
+void EndKont::invoke(CEKMachine* m) const {
+    // `@end`: the active end bound — the innermost interval, or the input length.
+    auto* iv = m->arena->alloc<IntValue>();
+    iv->v = static_cast<int64_t>(m->effective_end());
     m->result = iv;
 }
 
@@ -322,7 +374,21 @@ DEFINE_BINOP_KONT(GeKont,     ApplyGeKont)
 
 #undef DEFINE_BINOP_KONT
 
-// Numeric arithmetic apply: same-type Int+Int or Float+Float; cross-type fails.
+// Usual arithmetic conversions: an operand is numeric (int or float), and its value
+// widened to double. Mixed int/float promotes to float, like every compiler. Expression
+// evaluation is the int64/double model (the defined semantics) — it matches C for in-range
+// values; it does NOT replicate C's narrower-width integer wraparound or float32 precision
+// (those are the owning struct's typed-member behaviour, not the expression's). Pinned by
+// cek_test's ArithConformsToC against constant-folded C++.
+static inline bool is_num(const Value* v) {
+    return v && (v->tag == ValueTag::IntValue || v->tag == ValueTag::FloatValue);
+}
+static inline double as_double(const Value* v) {
+    return v->tag == ValueTag::FloatValue ? static_cast<const FloatValue*>(v)->v
+                                          : static_cast<double>(static_cast<const IntValue*>(v)->v);
+}
+
+// Numeric arithmetic apply: Int+Int stays int; any float operand promotes to float.
 #define DEFINE_ARITH_APPLY(ApplyKont, op_str, int_op, float_op)               \
     void ApplyKont::invoke(CEKMachine* m) const {                             \
         Value* lhs = m->result;                                               \
@@ -335,9 +401,8 @@ DEFINE_BINOP_KONT(GeKont,     ApplyGeKont)
             auto* r = m->arena->alloc<IntValue>();                            \
             r->v = (int_op);                                                  \
             m->result = r;                                                    \
-        } else if (lhs->tag == ValueTag::FloatValue && rhs->tag == ValueTag::FloatValue) { \
-            double a = static_cast<FloatValue*>(lhs)->v;                      \
-            double b = static_cast<FloatValue*>(rhs)->v;                      \
+        } else if (is_num(lhs) && is_num(rhs)) {                              \
+            double a = as_double(lhs), b = as_double(rhs);                    \
             (void)a; (void)b;                                                 \
             auto* r = m->arena->alloc<FloatValue>();                          \
             r->v = (float_op);                                                \
@@ -364,9 +429,9 @@ void ApplyDivKont::invoke(CEKMachine* m) const {
         auto* r = m->arena->alloc<IntValue>();
         r->v = static_cast<IntValue*>(lhs)->v / b;
         m->result = r;
-    } else if (lhs->tag == ValueTag::FloatValue && rhs->tag == ValueTag::FloatValue) {
+    } else if (is_num(lhs) && is_num(rhs)) {
         auto* r = m->arena->alloc<FloatValue>();
-        r->v = static_cast<FloatValue*>(lhs)->v / static_cast<FloatValue*>(rhs)->v;
+        r->v = as_double(lhs) / as_double(rhs);   // mixed int/float promotes to float
         m->result = r;
     } else {
         m->fail("type error: /");
@@ -424,7 +489,10 @@ void ApplyEqKont::invoke(CEKMachine* m) const {
     Value* lhs = m->result;
     Value* rhs = this->saved_right;
     if (!lhs || !rhs) { m->fail("type error: =="); return; }
-    if (lhs->tag != rhs->tag) { m->result = alloc_bool(m, false); return; }
+    if (lhs->tag != rhs->tag) {
+        if (is_num(lhs) && is_num(rhs)) { m->result = alloc_bool(m, as_double(lhs) == as_double(rhs)); return; }
+        m->result = alloc_bool(m, false); return;
+    }
     bool eq = false;
     switch (lhs->tag) {
         case ValueTag::IntValue:
@@ -452,7 +520,10 @@ void ApplyNeKont::invoke(CEKMachine* m) const {
     Value* lhs = m->result;
     Value* rhs = this->saved_right;
     if (!lhs || !rhs) { m->fail("type error: !="); return; }
-    if (lhs->tag != rhs->tag) { m->result = alloc_bool(m, true); return; }
+    if (lhs->tag != rhs->tag) {
+        if (is_num(lhs) && is_num(rhs)) { m->result = alloc_bool(m, as_double(lhs) != as_double(rhs)); return; }
+        m->result = alloc_bool(m, true); return;
+    }
     bool eq = false;
     switch (lhs->tag) {
         case ValueTag::IntValue:
@@ -475,14 +546,18 @@ void ApplyNeKont::invoke(CEKMachine* m) const {
     m->result = alloc_bool(m, !eq);
 }
 
-// Ordered comparison: same-type required (int, float, string); cross-type fails.
+// Ordered comparison: int/float/string. Mixed int/float promotes to float;
+// any other cross-type fails.
 #define DEFINE_ORDERED_APPLY(ApplyKont, op_str, op_token)                     \
     void ApplyKont::invoke(CEKMachine* m) const {                             \
         Value* lhs = m->result;                                               \
         Value* rhs = this->saved_right;                                       \
-        if (!lhs || !rhs || lhs->tag != rhs->tag) {                           \
-            m->fail("type error: " op_str);                                   \
-            return;                                                           \
+        if (!lhs || !rhs) { m->fail("type error: " op_str); return; }         \
+        if (lhs->tag != rhs->tag) {                                           \
+            if (is_num(lhs) && is_num(rhs)) {                                 \
+                m->result = alloc_bool(m, as_double(lhs) op_token as_double(rhs)); return; \
+            }                                                                 \
+            m->fail("type error: " op_str); return;                          \
         }                                                                     \
         bool b = false;                                                       \
         switch (lhs->tag) {                                                   \
@@ -761,7 +836,7 @@ void builtin_clamp(CEKMachine* m, Value** args) {
 // tag-prefixed unions where the discriminating byte is also the
 // first byte of each case body (see e.g. cap.bbq's CpInfo).
 void builtin_peek(CEKMachine* m, Value** /*args*/) {
-    if (m->pos >= m->input_length) { m->fail("peek: end of input"); return; }
+    if (m->pos >= m->effective_end()) { m->fail("peek: end of input"); return; }
     auto* r = m->arena->alloc<IntValue>();
     r->v = static_cast<int64_t>(m->input[m->pos]);
     m->result = r;
@@ -881,11 +956,22 @@ void CaptureValueApplyKont::invoke(CEKMachine* m) const {
     Value* v = m->result;
     if (!v || v->tag != ValueTag::FieldCaptureValue) { m->fail("path: capture-value on non-path"); return; }
     auto* cap = static_cast<FieldCaptureValue*>(v)->capture;
-    if (cap->computed_value == nullptr) {
-        m->fail("path: no computed value");
+    if (cap->computed_value != nullptr) {
+        m->result = lift_computed(*m->arena, cap->computed_value);
         return;
     }
-    m->result = cap->computed_value;
+    // A path to a plain (non-computed) scalar leaf — `ehdr.e_shoff`, `h.n` — re-decodes
+    // its recorded span from the input, matching the compiled readers (node_int). The
+    // baked CaptureType carries the endian, so this follows mid-struct @endian switches.
+    if (is_float_type(cap->type)) {
+        double d = 0;
+        if (!decode_float(cap, m->input, &d)) { m->fail("path: cannot decode float leaf"); return; }
+        auto* fv = m->arena->alloc<FloatValue>(); fv->v = d; m->result = fv;
+    } else {
+        int64_t bits = 0; bool sgn = false;
+        if (!decode_int(cap, m->input, &bits, &sgn)) { m->fail("path: cannot decode scalar leaf"); return; }
+        auto* iv = m->arena->alloc<IntValue>(); iv->v = bits; m->result = iv;
+    }
 }
 
 // ── Site consumers (8) ────────────────────────────────────
@@ -924,7 +1010,6 @@ void EvalConstraintCheckKont::invoke(CEKMachine* m) const {
 
 void BindComputeNode::invoke(CEKMachine* m) const {
     auto* store = m->arena->alloc<BindComputeStoreKont>();
-    store->field_name = this->field_name;
     store->next = this->next;
     m->push_kont(store);
     m->push_kont(this->compute_expr);
@@ -933,17 +1018,17 @@ void BindComputeNode::invoke(CEKMachine* m) const {
 void BindComputeStoreKont::invoke(CEKMachine* m) const {
     Value* v = m->result;
     if (!v) { m->fail("bind-compute: null value"); return; }
-    m->builder.add_computed(this->field_name, v, m->pos);
-
-    auto* new_env = m->arena->alloc<Environment>();
-    new_env->binding.name = this->field_name;
-    new_env->binding.value = v;
-    new_env->binding.start_offset = m->pos;
-    new_env->binding.end_offset = m->pos;
-    new_env->binding.type = CaptureType::Computed;
-    new_env->parent = m->env;
-    m->env = new_env;
-
+    // Producer: wrap the computed value as a Computed FieldCaptureValue at the
+    // current position (no bytes consumed); the store konts that follow record it
+    // (Computed → value in the tree) and bind it.
+    auto* cap = m->arena->alloc<FieldCapture>();
+    cap->start_offset = m->pos;
+    cap->end_offset = m->pos;
+    cap->type = CaptureType::Computed;
+    cap->computed_value = lower_computed(*m->arena, v);
+    auto* fcv = m->arena->alloc<FieldCaptureValue>();
+    fcv->capture = cap;
+    m->result = fcv;
     m->push_kont(this->next);
 }
 
@@ -964,7 +1049,6 @@ void SetEndianApplyKont::invoke(CEKMachine* m) const {
 
 void MatchBytesNode::invoke(CEKMachine* m) const {
     auto* apply = m->arena->alloc<MatchBytesApplyKont>();
-    apply->field_name = this->field_name;
     apply->is_string = this->is_string;
     apply->next = this->next;
     m->push_kont(apply);
@@ -975,24 +1059,21 @@ void MatchBytesApplyKont::invoke(CEKMachine* m) const {
     Value* v = m->result;
     if (!v || v->tag != ValueTag::IntValue) { m->fail("bytes length not integer"); return; }
     int64_t len = static_cast<IntValue*>(v)->v;
-    if (len < 0 || m->pos + static_cast<size_t>(len) > m->input_length) {
+    if (len < 0 || m->pos + static_cast<size_t>(len) > m->effective_end()) {
         m->fail("bytes out of range");
         return;
     }
     size_t start = m->pos;
     m->pos += static_cast<size_t>(len);
-    CaptureType ct = this->is_string ? CaptureType::String : CaptureType::Bytes;
-    m->builder.add_field(this->field_name, start, m->pos, ct);
-
-    auto* new_env = m->arena->alloc<Environment>();
-    new_env->binding.name = this->field_name;
-    new_env->binding.value = nullptr;  // bytes/string don't bind a typed scalar
-    new_env->binding.start_offset = start;
-    new_env->binding.end_offset = m->pos;
-    new_env->binding.type = ct;
-    new_env->parent = m->env;
-    m->env = new_env;
-
+    // Producer: yield the byte span as a FieldCaptureValue (no scalar value, so
+    // computed_value stays null); the store konts that follow record/bind it.
+    auto* cap = m->arena->alloc<FieldCapture>();
+    cap->start_offset = start;
+    cap->end_offset = m->pos;
+    cap->type = this->is_string ? CaptureType::String : CaptureType::Bytes;
+    auto* fcv = m->arena->alloc<FieldCaptureValue>();
+    fcv->capture = cap;
+    m->result = fcv;
     m->push_kont(this->next);
 }
 
@@ -1001,6 +1082,7 @@ void SwitchDispatchNode::invoke(CEKMachine* m) const {
     select->cases = this->cases;
     select->cases_count = this->cases_count;
     select->default_target = this->default_target;
+    select->default_reject = this->default_reject;
     m->push_kont(select);
     m->push_kont(this->discriminator_expr);
 }
@@ -1008,6 +1090,11 @@ void SwitchDispatchNode::invoke(CEKMachine* m) const {
 void SwitchSelectKont::invoke(CEKMachine* m) const {
     Value* v = m->result;
     if (!v) { m->fail("switch: null discriminator"); return; }
+    // The default arm's ordinal follows the last case (matches the read-side model,
+    // which appends default_val after the cases).
+    int max_ordinal = -1;
+    for (int i = 0; i < this->cases_count; ++i)
+        if (this->cases[i].ordinal > max_ordinal) max_ordinal = this->cases[i].ordinal;
     for (int i = 0; i < this->cases_count; ++i) {
         const switch_case& c = this->cases[i];
         if (!c.match_value || c.match_value->tag != v->tag) continue;
@@ -1024,14 +1111,19 @@ void SwitchSelectKont::invoke(CEKMachine* m) const {
                 return;
         }
         if (match) {
+            // Record which case the parser took; the arm's first capture consumes it.
+            m->builder.set_pending_variant_tag(c.ordinal);
             m->push_kont(c.target);
             return;
         }
     }
     if (this->default_target) {
+        m->builder.set_pending_variant_tag(max_ordinal + 1);
         m->push_kont(this->default_target);
+    } else if (this->default_reject) {
+        m->fail("switch: discriminant rejected by `default: reject`");
     } else {
-        m->fail("switch: no matching case");
+        m->fail("switch: no matching case and no default");
     }
 }
 
@@ -1047,6 +1139,7 @@ static void push_resync_savepoint(CEKMachine* m, KontNode* resync_target) {
     sp->type = FrameType::Savepoint;
     sp->saved_env = m->env;
     sp->saved_pos = m->pos;
+    sp->saved_interval_depth = m->interval_depth;
     sp->saved_endian = m->little_endian;
     sp->saved_kont_size = m->kont_stack_size();
     sp->capture_mark = m->builder.mark();
@@ -1086,7 +1179,7 @@ void BeginArrayNode::invoke(CEKMachine* m) const {
 
     push_resync_savepoint(m, this->resync_target);
 
-    if (this->mode == ArrayMode::EOF_ && m->pos >= m->input_length) {
+    if (this->mode == ArrayMode::EOF_ && m->pos >= m->effective_end()) {
         m->push_kont(this->end_node);
     } else {
         m->push_kont(this->next);
@@ -1135,6 +1228,7 @@ void ArrayNextNode::invoke(CEKMachine* m) const {
         auto* sp = static_cast<Savepoint*>(m->frame_top);
         sp->saved_env = m->env;
         sp->saved_pos = m->pos;
+        sp->saved_interval_depth = m->interval_depth;
         sp->saved_endian = m->little_endian;
         sp->saved_kont_size = m->kont_stack_size();
         sp->capture_mark = m->builder.mark();
@@ -1152,7 +1246,7 @@ void ArrayNextNode::invoke(CEKMachine* m) const {
             m->push_kont(lf->counter >= lf->limit ? this->end_node : this->body_entry);
             break;
         case ArrayMode::EOF_:
-            m->push_kont(m->pos >= m->input_length ? this->end_node : this->body_entry);
+            m->push_kont(m->pos >= m->effective_end() ? this->end_node : this->body_entry);
             break;
         case ArrayMode::Count: {
             auto* check = m->arena->alloc<ArrayCountCheckKont>();
@@ -1230,13 +1324,27 @@ void ResyncKont::invoke(CEKMachine* m) const {
     if (!frame) { m->fail("ResyncKont: no Savepoint in scope"); return; }
     auto* sp = static_cast<Savepoint*>(frame);
     m->pos = sp->saved_pos;
+    m->interval_depth = sp->saved_interval_depth;
     m->env = sp->saved_env;
     m->little_endian = sp->saved_endian;
     m->builder.restore(sp->capture_mark);
     m->truncate_kont_stack(sp->saved_kont_size);
 
     // Advance one byte past the failed element start.
-    if (m->pos >= m->input_length) {
+    if (m->pos >= m->effective_end()) {
+        // No bytes left to scan. A counted array (`[n] resync`) declares exactly n
+        // elements — exiting with fewer silently violates the declared structure
+        // (the IPG correct-by-construction guarantee), so it is a parse failure.
+        // An eof/until array has no count contract and exits normally.
+        auto* lf = static_cast<LoopFrame*>(sp->prev);
+        if (lf && lf->type == FrameType::Loop && lf->limit >= 0 && lf->counter < lf->limit) {
+            // Drop the resync savepoint first: otherwise fail() walks back to it,
+            // re-pushes this ResyncKont, and loops. With it gone, the failure unwinds
+            // past the array to an enclosing backtrack scope (or fails the parse).
+            m->frame_top = sp->prev;
+            m->fail("resync: fewer elements than the declared count");
+            return;
+        }
         // No bytes left to scan — pop the Savepoint and exit the
         // array. EndArray then pops the LoopFrame.
         m->frame_top = sp->prev;
@@ -1248,6 +1356,7 @@ void ResyncKont::invoke(CEKMachine* m) const {
     // Refresh savepoint state for the new attempt position so a
     // subsequent failure re-enters at the next byte.
     sp->saved_pos = m->pos;
+    sp->saved_interval_depth = m->interval_depth;
     sp->saved_env = m->env;
     sp->saved_endian = m->little_endian;
     sp->saved_kont_size = m->kont_stack_size();
@@ -1258,50 +1367,46 @@ void ResyncKont::invoke(CEKMachine* m) const {
 
 // ── Bitfield ──────────────────────────────────────────────
 
-void BitfieldReadNode::invoke(CEKMachine* m) const {
+void ExtractBitsNode::invoke(CEKMachine* m) const {
     size_t nbytes = container.byte_count();
-    if (m->pos + nbytes > m->input_length) {
+    if (m->pos + nbytes > m->effective_end()) {
         m->fail("bitfield: unexpected end of input");
         return;
     }
-
+    // Read the container in place — pos is NOT advanced; every member reads the
+    // same bytes, and AdvancePos moves past it after the last member. Shared
+    // interval [start, end) across all members; runtime msb_first for Native.
     int64_t raw = read_primitive(m->input, m->pos, container, m->little_endian);
     size_t start = m->pos;
-    m->pos += nbytes;
-    size_t end = m->pos;
+    size_t end = m->pos + nbytes;
 
     bool msb_first = (container.endian == PrimEndian::Big) ||
                      (container.endian == PrimEndian::Native && !m->little_endian);
     int total_bits = static_cast<int>(nbytes * 8);
-    int offset = msb_first ? total_bits : 0;
+    int shift = msb_first ? (total_bits - this->offset_before - this->width_bits)
+                          : this->offset_before;
+    int64_t mask = (this->width_bits >= 64) ? ~int64_t(0)
+                                            : ((int64_t(1) << this->width_bits) - 1);
 
-    for (int i = 0; i < entries_count; ++i) {
-        const bitfield_entry& e = entries[i];
-        int64_t mask = (e.width_bits >= 64) ? ~int64_t(0)
-                                            : ((int64_t(1) << e.width_bits) - 1);
-        int64_t val;
-        if (msb_first) {
-            offset -= e.width_bits;
-            val = (raw >> offset) & mask;
-        } else {
-            val = (raw >> offset) & mask;
-            offset += e.width_bits;
-        }
+    auto* iv = m->arena->alloc<IntValue>();
+    iv->v = (raw >> shift) & mask;
+    // Producer: yield the extracted bits as a Computed value over the container's
+    // (shared) interval; the store konts that follow record/bind it.
+    auto* cap = m->arena->alloc<FieldCapture>();
+    cap->start_offset = start;
+    cap->end_offset = end;
+    cap->type = CaptureType::Computed;
+    cap->computed_value = lower_computed(*m->arena, iv);
+    auto* fcv = m->arena->alloc<FieldCaptureValue>();
+    fcv->capture = cap;
+    m->result = fcv;
+    m->push_kont(this->next);
+}
 
-        auto* iv = m->arena->alloc<IntValue>();
-        iv->v = val;
-        m->builder.add_field(e.name, start, end, CaptureType::Computed, iv);
-
-        auto* new_env = m->arena->alloc<Environment>();
-        new_env->binding.name = e.name;
-        new_env->binding.value = iv;
-        new_env->binding.start_offset = start;
-        new_env->binding.end_offset = end;
-        new_env->binding.type = CaptureType::Computed;
-        new_env->parent = m->env;
-        m->env = new_env;
-    }
-
+void AdvancePosNode::invoke(CEKMachine* m) const {
+    // Move past the bitfield container the members just read in place. They
+    // already verified it fits, so no bounds check is needed.
+    m->pos += static_cast<size_t>(this->by);
     m->push_kont(this->next);
 }
 
@@ -1317,7 +1422,7 @@ void ExternalCallNode::invoke(CEKMachine* m) const {
         m->fail("external parser not registered");
         return;
     }
-    size_t remaining = m->input_length - m->pos;
+    size_t remaining = m->effective_end() - m->pos;
     size_t consumed = 0;
     bool ok = entry->fn(m->input + m->pos, remaining, &consumed,
                         m->arena, entry->user_data);
@@ -1327,18 +1432,15 @@ void ExternalCallNode::invoke(CEKMachine* m) const {
     }
     size_t start = m->pos;
     m->pos += consumed;
-
-    m->builder.add_field(this->field_name, start, m->pos, CaptureType::External);
-
-    auto* new_env = m->arena->alloc<Environment>();
-    new_env->binding.name = this->field_name;
-    new_env->binding.value = nullptr;
-    new_env->binding.start_offset = start;
-    new_env->binding.end_offset = m->pos;
-    new_env->binding.type = CaptureType::External;
-    new_env->parent = m->env;
-    m->env = new_env;
-
+    // Producer: yield the external span as a FieldCaptureValue (no scalar value);
+    // the store konts that follow record/bind it.
+    auto* cap = m->arena->alloc<FieldCapture>();
+    cap->start_offset = start;
+    cap->end_offset = m->pos;
+    cap->type = CaptureType::External;
+    auto* fcv = m->arena->alloc<FieldCaptureValue>();
+    fcv->capture = cap;
+    m->result = fcv;
     m->push_kont(this->next);
 }
 
@@ -1401,6 +1503,7 @@ void OnFailKont::invoke(CEKMachine* m) const {
     }
     auto* sp = static_cast<Savepoint*>(frame);
     m->pos = sp->saved_pos;
+    m->interval_depth = sp->saved_interval_depth;
     m->env = sp->saved_env;
     m->little_endian = sp->saved_endian;
     m->builder.restore(sp->capture_mark);
@@ -1455,6 +1558,61 @@ void ReturnRuleNode::invoke(CEKMachine* m) const {
     }
 
 // (All static spine konts implemented above.)
+
+// --- LEB128 variable-length decoders ---
+//
+// LSB-first base-128, 7 value bits/byte, bit 7 = continuation. Strict: bounded to
+// ceil(bits/7) bytes, the final byte's unused high bits must be zero (unsigned) or a
+// clean sign-extension (signed). Mirrors the C/C++ runtimes' bbq_read_uleb128/sleb128.
+// On success sets *out and *consumed; returns false on truncation / overlong / over-wide.
+static bool decode_uleb128(const uint8_t* data, size_t pos, size_t len, int bits,
+                           uint64_t* out, size_t* consumed) {
+    uint64_t result = 0;
+    int shift = 0;
+    int maxbytes = (bits + 6) / 7;
+    for (int i = 0; i < maxbytes; i++) {
+        if (pos + (size_t)i >= len) return false;       // truncated
+        uint8_t byte = data[pos + i];
+        if (i == maxbytes - 1) {
+            if (byte & 0x80) return false;              // too long
+            int avail = bits - shift;
+            if (avail < 7 && (byte >> avail)) return false;  // value too large
+        }
+        result |= (uint64_t)(byte & 0x7f) << shift;
+        if (!(byte & 0x80)) { *out = result; *consumed = (size_t)i + 1; return true; }
+        shift += 7;
+    }
+    return false;                                       // unterminated
+}
+
+static bool decode_sleb128(const uint8_t* data, size_t pos, size_t len, int bits,
+                           int64_t* out, size_t* consumed) {
+    uint64_t result = 0;
+    int shift = 0;
+    int maxbytes = (bits + 6) / 7;
+    for (int i = 0; i < maxbytes; i++) {
+        if (pos + (size_t)i >= len) return false;       // truncated
+        uint8_t byte = data[pos + i];
+        if (i == maxbytes - 1) {
+            if (byte & 0x80) return false;              // too long
+            int avail = bits - shift;
+            uint8_t low_mask = (uint8_t)(0x7f >> (7 - avail));
+            uint8_t hi = (uint8_t)((byte & 0x7f) & ~low_mask);
+            uint8_t expect = (byte & (1u << (avail - 1)))
+                           ? (uint8_t)(0x7f & ~low_mask) : 0;
+            if (hi != expect) return false;             // value out of range
+        }
+        result |= (uint64_t)(byte & 0x7f) << shift;
+        shift += 7;
+        if (!(byte & 0x80)) {
+            if (shift < 64 && (byte & 0x40)) result |= ~(uint64_t)0 << shift;
+            *out = (int64_t)result;
+            *consumed = (size_t)i + 1;
+            return true;
+        }
+    }
+    return false;                                       // unterminated
+}
 
 // --- Helper: read a primitive into a typed Value ---
 //
@@ -1514,8 +1672,94 @@ void BeginStructNode::invoke(CEKMachine* m) const {
     m->push_kont(this->next);
 }
 
+void BeginVariantNode::invoke(CEKMachine* m) const {
+    // A union/alternatives variant opens a named capture scope (like BeginStruct)
+    // that ALSO records which arm matched — the discriminator decision, so readers
+    // read it instead of re-deriving it.
+    m->builder.begin_variant(this->variant_name, m->pos, this->variant_tag);
+    m->push_kont(this->next);
+}
+
 void EndStructNode::invoke(CEKMachine* m) const {
     m->builder.end_struct(m->pos);
+    m->push_kont(this->next);
+}
+
+// ── Interval region konts ───────────────────────────────────
+// Each region kont carries its offset expression and triggers it (push
+// [apply, expr]); the apply consumer reads the evaluated offset from ac.
+// Same eval-and-apply discipline as MatchBytes.
+
+void SeekKont::invoke(CEKMachine* m) const {
+    auto* apply = m->arena->alloc<SeekApplyKont>();
+    apply->next = this->next;
+    m->push_kont(apply);
+    m->push_kont(this->expr);
+}
+
+void SeekApplyKont::invoke(CEKMachine* m) const {
+    // `@[start, end]` random access: jump the cursor to the evaluated start.
+    if (!m->result || m->result->tag != ValueTag::IntValue) {
+        m->fail("interval start is not an integer");
+        return;
+    }
+    int64_t target = static_cast<IntValue*>(m->result)->v;
+    if (target < 0 || static_cast<size_t>(target) > m->input_length) {
+        m->fail("interval start out of range");
+        return;
+    }
+    m->pos = static_cast<size_t>(target);
+    m->push_kont(this->next);
+}
+
+void PushIntervalNode::invoke(CEKMachine* m) const {
+    auto* apply = m->arena->alloc<PushIntervalApplyKont>();
+    apply->relative = this->relative;
+    apply->next = this->next;
+    m->push_kont(apply);
+    m->push_kont(this->expr);
+}
+
+void PushIntervalApplyKont::invoke(CEKMachine* m) const {
+    if (!m->result || m->result->tag != ValueTag::IntValue) {
+        m->fail("interval end is not an integer");
+        return;
+    }
+    int64_t v = static_cast<IntValue*>(m->result)->v;
+    // The new window is [start, end). start = the cursor (already Seek'd to the
+    // interval's left for @[start,end]; the current pos for @[length]); end is the
+    // absolute end, or pos+length when relative.
+    size_t start = m->pos;
+    size_t end = this->relative ? m->pos + static_cast<size_t>(v < 0 ? 0 : v)
+                                : static_cast<size_t>(v < 0 ? 0 : v);
+    // IPG confinement: a nested interval may only NARROW the parent's window — it
+    // must fall entirely within [effective_start, effective_end). Escaping it is a
+    // parse failure (the paper's "checks if the interval falls in the range").
+    if (start > end || start < m->effective_start() || end > m->effective_end()) {
+        m->fail("interval out of range");
+        return;
+    }
+    if (m->interval_depth >= CEKMachine::MAX_INTERVAL_DEPTH) {
+        m->fail("interval nesting too deep");
+        return;
+    }
+    m->interval_starts[m->interval_depth] = start;
+    m->interval_ends[m->interval_depth] = end;
+    m->interval_depth++;
+    m->push_kont(this->next);
+}
+
+void PopIntervalNode::invoke(CEKMachine* m) const {
+    if (m->interval_depth > 0) {
+        // A checked pop (an @rest window) demands exact consumption: a size
+        // prefix means the rest IS that many bytes, not at most. Reads can't
+        // overrun effective_end(), so pos <= end always — pos < end is leftover.
+        if (this->checked && m->pos != m->interval_ends[m->interval_depth - 1]) {
+            m->fail("interval: size mismatch");
+            return;
+        }
+        m->interval_depth--;
+    }
     m->push_kont(this->next);
 }
 
@@ -1530,6 +1774,7 @@ void BeginChoiceNode::invoke(CEKMachine* m) const {
     sp->type = FrameType::Savepoint;
     sp->saved_env = m->env;
     sp->saved_pos = m->pos;
+    sp->saved_interval_depth = m->interval_depth;
     sp->saved_endian = m->little_endian;
     sp->saved_kont_size = m->kont_stack_size();
     sp->capture_mark = m->builder.mark();
@@ -1554,6 +1799,7 @@ void BeginOptionalNode::invoke(CEKMachine* m) const {
     sp->type = FrameType::Savepoint;
     sp->saved_env = m->env;
     sp->saved_pos = m->pos;
+    sp->saved_interval_depth = m->interval_depth;
     sp->saved_endian = m->little_endian;
     sp->saved_kont_size = m->kont_stack_size();
     sp->capture_mark = m->builder.mark();
@@ -1572,33 +1818,111 @@ void EndOptionalNode::invoke(CEKMachine* m) const {
 }
 
 void MatchPrimitiveNode::invoke(CEKMachine* m) const {
+    size_t start = m->pos;
+    Value* val;
+    CaptureType ct;
+
+    if (prim.encoding != PrimEncoding::Fixed) {
+        // Variable-length LEB128: decode now (the byte span is data-dependent), advance
+        // pos by the bytes actually consumed, and record the decoded integer as a
+        // Computed capture (a fixed-width byte span can't be re-decoded as a varint).
+        int bits = (prim.width == PrimWidth::W64) ? 64 : 32;
+        size_t consumed = 0;
+        auto* iv = m->arena->alloc<IntValue>();
+        if (prim.encoding == PrimEncoding::Uleb) {
+            uint64_t u;
+            if (!decode_uleb128(m->input, m->pos, m->effective_end(), bits, &u, &consumed)) {
+                m->fail("invalid uleb128");
+                return;
+            }
+            iv->v = (int64_t)u;
+        } else {
+            int64_t s;
+            if (!decode_sleb128(m->input, m->pos, m->effective_end(), bits, &s, &consumed)) {
+                m->fail("invalid sleb128");
+                return;
+            }
+            iv->v = s;
+        }
+        m->pos += consumed;
+        // Producer: yield a placeable FieldCaptureValue to ac; place() records/
+        // binds/discards it. No capture or bind here, and no spine push — the
+        // place node's PlaceApplyKont is already queued beneath this producer.
+        auto* cap = m->arena->alloc<FieldCapture>();
+        cap->start_offset = start;
+        cap->end_offset = m->pos;
+        cap->type = CaptureType::Computed;
+        cap->computed_value = lower_computed(*m->arena, iv);
+        auto* fcv = m->arena->alloc<FieldCaptureValue>();
+        fcv->capture = cap;
+        m->result = fcv;
+        m->push_kont(this->next);
+        return;
+    }
+
     size_t nbytes = prim.byte_count();
 
     // Bounds check
-    if (m->pos + nbytes > m->input_length) {
+    if (m->pos + nbytes > m->effective_end()) {
         m->fail("unexpected end of input");
         return;
     }
 
-    size_t start = m->pos;
-    Value* val = read_primitive_as_value(m, prim);
+    val = read_primitive_as_value(m, prim);
     m->pos += nbytes;
     size_t end = m->pos;
 
-    // Record capture
-    CaptureType ct = primitive_capture_type(prim, m->little_endian);
-    m->builder.add_field(field_name, start, end, ct);
+    ct = primitive_capture_type(prim, m->little_endian);
+    // Producer: yield a placeable FieldCaptureValue to ac. The value is carried
+    // for the env binding; place() applies the "value in the tree only for
+    // Computed" rule, so a fixed primitive's tree capture stays valueless.
+    auto* cap = m->arena->alloc<FieldCapture>();
+    cap->start_offset = start;
+    cap->end_offset = end;
+    cap->type = ct;
+    cap->computed_value = lower_computed(*m->arena, val);
+    auto* fcv = m->arena->alloc<FieldCaptureValue>();
+    fcv->capture = cap;
+    m->result = fcv;
+    m->push_kont(this->next);
+}
 
-    // Extend env (immutable list)
+// ── Concrete store konts ──
+// Each reads the producer's value from ac (a FieldCaptureValue carrying the
+// interval + type + value) and does exactly one thing with it.
+
+static FieldCapture* place_value(CEKMachine* m, const char* who) {
+    Value* v = m->result;
+    if (!v || v->tag != ValueTag::FieldCaptureValue) {
+        m->fail(who);
+        return nullptr;
+    }
+    return static_cast<FieldCaptureValue*>(v)->capture;
+}
+
+void CaptureKont::invoke(CEKMachine* m) const {
+    FieldCapture* cap = place_value(m, "capture: no value");
+    if (!cap) return;
+    // The output node carries a value only for Computed types; a fixed
+    // primitive's span is re-decoded, so its node stays valueless (parity).
+    ComputedValue* tree_val = (cap->type == CaptureType::Computed) ? cap->computed_value
+                                                                   : nullptr;
+    m->builder.add_field(this->name, cap->start_offset, cap->end_offset,
+                         cap->type, tree_val);
+    m->push_kont(this->next);
+}
+
+void StoreEnvKont::invoke(CEKMachine* m) const {
+    FieldCapture* cap = place_value(m, "store_env: no value");
+    if (!cap) return;
     auto* new_env = m->arena->alloc<Environment>();
-    new_env->binding.name = field_name;
-    new_env->binding.value = val;
-    new_env->binding.start_offset = start;
-    new_env->binding.end_offset = end;
-    new_env->binding.type = ct;
+    new_env->binding.name = this->name;
+    new_env->binding.value = lift_computed(*m->arena, cap->computed_value);  // carried by the producer
+    new_env->binding.start_offset = cap->start_offset;
+    new_env->binding.end_offset = cap->end_offset;
+    new_env->binding.type = cap->type;
     new_env->parent = m->env;
     m->env = new_env;
-
     m->push_kont(this->next);
 }
 

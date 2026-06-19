@@ -268,8 +268,29 @@ void BurgBackend::emit_pattern_guards(burg_ast::TreePattern* pat,
 std::string BurgBackend::pattern_guard(burg_ast::TreePattern* pat) {
     std::string guard;
     int arity = (int)pat->children.size();
-    if (arity > 0)
+    // Match by arity (BURG's job): an operand pattern needs at least its operands;
+    // a leaf pattern (arity 0) must match ONLY arity-0 nodes, else it over-matches
+    // and — being cheapest — steals higher-arity nodes from their operand rules
+    // (e.g. `Foo` stealing a `Foo(expr)` node). Same terminal, two arities, picked
+    // apart by child_count.
+    if (arity > 0) {
         guard = "p->child_count >= " + std::to_string(arity);
+    } else {
+        // A leaf pattern over a terminal that ALSO has an operand rule must guard
+        // arity 0, else it over-matches (and, being cheapest, steals) the operand
+        // node — e.g. `Foo` stealing a `Foo(expr)` node. A terminal with ONLY a leaf
+        // rule needs no guard: in slot-based IRs its operands are virtual and
+        // child_count is unrelated to the pattern, so an arity check would wrongly
+        // reject. The disambiguation is needed exactly when both shapes coexist.
+        bool has_operand_rule = false;
+        for (auto* r : a_->spec->rules)
+            if (r->pattern->name == pat->name && !r->pattern->children.empty()) {
+                has_operand_rule = true;
+                break;
+            }
+        if (has_operand_rule)
+            guard = "p->child_count == 0";
+    }
     emit_pattern_guards(pat, "p", guard);
     return guard;
 }

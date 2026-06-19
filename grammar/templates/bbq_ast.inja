@@ -128,6 +128,25 @@ struct ASTVisitor {
 {% endfor %}
 };
 
+// ── Node kind tag ───────────────────────────────────────────
+//
+// One value per node type, so consumers can `switch (n->kind())` instead of a
+// dynamic_cast chain or a one-arm-per-type visitor. (The visitor stays for the
+// cases that genuinely want per-type double dispatch.)
+
+enum class NodeKind {
+{% for def in definitions %}
+{% if def.type == "sum" and not (existsIn(def, "is_enum") and def.is_enum) %}
+{% for type in def.types %}
+    {{type.name}},
+{% endfor %}
+{% endif %}
+{% if def.type == "product" %}
+    {{def.name}},
+{% endif %}
+{% endfor %}
+};
+
 // ── AST node base ───────────────────────────────────────────
 
 struct ASTNode {
@@ -135,6 +154,7 @@ struct ASTNode {
 
     virtual ~ASTNode() = default;
     virtual void accept(ASTVisitor& visitor) = 0;
+    virtual NodeKind node_kind() const = 0;
 
     void* operator new(size_t size) {
         return get_arena().allocate(size);
@@ -179,6 +199,7 @@ struct {{type.name}} : public {{type.base}} {
 {% endif %}
 
     void accept(ASTVisitor& visitor) override { visitor.visit(this); }
+    NodeKind node_kind() const override { return NodeKind::{{type.name}}; }
 
 {% for field in type.fields %}
 {% if field.flag == "sequence" %}
@@ -218,6 +239,7 @@ struct {{def.name}} : public ASTNode {
 {% endif %}
 
     void accept(ASTVisitor& visitor) override { visitor.visit(this); }
+    NodeKind node_kind() const override { return NodeKind::{{def.name}}; }
 
 {% for field in def.fields %}
 {% if field.flag == "sequence" %}

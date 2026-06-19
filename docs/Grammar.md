@@ -6,16 +6,18 @@ BBQ is a domain-specific language for describing the structure and constraints o
 binary data formats. It combines parsing expression grammar concepts with a
 declarative type system for validation and random-access parsing.
 
-A BBQ specification can be compiled to standalone C++ parser code (static codegen)
-or executed directly via the CEK VM backend (used by the Python module and CLI).
+A BBQ specification can be compiled to a standalone parser (static codegen) or
+interpreted directly — the same grammar yields the same parse either way.
 
 ## 2. Top-Level Structure
 
-A `.bbq` file consists of zero or more directives followed by one or more rules.
+A `.bbq` file consists of zero or more directives and code blocks followed by
+one or more rules.
 
 ```
-grammar    = directive* rule+
+grammar    = ( directive | code_block )* rule+
 directive  = "@endian" ( "big" | "little" )
+code_block = ( "@header" | "@source" | "@writer" ) "(." inline_code ".)"
 rule       = identifier "=" type_body
 ```
 
@@ -42,6 +44,26 @@ each rule produces a C++ type and a parse function.
 Header = struct { magic: uint32be, version: uint16le }
 Entries = array<Entry>(none, eof)
 Flags = uint8
+```
+
+### 2.3 Code Blocks
+
+Code blocks carry verbatim host-language code into the generated output, so a
+spec can ship its own helpers (most commonly `where` predicates — see §7.4)
+without a separate hand-maintained file. `@header` lands in the generated types
+header (visible to every translation unit), `@source` in the reader, `@writer`
+in the writer. The convention is declarations in `@header`, definitions in
+`@source`/`@writer`.
+
+```bbq
+@header (.
+bool name_utf8_ok(bbq_bytes_t b);
+.)
+@source (.
+bool name_utf8_ok(bbq_bytes_t b) { /* … */ }
+.)
+
+Name = struct { count: uleb128, bytes: bytes[count] } where name_utf8_ok(bytes)
 ```
 
 ## 3. Type Expressions
@@ -90,7 +112,7 @@ type_primary = "struct"   struct_body
 Ordered collection of named fields, parsed sequentially.
 
 ```
-struct_body = "{" [ field ( "," field )* ","? ] "}"
+struct_body = "{" [ field ( "," field )* ","? ] "}" [ "where" expr ]
 field       = identifier ":" type_body [ "where" expr ] [ interval ]
 ```
 
@@ -101,6 +123,19 @@ Header = struct {
     flags:   uint8,
     length:  uint32le where length > 0
 }
+```
+
+A `where` after the closing brace constrains the **whole struct** — it runs after
+all fields have parsed, with every field plus the context builtins (§7.3) in
+scope. This is the place for whole-construct properties like checksums or
+encoding validation, usually via a user predicate (§7.4):
+
+```bbq
+IPv4Header = struct {
+    …
+    checksum: uint16,
+    …
+} where ipv4_checksum_ok(@buffer, checksum)
 ```
 
 ### 4.2 Union
@@ -172,14 +207,14 @@ Records = array<Record> (none, eof) resync
 When an element fails to parse at the current position (bytes-out-of-range,
 where-check false, etc.), the parser restores to the start of the failed
 attempt, advances `pos` by one, and tries again from the new position. On
-EOF the array terminates with the records gathered so far.
+EOF an `eof`-terminated array ends with the records gathered so far. A counted
+`[count]` array that has not yet collected `count` records when EOF is reached
+**fails** — a declared count left unmet is a malformed structure, never silently
+returned short (the IPG correct-by-construction guarantee).
 
 `resync` is rejected by sema when combined with `until` — the two have
 contradictory semantics around per-element termination. Compatible with
 `[count]`, `count(N)`, and `eof` terminators.
-
-`resync` is supported by the **CEK VM backend only**. The static C++
-generator does not currently emit resync-mode parsers.
 
 ### 4.4 Optional
 
@@ -203,12 +238,15 @@ No backtracking; the discriminator is evaluated once.
 ```
 switch_body    = "(" expr ")" "{" switch_case* [ default_case ] "}"
 switch_case    = case_value ":" type_body [ interval ] ";"
-default_case   = "default" ":" type_body [ interval ] ";"
-case_value     = integer | string | identifier | dotted_ref
+default_case   = "default" ":" ( type_body [ interval ] | "reject" ) ";"
+case_value     = integer [ ".." integer ] | string | identifier | dotted_ref
 ```
 
-Cases can be integer literals, string literals, bare identifiers (enum constants),
-or dotted references.
+Cases can be integer literals, inclusive integer **ranges** (`lo .. hi`), string
+literals, bare identifiers (enum constants), or dotted references. The default
+case can be `reject` (a contextual keyword) to make the fallthrough an explicit,
+audit-visible parse failure — the idiom for fail-closed grammars where an
+unlisted discriminant is malformed input, not data to skip.
 
 ```bbq
 # Integer cases
@@ -216,6 +254,14 @@ Payload = switch(header.type) {
     1: TextPayload;
     2: BinaryPayload;
     default: RawPayload;
+}
+
+# Range cases + fail-closed default
+Instr = switch(op) {
+    0x00 .. 0x01: Empty;
+    0x02 .. 0x03: Block;
+    0x0e:         BrTable;
+    default:      reject;
 }
 
 # String cases
@@ -262,10 +308,13 @@ extern_body = "(" string "," string ")"
 Payload = extern("decompress_zlib", "std::vector<uint8_t>")
 ```
 
-The user must provide a function with signature:
-```cpp
-bool decompress_zlib(bbq::BBQContext& ctx, std::vector<uint8_t>& out);
+The extern is supplied to the runtime that executes the spec. With the Python
+module, register a callable:
+```python
+spec.register_extern("decompress_zlib", fn)   # fn(memoryview) -> int | None
 ```
+`fn` receives the remaining input and returns the number of bytes consumed, or
+`None` to fail the parse.
 
 ### 4.8 Bitfield
 
@@ -325,8 +374,18 @@ primitive_type = primitive_keyword [ "where" expr ] [ interval ]
 | `int16`, `int16le`, `int16be` | 2 bytes | signed |
 | `int32`, `int32le`, `int32be` | 4 bytes | signed |
 | `int64`, `int64le`, `int64be` | 8 bytes | signed |
+| `uleb128` | 1–5 bytes | unsigned LEB128, u32 value range |
+| `uleb64` | 1–10 bytes | unsigned LEB128, u64 value range |
+| `sleb128` | 1–5 bytes | signed LEB128, s32 value range |
+| `sleb64` | 1–10 bytes | signed LEB128, s64 value range |
 
 Unsuffixed multi-byte types use the `@endian` directive's default (little if unset).
+
+The LEB128 varint types are strict on read — an encoding longer than the value
+range allows (or with set bits beyond it) is a parse error, not a truncation —
+and canonical (minimal-length) on write. Like any integer type they can carry
+`where` constraints, drive switches, size arrays, and scope `@rest` intervals
+(§6).
 
 ### 5.2 Float Types
 
@@ -349,6 +408,7 @@ Intervals specify byte ranges for parsing.
 
 ```
 interval = "[" expr [ "," expr ] "]"
+rest     = integer_field "@rest"
 ```
 
 - `[start, end]` — seek to `start`, parse until `end` (absolute positions)
@@ -367,6 +427,33 @@ Record = struct {
     tag:  string[4]
 }
 ```
+
+### 6.1 `@rest` — size-prefixed windows
+
+An integer field marked `@rest` declares that its value is the byte length of
+the **rest of the enclosing struct** — the size-prefix idiom (TLV payloads,
+WASM sections, archive members). All subsequent fields parse inside that
+window; `@end`/`@remaining` reflect it.
+
+```bbq
+Section = struct {
+    id:   uint8,
+    size: uleb128 @rest,       # everything after `size` is exactly `size` bytes
+    body: switch(id) { … }
+}
+```
+
+`@rest` windows are **confined**: a window that extends past its parent (or the
+input) fails the parse at the size field — it is never silently clamped — and
+the struct must consume the window **exactly**; leftover bytes at the close are
+a parse error ("size mismatch"), since a size prefix means *is*, not *at most*.
+Nested `@rest` scopes nest (a child window must lie inside the parent's).
+
+On the write side, a `uleb` `@rest` size is **recomputed from the serialized
+rest**, not echoed from the struct — so programmatically-built or edited trees
+serialize with correct sizes. Fixed-width `@rest` fields write their stored
+value. The seek-based `[start, end]` windows are random-access views and carry
+no exact-consumption requirement.
 
 ## 7. Expressions
 
@@ -396,34 +483,57 @@ switch discriminators, and compute values.
 ```
 primary = integer | float | string | "true" | "false" | "EOI"
         | identifier "(" [ expr ( "," expr )* ] ")"    # function call
+        | "@" identifier                                # context builtin
         | identifier                                    # field reference
         | "(" expr ")"
 ```
 
-### 7.3 References
+### 7.3 References and Context Builtins
 
 Field references access previously parsed fields in the same struct. Dot notation
-accesses nested fields; bracket notation indexes arrays.
+accesses nested fields; bracket notation indexes arrays. A **bare identifier is
+always a field reference** — the parse-state environment lives behind the
+reserved `@` sigil, so fields named `pos`, `buffer`, or `i` never collide with it.
 
 ```bbq
 header.length           # nested field
 entries[i].size         # array element field
-remaining               # ctx.remaining() — bytes left in current scope
-pos                     # ctx.pos() — current byte position
-at_end                  # ctx.at_end() — true if no bytes remain
 peek()                  # byte value at current position (without consuming)
-EOI                     # ctx.total_size() — end of input position
-i                       # loop variable in per-element intervals
+EOI                     # end-of-input position
 ```
+
+The context builtins are a closed set (an unknown `@name` is a compile error):
+
+| Builtin | Meaning |
+|---------|---------|
+| `@start` | the enclosing construct's entry offset |
+| `@end` | the active end bound (innermost interval, or end of input) |
+| `@pos` | the parse cursor |
+| `@index` | the current array/loop index |
+| `@buffer` | the construct's consumed bytes, `input[@start..@pos)` |
+| `@remaining` | `@end - @pos` |
+
+Together with the in-scope field values these form the complete environment of
+any expression: a field's *name* is its decoded value, `@buffer` is the raw
+on-wire bytes (e.g. a `uleb128` field's name is the integer; `@buffer` over it
+is the raw varint bytes).
 
 ### 7.4 Function Calls
 
-Function calls invoke runtime-provided utility functions (prefixed with `bbq::` in
-generated code).
+The built-in math functions (`abs`, `min`, `max`, `clamp`) map to the runtime
+(`bbq_…`/`bbq::…` in generated code). **Any other name is a user function**,
+called verbatim — supply it via code blocks (§2.3): declare in `@header`, define
+in `@source` (and/or `@writer`). The dominant use is bool-returning `where`
+predicates: a field passes as its decoded value (a `bytes` field as the
+generated bytes type), and `@buffer` passes the raw consumed bytes, so a
+predicate can validate either view.
 
 ```bbq
-crc32(data, length)
+crc32(@buffer, length)
 abs(offset)
+
+# struct-level where calling a user predicate (declared in @header)
+Name = struct { count: uleb128, bytes: bytes[count] } where name_utf8_ok(bytes)
 ```
 
 ## 8. Lexical Elements

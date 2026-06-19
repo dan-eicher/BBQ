@@ -1,0 +1,142 @@
+// opgen.asdl — AST for the opcode specification DSL
+//
+// Covers the opcodes.def grammar vocabulary consumed by the VM/table emitters.
+//
+// Generate with:
+//   asdl -i opgen.asdl -t templates/c.inja -o opgen_ast.h -l c
+
+module opgen {
+
+    type ident   = "const char*"
+    type int32   = "int32_t"
+    type int64   = "int64_t"
+    type float64 = "double"
+    type rawcode = "const char*"    // arena-dup'd raw source span of a
+                                    // "(. ... .)" block in opcodes.def
+
+    // Unified type tag for both stack slots and bytecode operands.
+    // Context (stack_param vs operand_param) determines which subset
+    // is valid; derive.c validates at table-generation time.
+    value_type = TyI8  | TyI16 | TyI32
+               | TyU8  | TyU16
+               | TyRef
+               | TyWord | TyDword
+               | TyI64 | TyF32 | TyF64    // JVM: long, float, double
+               | TyV128                   // WASM: 128-bit SIMD vector (sets the slot width)
+               | TyI8x16 | TyI16x8 | TyI32x4 | TyI64x2 | TyF32x4 | TyF64x2  // WASM SIMD lane views of a v128 (storage = v128; the body lowers per-lane)
+               | TyFuncRef | TyExternRef  // WASM: reference types
+               | TyI31Ref                 // WASM GC: an unboxed 31-bit int reference
+               | TyUleb32 | TyUleb64      // WASM operand widths: unsigned LEB128 varint (carrier u32/u64)
+               | TySleb32 | TySleb64      // WASM operand widths: signed LEB128 varint (carrier s32/s64)
+               | TyMemarg                 // WASM memarg: align-flags u32 (bit6 ⇒ memidx u32 follows) then offset u64; binds the offset (carrier u64)
+               | TyAny                    // runtime-typed value; slot width (1/2) from the stack tag
+
+    // sem_expr captures the rare "= expr" form on stack outputs that
+    // the harness emitter uses for dup/dup2/etc. — e.g.
+    //   dup (word a -- word a = "a", word a_copy = "a")
+    // Empty for ordinary stack params.
+    stack_param   = StackParam(value_type ty, ident name, ident ?sem_expr)
+    operand_param = OperandParam(value_type ty, ident name, bool cp_ref)
+
+    // Error annotation: optional condition + an error-name tag.
+    // An unconditional error has condition == NULL.
+    error_case = ErrorCase(rawcode ?condition, ident error_name)
+
+    // Type of a local-variable-referencing opcode's referenced slot:
+    // sload/sstore touch a short, iload/istore an int (2 slots), aload
+    // /astore a reference. ret reads the slot as a return address but
+    // probes treat it as short (single-slot). Drives bad-local probes
+    // and store-side stack prep.
+    local_value_kind = LvShort | LvInt | LvRef
+                     | LvLong | LvFloat | LvDouble    // JVM
+    local_value_decl = LocalValueDecl(local_value_kind kind)
+
+    // ── Semantic action language ──────────────────────────────
+    // The opcode body is the interior of one method, written in the Java
+    // block-statement grammar (Alves-Foss/Frincke §2.11/§2.12, with the
+    // attribute/ERROR apparatus dropped). Object/field/array/invoke
+    // effects are expressed as built-in calls (SCall) over a runtime
+    // boundary — the action language deliberately has no
+    // `new`/`this`/`super`/`instanceof`/dotted-field syntax (those name
+    // class/type machinery an opcode action does not possess), no
+    // loops/switch/labels/break/continue/try/synchronized (control-flow
+    // with no role in a single opcode's straight-line action), and no
+    // ++/--/compound-assignment (side-effecting expression sugar). See
+    // the grammar header in opgen.peg for the full rationale. Precedence
+    // is captured by tree structure, so there is no paren node.
+    sem_expr = SBinOp(ident op, sem_expr left, sem_expr right)
+             | SUnary(ident op, sem_expr operand)
+             | STernary(sem_expr cond, sem_expr then_, sem_expr else_)
+             | SCast(ident ty, sem_expr operand)        // ty: java prim type
+             | SIndex(sem_expr base, sem_expr index)    // base[index]
+             | SCall(ident name, sem_expr *args)        // built-in invocation
+             | SIdent(ident name)
+             | SInt(int64 value)
+             | SFloat(float64 value)
+
+    sem_stmt = SAssign(sem_expr target, sem_expr value)    // target = value;
+             | SExprStmt(sem_expr value)                   // expr;
+             | SLocalDecl(ident ty, ident name, sem_expr ?init)
+             | SIf(sem_expr cond, sem_stmt then_, sem_stmt ?else_)
+             | SWhile(sem_expr cond, sem_stmt body)               // while (cond) body
+             | SFor(sem_stmt ?init, sem_expr ?cond,                // for (init; cond; update) body
+                    sem_stmt ?update, sem_stmt body)
+             | SBlock(sem_stmt *stmts)
+             | STrap
+
+    // ── Method declarations (the built-in vocabulary) ─────────
+    // A built-in (ddcgc's Aux) is a `native` method: signature here, C body in
+    // the runtime, called by name (method name == runtime C function). A helper
+    // (ddcgc's Fun) is a method with an action-language body. Both parse via the
+    // same JLS method-declaration rule. `ret_ty`/param `ty` are a Java primitive
+    // type, `ref`, or `void`. A native method carries no body (empty sem_body).
+    method_param = MethodParam(ident ty, ident name)
+    method_decl  = MethodDecl(bool native, ident ret_ty, ident name,
+                              method_param *params, sem_stmt *body)
+
+    // The control-flow status vocabulary, declared in the spec so the
+    // generator stays target-agnostic (no baked-in YOCTOJC_* identifiers):
+    // `type` is the C status type, `ok`/`err`/`halt` its constants.
+    status_decl = StatusDecl(ident type, ident ok, ident err, ident halt)
+
+    // A slot/type-table row, declared in the spec so the slot model swaps per
+    // target (JCVM 16-bit vs JVM 32-bit word) without changing the generator:
+    // `ty` is the value type, `scalar`/`uscalar` its signed/unsigned C type,
+    // `slots` how many operand-stack/local slots it occupies, `field` the
+    // slot-union member ('i'/'f'/'r'/'s'). Unspecified types fall back to the
+    // built-in 16-bit JCVM defaults.
+    type_decl = TypeDecl(value_type ty, ident scalar, ident uscalar,
+                         int32 slots, ident field)
+
+    // One opcode definition.
+    opcode = Opcode(ident mnemonic,
+                    int32 opcode_val,
+                    int32 subop,        // -1 = top-level (1-byte); >=0 = prefixed (opcode_val is the prefix, subop the ULEB subopcode)
+                    operand_param *operands,
+                    stack_param   *stack_in,
+                    stack_param   *stack_out,
+                    error_case    *errors,
+                    ident         *flags,
+                    local_value_decl  ?local_value,
+                    sem_stmt      *sem_body)
+
+    // `headers`: raw `(. ... .)` blocks at the top of opcodes.def —
+    // emitted verbatim near the top of the generated opcodes.h so
+    // users can inject forward declarations, typedefs, etc.
+    // `body_c`: everything after the optional `%%` marker at the
+    // end of opcodes.def — emitted verbatim at the end of the
+    // generated opcode_tables.c so users can attach helper function
+    // definitions that reference the tables without needing a
+    // separate .c file.
+    // `backend`: the `backend "<header>"` directive — the substrate
+    // header (frame_t/vm_t/heap_t) a consumer supplies. opgen #includes
+    // it at the value-model's substrate point in runtime_api.h; absent,
+    // the self-test default frame is emitted instead.
+    module = Module(opcode *opcodes,
+                    method_decl *methods,
+                    status_decl ?status,
+                    type_decl *types,
+                    rawcode *headers,
+                    rawcode ?body_c,
+                    rawcode ?backend)
+}

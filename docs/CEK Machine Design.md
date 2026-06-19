@@ -41,10 +41,10 @@ the static C++ code generator. Both backends share the same frontend
                    ┌─────────────┴─────────────────┐
                    │                                │
           ┌────────▼────────┐             ┌─────────▼─────────┐
-          │ Static Backend   │             │ CEK Backend        │
-          │ TypeEmitter      │             │ DDCG Compiler      │
-          │ ParserEmitter    │             │ AST → Kont Graph   │
-          │ → C++ source     │             └─────────┬──────────┘
+          │ Render Backend   │             │ CEK Backend        │
+          │ lower → JSON     │             │ DDCG Compiler      │
+          │ → inja → C/C++   │             │ AST → Kont Graph   │
+          │   (zero-copy)    │             └─────────┬──────────┘
           └──────────────────┘                       │
                                             Immutable continuation graph
                                                      │

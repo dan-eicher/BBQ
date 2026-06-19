@@ -1,0 +1,460 @@
+// bbq.burg — lower the BBQ CEK kont graph (the SAME IR the CEK machine
+// evals, from ddcg) to the universal json op-list the emitters consume,
+// the cg_jump way (Dybvig DDCG p.13). Replaces RenderReaderC's hand-walk:
+// burg tiles the operand sub-trees (kont_expr = BURG_NODE_CHILD → expr
+// strings) and walks the spine (kont_node = BURG_NODE_SUCC), each spine
+// rule pushing the json op then cg_jump-ing its continuation.
+//
+// Arities are the kont_expr operand counts from bbq_ir.asdl; the kont_node
+// successors are spine edges, not BURG children. Run analysis with:
+//   burgc -i bbq.burg -asdl build/bbq_ir.json --coverage
+
+COMPILER bbq_render
+
+(. #include "bbq_codegen.h"
+   using namespace bbq::render;
+   using namespace bbq::cek;
+   #define E emit
+   #define BURG_NODE_TYPE          bbq::cek::KontNode*
+   #define BURG_NODE_OP(n)         (k_op(n))
+   #define BURG_NODE_ARITY(n)      (k_arity(n))
+   #define BURG_NODE_CHILD(n,i)    (k_child(n,i))
+   #define BURG_NODE_ID(n)         ((void*)(n))
+   #define BURG_NODE_SUCC_COUNT(n) (k_succ_count(n))
+   #define BURG_NODE_SUCC(n,i)     (k_succ(n,i))
+.)
+
+MEMBERS (. bbq::render::Emit emit; .)
+
+START spine
+
+// ── Terminals: the static_kont kinds (from bbq_ir.asdl) ──────────────
+TERM MatchPrimitiveNode = bbq::cek::MatchPrimitiveNode::kind_value
+TERM CaptureKont        = bbq::cek::CaptureKont::kind_value
+TERM StoreEnvKont       = bbq::cek::StoreEnvKont::kind_value
+TERM BeginStructNode    = bbq::cek::BeginStructNode::kind_value
+TERM BeginVariantNode   = bbq::cek::BeginVariantNode::kind_value
+TERM EndStructNode      = bbq::cek::EndStructNode::kind_value
+TERM SeekKont           = bbq::cek::SeekKont::kind_value
+TERM PushIntervalNode   = bbq::cek::PushIntervalNode::kind_value
+TERM PopIntervalNode    = bbq::cek::PopIntervalNode::kind_value
+TERM EvalConstraintNode = bbq::cek::EvalConstraintNode::kind_value
+TERM BindComputeNode    = bbq::cek::BindComputeNode::kind_value
+TERM InvokeRuleNode     = bbq::cek::InvokeRuleNode::kind_value
+TERM ReturnRuleNode     = bbq::cek::ReturnRuleNode::kind_value
+TERM OnFailKont         = bbq::cek::OnFailKont::kind_value
+TERM AbortRuleKont      = bbq::cek::AbortRuleKont::kind_value
+TERM BeginChoiceNode    = bbq::cek::BeginChoiceNode::kind_value
+TERM CommitChoiceNode   = bbq::cek::CommitChoiceNode::kind_value
+TERM BeginOptionalNode  = bbq::cek::BeginOptionalNode::kind_value
+TERM EndOptionalNode    = bbq::cek::EndOptionalNode::kind_value
+TERM BeginArrayNode     = bbq::cek::BeginArrayNode::kind_value
+TERM ArrayNextNode      = bbq::cek::ArrayNextNode::kind_value
+TERM EndArrayNode       = bbq::cek::EndArrayNode::kind_value
+TERM ResyncKont         = bbq::cek::ResyncKont::kind_value
+TERM SwitchDispatchNode = bbq::cek::SwitchDispatchNode::kind_value
+TERM ExtractBitsNode    = bbq::cek::ExtractBitsNode::kind_value
+TERM AdvancePosNode     = bbq::cek::AdvancePosNode::kind_value
+TERM SetEndianNode      = bbq::cek::SetEndianNode::kind_value
+TERM ExternalCallNode   = bbq::cek::ExternalCallNode::kind_value
+TERM MatchBytesNode     = bbq::cek::MatchBytesNode::kind_value
+TERM HaltNode           = bbq::cek::HaltNode::kind_value
+// expression (operand) konts
+TERM IntLitKont    = bbq::cek::IntLitKont::kind_value
+TERM BoolLitKont   = bbq::cek::BoolLitKont::kind_value
+TERM FloatLitKont  = bbq::cek::FloatLitKont::kind_value
+TERM StrLitKont    = bbq::cek::StrLitKont::kind_value
+TERM RefKont       = bbq::cek::RefKont::kind_value
+TERM PosKont       = bbq::cek::PosKont::kind_value
+TERM RemainingKont = bbq::cek::RemainingKont::kind_value
+TERM EOIKont       = bbq::cek::EOIKont::kind_value
+TERM LoopVarKont   = bbq::cek::LoopVarKont::kind_value
+TERM BufferKont    = bbq::cek::BufferKont::kind_value
+TERM StartKont     = bbq::cek::StartKont::kind_value
+TERM EndKont       = bbq::cek::EndKont::kind_value
+TERM NegKont       = bbq::cek::NegKont::kind_value
+TERM BitNotKont    = bbq::cek::BitNotKont::kind_value
+TERM NotKont       = bbq::cek::NotKont::kind_value
+TERM AddKont       = bbq::cek::AddKont::kind_value
+TERM SubKont       = bbq::cek::SubKont::kind_value
+TERM MulKont       = bbq::cek::MulKont::kind_value
+TERM DivKont       = bbq::cek::DivKont::kind_value
+TERM ModKont       = bbq::cek::ModKont::kind_value
+TERM BitAndKont    = bbq::cek::BitAndKont::kind_value
+TERM BitOrKont     = bbq::cek::BitOrKont::kind_value
+TERM BitXorKont    = bbq::cek::BitXorKont::kind_value
+TERM ShlKont       = bbq::cek::ShlKont::kind_value
+TERM ShrKont       = bbq::cek::ShrKont::kind_value
+TERM EqKont        = bbq::cek::EqKont::kind_value
+TERM NeKont        = bbq::cek::NeKont::kind_value
+TERM LtKont        = bbq::cek::LtKont::kind_value
+TERM LeKont        = bbq::cek::LeKont::kind_value
+TERM GtKont        = bbq::cek::GtKont::kind_value
+TERM GeKont        = bbq::cek::GeKont::kind_value
+TERM LogicalAndKont = bbq::cek::LogicalAndKont::kind_value
+TERM LogicalOrKont  = bbq::cek::LogicalOrKont::kind_value
+TERM TernaryKont    = bbq::cek::TernaryKont::kind_value
+TERM CallKont       = bbq::cek::CallKont::kind_value
+TERM PathStartKont   = bbq::cek::PathStartKont::kind_value
+TERM FieldAccessKont = bbq::cek::FieldAccessKont::kind_value
+TERM IndexAccessKont = bbq::cek::IndexAccessKont::kind_value
+TERM CaptureValueKont = bbq::cek::CaptureValueKont::kind_value
+
+RULES
+
+// ── expr: operand konts → neutral expr-tree nodes on the semantic stack ──────
+// burg builds backend-blind expr records (`{"e": kind, ...}`); the Emitter
+// spells the profile-specific LEAVES (builtins/refs/path-nav) at render time. The
+// combinators (bin/un/tern/call/literals) are profile-neutral. Children reduce
+// before parents (bottom-up), so a node's operands are already on the stack.
+expr: IntLitKont    = 1 (. E.epush({{"e","int"},   {"v", ((IntLitKont*)node)->v}}); .);
+expr: BoolLitKont   = 1 (. E.epush({{"e","bool"},  {"v", ((BoolLitKont*)node)->v}}); .);
+expr: FloatLitKont  = 1 (. E.epush({{"e","float"}, {"v", ((FloatLitKont*)node)->v}}); .);
+expr: StrLitKont    = 1 (. E.epush({{"e","str"},   {"v", std::string(((StrLitKont*)node)->v)}}); .);
+expr: RefKont       = 1 (. E.eref((RefKont*)node); .);
+expr: PosKont       = 1 (. E.epush({{"e","builtin"},{"name","pos"}}); .);
+expr: RemainingKont = 1 (. E.epush({{"e","builtin"},{"name","remaining"}}); .);
+expr: EOIKont       = 1 (. E.epush({{"e","builtin"},{"name","at_end"}}); .);
+expr: LoopVarKont   = 1 (. E.epush({{"e","builtin"},{"name","loop_index"}}); .);
+expr: BufferKont    = 1 (. E.epush({{"e","builtin"},{"name","buffer"}}); .);
+expr: StartKont     = 1 (. E.epush({{"e","builtin"},{"name","start"}}); .);
+expr: EndKont       = 1 (. E.epush({{"e","builtin"},{"name","end"}}); .);
+expr: PathStartKont = 1 (. E.epush({{"e","path_start"},{"name", std::string(((PathStartKont*)node)->name)}}); .);
+expr: NegKont(expr)    = 1 (. E.eun("-"); .);
+expr: BitNotKont(expr) = 1 (. E.eun("~"); .);
+expr: NotKont(expr)    = 1 (. E.eun("!"); .);
+expr: AddKont(expr, expr)    = 1 (. E.ebin("+"); .);
+expr: SubKont(expr, expr)    = 1 (. E.ebin("-"); .);
+expr: MulKont(expr, expr)    = 1 (. E.ebin("*"); .);
+expr: DivKont(expr, expr)    = 1 (. E.ebin("/"); .);
+expr: ModKont(expr, expr)    = 1 (. E.ebin("%"); .);
+expr: BitAndKont(expr, expr) = 1 (. E.ebin("&"); .);
+expr: BitOrKont(expr, expr)  = 1 (. E.ebin("|"); .);
+expr: BitXorKont(expr, expr) = 1 (. E.ebin("^"); .);
+expr: ShlKont(expr, expr)    = 1 (. E.ebin("<<"); .);
+expr: ShrKont(expr, expr)    = 1 (. E.ebin(">>"); .);
+expr: EqKont(expr, expr)     = 1 (. E.ebin("=="); .);
+expr: NeKont(expr, expr)     = 1 (. E.ebin("!="); .);
+expr: LtKont(expr, expr)     = 1 (. E.ebin("<"); .);
+expr: LeKont(expr, expr)     = 1 (. E.ebin("<="); .);
+expr: GtKont(expr, expr)     = 1 (. E.ebin(">"); .);
+expr: GeKont(expr, expr)     = 1 (. E.ebin(">="); .);
+expr: LogicalAndKont(expr, expr) = 1 (. E.ebin("&&"); .);
+expr: LogicalOrKont(expr, expr)  = 1 (. E.ebin("||"); .);
+expr: TernaryKont(expr, expr, expr) = 1 (. json e = E.epop(), t = E.epop(), c = E.epop();
+        E.epush({{"e","tern"},{"c",std::move(c)},{"t",std::move(t)},{"e2",std::move(e)}}); .);
+expr: FieldAccessKont(expr)   = 1 (. E.epush({{"e","path_field"}, {"base", E.epop()},
+        {"field", std::string(((FieldAccessKont*)node)->field)}}); .);
+// Index into an array field. c-owning: the owning array is `struct { T* items; size_t
+// count; }`, so `xs[i]` is `xs.items[i]`; the view navigates the array capture's i-th
+// child. Operands pop base-then-index (the Emitter normalizes a dot-terminated base).
+expr: IndexAccessKont(expr, expr) = 1 (. json base = E.epop(), idx = E.epop();
+        E.epush({{"e","path_index"},{"base",std::move(base)},{"idx",std::move(idx)}}); .);
+// Path value: c-owning's tiled path IS the scalar (owning struct member); the
+// view decodes the navigated capture's leaf on access.
+expr: CaptureValueKont(expr)  = 1 (. E.epush({{"e","path_value"},{"x", E.epop()}}); .);
+// Function call (e.g. a `where` predicate calling an @source function). Variadic:
+// per-arity rules pin the args burg tiles, then ecall pops them and builds the call.
+expr: CallKont                              where (. node->child_count() == 0 .) = 1 (. E.ecall((CallKont*)node, 0); .);
+expr: CallKont(expr)                        where (. node->child_count() == 1 .) = 1 (. E.ecall((CallKont*)node, 1); .);
+expr: CallKont(expr, expr)                  where (. node->child_count() == 2 .) = 1 (. E.ecall((CallKont*)node, 2); .);
+expr: CallKont(expr, expr, expr)            where (. node->child_count() == 3 .) = 1 (. E.ecall((CallKont*)node, 3); .);
+expr: CallKont(expr, expr, expr, expr)      where (. node->child_count() == 4 .) = 1 (. E.ecall((CallKont*)node, 4); .);
+
+// ── spine: each kont → one stencil record {id, op, fields, succ} ─────
+// Linear constructs (read/compute/bytes/constraint/invoke/return) are
+// implemented; the read collapses its following Capture/StoreEnv pair.
+// Branchy konts (array/switch/choice/interval) record their fields here and
+// are rendered to stencils in the next slice — the template #errors on any
+// op it does not yet implement, so nothing is silently dropped.
+spine: MatchPrimitiveNode = 1 (. if (!E.absorbed.count(node)) {
+        StoreInfo si = collapse_store(E, node);
+        E.node(node, "read", {{"target", si.target}, {"next", si.after_id},
+                              {"prim", prim_json(((MatchPrimitiveNode*)node)->prim, E.default_le)},
+                              {"msg", si.target + ": read failed"}});
+        } .);
+spine: CaptureKont        = 1 (. /* absorbed by the preceding read */ .);
+spine: StoreEnvKont       = 1 (. /* absorbed by the preceding read */ .);
+spine: BeginStructNode    = 1 (. if (!E.absorbed.count(node)) {
+        const char* sn = ((BeginStructNode*)node)->struct_name;
+        auto sw = E.sw_targets.find(node);
+        // ALWAYS emit a neutral begin_struct carrying its scope context. The owning
+        // Emitter folds it into the compile-time path (and drops it); the view renders a
+        // runtime stencil. (Step A: still accumulate below; Step B moves it to the fold.)
+        json bs = {{"name", sn ? sn : ""}, {"next", E.next_id(node->succ(0))}};
+        if (sw != E.sw_targets.end()) { bs["case_field"] = sw->second.first; bs["case_member"] = sw->second.second; }
+        else if (E.opt_value.count(node)) bs["opt_value"] = true;
+        E.node(node, "begin_struct", bs);
+        } .);
+spine: BeginVariantNode   = 1 (. /* choice-internal: the BeginChoice stencil targets
+        u.<variant_name> directly, so the variant scope marker emits nothing. */ .);
+spine: EndStructNode      = 1 (. if (!E.absorbed.count(node)) {
+        // ALWAYS emit a neutral end_struct (owning folds + drops it, view keeps it).
+        E.node(node, "end_struct", {{"next", E.next_id(node->succ(0))}});
+        } .);
+spine: EvalConstraintNode(expr) = 1 (. json cond = E.epop();
+        const KontNode* on_false = node->succ(0);
+        const KontNode* on_true = node->succ(1);
+        bool hard = on_false->kind() == KontKind::AbortRuleKont ||
+                    on_false->kind() == KontKind::OnFailKont;
+        if (hard) {
+            // hard `where`: false arm (succ0) is AbortRule (absorbed → return false).
+            E.node(node, "constraint", {{"expr", cond}, {"next", E.next_id(on_true)},
+                                        {"msg", "constraint failed"}});
+        } else if (on_true->kind() == KontKind::MatchPrimitiveNode) {
+            // optional<prim> where cond: on_true reads the value (absorbed),
+            // on_false (succ0) is the join taken when absent.
+            auto* mp = (MatchPrimitiveNode*)on_true;
+            const KontNode* c = on_true->succ(0);
+            const char* nm = (c->kind() == KontKind::CaptureKont)
+                ? ((CaptureKont*)c)->name : ((StoreEnvKont*)c)->name;
+            std::string name = nm ? nm : "";
+            E.absorbed.insert(on_true);
+            std::string tgt = name;  // leaf; fold prepends the path
+            E.node(node, "optional_prim", {{"target", tgt}, {"cond", cond},
+                    {"prim", prim_json(mp->prim, E.default_le)}, {"next", E.next_id(node->succ(0))},
+                    {"msg", tgt + ": read failed"}});
+        } else {
+            // optional<Rule|bytes|...>: has_value + branch; the present element (on_true)
+            // is retargeted to `<field>.value` (registered in opt_value, applied by the
+            // element's BeginStruct scope / collapse_store). on_false (succ0) is absent.
+            std::string fname;
+            if (on_true->kind() == KontKind::BeginStructNode) {
+                const char* sn = ((BeginStructNode*)on_true)->struct_name;
+                fname = sn ? sn : "";
+            } else if (on_true->kind() == KontKind::MatchBytesNode) {
+                const KontNode* c = on_true->succ(0);
+                const char* nm = (c->kind() == KontKind::CaptureKont) ? ((CaptureKont*)c)->name
+                               : (c->kind() == KontKind::StoreEnvKont) ? ((StoreEnvKont*)c)->name : nullptr;
+                fname = nm ? nm : "";
+            }
+            E.opt_value.insert(on_true);
+            std::string tgt = fname;  // leaf; fold prepends the path
+            E.node(node, "optional", {{"target", tgt}, {"cond", cond},
+                    {"present", E.next_id(on_true)}, {"absent", E.next_id(on_false)},
+                    {"msg", fname + ": optional"}});
+        } .);
+spine: BindComputeNode(expr)    = 1 (. json e = E.epop(); StoreInfo si = collapse_store(E, node);
+        E.node(node, "compute", {{"target", si.target}, {"expr", e}, {"next", si.after_id}}); .);
+spine: MatchBytesNode(expr) = 1 (. json len = E.epop(); StoreInfo si = collapse_store(E, node);
+        E.node(node, "read_bytes", {{"target", si.target}, {"len", len}, {"next", si.after_id},
+                                    {"is_string", ((MatchBytesNode*)node)->is_string},
+                                    {"msg", si.target + ": read failed"}}); .);
+spine: InvokeRuleNode     = 1 (. if (!E.absorbed.count(node)) {
+        std::string t = "";  // empty leaf; fold sets target = container(prefix)
+        // Neutral: record the callee's base name; each template spells the call
+        // (c-owning: <base>_read(ctx, &target); view: <base>_v_entry(r), building the
+        // sub-rule into the shared reader/builder).
+        E.node(node, "invoke", {{"fn", E.cname(((InvokeRuleNode*)node)->rule_name)},
+                                {"target", t}, {"next", E.next_id(node->succ(0))},
+                                {"msg", std::string(((InvokeRuleNode*)node)->rule_name) + " failed"}});
+        } .);
+spine: AdvancePosNode     = 1 (. if (!E.absorbed.count(node))
+        E.node(node, "advance", {{"by", ((AdvancePosNode*)node)->by},
+                                 {"next", E.next_id(node->succ(0))}}); .);
+spine: ReturnRuleNode     = 1 (. if (!E.absorbed.count(node)) E.node(node, "return"); .);
+spine: HaltNode           = 1 (. /* terminal: a return already happened */ .);
+
+// Branchy / interval konts — fields recorded; stencils land in the next slice.
+spine: SeekKont(expr)     = 1 (. E.node(node, "seek", {{"expr", E.epop()}, {"next", E.next_id(node->succ(0))}}); .);
+spine: PushIntervalNode(expr) = 1 (. json e = E.epop();
+        // Neutral: the window expr + whether it is relative. The owning writer's @rest
+        // size-from-content derivation (a relative window sized by the field just read)
+        // is its own post_lower concern, not burg's.
+        E.node(node, "push_interval", {{"expr", e},
+                {"relative", ((PushIntervalNode*)node)->relative},
+                {"next", E.next_id(node->succ(0))}}); .);
+spine: PopIntervalNode    = 1 (. E.node(node, "pop_interval",
+        {{"checked", ((PopIntervalNode*)node)->checked}, {"next", E.next_id(node->succ(0))}}); .);
+// OnFail / BeginVariant / CommitChoice are choice-internal — the BeginChoice
+// stencil reconstructs the arms and does the save/try/restore directly, so these
+// emit no stencil of their own.
+spine: OnFailKont         = 1 (. /* choice-internal */ .);
+spine: AbortRuleKont      = 1 (. /* failure is `return bbq_fail(...)` inline at the
+        constraint/choice that targets it — the bool-returning reader has no abort
+        stencil; a false return propagates to the caller's invoke check. */ .);
+spine: BeginChoiceNode    = 1 (. // Reconstruct the arms (mirror RenderReaderC): arm 0 is succ(1); the rest
+        // hang off the OnFail chain at succ(0). Each arm is a BeginVariant whose
+        // body invokes the variant's rule into u.<variant_name>; the choice tries
+        // each (save / set tag / invoke / restore-on-fail) and is terminal.
+        std::vector<const KontNode*> arms; arms.push_back(node->succ(1));
+        for (const KontNode* link = node->succ(0);
+             link && link->kind() == KontKind::OnFailKont && link->succ(0);
+             link = link->succ(1))
+            arms.push_back(link->succ(0));
+        json jarms = json::array();
+        for (const KontNode* arm : arms) {
+            auto* bv = (BeginVariantNode*)arm;
+            const KontNode* body = arm->succ(0);
+            if (body->kind() == KontKind::InvokeRuleNode)
+                jarms.push_back({{"tag", bv->variant_tag},
+                                 {"name", std::string(bv->variant_name)},
+                                 {"fn", E.cname(((InvokeRuleNode*)body)->rule_name)},
+                                 {"target", "u." + std::string(bv->variant_name)}});  // leaf; fold prepends
+            // Absorb the arm body (BeginVariant→Invoke→EndStruct→[Commit]→Return join).
+            for (const KontNode* n = arm; n; n = n->succ(0)) {
+                E.absorbed.insert(n);
+                if (n->kind() == KontKind::ReturnRuleNode) break;
+            }
+        }
+        E.node(node, "choice", {{"tag_target", std::string("tag")}, {"arms", jarms},  // leaf; fold prepends
+                                {"msg", "no variant matched"}}); .);
+spine: CommitChoiceNode   = 1 (. /* choice-internal */ .);
+// Bare `optional<T>` (no `where`): try/restore. succ(0)=on_fail (absent join, an
+// OnFailKont → Lnext), succ(1)=inner element, succ(2)=next (== Lnext). The inner
+// captures into `<field>.value` (opt_value retarget, same as the predicated
+// optional<Rule|bytes>); begin_optional sets `<field>.has_value` from the inner's
+// success and the template restores the cursor on failure. The inner chain ends at
+// EndOptional, which `return true`s back into begin_optional's sub-call.
+spine: BeginOptionalNode  = 1 (. const KontNode* inner = node->succ(1);
+        std::string fname;
+        if (inner->kind() == KontKind::BeginStructNode) {
+            const char* sn = ((BeginStructNode*)inner)->struct_name; fname = sn ? sn : "";
+        } else if (inner->kind() == KontKind::MatchPrimitiveNode ||
+                   inner->kind() == KontKind::MatchBytesNode) {
+            const KontNode* c = inner->succ(0);
+            const char* nm = (c->kind() == KontKind::CaptureKont) ? ((CaptureKont*)c)->name
+                           : (c->kind() == KontKind::StoreEnvKont) ? ((StoreEnvKont*)c)->name : nullptr;
+            fname = nm ? nm : "";
+        }
+        E.opt_value.insert(inner);
+        std::string tgt = fname;  // leaf; fold prepends the path
+        E.node(node, "begin_optional", {{"target", tgt}, {"inner", E.next_id(inner)},
+            {"next", E.next_id(node->succ(2))}}); .);
+spine: EndOptionalNode    = 1 (. E.node(node, "end_optional"); .);
+// Array = a tail-call loop (mirrors the CEK's LoopFrame), NOT a collapsed for-loop.
+// BeginArray allocs + sets up the loop, then is a scope pushing the indexed element
+// slot as the capture prefix; the element body emits as ordinary stencils into that
+// slot (so prim/bytes/rule/interval/nested all work); ArrayNext musttails back to the
+// body or out to the end; EndArray pops the scope. The element's per-iteration index
+// is bbq_loop_index(ctx) (so `@index` in element intervals resolves to it).
+// Counted array (FixedCount/Count): count_expr is present → arity 1, tiled here.
+spine: BeginArrayNode(expr) = 1 (. BeginArrayNode* ba = (BeginArrayNode*)node;
+        json count = E.epop();
+        // A nested array's element array is positional (null name) — the prefix is
+        // already the outer slot, so an empty field targets it.
+        std::string an = ba->array_name ? ba->array_name : "";
+        std::string fld = an;  // leaf; fold sets field = prefix+leaf and pushes the slot
+        // Neutral: the count expr + the loop edges. The owning writer's count-from-content
+        // (reserve a placeholder at the count field, patch it with the array's real length)
+        // is derived in its own post_lower, not baked here.
+        if (ba->resync_target) {
+            // counted + resync: collect exactly `count` elements, each parsed under a
+            // checkpoint that advances one byte and retries on failure; eof before
+            // `count` elements is a hard failure.
+            E.node(node, "array_begin_resync", {{"field", fld}, {"counted", true}, {"count", count},
+                       {"body", E.next_id(node->succ(2))}, {"end", E.next_id(node->succ(0))},
+                       {"msg", an + ": resync count not met"}});
+        } else {
+            E.node(node, "array_begin", {{"field", fld}, {"count", count},
+                       {"body", E.next_id(node->succ(2))}, {"end", E.next_id(node->succ(0))},
+                       {"msg", an + ": alloc failed"}});
+        }
+        E.array_fields.push_back(fld); .);
+// Uncounted array (eof/until): no count_expr → arity 0. The CEK's LoopFrame has
+// limit=-1; the count is grown as elements parse. mode picks the continuation
+// check (eof: cursor < window; until: predicate). resync routes through ResyncKont
+// (succ(1)), which is RPO-reachable and gates loudly (CEK-VM-only feature).
+spine: BeginArrayNode = 1 (. BeginArrayNode* ba = (BeginArrayNode*)node;
+        std::string an = ba->array_name ? ba->array_name : "";
+        std::string fld = an;  // leaf; fold sets field = prefix+leaf and pushes the slot
+        // resync (eof only; sema forbids resync+until): the element is parsed under a
+        // checkpoint and, on failure, the cursor advances one byte and retries — the
+        // CEK ResyncKont loop. The driver calls the element body as a sub-unit; the
+        // body's ArrayNext returns true, so the call signals parse success/failure.
+        if (ba->resync_target) {
+            E.node(node, "array_begin_resync", {{"field", fld}, {"counted", false},
+                    {"body", E.next_id(node->succ(2))}, {"end", E.next_id(node->succ(0))},
+                    {"msg", an + ": alloc failed"}});
+        } else {
+            const char* mode = ba->mode == bbq::cek::ArrayMode::EOF_ ? "eof" : "until";
+            E.node(node, "array_begin_grow", {{"field", fld}, {"mode", mode},
+                    {"body", E.next_id(node->succ(2))}, {"end", E.next_id(node->succ(0))},
+                    {"msg", an + ": alloc failed"}});
+        }
+        E.array_fields.push_back(fld); .);
+spine: ArrayNextNode      = 1 (. ArrayNextNode* an = (ArrayNextNode*)node;
+        int body = E.next_id(node->succ(1)), end = E.next_id(node->succ(0));
+        if (an->resync) {
+            // resync element terminator: the driver in array_begin_resync called the
+            // element body as a sub-unit; reaching here means it parsed → return true.
+            E.node(node, "array_elem_done");
+        } else if (an->mode == bbq::cek::ArrayMode::FixedCount) {
+            E.node(node, "array_next", {{"body", body}, {"end", end}});
+        } else if (an->mode == bbq::cek::ArrayMode::EOF_) {
+            // grow-while `pos < end`, as a neutral bin node over two builtins.
+            json cond = {{"e","bin"},{"op","<"},
+                         {"l",{{"e","builtin"},{"name","pos"}}},
+                         {"r",{{"e","builtin"},{"name","end"}}}};
+            E.node(node, "array_next_grow", {{"field", E.array_fields.back()},
+                    {"cond", std::move(cond)},
+                    {"body", body}, {"end", end}, {"msg", "array: grow failed"}});
+        } else if (an->mode == bbq::cek::ArrayMode::Until) {
+            // until_expr is a kont_ref (the CEK reads the field directly); tile it on
+            // demand with the same expr machinery burg uses for child operands. The
+            // neutral grow condition is `!(until)`. The owning writer's trailing-pad
+            // derivation (a buffer-terminal `@remaining </<= K` terminator reserves K
+            // bytes so a stored count round-trips) is its own post_lower concern.
+            BurgState* us = burg_label_tree((bbq::cek::KontNode*)an->until_expr);
+            burg_reduce((bbq::cek::KontNode*)an->until_expr, us, expr_NT);
+            json until = E.epop();
+            E.node(node, "array_next_grow", {{"field", E.array_fields.back()},
+                    {"cond", json{{"e","un"},{"op","!"},{"x", std::move(until)}}},
+                    {"body", body}, {"end", end}, {"msg", "array: grow failed"}});
+        } else {
+            // Count mode: re-evaluate the bound each iteration (CEK ArrayCountCheckKont),
+            // tiling count_expr on demand exactly like until above.
+            BurgState* cs = burg_label_tree((bbq::cek::KontNode*)an->count_expr);
+            burg_reduce((bbq::cek::KontNode*)an->count_expr, cs, expr_NT);
+            json cnt = E.epop();
+            E.node(node, "array_next_count", {{"count", cnt}, {"body", body}, {"end", end}});
+        } .);
+spine: EndArrayNode       = 1 (. if (!E.absorbed.count(node)) {
+        // ALWAYS emit a neutral end_array (owning folds + drops it, view keeps it).
+        E.node(node, "end_array", {{"next", E.next_id(node->succ(0))}});
+        E.array_fields.pop_back();
+        } .);
+spine: ResyncKont         = 1 (. /* the restore+advance+retry loop is inlined into the
+        array_begin_resync driver; the ResyncKont node itself emits nothing. */ .);
+spine: SwitchDispatchNode(expr) = 1 (. SwitchDispatchNode* sw = (SwitchDispatchNode*)node;
+        json disc = E.epop();
+        // The one wrapper field names every arm `<field>.u.<member>` — canonical, the
+        // names the types model emits; the templates convert per language. Group case
+        // match values by target (a range fans several labels onto one body), assigning
+        // each distinct target the clause member `case_<i>`. EVERY arm (struct, scalar,
+        // default) is registered the same way: a struct arm's BeginStruct folds the
+        // member into the path, a scalar arm's collapse_store redirects its leaf to it.
+        std::string field = switch_field_name(sw);
+        std::unordered_map<const void*, int> seen;
+        json cases = json::array();
+        for (int ci = 0; ci < sw->cases_count; ci++) {
+            const KontNode* tgt = sw->cases[ci].target;
+            int64_t label = ((bbq::cek::IntValue*)sw->cases[ci].match_value)->v;
+            auto it = seen.find(tgt);
+            if (it != seen.end()) { cases[it->second]["labels"].push_back(label); continue; }
+            int vi = (int)cases.size(); seen[tgt] = vi;
+            E.sw_targets[tgt] = { field, "case_" + std::to_string(vi) };
+            // ordinal = the case ordinal the view records as variant_tag (which arm matched).
+            cases.push_back({{"labels", json::array({label})}, {"target", E.next_id(tgt)},
+                             {"ordinal", vi}});
+        }
+        if (sw->default_target && !sw->default_reject)
+            E.sw_targets[sw->default_target] = { field, "default_val" };
+        E.node(node, "switch", {{"disc", disc}, {"tag_target", field},  // leaf; fold prepends
+                                {"cases", cases}, {"default_reject", sw->default_reject},
+                                {"has_default", sw->default_target != nullptr},
+                                {"default_target", E.next_id(sw->default_target)},
+                                {"default_ordinal", (int)cases.size()}}); .);
+spine: ExtractBitsNode    = 1 (. if (!E.absorbed.count(node)) {
+        BitfieldInfo bf = collapse_bitfield(E, node);
+        E.node(node, "bitfield", {{"members", bf.members}, {"prim", bf.prim},
+                                  {"next", bf.next}, {"msg", "bitfield read failed"}});
+        } .);
+spine: SetEndianNode(expr) = 1 (. E.node(node, "set_endian",
+        {{"expr", E.epop()}, {"next", E.next_id(node->succ(0))}}); .);
+spine: ExternalCallNode   = 1 (. StoreInfo si = collapse_store(E, node);
+        const char* wf = ((ExternalCallNode*)node)->write_func;
+        E.node(node, "extern", {{"func", ((ExternalCallNode*)node)->func_name},
+            {"write_func", wf ? std::string(wf) : std::string()},
+            {"target", si.target}, {"next", si.after_id},
+            {"msg", si.target + ": extern failed"}}); .);

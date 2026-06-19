@@ -44,12 +44,19 @@ PRODUCTIONS
 
 BBQ
     (. std::vector<EndianDirective*> dirs;
-       std::vector<Rule*> rules; .)
-    = { Directive<&dirs> }
+       std::vector<Rule*> rules;
+       std::vector<CodeBlock*> codes; .)
+    = { ( Directive<&dirs>
+        | CodeDirective<&codes>
+        )
+      }
       Rule_<&rules>
-      { Rule_<&rules> }
+      { ( Rule_<&rules>
+        | CodeDirective<&codes>
+        )
+      }
     (. skip(); if (!at_end()) return false; .)
-    (. ast = new Grammar(std::move(dirs), std::move(rules));
+    (. ast = new Grammar(std::move(dirs), std::move(rules), std::move(codes));
        ast->loc = SourceLoc{nullptr, 1, 1}; .)
 .
 
@@ -62,6 +69,23 @@ Directive <. std::vector<EndianDirective*> *dirs .>
     (. auto* d = new EndianDirective(e);
        d->loc = Loc();
        dirs->push_back(d); .)
+.
+
+// Verbatim C code woven into the generated output. `@header` lands in the
+// types header (after the generated types); `@source` lands in the reader
+// implementation file (after the generated readers). The body is delimited
+// by (.  .), scanned raw — the same convention as pegc's action blocks.
+CodeDirective <. std::vector<CodeBlock*> *codes .>
+    (. CodeSection section; std::string code; SourceLoc loc; .)
+    = ( "@header" (. section = CodeSection::HeaderBlock; .)
+      | "@source" (. section = CodeSection::SourceBlock; .)
+      | "@writer" (. section = CodeSection::WriterBlock; .)
+      )
+      (. loc = Loc(); .)
+      "(." (. if (!scan_to("." ")", code)) return false; .)
+    (. auto* cb = new CodeBlock(section, std::move(code));
+       cb->loc = loc;
+       codes->push_back(cb); .)
 .
 
 Rule_ <. std::vector<Rule*> *rules .>
@@ -120,6 +144,7 @@ TypePrimary <. TypeExpr* *result .>
 
 StructBody <. TypeExpr* *result .>
     (. std::vector<Field*> fields;
+       Expr* constr = nullptr;
        SourceLoc loc = Loc(); .)
     = "{"
       [ StructElement<&fields>
@@ -127,7 +152,9 @@ StructBody <. TypeExpr* *result .>
         [ "," ]
       ]
       "}"
-    (. *result = new Struct(std::move(fields));
+      [ ConstraintBlock<&constr> ]
+    (. *result = new Struct(std::move(fields),
+           constr ? std::optional<Expr*>(constr) : std::nullopt);
        (*result)->loc = loc; .)
 .
 
@@ -333,12 +360,16 @@ DefaultCaseRule <. SwitchDefault* *result .>
 
 CaseValueRule <. CaseValue* *result .>
     (. peg::Span span;
-       std::vector<std::string> path;
        std::string s;
-       int64_t ival; .)
+       int64_t ival;
+       int64_t hi = 0;
+       bool is_range = false; .)
     = DottedRef<result>
-    | integer<span>           (. ival = std::stoll(span.to_string(), nullptr, 0);
-                                *result = new IntValue(ival); (*result)->loc = Loc(); .)
+    | integer<span>           (. ival = std::stoll(span.to_string(), nullptr, 0); .)
+      [ ".." integer<span>    (. hi = std::stoll(span.to_string(), nullptr, 0); is_range = true; .) ]
+                              (. *result = is_range ? (CaseValue*)new RangeValue(ival, hi)
+                                                    : (CaseValue*)new IntValue(ival);
+                                 (*result)->loc = Loc(); .)
     | string_lit<span>        (. s = peg::unescape_string_lit(span);
                                 *result = new StrValue(std::move(s)); (*result)->loc = Loc(); .)
     | !"default" ident<span>  (. s = span.to_string();
@@ -375,18 +406,26 @@ ComputeBody <. TypeExpr* *result .>
 // ── Extern ──────────────────────────────────────────────
 
 ExternBody <. TypeExpr* *result .>
-    (. peg::Span func_span; peg::Span ctype_span;
-       std::string func; std::string ctype;
+    (. peg::Span func_span; peg::Span s2_span; peg::Span s3_span;
+       std::string func; std::string s2; std::string s3;
+       std::string write_func; std::string ctype;
+       bool have_s3 = false;
        Expr* constr = nullptr; Interval* iv = nullptr;
        SourceLoc loc = Loc(); .)
     = "("
       string_lit<func_span>   (. func = peg::unescape_string_lit(func_span); .)
       ","
-      string_lit<ctype_span>  (. ctype = peg::unescape_string_lit(ctype_span); .)
+      string_lit<s2_span>     (. s2 = peg::unescape_string_lit(s2_span); .)
+      [ ","
+        string_lit<s3_span>   (. s3 = peg::unescape_string_lit(s3_span); have_s3 = true; .)
+      ]
       ")"
       [ ConstraintBlock<&constr> ]
       [ IntervalSpec<&iv> ]
-    (. *result = new Extern(std::move(func), std::move(ctype),
+    (. // extern("read","ctype")  OR  extern("read","write","ctype")
+       if (have_s3) { write_func = std::move(s2); ctype = std::move(s3); }
+       else         { ctype = std::move(s2); }
+       *result = new Extern(std::move(func), std::move(write_func), std::move(ctype),
            constr ? std::optional<Expr*>(constr) : std::nullopt,
            iv     ? std::optional<Interval*>(iv) : std::nullopt);
        (*result)->loc = loc; .)
@@ -711,6 +750,10 @@ PrimaryExpr <. Expr* *result .>
          (*result)->loc = Loc(); .)
     | "EOI"
       (. *result = new EOI();
+         (*result)->loc = Loc(); .)
+    | "@" ident<span>
+      (. name = span.to_string();
+         *result = new Builtin(std::move(name));
          (*result)->loc = Loc(); .)
     | CallExpr<result>
     | ident<span>

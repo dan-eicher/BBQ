@@ -163,9 +163,9 @@ Elf64_Rel = struct {
 Elf64 = struct {
     ehdr: Elf64_Ehdr,
     shdrs: array<Elf64_Shdr>[ehdr.e_shnum]
-        @ [ehdr.e_shoff + i * ehdr.e_shentsize,
-           ehdr.e_shoff + (i + 1) * ehdr.e_shentsize],
+        @ [ehdr.e_shoff + @index * ehdr.e_shentsize,
+           ehdr.e_shoff + (@index + 1) * ehdr.e_shentsize],
     phdrs: array<Elf64_Phdr>[ehdr.e_phnum]
-        @ [ehdr.e_phoff + i * ehdr.e_phentsize,
-           ehdr.e_phoff + (i + 1) * ehdr.e_phentsize]
+        @ [ehdr.e_phoff + @index * ehdr.e_phentsize,
+           ehdr.e_phoff + (@index + 1) * ehdr.e_phentsize]
 }

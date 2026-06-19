@@ -6,9 +6,11 @@
 // (stencils) and their _HOLE_ relocations, and generates stencil_table.h.
 
 #include "elf64Types.h"
-#include "elf64Parser.h"
+#include "elf64Reader.h"
+#include "bbq_reader.h"   // bbq::ParseArena
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <map>
@@ -73,16 +75,14 @@ struct Stencil {
 // ── ELF parsing ────────────────────────────────────────────────
 
 static const char* elf_string(const uint8_t* data, size_t data_size,
-                              const Elf64& elf, uint32_t sh_link, uint32_t name_idx) {
-    if (sh_link >= elf.shdrs.size()) return "";
-    auto& strs = elf.shdrs[sh_link];
-    size_t off = strs.sh_offset + name_idx;
+                              elf::Elf64 e, uint32_t sh_link, uint32_t name_idx) {
+    if (sh_link >= e.shdrs().size()) return "";
+    size_t off = (size_t)e.shdrs()[sh_link].sh_offset() + name_idx;
     if (off >= data_size) return "";
     return reinterpret_cast<const char*>(data + off);
 }
 
 struct ElfInfo {
-    Elf64 elf;
     std::vector<StencilInfo> stencils;
     size_t text_offset = 0;
     size_t text_size = 0;
@@ -93,33 +93,34 @@ struct ElfInfo {
 
 static ElfInfo parse_elf(const uint8_t* data, size_t size) {
     ElfInfo info;
-    bbq::BBQContext ctx(data, size);
-    if (!parse_Elf64(ctx, info.elf)) {
-        info.error = ctx.format_errors();
+    bbq::ParseArena arena;      // owns the capture index; outlives the handles below
+    bbq::CaptureMetadata r = elf::Elf64_read(data, size, arena);
+    if (!r.success) {
+        info.error = "ELF64 parse failed";
         return info;
     }
-
-    auto& elf = info.elf;
-    auto& ehdr = elf.ehdr;
+    elf::Elf64 e(r.root, data, nullptr);   // zero-copy view over `data` (index in `arena`)
+    auto ehdr = e.ehdr();
+    auto shdrs = e.shdrs();
 
     // Find section name string table
     const char* shstrtab = nullptr;
     size_t shstrtab_size = 0;
-    if (ehdr.e_shstrndx < elf.shdrs.size()) {
-        auto& ss = elf.shdrs[ehdr.e_shstrndx];
-        if (ss.sh_offset + ss.sh_size <= size) {
-            shstrtab = reinterpret_cast<const char*>(data + ss.sh_offset);
-            shstrtab_size = ss.sh_size;
+    if (ehdr.e_shstrndx() < shdrs.size()) {
+        auto ss = shdrs[ehdr.e_shstrndx()];
+        if (ss.sh_offset() + ss.sh_size() <= size) {
+            shstrtab = reinterpret_cast<const char*>(data + ss.sh_offset());
+            shstrtab_size = ss.sh_size();
         }
     }
 
     // Find .text section
-    for (size_t i = 0; i < elf.shdrs.size(); i++) {
-        auto& s = elf.shdrs[i];
-        if (s.sh_type == SHT_PROGBITS && shstrtab && s.sh_name < shstrtab_size) {
-            if (strcmp(shstrtab + s.sh_name, ".text") == 0) {
-                info.text_offset = s.sh_offset;
-                info.text_size = s.sh_size;
+    for (size_t i = 0; i < shdrs.size(); i++) {
+        auto s = shdrs[i];
+        if (s.sh_type() == SHT_PROGBITS && shstrtab && s.sh_name() < shstrtab_size) {
+            if (strcmp(shstrtab + s.sh_name(), ".text") == 0) {
+                info.text_offset = s.sh_offset();
+                info.text_size = s.sh_size();
                 info.text_shndx = i;
                 break;
             }
@@ -131,32 +132,36 @@ static ElfInfo parse_elf(const uint8_t* data, size_t size) {
         return info;
     }
 
-    // Find all global function symbols in .text
-    for (size_t si = 0; si < elf.shdrs.size(); si++) {
-        auto& s = elf.shdrs[si];
-        if (s.sh_type != SHT_SYMTAB) continue;
+    // Find all global function symbols in .text. Each symbol-table entry is
+    // parsed as a standalone Elf64_Sym at its computed offset — the render
+    // backend exposes a parse entry per rule, so no manual interval is needed.
+    for (size_t si = 0; si < shdrs.size(); si++) {
+        auto s = shdrs[si];
+        if (s.sh_type() != SHT_SYMTAB) continue;
 
-        size_t sym_count = s.sh_entsize ? s.sh_size / s.sh_entsize : 0;
+        uint64_t entsize = s.sh_entsize();
+        size_t sym_count = entsize ? (size_t)(s.sh_size() / entsize) : 0;
         for (size_t j = 0; j < sym_count; j++) {
-            size_t sym_off = s.sh_offset + j * s.sh_entsize;
-            bbq::BBQContext sym_ctx(data, size);
-            auto scope = sym_ctx.push_interval(sym_off, sym_off + s.sh_entsize);
+            size_t sym_off = (size_t)s.sh_offset() + j * entsize;
+            if (sym_off + entsize > size) continue;
 
-            Elf64_Sym sym;
-            if (!parse_Elf64_Sym(sym_ctx, sym)) continue;
+            bbq::ParseArena sym_arena;
+            bbq::CaptureMetadata sr = elf::Elf64_Sym_read(data + sym_off, size - sym_off, sym_arena);
+            if (!sr.success) continue;
+            elf::Elf64_Sym sym(sr.root, data + sym_off, nullptr);
 
             // Global function symbols in .text
-            if (sym.st_bind < STB_GLOBAL) continue;
-            if (sym.st_type != STT_FUNC) continue;
-            if (sym.st_shndx != info.text_shndx) continue;
+            if (sym.st_bind() < STB_GLOBAL) continue;
+            if (sym.st_type() != STT_FUNC) continue;
+            if (sym.st_shndx() != info.text_shndx) continue;
 
-            const char* name = elf_string(data, size, elf, s.sh_link, sym.st_name);
+            const char* name = elf_string(data, size, e, s.sh_link(), sym.st_name());
             if (name[0] == '\0') continue;
 
             StencilInfo si_info;
             si_info.name = name;
-            si_info.offset = sym.st_value;
-            si_info.size = sym.st_size;
+            si_info.offset = sym.st_value();
+            si_info.size = sym.st_size();
             info.stencils.push_back(si_info);
         }
     }
@@ -168,45 +173,46 @@ static ElfInfo parse_elf(const uint8_t* data, size_t size) {
               });
 
     // Parse .rela.text relocations
-    for (size_t si = 0; si < elf.shdrs.size(); si++) {
-        auto& s = elf.shdrs[si];
-        if (s.sh_type != SHT_RELA) continue;
-        if (s.sh_info != info.text_shndx) continue;
+    for (size_t si = 0; si < shdrs.size(); si++) {
+        auto s = shdrs[si];
+        if (s.sh_type() != SHT_RELA) continue;
+        if (s.sh_info() != info.text_shndx) continue;
 
-        if (s.sh_link >= elf.shdrs.size()) continue;
-        auto& symtab = elf.shdrs[s.sh_link];
+        if (s.sh_link() >= shdrs.size()) continue;
+        auto symtab = shdrs[s.sh_link()];
 
-        size_t rela_count = s.sh_entsize ? s.sh_size / s.sh_entsize : 0;
+        uint64_t entsize = s.sh_entsize();
+        size_t rela_count = entsize ? (size_t)(s.sh_size() / entsize) : 0;
         for (size_t j = 0; j < rela_count; j++) {
-            size_t rela_off = s.sh_offset + j * s.sh_entsize;
-            if (rela_off + s.sh_entsize > size) continue;
+            size_t rela_off = (size_t)s.sh_offset() + j * entsize;
+            if (rela_off + entsize > size) continue;
 
-            bbq::BBQContext rela_ctx(data, size);
-            auto scope = rela_ctx.push_interval(rela_off, rela_off + s.sh_entsize);
-
-            Elf64_Rela rela;
-            if (!parse_Elf64_Rela(rela_ctx, rela)) continue;
+            bbq::ParseArena rela_arena;
+            bbq::CaptureMetadata rr = elf::Elf64_Rela_read(data + rela_off, size - rela_off, rela_arena);
+            if (!rr.success) continue;
+            elf::Elf64_Rela rela(rr.root, data + rela_off, nullptr);
 
             // Resolve symbol name
-            uint32_t sym_idx = rela.r_sym;
-            size_t sym_count = symtab.sh_entsize ?
-                symtab.sh_size / symtab.sh_entsize : 0;
+            uint32_t sym_idx = rela.r_sym();
+            uint64_t st_entsize = symtab.sh_entsize();
+            size_t sym_count = st_entsize ? (size_t)(symtab.sh_size() / st_entsize) : 0;
             if (sym_idx >= sym_count) continue;
 
-            size_t sym_off = symtab.sh_offset + sym_idx * symtab.sh_entsize;
-            bbq::BBQContext sym_ctx(data, size);
-            auto sym_scope = sym_ctx.push_interval(sym_off, sym_off + symtab.sh_entsize);
+            size_t sym_off = (size_t)symtab.sh_offset() + sym_idx * st_entsize;
+            if (sym_off + st_entsize > size) continue;
 
-            Elf64_Sym sym;
-            if (!parse_Elf64_Sym(sym_ctx, sym)) continue;
+            bbq::ParseArena sym_arena;
+            bbq::CaptureMetadata sr = elf::Elf64_Sym_read(data + sym_off, size - sym_off, sym_arena);
+            if (!sr.success) continue;
+            elf::Elf64_Sym sym(sr.root, data + sym_off, nullptr);
 
-            const char* name = elf_string(data, size, elf, symtab.sh_link, sym.st_name);
+            const char* name = elf_string(data, size, e, symtab.sh_link(), sym.st_name());
 
             RelaEntry re;
-            re.offset = rela.r_offset;
-            re.type = rela.r_type;
+            re.offset = rela.r_offset();
+            re.type = rela.r_type();
             re.sym_name = name;
-            re.addend = rela.r_addend;
+            re.addend = rela.r_addend();
             info.text_relas.push_back(re);
         }
     }
@@ -239,6 +245,7 @@ static const char* patch_type_name(PatchType t) {
 static std::vector<Stencil> extract_stencils(const uint8_t* data, const ElfInfo& info) {
     std::vector<Stencil> stencils;
     const uint8_t* text = data + info.text_offset;
+    bool had_unnamed = false;
 
     for (auto& si : info.stencils) {
         Stencil s;
@@ -254,8 +261,22 @@ static std::vector<Stencil> extract_stencils(const uint8_t* data, const ElfInfo&
             if (rela.offset < si.offset) continue;
             if (rela.offset >= si.offset + si.size) continue;
 
-            // Only extract _HOLE_ relocations
-            if (rela.sym_name.substr(0, 6) != "_HOLE_") continue;
+            // A stencil may reference ONLY named _HOLE_ symbols (the driver plugs a
+            // per-instance value: operand, continuation, native pointer). Any other
+            // relocation — typically a compiler-emitted .rodata constant (a float /
+            // vector literal) — cannot be copy-and-patched: its RIP-relative load
+            // would dangle, and pooling it by hand reinvents the linker (alignment,
+            // size). The fix is to move that op into a native, where clang and the
+            // real linker lay the constant out correctly. Fail loudly here.
+            if (rela.sym_name.rfind("_HOLE_", 0) != 0) {
+                fprintf(stderr,
+                    "jitterator: stencil '%s': non-_HOLE_ relocation against '%s' "
+                    "at offset %u — a compiler constant. Move this op into a native.\n",
+                    si.name.c_str(), rela.sym_name.c_str(),
+                    (unsigned)(rela.offset - si.offset));
+                had_unnamed = true;
+                continue;
+            }
 
             // Find or create hole index for this symbol
             uint16_t hole_idx = 0;
@@ -291,6 +312,11 @@ static std::vector<Stencil> extract_stencils(const uint8_t* data, const ElfInfo&
         stencils.push_back(std::move(s));
     }
 
+    if (had_unnamed) {
+        fprintf(stderr, "jitterator: aborting — one or more stencils reference "
+                        "non-_HOLE_ symbols (see above).\n");
+        exit(1);
+    }
     return stencils;
 }
 
@@ -306,7 +332,8 @@ static std::string render_stencil_table(const std::vector<Stencil>& stencils) {
     std::string out;
     out += "// stencil_table.h — generated by jitterator. DO NOT EDIT.\n";
     out += "#pragma once\n";
-    out += "#include <stdint.h>\n\n";
+    out += "#include <stdint.h>\n";
+    out += "#include <stddef.h>  /* NULL */\n\n";
 
     // Stencil ID enum
     out += "typedef enum {\n";
@@ -390,11 +417,11 @@ static std::string render_stencil_table(const std::vector<Stencil>& stencils) {
         snprintf(buf, sizeof(buf),
                  "    [STENCIL_%s] = {code_%s, %zu, %s, %zu, %zu, %u, %s},\n",
                  upper.c_str(), s.name.c_str(), s.code.size(),
-                 s.patches.empty() ? "nullptr" : ("patches_" + s.name).c_str(),
+                 s.patches.empty() ? "NULL" : ("patches_" + s.name).c_str(),
                  s.patches.size(),
                  s.hole_names.size(),
                  s.data_hole_count,
-                 s.hole_names.empty() ? "nullptr" : ("holes_" + s.name).c_str());
+                 s.hole_names.empty() ? "NULL" : ("holes_" + s.name).c_str());
         out += buf;
     }
     out += "};\n";

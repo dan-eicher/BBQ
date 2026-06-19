@@ -1,17 +1,19 @@
 #include "Sema.h"
 #include <algorithm>
 #include <queue>
+#include <set>
 
 using namespace BBQ;
 
 namespace {
 
-// Check if an expression tree contains a reference to loop index 'i'
+// Check if an expression tree references the loop index — the `@index` builtin.
+// (A bare `i` is an ordinary field reference, never the loop index.)
 bool contains_loop_var(Expr* expr) {
+    if (auto* b = dynamic_cast<Builtin*>(expr))
+        return b->name == "index";
     if (auto* ref = dynamic_cast<Ref*>(expr)) {
-        if (auto* simple = dynamic_cast<Simple*>(ref->path))
-            return simple->name == "i";
-        // FieldAcc/IndexAcc: check base recursively
+        // IndexAcc may still hold `@index` in its subscript expression.
         if (auto* ia = dynamic_cast<IndexAcc*>(ref->path))
             return contains_loop_var(ia->index);
         return false;
@@ -60,12 +62,66 @@ bool Sema::analyze(Grammar* grammar) {
         }
     }
 
+    // Inline-struct registration (shape side-data): once, in topological order,
+    // so the C namer + backends read the set instead of re-walking per instance.
+    if (!errors_.has_errors()) {
+        for (auto* rule : sorted_)
+            if (auto* st = dynamic_cast<Struct*>(rule->body))
+                register_inline_structs(rule->name, st);
+    }
+
     // Phase 8: resolve cross-rule references
     if (!errors_.has_errors()) {
         resolve_cross_refs();
     }
 
     return !errors_.has_errors();
+}
+
+// Classify each switch case's CaseValue into a resolved label, once. Backends
+// render it (the enum value uses lo/name; the C switch expands a Range to many
+// `case` lines). Lazily memoized; AST-only, no CEK dependency.
+const std::vector<SwitchCaseLabel>& Sema::switch_case_labels(BBQ::Switch* sw) {
+    auto it = switch_labels_.find(sw);
+    if (it != switch_labels_.end()) return it->second;
+
+    std::vector<SwitchCaseLabel> labels;
+    for (size_t i = 0; i < sw->cases.size(); i++) {
+        SwitchCaseLabel l;
+        l.index = static_cast<int>(i);
+        CaseValue* v = sw->cases[i]->value;
+        if (auto* iv = dynamic_cast<IntValue*>(v)) {
+            l.kind = SwitchCaseLabel::Kind::Int; l.lo = iv->value;
+        } else if (auto* rv = dynamic_cast<RangeValue*>(v)) {
+            l.kind = SwitchCaseLabel::Kind::Range; l.lo = rv->lo; l.hi = rv->hi;
+        } else if (auto* idv = dynamic_cast<IdentValue*>(v)) {
+            l.kind = SwitchCaseLabel::Kind::Ident; l.name = idv->name;
+        } else if (auto* rfv = dynamic_cast<RefValue*>(v)) {
+            l.kind = SwitchCaseLabel::Kind::Ref;
+            for (size_t j = 0; j < rfv->path.size(); j++) { if (j) l.name += "_"; l.name += rfv->path[j]; }
+        } else {
+            l.kind = SwitchCaseLabel::Kind::Positional;
+        }
+        labels.push_back(std::move(l));
+    }
+    return switch_labels_.emplace(sw, std::move(labels)).first->second;
+}
+
+// Synthesize names for nested inline structs (innermost first), prefix-independent.
+// Verbatim from the retired CTypeMapper::register_inline_structs so the generated
+// names are byte-identical; the C namer applies the CLI prefix + snake_case on top.
+void Sema::register_inline_structs(const std::string& base, BBQ::Struct* st) {
+    for (auto* field : st->fields) {
+        if (dynamic_cast<EndianSwitch*>(field->body)) continue;
+        if (auto* nested = dynamic_cast<Struct*>(field->body)) {
+            std::string name = base + "_" + field->name;
+            if (inline_struct_name_.find(nested) == inline_struct_name_.end()) {
+                register_inline_structs(name, nested);
+                inline_struct_name_[nested] = name;
+                inline_structs_.push_back({name, nested});
+            }
+        }
+    }
 }
 
 // --- Phase 1: collect rule names ---
@@ -104,6 +160,10 @@ void Sema::validate_type(TypeExpr* type, const std::string& ctx, bool guarded) {
             if (field->constraint)
                 validate_expr(*field->constraint, ctx);
         }
+        // A struct-level `where` runs after all fields are parsed, so it may
+        // reference any of them (e.g. a checksum over the whole header).
+        if (st->constraint)
+            validate_expr(*st->constraint, ctx);
     } else if (auto* u = dynamic_cast<Union*>(type)) {
         for (auto* variant : u->variants) {
             validate_type(variant->body, ctx, guarded);
@@ -164,8 +224,12 @@ void Sema::validate_type(TypeExpr* type, const std::string& ctx, bool guarded) {
             }
         }
     } else if (auto* opt = dynamic_cast<Optional*>(type)) {
-        // Optional element is guarded — the value may be absent at runtime.
-        validate_type(opt->element, ctx, true);
+        // Unlike Array (a pointer — cycle-safe, only needs a forward decl),
+        // Optional embeds its element BY VALUE (`{bool has_value; T value;}`),
+        // so T's full definition must precede the container: it IS a topo-sort
+        // dependency (unguarded). A recursive optional would be an infinite
+        // by-value type and is correctly rejected as a cycle.
+        validate_type(opt->element, ctx, false);
         if (opt->constraint)
             validate_expr(*opt->constraint, ctx);
     } else if (auto* sw = dynamic_cast<Switch*>(type)) {
@@ -261,6 +325,15 @@ void Sema::validate_expr(Expr* expr, const std::string& ctx) {
         for (auto* arg : call->args) {
             validate_expr(arg, ctx);
         }
+    } else if (auto* b = dynamic_cast<Builtin*>(expr)) {
+        // @name is a reserved, closed set of context builtins — reject typos so
+        // they don't silently read as something unexpected.
+        static const std::set<std::string> known = {
+            "pos", "start", "end", "index", "buffer", "remaining"};
+        if (!known.count(b->name))
+            errors_.error(b->loc, "unknown builtin @%s "
+                "(known: @pos @start @end @index @buffer @remaining)",
+                b->name.c_str());
     }
     // Literals and EOI: nothing to validate
 }
@@ -475,16 +548,16 @@ void Sema::check_forward_refs_struct(Struct* st,
             }
         }
 
-        // Check for loop index 'i' used outside element interval context.
-        // Compute expressions are exempt — 'i' may come from a parent's
-        // array loop via ctx.loop_index() at runtime.
+        // Check for the loop index `@index` used outside element interval context.
+        // Compute expressions are exempt — `@index` may come from a parent's
+        // array loop via the runtime loop index.
         {
             bool has_element_interval = false;
             if (auto* arr = dynamic_cast<Array*>(field->body))
                 has_element_interval = arr->element_interval.has_value();
 
             if (!has_element_interval) {
-                // Collect all expressions to check for 'i'
+                // Collect all expressions to check for `@index`
                 std::vector<Expr*> exprs_to_check;
                 if (field->constraint)
                     exprs_to_check.push_back(*field->constraint);
@@ -500,7 +573,7 @@ void Sema::check_forward_refs_struct(Struct* st,
                 for (auto* e : exprs_to_check) {
                     if (contains_loop_var(e)) {
                         errors_.error(field->loc,
-                            "loop index 'i' referenced outside per-element interval context in field '%s'",
+                            "@index referenced outside per-element interval context in field '%s'",
                             field->name.c_str());
                         break;
                     }
@@ -540,9 +613,8 @@ void Sema::collect_expr_refs(Expr* expr, std::unordered_set<std::string>& refs) 
 
 void Sema::collect_refpath_refs(RefPath* path, std::unordered_set<std::string>& refs) {
     if (auto* simple = dynamic_cast<Simple*>(path)) {
-        // Built-in context properties — not field references
-        if (simple->name == "remaining" || simple->name == "pos" || simple->name == "at_end" || simple->name == "i")
-            return;
+        // A bare identifier is a field reference (context builtins use the `@`
+        // sigil and are Builtin nodes, not Simple refs).
         refs.insert(simple->name);
     } else if (auto* fa = dynamic_cast<FieldAcc*>(path)) {
         collect_refpath_refs(fa->base, refs);
@@ -812,6 +884,11 @@ ExprType Sema::type_of_expr(Expr* expr, const TypeCheckScope& scope) {
     if (dynamic_cast<EndianLit*>(expr)) return ExprType::Endian;
     if (dynamic_cast<EOI*>(expr))      return ExprType::Integer;
 
+    if (auto* b = dynamic_cast<Builtin*>(expr)) {
+        // @buffer is the raw byte span; the rest are byte offsets / counts.
+        return (b->name == "buffer") ? ExprType::Bytes : ExprType::Integer;
+    }
+
     if (auto* ref = dynamic_cast<Ref*>(expr))
         return type_of_ref_path(ref->path, scope);
 
@@ -901,10 +978,8 @@ ExprType Sema::type_of_expr(Expr* expr, const TypeCheckScope& scope) {
 
 ExprType Sema::type_of_ref_path(RefPath* path, const TypeCheckScope& scope) {
     if (auto* simple = dynamic_cast<Simple*>(path)) {
-        if (simple->name == "remaining" || simple->name == "pos" || simple->name == "i")
-            return ExprType::Integer;
-        if (simple->name == "at_end")
-            return ExprType::Bool;
+        // A bare identifier is a field — typed from the scope. Context builtins are
+        // `@`-sigil Builtin nodes, typed in type_of_expr, not here.
         auto it = scope.types.find(simple->name);
         if (it != scope.types.end()) return it->second;
         return ExprType::Unknown;
@@ -1202,9 +1277,13 @@ void Sema::check_types_struct(Struct* st, TypeCheckScope inherited,
             continue;
         }
 
-        // Add field to scope BEFORE checking (self-reference is valid)
-        scope.types[field->name] = type_of_type_expr(field->body);
+        // Add field to scope BEFORE checking (self-reference is valid). The
+        // resolved type is also attached durably (field_types_) — the shape
+        // side-data backends read instead of re-deriving.
+        ExprType ft = type_of_type_expr(field->body);
+        scope.types[field->name] = ft;
         scope.bodies[field->name] = field->body;
+        field_types_[field] = ft;
 
         check_field_types(field, scope, ctx);
 
@@ -1270,11 +1349,6 @@ void Sema::resolve_cross_refs_in_expr(Expr* expr, const std::string& rule_name,
     } else if (auto* ref = dynamic_cast<Ref*>(expr)) {
         auto* simple = dynamic_cast<Simple*>(ref->path);
         if (!simple) return;
-
-        // Skip built-ins
-        if (simple->name == "i" || simple->name == "remaining" ||
-            simple->name == "pos" || simple->name == "at_end")
-            return;
 
         // Skip if already a local field
         if (local_fields.count(simple->name)) return;
@@ -1424,6 +1498,47 @@ void Sema::resolve_cross_refs() {
 
         resolve_cross_refs_in_type(rule->body, rule->name, local_fields);
     }
+}
+
+// Resolved fact: ownership. Aggregates (array/union/switch/alternatives) always
+// own; bytes/string leaves own their buffer; struct/ruleref/optional recurse.
+// Memoized — the entry is seeded false before recursing so a recursive type
+// terminates (an improvement over the per-render walk it replaces, which had no
+// guard). AST-only, so this stays in the frontend with no CEK dependency.
+bool Sema::type_needs_free(BBQ::TypeExpr* type) {
+    if (!type) return false;
+    auto it = needs_free_.find(type);
+    if (it != needs_free_.end()) return it->second;
+    needs_free_[type] = false;  // cycle guard
+
+    bool result = false;
+    switch (type->node_kind()) {
+        case NodeKind::Array: case NodeKind::Union:
+        case NodeKind::Switch: case NodeKind::Alternatives:
+            result = true; break;
+        case NodeKind::Primitive: {
+            auto* p = static_cast<Primitive*>(type);
+            result = dynamic_cast<BytesKind*>(p->kind) || dynamic_cast<StringKind*>(p->kind);
+            break;
+        }
+        case NodeKind::Optional:
+            result = type_needs_free(static_cast<Optional*>(type)->element);
+            break;
+        case NodeKind::RuleRef: {
+            auto* r = lookup_rule(static_cast<RuleRef*>(type)->name);
+            result = r && type_needs_free(r->body);
+            break;
+        }
+        case NodeKind::Struct:
+            for (auto* f : static_cast<Struct*>(type)->fields) {
+                if (dynamic_cast<EndianSwitch*>(f->body)) continue;
+                if (type_needs_free(f->body)) { result = true; break; }
+            }
+            break;
+        default: result = false; break;
+    }
+    needs_free_[type] = result;
+    return result;
 }
 
 } // namespace bbqgen

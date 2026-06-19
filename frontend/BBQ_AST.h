@@ -19,6 +19,12 @@ namespace BBQ {
 
 // ── Enum types ──────────────────────────────────────────────
 
+enum class CodeSection {
+    HeaderBlock,
+    SourceBlock,
+    WriterBlock
+};
+
 enum class Width {
     W8,
     W16,
@@ -35,6 +41,12 @@ enum class Endianness {
     Little,
     Big,
     Default
+};
+
+enum class Encoding {
+    Fixed,
+    Uleb,
+    Sleb
 };
 
 enum class Binop {
@@ -69,6 +81,7 @@ enum class Unaryop {
 
 struct Grammar;
 struct EndianDirective;
+struct CodeBlock;
 struct Rule;
 struct TypeExpr;
 struct BitfieldEntry;
@@ -86,6 +99,7 @@ struct Expr;
 struct RefPath;
 struct Grammar;
 struct EndianDirective;
+struct CodeBlock;
 struct Rule;
 struct Alternatives;
 struct Struct;
@@ -113,6 +127,7 @@ struct TypeTerm;
 struct SwitchCase;
 struct SwitchDefault;
 struct IntValue;
+struct RangeValue;
 struct StrValue;
 struct IdentValue;
 struct RefValue;
@@ -134,6 +149,7 @@ struct Ref;
 struct Call;
 struct EndianLit;
 struct EOI;
+struct Builtin;
 struct Simple;
 struct FieldAcc;
 struct IndexAcc;
@@ -210,6 +226,7 @@ struct ASTVisitor {
 
     virtual void visit(Grammar* node) {}
     virtual void visit(EndianDirective* node) {}
+    virtual void visit(CodeBlock* node) {}
     virtual void visit(Rule* node) {}
     virtual void visit(Alternatives* node) {}
     virtual void visit(Struct* node) {}
@@ -237,6 +254,7 @@ struct ASTVisitor {
     virtual void visit(SwitchCase* node) {}
     virtual void visit(SwitchDefault* node) {}
     virtual void visit(IntValue* node) {}
+    virtual void visit(RangeValue* node) {}
     virtual void visit(StrValue* node) {}
     virtual void visit(IdentValue* node) {}
     virtual void visit(RefValue* node) {}
@@ -258,9 +276,75 @@ struct ASTVisitor {
     virtual void visit(Call* node) {}
     virtual void visit(EndianLit* node) {}
     virtual void visit(EOI* node) {}
+    virtual void visit(Builtin* node) {}
     virtual void visit(Simple* node) {}
     virtual void visit(FieldAcc* node) {}
     virtual void visit(IndexAcc* node) {}
+};
+
+// ── Node kind tag ───────────────────────────────────────────
+//
+// One value per node type, so consumers can `switch (n->kind())` instead of a
+// dynamic_cast chain or a one-arm-per-type visitor. (The visitor stays for the
+// cases that genuinely want per-type double dispatch.)
+
+enum class NodeKind {
+    Grammar,
+    EndianDirective,
+    CodeBlock,
+    Rule,
+    Alternatives,
+    Struct,
+    Union,
+    Array,
+    Optional,
+    Switch,
+    Compute,
+    Primitive,
+    RuleRef,
+    Extern,
+    Bitfield,
+    EndianSwitch,
+    BitfieldEntry,
+    Field,
+    Variant,
+    FixedCount,
+    SepTerm,
+    TypeSep,
+    NoneSep,
+    EofTerm,
+    CountTerm,
+    UntilTerm,
+    TypeTerm,
+    SwitchCase,
+    SwitchDefault,
+    IntValue,
+    RangeValue,
+    StrValue,
+    IdentValue,
+    RefValue,
+    StartEnd,
+    Length,
+    IntegerKind,
+    FloatKind,
+    BytesKind,
+    StringKind,
+    BoolKind,
+    BinOp,
+    UnaryOp,
+    Ternary,
+    IntLit,
+    FloatLit,
+    StrLit,
+    BoolLit,
+    Ref,
+    Call,
+    EndianLit,
+    EOI,
+    Builtin,
+    Simple,
+    FieldAcc,
+    IndexAcc,
 };
 
 // ── AST node base ───────────────────────────────────────────
@@ -270,6 +354,7 @@ struct ASTNode {
 
     virtual ~ASTNode() = default;
     virtual void accept(ASTVisitor& visitor) = 0;
+    virtual NodeKind node_kind() const = 0;
 
     void* operator new(size_t size) {
         return get_arena().allocate(size);
@@ -287,14 +372,17 @@ struct ASTNode {
 struct Grammar : public ASTNode {
     Grammar(
         std::vector<EndianDirective*> directives,
-        std::vector<Rule*> rules
+        std::vector<Rule*> rules,
+        std::vector<CodeBlock*> codes
     )
-        : directives(std::move(directives)), rules(std::move(rules)) {}
+        : directives(std::move(directives)), rules(std::move(rules)), codes(std::move(codes)) {}
 
     void accept(ASTVisitor& visitor) override { visitor.visit(this); }
+    NodeKind node_kind() const override { return NodeKind::Grammar; }
 
     std::vector<EndianDirective*> directives;
     std::vector<Rule*> rules;
+    std::vector<CodeBlock*> codes;
 };
 
 struct EndianDirective : public ASTNode {
@@ -304,8 +392,23 @@ struct EndianDirective : public ASTNode {
         : endian(endian) {}
 
     void accept(ASTVisitor& visitor) override { visitor.visit(this); }
+    NodeKind node_kind() const override { return NodeKind::EndianDirective; }
 
     Endianness endian;
+};
+
+struct CodeBlock : public ASTNode {
+    CodeBlock(
+        CodeSection section,
+        std::string code
+    )
+        : section(section), code(code) {}
+
+    void accept(ASTVisitor& visitor) override { visitor.visit(this); }
+    NodeKind node_kind() const override { return NodeKind::CodeBlock; }
+
+    CodeSection section;
+    std::string code;
 };
 
 struct Rule : public ASTNode {
@@ -316,6 +419,7 @@ struct Rule : public ASTNode {
         : name(name), body(body) {}
 
     void accept(ASTVisitor& visitor) override { visitor.visit(this); }
+    NodeKind node_kind() const override { return NodeKind::Rule; }
 
     std::string name;
     TypeExpr* body;
@@ -333,19 +437,23 @@ struct Alternatives : public TypeExpr {
         : alts(std::move(alts)) {}
 
     void accept(ASTVisitor& visitor) override { visitor.visit(this); }
+    NodeKind node_kind() const override { return NodeKind::Alternatives; }
 
     std::vector<TypeExpr*> alts;
 };
 
 struct Struct : public TypeExpr {
     Struct(
-        std::vector<Field*> fields
+        std::vector<Field*> fields,
+        std::optional<Expr*> constraint
     )
-        : fields(std::move(fields)) {}
+        : fields(std::move(fields)), constraint(std::move(constraint)) {}
 
     void accept(ASTVisitor& visitor) override { visitor.visit(this); }
+    NodeKind node_kind() const override { return NodeKind::Struct; }
 
     std::vector<Field*> fields;
+    std::optional<Expr*> constraint;
 };
 
 struct Union : public TypeExpr {
@@ -355,6 +463,7 @@ struct Union : public TypeExpr {
         : variants(std::move(variants)) {}
 
     void accept(ASTVisitor& visitor) override { visitor.visit(this); }
+    NodeKind node_kind() const override { return NodeKind::Union; }
 
     std::vector<Variant*> variants;
 };
@@ -371,6 +480,7 @@ struct Array : public TypeExpr {
         : element(element), spec(spec), constraint(std::move(constraint)), interval(std::move(interval)), element_interval(std::move(element_interval)), resync(resync) {}
 
     void accept(ASTVisitor& visitor) override { visitor.visit(this); }
+    NodeKind node_kind() const override { return NodeKind::Array; }
 
     TypeExpr* element;
     ArraySpec* spec;
@@ -389,6 +499,7 @@ struct Optional : public TypeExpr {
         : element(element), constraint(std::move(constraint)), interval(std::move(interval)) {}
 
     void accept(ASTVisitor& visitor) override { visitor.visit(this); }
+    NodeKind node_kind() const override { return NodeKind::Optional; }
 
     TypeExpr* element;
     std::optional<Expr*> constraint;
@@ -404,6 +515,7 @@ struct Switch : public TypeExpr {
         : discriminator(discriminator), cases(std::move(cases)), default_(std::move(default_)) {}
 
     void accept(ASTVisitor& visitor) override { visitor.visit(this); }
+    NodeKind node_kind() const override { return NodeKind::Switch; }
 
     Expr* discriminator;
     std::vector<SwitchCase*> cases;
@@ -418,6 +530,7 @@ struct Compute : public TypeExpr {
         : expression(expression), result_type(result_type) {}
 
     void accept(ASTVisitor& visitor) override { visitor.visit(this); }
+    NodeKind node_kind() const override { return NodeKind::Compute; }
 
     Expr* expression;
     PrimitiveKind* result_type;
@@ -432,6 +545,7 @@ struct Primitive : public TypeExpr {
         : kind(kind), constraint(std::move(constraint)), interval(std::move(interval)) {}
 
     void accept(ASTVisitor& visitor) override { visitor.visit(this); }
+    NodeKind node_kind() const override { return NodeKind::Primitive; }
 
     PrimitiveKind* kind;
     std::optional<Expr*> constraint;
@@ -447,6 +561,7 @@ struct RuleRef : public TypeExpr {
         : name(name), constraint(std::move(constraint)), interval(std::move(interval)) {}
 
     void accept(ASTVisitor& visitor) override { visitor.visit(this); }
+    NodeKind node_kind() const override { return NodeKind::RuleRef; }
 
     std::string name;
     std::optional<Expr*> constraint;
@@ -456,15 +571,18 @@ struct RuleRef : public TypeExpr {
 struct Extern : public TypeExpr {
     Extern(
         std::string func_name,
+        std::string write_func,
         std::string cpp_type,
         std::optional<Expr*> constraint,
         std::optional<Interval*> interval
     )
-        : func_name(func_name), cpp_type(cpp_type), constraint(std::move(constraint)), interval(std::move(interval)) {}
+        : func_name(func_name), write_func(write_func), cpp_type(cpp_type), constraint(std::move(constraint)), interval(std::move(interval)) {}
 
     void accept(ASTVisitor& visitor) override { visitor.visit(this); }
+    NodeKind node_kind() const override { return NodeKind::Extern; }
 
     std::string func_name;
+    std::string write_func;
     std::string cpp_type;
     std::optional<Expr*> constraint;
     std::optional<Interval*> interval;
@@ -478,6 +596,7 @@ struct Bitfield : public TypeExpr {
         : container(container), entries(std::move(entries)) {}
 
     void accept(ASTVisitor& visitor) override { visitor.visit(this); }
+    NodeKind node_kind() const override { return NodeKind::Bitfield; }
 
     PrimitiveKind* container;
     std::vector<BitfieldEntry*> entries;
@@ -490,6 +609,7 @@ struct EndianSwitch : public TypeExpr {
         : endian_expr(endian_expr) {}
 
     void accept(ASTVisitor& visitor) override { visitor.visit(this); }
+    NodeKind node_kind() const override { return NodeKind::EndianSwitch; }
 
     Expr* endian_expr;
 };
@@ -503,6 +623,7 @@ struct BitfieldEntry : public ASTNode {
         : name(name), width(width), constraint(std::move(constraint)) {}
 
     void accept(ASTVisitor& visitor) override { visitor.visit(this); }
+    NodeKind node_kind() const override { return NodeKind::BitfieldEntry; }
 
     std::string name;
     int64_t width;
@@ -520,6 +641,7 @@ struct Field : public ASTNode {
         : name(name), body(body), constraint(std::move(constraint)), interval(std::move(interval)), scopes_rest(scopes_rest) {}
 
     void accept(ASTVisitor& visitor) override { visitor.visit(this); }
+    NodeKind node_kind() const override { return NodeKind::Field; }
 
     std::string name;
     TypeExpr* body;
@@ -538,6 +660,7 @@ struct Variant : public ASTNode {
         : name(name), body(body), constraint(std::move(constraint)), interval(std::move(interval)) {}
 
     void accept(ASTVisitor& visitor) override { visitor.visit(this); }
+    NodeKind node_kind() const override { return NodeKind::Variant; }
 
     std::string name;
     TypeExpr* body;
@@ -557,6 +680,7 @@ struct FixedCount : public ArraySpec {
         : count(count) {}
 
     void accept(ASTVisitor& visitor) override { visitor.visit(this); }
+    NodeKind node_kind() const override { return NodeKind::FixedCount; }
 
     Expr* count;
 };
@@ -569,6 +693,7 @@ struct SepTerm : public ArraySpec {
         : sep(sep), term(term) {}
 
     void accept(ASTVisitor& visitor) override { visitor.visit(this); }
+    NodeKind node_kind() const override { return NodeKind::SepTerm; }
 
     Separator* sep;
     Terminator* term;
@@ -586,6 +711,7 @@ struct TypeSep : public Separator {
         : sep_type(sep_type) {}
 
     void accept(ASTVisitor& visitor) override { visitor.visit(this); }
+    NodeKind node_kind() const override { return NodeKind::TypeSep; }
 
     TypeExpr* sep_type;
 };
@@ -593,6 +719,7 @@ struct TypeSep : public Separator {
 struct NoneSep : public Separator {
 
     void accept(ASTVisitor& visitor) override { visitor.visit(this); }
+    NodeKind node_kind() const override { return NodeKind::NoneSep; }
 
 };
 
@@ -604,6 +731,7 @@ struct Terminator : public ASTNode {
 struct EofTerm : public Terminator {
 
     void accept(ASTVisitor& visitor) override { visitor.visit(this); }
+    NodeKind node_kind() const override { return NodeKind::EofTerm; }
 
 };
 
@@ -614,6 +742,7 @@ struct CountTerm : public Terminator {
         : count(count) {}
 
     void accept(ASTVisitor& visitor) override { visitor.visit(this); }
+    NodeKind node_kind() const override { return NodeKind::CountTerm; }
 
     Expr* count;
 };
@@ -625,6 +754,7 @@ struct UntilTerm : public Terminator {
         : condition(condition) {}
 
     void accept(ASTVisitor& visitor) override { visitor.visit(this); }
+    NodeKind node_kind() const override { return NodeKind::UntilTerm; }
 
     Expr* condition;
 };
@@ -636,6 +766,7 @@ struct TypeTerm : public Terminator {
         : term_type(term_type) {}
 
     void accept(ASTVisitor& visitor) override { visitor.visit(this); }
+    NodeKind node_kind() const override { return NodeKind::TypeTerm; }
 
     TypeExpr* term_type;
 };
@@ -649,6 +780,7 @@ struct SwitchCase : public ASTNode {
         : value(value), target(target), interval(std::move(interval)) {}
 
     void accept(ASTVisitor& visitor) override { visitor.visit(this); }
+    NodeKind node_kind() const override { return NodeKind::SwitchCase; }
 
     CaseValue* value;
     TypeExpr* target;
@@ -664,6 +796,7 @@ struct SwitchDefault : public ASTNode {
         : target(std::move(target)), interval(std::move(interval)), is_reject(is_reject) {}
 
     void accept(ASTVisitor& visitor) override { visitor.visit(this); }
+    NodeKind node_kind() const override { return NodeKind::SwitchDefault; }
 
     std::optional<TypeExpr*> target;
     std::optional<Interval*> interval;
@@ -682,8 +815,23 @@ struct IntValue : public CaseValue {
         : value(value) {}
 
     void accept(ASTVisitor& visitor) override { visitor.visit(this); }
+    NodeKind node_kind() const override { return NodeKind::IntValue; }
 
     int64_t value;
+};
+
+struct RangeValue : public CaseValue {
+    RangeValue(
+        int64_t lo,
+        int64_t hi
+    )
+        : lo(lo), hi(hi) {}
+
+    void accept(ASTVisitor& visitor) override { visitor.visit(this); }
+    NodeKind node_kind() const override { return NodeKind::RangeValue; }
+
+    int64_t lo;
+    int64_t hi;
 };
 
 struct StrValue : public CaseValue {
@@ -693,6 +841,7 @@ struct StrValue : public CaseValue {
         : value(value) {}
 
     void accept(ASTVisitor& visitor) override { visitor.visit(this); }
+    NodeKind node_kind() const override { return NodeKind::StrValue; }
 
     std::string value;
 };
@@ -704,6 +853,7 @@ struct IdentValue : public CaseValue {
         : name(name) {}
 
     void accept(ASTVisitor& visitor) override { visitor.visit(this); }
+    NodeKind node_kind() const override { return NodeKind::IdentValue; }
 
     std::string name;
 };
@@ -715,6 +865,7 @@ struct RefValue : public CaseValue {
         : path(std::move(path)) {}
 
     void accept(ASTVisitor& visitor) override { visitor.visit(this); }
+    NodeKind node_kind() const override { return NodeKind::RefValue; }
 
     std::vector<std::string> path;
 };
@@ -732,6 +883,7 @@ struct StartEnd : public Interval {
         : start(start), end(end) {}
 
     void accept(ASTVisitor& visitor) override { visitor.visit(this); }
+    NodeKind node_kind() const override { return NodeKind::StartEnd; }
 
     Expr* start;
     Expr* end;
@@ -744,6 +896,7 @@ struct Length : public Interval {
         : length(length) {}
 
     void accept(ASTVisitor& visitor) override { visitor.visit(this); }
+    NodeKind node_kind() const override { return NodeKind::Length; }
 
     Expr* length;
 };
@@ -757,15 +910,18 @@ struct IntegerKind : public PrimitiveKind {
     IntegerKind(
         Width width,
         Signedness sign,
-        Endianness endian
+        Endianness endian,
+        Encoding encoding
     )
-        : width(width), sign(sign), endian(endian) {}
+        : width(width), sign(sign), endian(endian), encoding(encoding) {}
 
     void accept(ASTVisitor& visitor) override { visitor.visit(this); }
+    NodeKind node_kind() const override { return NodeKind::IntegerKind; }
 
     Width width;
     Signedness sign;
     Endianness endian;
+    Encoding encoding;
 };
 
 struct FloatKind : public PrimitiveKind {
@@ -776,6 +932,7 @@ struct FloatKind : public PrimitiveKind {
         : width(width), endian(endian) {}
 
     void accept(ASTVisitor& visitor) override { visitor.visit(this); }
+    NodeKind node_kind() const override { return NodeKind::FloatKind; }
 
     Width width;
     Endianness endian;
@@ -784,18 +941,21 @@ struct FloatKind : public PrimitiveKind {
 struct BytesKind : public PrimitiveKind {
 
     void accept(ASTVisitor& visitor) override { visitor.visit(this); }
+    NodeKind node_kind() const override { return NodeKind::BytesKind; }
 
 };
 
 struct StringKind : public PrimitiveKind {
 
     void accept(ASTVisitor& visitor) override { visitor.visit(this); }
+    NodeKind node_kind() const override { return NodeKind::StringKind; }
 
 };
 
 struct BoolKind : public PrimitiveKind {
 
     void accept(ASTVisitor& visitor) override { visitor.visit(this); }
+    NodeKind node_kind() const override { return NodeKind::BoolKind; }
 
 };
 
@@ -813,6 +973,7 @@ struct BinOp : public Expr {
         : left(left), op(op), right(right) {}
 
     void accept(ASTVisitor& visitor) override { visitor.visit(this); }
+    NodeKind node_kind() const override { return NodeKind::BinOp; }
 
     Expr* left;
     Binop op;
@@ -827,6 +988,7 @@ struct UnaryOp : public Expr {
         : op(op), operand(operand) {}
 
     void accept(ASTVisitor& visitor) override { visitor.visit(this); }
+    NodeKind node_kind() const override { return NodeKind::UnaryOp; }
 
     Unaryop op;
     Expr* operand;
@@ -841,6 +1003,7 @@ struct Ternary : public Expr {
         : cond(cond), then_branch(then_branch), else_branch(else_branch) {}
 
     void accept(ASTVisitor& visitor) override { visitor.visit(this); }
+    NodeKind node_kind() const override { return NodeKind::Ternary; }
 
     Expr* cond;
     Expr* then_branch;
@@ -854,6 +1017,7 @@ struct IntLit : public Expr {
         : value(value) {}
 
     void accept(ASTVisitor& visitor) override { visitor.visit(this); }
+    NodeKind node_kind() const override { return NodeKind::IntLit; }
 
     int64_t value;
 };
@@ -865,6 +1029,7 @@ struct FloatLit : public Expr {
         : value(value) {}
 
     void accept(ASTVisitor& visitor) override { visitor.visit(this); }
+    NodeKind node_kind() const override { return NodeKind::FloatLit; }
 
     float value;
 };
@@ -876,6 +1041,7 @@ struct StrLit : public Expr {
         : value(value) {}
 
     void accept(ASTVisitor& visitor) override { visitor.visit(this); }
+    NodeKind node_kind() const override { return NodeKind::StrLit; }
 
     std::string value;
 };
@@ -887,6 +1053,7 @@ struct BoolLit : public Expr {
         : value(value) {}
 
     void accept(ASTVisitor& visitor) override { visitor.visit(this); }
+    NodeKind node_kind() const override { return NodeKind::BoolLit; }
 
     bool value;
 };
@@ -898,6 +1065,7 @@ struct Ref : public Expr {
         : path(path) {}
 
     void accept(ASTVisitor& visitor) override { visitor.visit(this); }
+    NodeKind node_kind() const override { return NodeKind::Ref; }
 
     RefPath* path;
 };
@@ -910,6 +1078,7 @@ struct Call : public Expr {
         : func(func), args(std::move(args)) {}
 
     void accept(ASTVisitor& visitor) override { visitor.visit(this); }
+    NodeKind node_kind() const override { return NodeKind::Call; }
 
     std::string func;
     std::vector<Expr*> args;
@@ -922,6 +1091,7 @@ struct EndianLit : public Expr {
         : value(value) {}
 
     void accept(ASTVisitor& visitor) override { visitor.visit(this); }
+    NodeKind node_kind() const override { return NodeKind::EndianLit; }
 
     Endianness value;
 };
@@ -929,7 +1099,20 @@ struct EndianLit : public Expr {
 struct EOI : public Expr {
 
     void accept(ASTVisitor& visitor) override { visitor.visit(this); }
+    NodeKind node_kind() const override { return NodeKind::EOI; }
 
+};
+
+struct Builtin : public Expr {
+    Builtin(
+        std::string name
+    )
+        : name(name) {}
+
+    void accept(ASTVisitor& visitor) override { visitor.visit(this); }
+    NodeKind node_kind() const override { return NodeKind::Builtin; }
+
+    std::string name;
 };
 
 // ref_path
@@ -947,6 +1130,7 @@ struct Simple : public RefPath {
         : name(name), resolved_path(std::move(resolved_path)), resolved_parent(std::move(resolved_parent)), resolved_depth(resolved_depth) {}
 
     void accept(ASTVisitor& visitor) override { visitor.visit(this); }
+    NodeKind node_kind() const override { return NodeKind::Simple; }
 
     std::string name;
     std::optional<std::string> resolved_path;
@@ -962,6 +1146,7 @@ struct FieldAcc : public RefPath {
         : base(base), field(field) {}
 
     void accept(ASTVisitor& visitor) override { visitor.visit(this); }
+    NodeKind node_kind() const override { return NodeKind::FieldAcc; }
 
     RefPath* base;
     std::string field;
@@ -975,6 +1160,7 @@ struct IndexAcc : public RefPath {
         : base(base), index(index) {}
 
     void accept(ASTVisitor& visitor) override { visitor.visit(this); }
+    NodeKind node_kind() const override { return NodeKind::IndexAcc; }
 
     RefPath* base;
     Expr* index;

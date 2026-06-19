@@ -45,6 +45,16 @@ private:
             auto* n = new FloatKind(w, e); n->loc = loc; return n;
         }
 
+        // LEB128 varints: uleb128/uleb32 → u32, uleb64 → u64;
+        //                 sleb128/sleb32 → i32, sleb64 → i64. No endianness.
+        if (s == "uleb128" || s == "uleb32" || s == "uleb64" ||
+            s == "sleb128" || s == "sleb32" || s == "sleb64") {
+            Encoding enc = (s[0] == 'u') ? Encoding::Uleb : Encoding::Sleb;
+            Signedness sign = (s[0] == 'u') ? Signedness::Unsigned : Signedness::Signed;
+            Width w = (s.find("64") != std::string::npos) ? Width::W64 : Width::W32;
+            auto* n = new IntegerKind(w, sign, Endianness::Default, enc); n->loc = loc; return n;
+        }
+
         // Integer types (uint* / int*)
         if (s.substr(0, 4) == "uint" || s.substr(0, 3) == "int") {
             Signedness sign = Signedness::Signed;
@@ -64,7 +74,7 @@ private:
                 else if (suf == "be") e = Endianness::Big;
             }
 
-            auto* n = new IntegerKind(w, sign, e); n->loc = loc; return n;
+            auto* n = new IntegerKind(w, sign, e, Encoding::Fixed); n->loc = loc; return n;
         }
 
         return nullptr;

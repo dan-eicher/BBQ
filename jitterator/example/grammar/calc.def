@@ -1,0 +1,68 @@
+# calc.def — the calc VM op-set (a small stack machine, "WASM lite").
+#
+# opgen generates the calc's TWO execution tiers from this one source: the
+# threaded interpreter handlers (gen_interp.c) AND the copy-and-patch JIT
+# stencils (wasm_stencils.c) + the side-table the jit_driver reads. calc.burg
+# lowers the IR continuation graph to this bytecode (emit_op), exactly as
+# yoctojc's codegen.burg lowers to JCVM bytecode.
+#
+# Operands are sleb128 / u8 (the JIT bakes these as data holes; fixed-width
+# FETCH operands have no hole). Control transfers (br/goto/ret) go through the
+# backend's status natives — a branch repositions frame.code, a return delivers
+# the result and halts — so the interpreter and JIT share one control model.
+
+(. #include "bbq_runtime.h" .)
+
+# The VM substrate (frame_t/vm_t/heap_t: the bbq_ctx code cursor + value stack).
+# opgen #includes this into runtime_api.h at the value-model's substrate point.
+backend "calc_backend.h"
+
+status calc_status_t CALC_OK CALC_ERR CALC_HALT
+
+type i32 int32_t uint32_t 1 i
+
+# Control built-ins (the calc backend implements them). A status return marks
+# them as control transfers: the handler runs the native, then tail-dispatches.
+native status calc_br(int off);   # reposition the code cursor (absolute byte offset)
+native status calc_ret(int v);    # return v to the caller (or halt at the top level)
+native status calc_call(int entry, int nargs);   # save frame, pass args, enter the callee
+
+# ── Values ──────────────────────────────────────────────────
+const 0x01 [ sleb128 v ] ( -- i32 r )
+    (. r = v; .)
+
+# ── Arithmetic ──────────────────────────────────────────────
+add 0x02 (i32 a, i32 b -- i32 r)   (. r = a + b; .)
+sub 0x03 (i32 a, i32 b -- i32 r)   (. r = a - b; .)
+mul 0x04 (i32 a, i32 b -- i32 r)   (. r = a * b; .)
+neg 0x05 (i32 a -- i32 r)          (. r = -a; .)
+
+# ── Comparisons (yield 0 / 1) ───────────────────────────────
+eq 0x06 (i32 a, i32 b -- i32 r)    (. r = a == b; .)
+ne 0x07 (i32 a, i32 b -- i32 r)    (. r = a != b; .)
+lt 0x08 (i32 a, i32 b -- i32 r)    (. r = a < b; .)
+le 0x09 (i32 a, i32 b -- i32 r)    (. r = a <= b; .)
+gt 0x0A (i32 a, i32 b -- i32 r)    (. r = a > b; .)
+ge 0x0B (i32 a, i32 b -- i32 r)    (. r = a >= b; .)
+
+# ── Locals ──────────────────────────────────────────────────
+load  0x0C [ u8 idx ] ( -- i32 r )
+    local_value: int
+    (. r = locals[idx]; .)
+store 0x0D [ u8 idx ] (i32 v -- )
+    local_value: int
+    (. locals[idx] = v; .)
+
+# ── Control ─────────────────────────────────────────────────
+br_if 0x0E [ sleb128 off ] (i32 c -- )
+    (. if (c != 0) calc_br(off); .)
+br_ifz 0x12 [ sleb128 off ] (i32 c -- )   # inverted br_if (the peephole's branch-reversal form)
+    (. if (c == 0) calc_br(off); .)
+goto  0x0F [ sleb128 off ] ( -- )
+    (. calc_br(off); .)
+ret   0x10 (i32 v -- )
+    (. calc_ret(v); .)
+call  0x13 [ sleb128 entry, u8 nargs ] ( -- )   # save frame, pass nargs from the stack, enter the callee
+    (. calc_call(entry, nargs); .)
+
+pop 0x11 (i32 v -- )

@@ -173,26 +173,47 @@ bool Parser::string_lit(peg::Span& out) {
 bool Parser::parse_BBQ() {
     std::vector<EndianDirective*> dirs;
        std::vector<Rule*> rules;
+       std::vector<CodeBlock*> codes;
     for (;;) {
         auto _m0 = save();
         if (![&]() -> bool {
-            skip();
-            if (!parse_Directive(&dirs)) return false;
+            {
+                auto _m1 = save();
+                if ([&]() -> bool {
+                    skip();
+                    if (!parse_Directive(&dirs)) return false;
+                    return true;
+                }()) {} else {
+                restore(_m1);
+                skip();
+                if (!parse_CodeDirective(&codes)) return false;
+                }
+            }
             return true;
         }()) { restore(_m0); break; }
     }
     skip();
     if (!parse_Rule_(&rules)) return false;
     for (;;) {
-        auto _m1 = save();
+        auto _m2 = save();
         if (![&]() -> bool {
-            skip();
-            if (!parse_Rule_(&rules)) return false;
+            {
+                auto _m3 = save();
+                if ([&]() -> bool {
+                    skip();
+                    if (!parse_Rule_(&rules)) return false;
+                    return true;
+                }()) {} else {
+                restore(_m3);
+                skip();
+                if (!parse_CodeDirective(&codes)) return false;
+                }
+            }
             return true;
-        }()) { restore(_m1); break; }
+        }()) { restore(_m2); break; }
     }
     skip(); if (!at_end()) return false;
-    ast = new Grammar(std::move(dirs), std::move(rules));
+    ast = new Grammar(std::move(dirs), std::move(rules), std::move(codes));
        ast->loc = SourceLoc{nullptr, 1, 1};
     return true;
 }
@@ -218,6 +239,32 @@ bool Parser::parse_Directive(std::vector<EndianDirective*> * dirs) {
     auto* d = new EndianDirective(e);
        d->loc = Loc();
        dirs->push_back(d);
+    return true;
+}
+
+bool Parser::parse_CodeDirective(std::vector<CodeBlock*> * codes) {
+    CodeSection section; std::string code; SourceLoc loc;
+    skip();
+    if (peek_at("@header")) {
+        skip();
+        if (!match("@header")) return false;
+        section = CodeSection::HeaderBlock;
+    } else     if (peek_at("@source")) {
+        skip();
+        if (!match("@source")) return false;
+        section = CodeSection::SourceBlock;
+    } else {
+        skip();
+        if (!match("@writer")) return false;
+        section = CodeSection::WriterBlock;
+    }
+    loc = Loc();
+    skip();
+    if (!match("(.")) return false;
+    if (!scan_to("." ")", code)) return false;
+    auto* cb = new CodeBlock(section, std::move(code));
+       cb->loc = loc;
+       codes->push_back(cb);
     return true;
 }
 
@@ -388,6 +435,7 @@ bool Parser::parse_TypePrimary(TypeExpr* * result) {
 
 bool Parser::parse_StructBody(TypeExpr* * result) {
     std::vector<Field*> fields;
+       Expr* constr = nullptr;
        SourceLoc loc = Loc();
     skip();
     if (!match("{")) return false;
@@ -419,7 +467,16 @@ bool Parser::parse_StructBody(TypeExpr* * result) {
     }
     skip();
     if (!match("}")) return false;
-    *result = new Struct(std::move(fields));
+    {
+        auto _m3 = save();
+        if (![&]() -> bool {
+            skip();
+            if (!parse_ConstraintBlock(&constr)) return false;
+            return true;
+        }()) restore(_m3);
+    }
+    *result = new Struct(std::move(fields),
+           constr ? std::optional<Expr*>(constr) : std::nullopt);
        (*result)->loc = loc;
     return true;
 }
@@ -896,9 +953,10 @@ bool Parser::parse_DefaultCaseRule(SwitchDefault* * result) {
 
 bool Parser::parse_CaseValueRule(CaseValue* * result) {
     peg::Span span;
-       std::vector<std::string> path;
        std::string s;
        int64_t ival;
+       int64_t hi = 0;
+       bool is_range = false;
     {
         auto _m0 = save();
         if ([&]() -> bool {
@@ -911,7 +969,20 @@ bool Parser::parse_CaseValueRule(CaseValue* * result) {
             skip();
             if (!integer(span)) return false;
             ival = std::stoll(span.to_string(), nullptr, 0);
-                                *result = new IntValue(ival); (*result)->loc = Loc();
+            {
+                auto _m1 = save();
+                if (![&]() -> bool {
+                    skip();
+                    if (!match("..")) return false;
+                    skip();
+                    if (!integer(span)) return false;
+                    hi = std::stoll(span.to_string(), nullptr, 0); is_range = true;
+                    return true;
+                }()) restore(_m1);
+            }
+            *result = is_range ? (CaseValue*)new RangeValue(ival, hi)
+                                                    : (CaseValue*)new IntValue(ival);
+                                 (*result)->loc = Loc();
             return true;
         }()) {} else {
         restore(_m0);
@@ -924,14 +995,14 @@ bool Parser::parse_CaseValueRule(CaseValue* * result) {
         }()) {} else {
         restore(_m0);
         {
-            auto _m1 = save();
-            bool _ok1 = [&]() -> bool {
+            auto _m2 = save();
+            bool _ok2 = [&]() -> bool {
                 skip();
                 if (!match("default")) return false;
                 return true;
             }();
-            restore(_m1);
-            if (_ok1) return false;
+            restore(_m2);
+            if (_ok2) return false;
         }
         skip();
         if (!ident(span)) return false;
@@ -990,8 +1061,10 @@ bool Parser::parse_ComputeBody(TypeExpr* * result) {
 }
 
 bool Parser::parse_ExternBody(TypeExpr* * result) {
-    peg::Span func_span; peg::Span ctype_span;
-       std::string func; std::string ctype;
+    peg::Span func_span; peg::Span s2_span; peg::Span s3_span;
+       std::string func; std::string s2; std::string s3;
+       std::string write_func; std::string ctype;
+       bool have_s3 = false;
        Expr* constr = nullptr; Interval* iv = nullptr;
        SourceLoc loc = Loc();
     skip();
@@ -1002,27 +1075,41 @@ bool Parser::parse_ExternBody(TypeExpr* * result) {
     skip();
     if (!match(",")) return false;
     skip();
-    if (!string_lit(ctype_span)) return false;
-    ctype = peg::unescape_string_lit(ctype_span);
-    skip();
-    if (!match(")")) return false;
+    if (!string_lit(s2_span)) return false;
+    s2 = peg::unescape_string_lit(s2_span);
     {
         auto _m0 = save();
         if (![&]() -> bool {
             skip();
-            if (!parse_ConstraintBlock(&constr)) return false;
+            if (!match(",")) return false;
+            skip();
+            if (!string_lit(s3_span)) return false;
+            s3 = peg::unescape_string_lit(s3_span); have_s3 = true;
             return true;
         }()) restore(_m0);
     }
+    skip();
+    if (!match(")")) return false;
     {
         auto _m1 = save();
         if (![&]() -> bool {
             skip();
-            if (!parse_IntervalSpec(&iv)) return false;
+            if (!parse_ConstraintBlock(&constr)) return false;
             return true;
         }()) restore(_m1);
     }
-    *result = new Extern(std::move(func), std::move(ctype),
+    {
+        auto _m2 = save();
+        if (![&]() -> bool {
+            skip();
+            if (!parse_IntervalSpec(&iv)) return false;
+            return true;
+        }()) restore(_m2);
+    }
+    // extern("read","ctype")  OR  extern("read","write","ctype")
+       if (have_s3) { write_func = std::move(s2); ctype = std::move(s3); }
+       else         { ctype = std::move(s2); }
+       *result = new Extern(std::move(func), std::move(write_func), std::move(ctype),
            constr ? std::optional<Expr*>(constr) : std::nullopt,
            iv     ? std::optional<Interval*>(iv) : std::nullopt);
        (*result)->loc = loc;
@@ -1381,55 +1468,67 @@ bool Parser::parse_Relational(Expr* * result) {
     for (;;) {
         auto _m0 = save();
         if (![&]() -> bool {
-            skip();
-            if (peek_at("<=")) {
-                skip();
-                if (!match("<=")) return false;
-                skip();
-                if (!parse_Shift(&rhs)) return false;
-                *result = new BinOp(*result, Binop::Le, rhs);
+            {
+                auto _m1 = save();
+                if ([&]() -> bool {
+                    skip();
+                    if (!match("<=")) return false;
+                    skip();
+                    if (!parse_Shift(&rhs)) return false;
+                    *result = new BinOp(*result, Binop::Le, rhs);
            (*result)->loc = rhs->loc;
-            } else             if (peek_at(">=")) {
-                skip();
-                if (!match(">=")) return false;
-                skip();
-                if (!parse_Shift(&rhs)) return false;
-                *result = new BinOp(*result, Binop::Ge, rhs);
+                    return true;
+                }()) {} else {
+                restore(_m1);
+                if ([&]() -> bool {
+                    skip();
+                    if (!match(">=")) return false;
+                    skip();
+                    if (!parse_Shift(&rhs)) return false;
+                    *result = new BinOp(*result, Binop::Ge, rhs);
            (*result)->loc = rhs->loc;
-            } else             if (peek_at("<")) {
-                skip();
-                if (!match("<")) return false;
-                {
-                    auto _m1 = save();
-                    bool _ok1 = [&]() -> bool {
-                        skip();
-                        if (!match("<")) return false;
-                        return true;
-                    }();
-                    restore(_m1);
-                    if (_ok1) return false;
-                }
-                skip();
-                if (!parse_Shift(&rhs)) return false;
-                *result = new BinOp(*result, Binop::Lt, rhs);
+                    return true;
+                }()) {} else {
+                restore(_m1);
+                if ([&]() -> bool {
+                    skip();
+                    if (!match("<")) return false;
+                    {
+                        auto _m2 = save();
+                        bool _ok2 = [&]() -> bool {
+                            skip();
+                            if (!match("<")) return false;
+                            return true;
+                        }();
+                        restore(_m2);
+                        if (_ok2) return false;
+                    }
+                    skip();
+                    if (!parse_Shift(&rhs)) return false;
+                    *result = new BinOp(*result, Binop::Lt, rhs);
            (*result)->loc = rhs->loc;
-            } else {
+                    return true;
+                }()) {} else {
+                restore(_m1);
                 skip();
                 if (!match(">")) return false;
                 {
-                    auto _m2 = save();
-                    bool _ok2 = [&]() -> bool {
+                    auto _m3 = save();
+                    bool _ok3 = [&]() -> bool {
                         skip();
                         if (!match(">")) return false;
                         return true;
                     }();
-                    restore(_m2);
-                    if (_ok2) return false;
+                    restore(_m3);
+                    if (_ok3) return false;
                 }
                 skip();
                 if (!parse_Shift(&rhs)) return false;
                 *result = new BinOp(*result, Binop::Gt, rhs);
            (*result)->loc = rhs->loc;
+                }
+                }
+                }
             }
             return true;
         }()) { restore(_m0); break; }
@@ -1696,6 +1795,17 @@ bool Parser::parse_PrimaryExpr(Expr* * result) {
         restore(_m0);
         if ([&]() -> bool {
             skip();
+            if (!match("@")) return false;
+            skip();
+            if (!ident(span)) return false;
+            name = span.to_string();
+         *result = new Builtin(std::move(name));
+         (*result)->loc = Loc();
+            return true;
+        }()) {} else {
+        restore(_m0);
+        if ([&]() -> bool {
+            skip();
             if (!parse_CallExpr(result)) return false;
             return true;
         }()) {} else {
@@ -1717,6 +1827,7 @@ bool Parser::parse_PrimaryExpr(Expr* * result) {
         if (!parse_Expr_(result)) return false;
         skip();
         if (!match(")")) return false;
+        }
         }
         }
         }

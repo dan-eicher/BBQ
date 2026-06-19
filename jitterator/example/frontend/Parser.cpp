@@ -203,43 +203,63 @@ bool Parser::parse_CmpExpr(calc::Expr* * result) {
     {
         auto _m0 = save();
         if (![&]() -> bool {
-            skip();
-            if (peek_at("==")) {
-                skip();
-                if (!match("==")) return false;
-                skip();
-                if (!parse_AddExpr(&rhs)) return false;
-                *result = new calc::CmpEq(*result, rhs);
-            } else             if (peek_at("!=")) {
-                skip();
-                if (!match("!=")) return false;
-                skip();
-                if (!parse_AddExpr(&rhs)) return false;
-                *result = new calc::CmpNeq(*result, rhs);
-            } else             if (peek_at("<=")) {
-                skip();
-                if (!match("<=")) return false;
-                skip();
-                if (!parse_AddExpr(&rhs)) return false;
-                *result = new calc::CmpLe(*result, rhs);
-            } else             if (peek_at(">=")) {
-                skip();
-                if (!match(">=")) return false;
-                skip();
-                if (!parse_AddExpr(&rhs)) return false;
-                *result = new calc::CmpGe(*result, rhs);
-            } else             if (peek_at("<")) {
-                skip();
-                if (!match("<")) return false;
-                skip();
-                if (!parse_AddExpr(&rhs)) return false;
-                *result = new calc::CmpLt(*result, rhs);
-            } else {
+            {
+                auto _m1 = save();
+                if ([&]() -> bool {
+                    skip();
+                    if (!match("==")) return false;
+                    skip();
+                    if (!parse_AddExpr(&rhs)) return false;
+                    *result = new calc::CmpEq(*result, rhs);
+                    return true;
+                }()) {} else {
+                restore(_m1);
+                if ([&]() -> bool {
+                    skip();
+                    if (!match("!=")) return false;
+                    skip();
+                    if (!parse_AddExpr(&rhs)) return false;
+                    *result = new calc::CmpNeq(*result, rhs);
+                    return true;
+                }()) {} else {
+                restore(_m1);
+                if ([&]() -> bool {
+                    skip();
+                    if (!match("<=")) return false;
+                    skip();
+                    if (!parse_AddExpr(&rhs)) return false;
+                    *result = new calc::CmpLe(*result, rhs);
+                    return true;
+                }()) {} else {
+                restore(_m1);
+                if ([&]() -> bool {
+                    skip();
+                    if (!match(">=")) return false;
+                    skip();
+                    if (!parse_AddExpr(&rhs)) return false;
+                    *result = new calc::CmpGe(*result, rhs);
+                    return true;
+                }()) {} else {
+                restore(_m1);
+                if ([&]() -> bool {
+                    skip();
+                    if (!match("<")) return false;
+                    skip();
+                    if (!parse_AddExpr(&rhs)) return false;
+                    *result = new calc::CmpLt(*result, rhs);
+                    return true;
+                }()) {} else {
+                restore(_m1);
                 skip();
                 if (!match(">")) return false;
                 skip();
                 if (!parse_AddExpr(&rhs)) return false;
                 *result = new calc::CmpGt(*result, rhs);
+                }
+                }
+                }
+                }
+                }
             }
             return true;
         }()) restore(_m0);

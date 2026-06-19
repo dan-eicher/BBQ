@@ -286,7 +286,7 @@ TEST(Parse, ArrayCountTerm) {
 // --- Array with until terminator ---
 
 TEST(Parse, ArrayUntilTerm) {
-    auto* g = parse("Pkts = array<Packet>(none, until(remaining < 4))");
+    auto* g = parse("Pkts = array<Packet>(none, until(@remaining < 4))");
     ASSERT_NE(g, nullptr);
     auto* arr = dynamic_cast<Array*>(g->rules[0]->body);
     ASSERT_NE(arr, nullptr);
@@ -344,4 +344,147 @@ TEST(Parse, EndianSwitchField) {
     // The endian_expr should be a Ternary with Eq comparison as condition
     auto* tern = dynamic_cast<Ternary*>(es->endian_expr);
     ASSERT_NE(tern, nullptr);
+}
+
+// --- LEB128 varint primitives ---
+
+TEST(Parse, Leb128Primitives) {
+    auto* g = parse(
+        "Msg = struct {\n"
+        "    a: uleb128,\n"
+        "    b: sleb32,\n"
+        "    c: uleb64,\n"
+        "    d: sleb128\n"
+        "}");
+    ASSERT_NE(g, nullptr);
+    auto* st = dynamic_cast<Struct*>(g->rules[0]->body);
+    ASSERT_NE(st, nullptr);
+    ASSERT_EQ(st->fields.size(), 4u);
+    auto enc = [](Field* f) {
+        auto* p = dynamic_cast<Primitive*>(f->body);
+        return dynamic_cast<IntegerKind*>(p->kind);
+    };
+    // uleb128 → unsigned, W32 carrier, Uleb encoding, endian-free.
+    EXPECT_EQ(enc(st->fields[0])->encoding, Encoding::Uleb);
+    EXPECT_EQ(enc(st->fields[0])->width, Width::W32);
+    EXPECT_EQ(enc(st->fields[0])->sign, Signedness::Unsigned);
+    // sleb32 → signed, W32, Sleb.
+    EXPECT_EQ(enc(st->fields[1])->encoding, Encoding::Sleb);
+    EXPECT_EQ(enc(st->fields[1])->sign, Signedness::Signed);
+    // uleb64 → W64 carrier (explicit width); plain uleb128/sleb128 default to W32.
+    EXPECT_EQ(enc(st->fields[2])->encoding, Encoding::Uleb);
+    EXPECT_EQ(enc(st->fields[2])->width, Width::W64);
+    EXPECT_EQ(enc(st->fields[3])->encoding, Encoding::Sleb);
+    EXPECT_EQ(enc(st->fields[3])->width, Width::W32);   // sleb128 → W32 carrier
+    // A plain fixed integer keeps Encoding::Fixed.
+    auto* g2 = parse("P = struct { x: uint32 }");
+    auto* st2 = dynamic_cast<Struct*>(g2->rules[0]->body);
+    auto* p = dynamic_cast<Primitive*>(st2->fields[0]->body);
+    EXPECT_EQ(dynamic_cast<IntegerKind*>(p->kind)->encoding, Encoding::Fixed);
+}
+
+// --- Context builtins (@name) ---
+
+TEST(Parse, ContextBuiltins) {
+    auto* g = parse(
+        "H = struct { a: uint8, b: uint8 }\n"
+        "  where verify(@buffer, @start, @end, @pos, @index, @remaining)");
+    ASSERT_NE(g, nullptr);
+    auto* st = dynamic_cast<Struct*>(g->rules[0]->body);
+    ASSERT_NE(st, nullptr);
+    ASSERT_TRUE(st->constraint.has_value());
+    auto* call = dynamic_cast<Call*>(*st->constraint);
+    ASSERT_NE(call, nullptr);
+    ASSERT_EQ(call->args.size(), 6u);
+    const char* names[] = {"buffer", "start", "end", "pos", "index", "remaining"};
+    for (size_t i = 0; i < 6; i++) {
+        auto* b = dynamic_cast<Builtin*>(call->args[i]);
+        ASSERT_NE(b, nullptr) << "arg " << i << " not a Builtin";
+        EXPECT_EQ(b->name, names[i]);
+    }
+}
+
+// --- Struct-level where (constraint on the whole struct) ---
+
+TEST(Parse, StructLevelWhere) {
+    auto* g = parse(
+        "Hdr = struct { a: uint8, b: uint8 } where verify(buffer, b)");
+    ASSERT_NE(g, nullptr);
+    auto* st = dynamic_cast<Struct*>(g->rules[0]->body);
+    ASSERT_NE(st, nullptr);
+    ASSERT_EQ(st->fields.size(), 2u);
+    ASSERT_TRUE(st->constraint.has_value());
+    // The constraint is the function call verify(buffer, b).
+    auto* call = dynamic_cast<Call*>(*st->constraint);
+    ASSERT_NE(call, nullptr);
+    EXPECT_EQ(call->func, "verify");
+    EXPECT_EQ(call->args.size(), 2u);
+
+    // A struct without a where has no constraint.
+    auto* g2 = parse("P = struct { x: uint8 }");
+    auto* st2 = dynamic_cast<Struct*>(g2->rules[0]->body);
+    EXPECT_FALSE(st2->constraint.has_value());
+}
+
+// --- Switch range cases (lo..hi) ---
+
+TEST(Parse, SwitchRangeCase) {
+    auto* g = parse(
+        "Msg = struct {\n"
+        "    tag: uint8,\n"
+        "    body: switch(tag) {\n"
+        "        1..3: uint8;\n"
+        "        10:   uint16;\n"
+        "    }\n"
+        "}");
+    ASSERT_NE(g, nullptr);
+    auto* st = dynamic_cast<Struct*>(g->rules[0]->body);
+    auto* sw = dynamic_cast<Switch*>(st->fields[1]->body);
+    ASSERT_NE(sw, nullptr);
+    ASSERT_EQ(sw->cases.size(), 2u);
+    auto* rv = dynamic_cast<RangeValue*>(sw->cases[0]->value);
+    ASSERT_NE(rv, nullptr);
+    EXPECT_EQ(rv->lo, 1);
+    EXPECT_EQ(rv->hi, 3);
+    // The non-range case is still a plain IntValue.
+    EXPECT_NE(dynamic_cast<IntValue*>(sw->cases[1]->value), nullptr);
+}
+
+// --- Extern with separate write function ---
+
+TEST(Parse, ExternWithWriteFunc) {
+    // Two-arg form: read fn + type, no write fn.
+    auto* g = parse("P = extern(\"read_p\", \"my_t\")");
+    auto* ext = dynamic_cast<Extern*>(g->rules[0]->body);
+    ASSERT_NE(ext, nullptr);
+    EXPECT_EQ(ext->func_name, "read_p");
+    EXPECT_EQ(ext->cpp_type, "my_t");
+    EXPECT_EQ(ext->write_func, "");
+
+    // Three-arg form: read fn + write fn + type.
+    auto* g2 = parse("Q = extern(\"read_q\", \"write_q\", \"my_t\")");
+    auto* ext2 = dynamic_cast<Extern*>(g2->rules[0]->body);
+    ASSERT_NE(ext2, nullptr);
+    EXPECT_EQ(ext2->func_name, "read_q");
+    EXPECT_EQ(ext2->write_func, "write_q");
+    EXPECT_EQ(ext2->cpp_type, "my_t");
+}
+
+// --- Verbatim code blocks (@header / @source / @writer) ---
+
+TEST(Parse, CodeBlocks) {
+    auto* g = parse(
+        "@header (. struct extra { int n; }; .)\n"
+        "@source (. int helper(void) { return 1; } .)\n"
+        "@writer (. int whelper(void) { return 2; } .)\n"
+        "P = struct { x: uint8 }");
+    ASSERT_NE(g, nullptr);
+    ASSERT_EQ(g->codes.size(), 3u);
+    EXPECT_EQ(g->codes[0]->section, CodeSection::HeaderBlock);
+    EXPECT_EQ(g->codes[1]->section, CodeSection::SourceBlock);
+    EXPECT_EQ(g->codes[2]->section, CodeSection::WriterBlock);
+    EXPECT_NE(g->codes[0]->code.find("struct extra"), std::string::npos);
+    EXPECT_NE(g->codes[1]->code.find("helper"), std::string::npos);
+    // Rules still parse alongside the code blocks.
+    ASSERT_EQ(g->rules.size(), 1u);
 }

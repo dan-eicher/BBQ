@@ -1,315 +1,206 @@
 # BBQ Python Extension Module
 
-CPython C API extension module wrapping the CEK VM backend. Provides
-zero-copy parsing of binary data with lazy materialization — values are
-decoded from the underlying buffer only when accessed from Python.
+CPython C API extension wrapping the CEK VM. The workflow is **parse · explore ·
+edit · emit** for prototyping grammars and exploring binary formats: parse a real
+binary, get a zero-copy Python container, poke and edit it, and serialize back to
+bytes. There is **no write-verification** — `emit()` serializes the overlay exactly
+as poked; matching a format's derived fields (counts, lengths) to your edits is your
+job. For grammar-verified output, compile the spec to a C/C++ parser via `bbqc`.
 
-**Source:** `bindings/python/bbq_python.cpp` (single file, no headers)
-**Tests:** `test/test_bbq_python.py` (146 tests)
+A separate `bbq.build` submodule constructs binary content from scratch (a typed
+byte-emitter — the struct-tier analogue of Python's `struct`).
+
+**Source:** `bindings/python/bbq_python.cpp` (parse/edit) + `bindings/python/bbq_build.cpp` (construction)
+**Tests:** `test/test_bbq_python.py` (205 tests)
 
 ## Architecture
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
 │  Python                                                      │
-│  bbq.Spec  ──parse()──▶  bbq.ParseResult                    │
-│             ──parse_file()──▶  (mmap-backed)                 │
-│                              │                               │
-│                              ▼                               │
-│                          bbq.Node  (lazy, zero-copy)         │
-│                           ├── .field → Node                  │
-│                           ├── ["field"] → Node               │
-│                           ├── [i] → Node                     │
-│                           ├── [::2] → [Node, ...]            │
-│                           ├── int(n) / float(n) / str(n)     │
-│                           ├── bytes(n) / memoryview(n)       │
-│                           ├── n == 42 / n < 100              │
-│                           ├── .keys() / .values() / .items() │
-│                           ├── dict(n)                        │
-│                           ├── f"{n:08x}"                     │
-│                           └── dir(n)  (tab-completion)       │
-├──────────────────────────────────────────────────────────────┤
-│  C++ (bindings/python/bbq_python.cpp)                        │
+│  bbq.Spec  ──parse()──▶  bbq.ParseResult ──▶ bbq.Node        │
+│             ──parse_file()──▶ (mmap-backed)   (lazy, 0-copy) │
 │                                                              │
-│  PyBBQSpec     → owns CompiledGrammar*                       │
-│  PyBBQResult   → owns ParseArena* + Py_buffer + root         │
-│  PyBBQNode     → borrows FieldCapture* + back-ref Result     │
-│  PyBBQNodeIter → borrows FieldCapture children array         │
+│  bbq.build.{u8…u64,i8…i64,f32,f64,leb,sleb,text,raw}         │
+│            .Struct(**fields)  .Array(*elems)  → bytes(x)     │
 ├──────────────────────────────────────────────────────────────┤
-│  CEK VM (unchanged)                                          │
-│  CEKCompiler::compile() → CompiledGrammar*                   │
-│  CEKMachine::execute_from() → CaptureMetadata                │
+│  C++                                                         │
+│  bbq_python.cpp : Spec / ParseResult / Node over the CEK    │
+│                   parse + the bbq::zcow overlay (edit/emit)  │
+│  bbq_build.cpp  : grammar-free byte construction (knows only │
+│                   bytes; meets the parse side at bytes only) │
+├──────────────────────────────────────────────────────────────┤
+│  CEK VM (parse)  ·  bbq::zcow / bbq::emit (overlay + bytes)  │
 └──────────────────────────────────────────────────────────────┘
 ```
 
-## Ownership Model
-
-All types are GC-tracked where needed. No dangling pointers are possible.
-
-```
-PyBBQSpec (ref-counted)
-  ├─ owns CompiledGrammar* (deleted in tp_dealloc)
-  └─ owns ext_callables[] (Py_INCREF'd refs, Py_DECREF'd in tp_dealloc)
-
-PyBBQResult (ref-counted, GC-tracked)
-  ├─ owns ParseArena* (heap-allocated, deleted in tp_dealloc)
-  ├─ owns Py_buffer view (released in tp_dealloc; .obj holds the buffer/mmap ref)
-  ├─ holds Py_INCREF'd ref to PyBBQSpec (prevents grammar GC)
-  └─ CaptureMetadata.root → points into arena
-
-PyBBQNode (ref-counted, GC-tracked)
-  ├─ borrows const FieldCapture* (points into Result's arena)
-  └─ holds Py_INCREF'd ref to PyBBQResult (prevents arena GC)
-
-PyBBQNodeIter (ref-counted, GC-tracked)
-  ├─ borrows const FieldCapture* children array
-  └─ holds Py_INCREF'd ref to PyBBQResult (prevents arena GC)
-```
+The parse produces a `FieldCapture` index over the input buffer (zero-copy reads).
+Edits go through the `bbq::zcow` copy-on-write overlay; `emit()` blits unchanged
+(Borrowed) ranges and re-serializes changed (Owned) ones. ZCow knows only bytes — it
+has no concept of grammar, counts, or validity.
 
 ## Types
 
 ### `bbq.Spec`
 
-Wraps a compiled BBQ grammar. Thread-safe for concurrent reads (the
-continuation graph is immutable after compilation).
-
-**Methods:**
+A compiled grammar. Thread-safe for concurrent reads.
 
 | Method | Description |
 |--------|-------------|
-| `parse(data, *, rule=None)` | Parse `bytes`/`bytearray`/buffer. Returns `ParseResult`. |
-| `parse_file(path, *, rule=None)` | Parse a file (mmap'd for zero-copy). Returns `ParseResult`. |
+| `parse(data, *, rule=None)` | Parse `bytes`/buffer → `ParseResult`. |
+| `parse_file(path, *, rule=None)` | Parse a file (mmap'd, zero-copy) → `ParseResult`. |
 | `register_extern(name, callable)` | Register an external parser. See [External Parsers](#external-parsers). |
 
-**Properties:**
+Properties: `rules` (`list[str]`), `default_endian` (`"little"`/`"big"`).
 
-| Property | Type | Description |
-|----------|------|-------------|
-| `rules` | `list[str]` | Rule names defined in the spec |
-| `default_endian` | `str` | `"little"` or `"big"` |
+Module functions `bbq.compile(path)` / `bbq.compile_string(src)` build a `Spec`.
 
 ### `bbq.ParseResult`
 
-Owns the parse lifetime. Attribute access falls through to root children,
-so `result.header` is equivalent to `result.root.header`.
-
-**Properties:**
+Owns the parse lifetime; attribute access falls through to the root's children.
 
 | Property | Type | Description |
 |----------|------|-------------|
 | `success` | `bool` | Whether the parse succeeded |
-| `bytes_consumed` | `int` | Number of bytes consumed |
-| `error_message` | `str \| None` | Error message on failure, `None` on success |
-| `error_offset` | `int` | Byte offset where the error occurred |
-| `root` | `Node \| None` | Root node of the capture tree |
+| `bytes_consumed` | `int` | Bytes consumed |
+| `error_message` | `str \| None` | Error on failure |
+| `error_offset` | `int` | Byte offset of the error |
+| `root` | `Node \| None` | Root capture node |
 
-**Protocols:**
-
-| Operation | Behavior |
-|-----------|----------|
-| `result.field` | Attribute access to root children |
-| `result["field"]` | Subscript access (useful for Python-keyword field names) |
-| `result[0]` | Integer index into root children |
-| `result[0:2]` | Slice of root children → `list[Node]` |
-| `len(result)` | Number of root children |
-| `"field" in result` | Check if field name exists |
-| `for name, node in result:` | Iterate root children as `(name, node)` tuples |
-| `dir(result)` | Properties + root child names (tab-completion) |
-| `repr(result)` | `<bbq.ParseResult ok 7 bytes [tag, length, value]>` |
-
-### `bbq.Node`
-
-The core type. Wraps a single `FieldCapture*` with lazy materialization.
-Never copies data from the buffer until a Python value is requested.
-
-**Properties:**
-
-| Property | Type | Description |
-|----------|------|-------------|
-| `offset` | `tuple[int, int]` | `(start, end)` byte offsets in the buffer |
-| `raw` | `bytes` | Raw bytes from buffer `[start:end)` |
-| `capture_type` | `str` | Type name: `"uint32le"`, `"string"`, `"struct"`, etc. |
-| `name` | `str \| None` | Field name, or `None` for unnamed nodes (array elements) |
-| `value` | `int\|float\|bool\|str\|bytes\|Node` | Auto-materialized Python value |
-
-**Number protocol:**
-
-| Operation | Behavior |
-|-----------|----------|
-| `int(node)` | Decode integer value. TypeError on non-numeric types. |
-| `float(node)` | Decode float value. Int types promote to float. |
-| `bool(node)` | Truthy test: bool value, nonzero int, non-empty string, containers always true. |
-
-**Mapping protocol:**
-
-| Operation | Behavior |
-|-----------|----------|
-| `node["field"]` | Child by name → `Node`. Raises `KeyError` if missing. |
-| `node[i]` | Child by index → `Node`. Supports negative indices. |
-| `node[0:2]` | Slice of children → `list[Node]` |
-| `len(node)` | Child count for struct/array. `TypeError` on leaf nodes. |
-
-**Sequence protocol:**
-
-| Operation | Behavior |
-|-----------|----------|
-| `"field" in node` | Check if a child with the given name exists |
-
-**Buffer protocol:**
-
-| Operation | Behavior |
-|-----------|----------|
-| `bytes(node)` | Raw bytes of this node's span |
-| `memoryview(node)` | Read-only memoryview into the underlying buffer |
-
-**Iterator protocol:**
-
-| Operation | Behavior |
-|-----------|----------|
-| `for node in array_node:` | Yields child `Node` objects |
-| `for name, node in struct_node:` | Yields `(name, node)` tuples |
-| Leaf nodes | `TypeError: not iterable` |
-
-**Rich comparison:**
-
-| Operation | Behavior |
-|-----------|----------|
-| `node == 42` | Materialize value, compare with Python semantics |
-| `node < 100` | All comparison operators supported on leaf nodes |
-| Struct/array nodes | Identity comparison (`==`/`!=` only); ordering raises `TypeError` |
-
-**Methods:**
+Container protocols: `result.field`, `result["field"]`, `result[i]`, slices, `len()`,
+`in`, iteration as `(name, node)`, `dir()`. Plus:
 
 | Method | Description |
 |--------|-------------|
-| `keys()` | Child field names → `list[str]` (empty for leaf nodes) |
-| `values()` | Child nodes → `list[Node]` (empty for leaf nodes) |
-| `items()` | `list[tuple[str, Node]]` (empty for leaf nodes) |
+| `emit() -> bytes` | Serialize the overlay exactly as it stands (byte-identical to the input if unedited). No grammar derivation. |
+| `deltas() -> list[dict]` | The structured diff since parse: `{path, offset, old, new}` per changed field. |
 
-**Format protocol:**
+### `bbq.Node`
 
-| Operation | Example |
-|-----------|---------|
-| `f"{node:08x}"` | Format as hex: `"0000002a"` |
-| `f"{node:.2f}"` | Format as float: `"3.14"` |
-| `f"{node:>10s}"` | Format as string: `"     hello"` |
-| `format(node, "")` | Default string representation |
+The core lazy, zero-copy type over a single `FieldCapture`.
 
-**Other:**
+**Read / navigate:** `.field`, `["field"]`, `[i]` (negative ok), `[a:b]` slices,
+`len()`, `in`, iteration (struct → `(name, node)`, array → nodes), `keys()`/`values()`/`items()`, `dict(node)`, `dir()`.
+
+**Materialize:** `int()`, `float()`, `bool()`, `str()`, `bytes()`, `memoryview()`,
+`.value` (auto), rich comparison (`== 42`, `< 100`), `f"{node:08x}"`, `repr`.
+`hash()` raises (nodes have `__eq__`).
+
+**Properties:** `offset` `(start,end)`, `raw` (bytes), `capture_type` (str), `name`
+(`str|None`), `value`, and **`variant_tag`** — the union/switch arm ordinal, or
+`None` if the node is not a variant.
+
+**Edit (copy-on-write, byte-level):**
 
 | Operation | Behavior |
 |-----------|----------|
-| `str(node)` | String value for string nodes; `str(int)` for int nodes; `"True"`/`"False"` for bool |
-| `repr(node)` | `<bbq.Node 'magic' type=uint32le [0x0:0x4]>` |
-| `dir(node)` | Properties + methods + child names (tab-completion) |
-| `dict(node)` | Works on struct nodes via `items()` iteration |
-| `hash(node)` | Raises `TypeError: unhashable` (nodes have `__eq__`) |
+| `node.field = v` / `node[i] = v` | Set a leaf to an `int`/`float`/`bytes`/`str`/`bool`, keyed on the field's own recorded type (no grammar). |
+| `node.append(v)` | Append an array element: a scalar (typed from the array's existing elements), `bytes`, or a `bbq.build` object. |
+| `node[i] = bytes` / `bbq.build` obj | Splice an element wholesale (raw bytes in). |
+| `del node[i]` | Remove an array element. |
 
-### `bbq.NodeIter`
+`len(array_node)` is **live** — it reflects appends/deletes immediately, like a
+Python list. Structural *contents* (the new elements) are read back after
+`emit()` → re-parse. A format's count/length field is an ordinary byte; ZCow never
+derives it, so set it yourself if the format needs it (or re-parse to check).
 
-Iterator returned by `iter(node)` and `iter(result)`. Yields `(name, node)`
-tuples for struct nodes and bare `Node` objects for array nodes.
+## `bbq.build` — construction from scratch
 
-### `bbq.ParseError`
+A grammar-free factory of typed byte-emitters. Build mirrors read: leaves are typed
+scalars (a value, no children); containers are dict-/list-like; `bytes(x)` is the one
+shared verb.
 
-Exception raised by `compile()` and `compile_string()` on parse or semantic
-errors. Also raised by `parse()` for unknown rule names.
+**Leaf factories** (little-endian default; `endian="big"` to flip):
+`u8 u16 u32 u64  i8 i16 i32 i64  f32 f64`, `leb(v)` / `sleb(v)`, `text(s)` (UTF-8) /
+`raw(b)` (verbatim). A leaf has `.value`, `int()`/`float()`, `bytes()`, `.type`
+(`"u32le"`), `repr`. It has no `len`/index — it is not a container.
 
-## CaptureType → Python Value Mapping
+**Containers:**
+- `Struct(**fields)` — named, dict-like: `len`, `s["k"]`, `s.k`, `in`, iterate
+  `(name, child)`, `keys/values/items`, mutate (`s.k = ...`).
+- `Array(*elems)` (or `Array([elems])`) — positional, list-like: `len`, `a[i]`,
+  `append`, `del a[i]`, iterate.
 
-All conversions read directly from the buffer. Zero copy until a Python
-object is created.
+`bytes(x)` serializes (leaves encode; containers concatenate children in order). A
+scalar requires an explicit type (`b.u32(5)`, never bare `5`); a plain `bytes`/`bytearray`
+is accepted anywhere a child is. Names are labels only — never in the bytes.
 
-| CaptureType | `int()` | `float()` | `str()` | `bytes()` | `.value` |
-|---|---|---|---|---|---|
-| UInt8..UInt64* | decode | int→float | `str(int)` | raw | `int` |
-| Int8..Int64* | decode | int→float | `str(int)` | raw | `int` |
-| Float32/64* | TypeError | decode | `str(float)` | raw | `float` |
-| Bool | 0/1 | TypeError | `"True"/"False"` | raw | `bool` |
-| String | TypeError | TypeError | decode UTF-8 | raw | `str` |
-| Bytes | TypeError | TypeError | repr | raw | `bytes` |
-| Computed | value | float(value) | `str(value)` | raw | `int` |
-| Struct | TypeError | TypeError | repr | span bytes | `Node` (self) |
-| Array | TypeError | TypeError | repr | span bytes | `Node` (self) |
-| External | TypeError | TypeError | repr | raw | `bytes` |
+```python
+import bbq, bbq.build as b
 
-Endianness is baked into the `CaptureType` enum (e.g., `UInt32LE` vs
-`UInt32BE`), so decode is a simple switch — no runtime endian parameter.
+rec = b.Struct(
+    magic = b.u32(0xCAFEBABE, endian="big"),
+    n     = b.u8(3),
+    xs    = b.Array(b.u16(10), b.u16(20), b.u16(30)),
+)
+data = bytes(rec)                 # a whole binary from scratch
+```
+
+### Construction ↔ ZCow boundary
+
+The two layers meet only at **bytes**:
+
+- **New file from nothing:** `bytes(bbq.build.Struct(...))` — no parse, no overlay.
+- **Add to a parsed file:** the build object's bytes cross into the ZCow overlay as
+  an Owned node; `emit()` stitches them with the untouched (zero-copy) original.
+
+```python
+r = spec.parse(data)
+r.records.append(b.Struct(v=b.u8(3), w=b.u8(4)))   # enters as bytes
+out = r.emit()
+```
+
+A built object added to a parse is opaque bytes in the tree afterward — re-parse to
+navigate it as structure.
+
+## CaptureType → Python value
+
+All conversions read directly from the buffer (zero copy until a value is requested).
+
+| CaptureType | `.value` |
+|---|---|
+| UInt8..UInt64*, Int8..Int64* | `int` |
+| Float32/64* | `float` |
+| Bool | `bool` |
+| String | `str` (UTF-8) |
+| Bytes / External | `bytes` |
+| Computed | `int`/`bool`/`float`/`str` per its stored kind |
+| Struct / Array | `Node` (self) |
+
+Endianness is baked into the `CaptureType` (e.g. `UInt32LE` vs `UInt32BE`).
+
+## External Parsers
+
+A spec can delegate to a Python callable via `extern("name", "type")`:
+
+```python
+spec = bbq.compile_string('Msg = struct { hdr: uint32, blob: extern("decompress", "void") }')
+spec.register_extern("decompress", lambda mv: len(mv))   # (memoryview) -> int consumed | None
+result = spec.parse(raw_bytes)
+```
+
+The callable gets a read-only `memoryview` of the remaining input and returns the
+number of bytes consumed (or `None`/raise to fail). The `Spec` holds a strong
+reference to each registered callable.
 
 ## Error Handling
 
 | Condition | Exception |
 |-----------|-----------|
-| Compile failure (parse/sema) | `bbq.ParseError` |
+| Compile failure | `bbq.ParseError` |
 | Unknown rule name | `bbq.ParseError` |
 | Parse failure | `result.success == False` (not an exception) |
-| `int()` on non-integer type | `TypeError` |
-| `float()` on non-numeric type | `TypeError` |
-| Missing field attribute | `AttributeError` |
-| Missing field subscript | `KeyError` |
+| `int()`/`float()` on a wrong type | `TypeError` |
+| Missing field attribute / subscript | `AttributeError` / `KeyError` |
 | Index out of range | `IndexError` |
-| `len()`/`iter()`/subscript on leaf | `TypeError` |
-| Bad subscript key type | `TypeError` |
-| `hash(node)` | `TypeError: unhashable` |
-| `register_extern(name, non_callable)` | `TypeError` |
-
-## External Parsers
-
-BBQ specs can delegate to user-provided functions via `extern("name", "type")`.
-In Python, register a callable before parsing:
-
-```python
-spec = bbq.compile_string('''
-Msg = struct {
-    header: uint32,
-    payload: extern("decompress", "void")
-}
-''')
-
-def decompress(data: memoryview) -> int:
-    """Return number of bytes consumed, or None on failure."""
-    # data is a read-only memoryview of remaining input
-    return len(data)
-
-spec.register_extern("decompress", decompress)
-result = spec.parse(raw_bytes)
-```
-
-**Callable signature:** `(memoryview) -> int | None`
-
-- The `memoryview` covers remaining input from the current parse position.
-- Return an `int` (number of bytes consumed) on success.
-- Return `None` to signal failure (the VM will backtrack or fail).
-- Raising an exception is treated as failure (exception is cleared internally).
-- Returning a value larger than `len(data)` is treated as failure.
-- Returning `0` is valid (zero-length capture).
-
-**Multiple externs:** Call `register_extern()` once per name. Registering the
-same name twice replaces the previous callable.
-
-**Lifecycle:** The Spec holds strong references (`Py_INCREF`) to all
-registered callables. They are released when the Spec is deallocated.
-
-**Capture type:** External fields appear as `CaptureType::External`. The
-`.value` property returns raw `bytes` of the consumed span.
+| `bbq.build` child that isn't a build value or bytes | `TypeError` |
 
 ## Build
 
-The Python extension is optional — built only if `Python3::Development` is
-found by CMake.
-
-```cmake
-find_package(Python3 COMPONENTS Development)
-if(Python3_FOUND)
-    add_library(bbq_python MODULE bindings/python/bbq_python.cpp)
-    target_link_libraries(bbq_python PRIVATE bbq_frontend bbq_cek_backend Python3::Python)
-    set_target_properties(bbq_python PROPERTIES PREFIX "" OUTPUT_NAME "bbq")
-endif()
-```
+Built only if `Python3::Development` is found.
 
 ```sh
-# Build and test
 cmake -B build && cmake --build build -j4
-ctest --test-dir build --output-on-failure
+ctest --test-dir build -R bbq_python --output-on-failure
 PYTHONPATH=build python -m pytest test/test_bbq_python.py -v
 ```

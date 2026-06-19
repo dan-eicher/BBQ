@@ -1,0 +1,91 @@
+{# BBQ C types header — rendered from the neutral type model. Every type use is a
+   neutral node spelled by c_type(); every name is the canonical CamelCase rule
+   name spelled by c_sname() (struct tag) / c_tname() (typedef). The template holds
+   no C naming or type logic of its own. #}
+#ifndef BBQ_GENERATED_TYPES_H
+#define BBQ_GENERATED_TYPES_H
+
+#include <stdint.h>
+#include <stdbool.h>
+#include <stddef.h>
+#include "bbq_runtime.h"
+
+{% for n in forward_inline %}
+typedef struct {{ c_sname(n) }} {{ c_tname(n) }};
+{% endfor %}
+{% for r in forward_rules %}
+typedef struct {{ c_sname(r.name) }} {{ c_tname(r.name) }};
+{% endfor %}
+
+{% for d in defs %}
+{% if d.kind == "struct" %}
+{% for s in d.inlines %}
+struct {{ c_sname(s.name) }} {
+{% for f in s.fields %}
+    {{ c_type(f.type) }} {{ f.name }};
+{% endfor %}
+};
+
+{% endfor %}
+struct {{ c_sname(d.name) }} {
+{% for f in d.fields %}
+    {{ c_type(f.type) }} {{ f.name }};
+{% endfor %}
+};
+{% else if d.kind == "tagged" %}
+enum {{ c_sname(d.name) }}_tag {
+{% for e in d.enum %}
+{% if e.has_value %}
+    {{ c_sname(d.name) }}_{{ e.member }} = {{ e.value }},
+{% else %}
+    {{ c_sname(d.name) }}_{{ e.member }},
+{% endif %}
+{% endfor %}
+};
+
+struct {{ c_sname(d.name) }} {
+    enum {{ c_sname(d.name) }}_tag tag;
+    union {
+{% for v in d.variants %}
+        {{ c_type(v.type) }} {{ v.member }};
+{% endfor %}
+    } u;
+};
+{% else if d.kind == "array" %}
+typedef struct {
+    {{ c_type(d.elem_type) }}* items;
+    size_t count;
+} {{ c_tname(d.name) }};
+{% else if d.kind == "optional" %}
+typedef struct {
+    bool has_value;
+    {{ c_type(d.elem_type) }} value;
+} {{ c_tname(d.name) }};
+{% else if d.kind == "typedef" %}
+typedef {{ c_type(d.underlying) }} {{ c_tname(d.name) }};
+{% else if d.kind == "bitfield" %}
+struct {{ c_sname(d.name) }} {
+{% for e in d.entries %}
+    {{ bitfield_type(e.width) }} {{ e.name }};
+{% endfor %}
+};
+{% endif %}
+
+{% endfor %}
+
+{% if has_frees %}
+// ── Free functions ──
+
+#include <stdlib.h>
+
+{% for fr in frees %}
+static inline void {{ c_sname(fr.name) }}_free({{ c_tname(fr.name) }}* p);
+{% endfor %}
+
+{% for fr in frees %}
+static inline void {{ c_sname(fr.name) }}_free({{ c_tname(fr.name) }}* p) {
+{{ fr.body }}}
+
+{% endfor %}
+{% endif %}
+{{ user_header }}#endif /* BBQ_GENERATED_TYPES_H */

@@ -1,52 +1,47 @@
 # Jitterator — Copy-and-Patch stencil extractor
 
+# The ELF64 reader is generated from extract/elf64.bbq by bbqc's render C++
+# backend — the cpp-zcow (view) parser: builds a zero-copy capture index, read
+# through header-only handles. Regenerated whenever the grammar or templates
+# change, so it can't go stale.
+set(ELF64_TYPES  ${CMAKE_CURRENT_BINARY_DIR}/elf64Types.h)
+set(ELF64_READER ${CMAKE_CURRENT_BINARY_DIR}/elf64Reader.h)
+add_custom_command(
+    OUTPUT ${ELF64_TYPES} ${ELF64_READER}
+    COMMAND bbqc -backend cpp
+                 -prefix elf64 -namespace elf
+                 -templates ${CMAKE_SOURCE_DIR}/backends/render/templates
+                 -o ${CMAKE_CURRENT_BINARY_DIR}
+                 ${CMAKE_CURRENT_SOURCE_DIR}/extract/elf64.bbq
+    DEPENDS bbqc
+            ${CMAKE_CURRENT_SOURCE_DIR}/extract/elf64.bbq
+            ${CMAKE_SOURCE_DIR}/backends/render/templates/types_cpp.inja
+            ${CMAKE_SOURCE_DIR}/backends/render/templates/reader_view_cpp.inja
+    COMMENT "bbqc: elf64.bbq -> elf64Types.h + elf64Reader.h (cpp-zcow view parser)"
+    VERBATIM
+)
+
 add_executable(jitterator
     src/jitterator.cpp
-    extract/elf64Parser.cpp
+    ${CMAKE_SOURCE_DIR}/backends/cpp/runtime/CaptureDecode.cpp  # shared offset->value decoders
+    ${ELF64_TYPES} ${ELF64_READER}
 )
+# A C++ parser consumer depends ONLY on the neutral index runtime — never on the
+# CEK machine (backends/cek). That this builds without backends/cek is the proof.
 target_include_directories(jitterator PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/extract
-    ${CMAKE_SOURCE_DIR}/backends/cpp/runtime  # BBQContext.h
+    ${CMAKE_CURRENT_BINARY_DIR}                 # generated elf64Types.h / elf64Parser.h
+    ${CMAKE_SOURCE_DIR}/backends/cpp/runtime     # bbq_node.h + the index runtime
 )
 
-# --- Calculator proof-of-life example ---
-add_executable(calc_example
-    example/calc.cpp
-)
-target_include_directories(calc_example PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/example
-    ${CMAKE_CURRENT_SOURCE_DIR}/runtime
-)
-
-# --- Calculator JIT (full toolchain demo: pegc + asdl + burgc + jitterator) ---
-
-# Compile calc_stencils.c → calc_stencils.o with the preserve_none /
-# musttail attributes intact, then run jitterator on it to extract
-# bytecode + patch info into calc_stencil_table.h. The header is
-# checked into source so calc_jit.cpp / compiler.h can include it.
-set(CALC_STENCILS_O ${CMAKE_CURRENT_BINARY_DIR}/calc_stencils.o)
-set(CALC_STENCIL_TABLE ${CMAKE_CURRENT_SOURCE_DIR}/example/calc_stencil_table.h)
+# --- Calculator (full toolchain demo: pegc + asdl + ddcg + burgc + opgen) ---
+# The calc lowers parsed programs through pegc → ddcg → CPS/ANF IR →
+# burgc (cg_jump) → opgen-generated two-tier VM. clang is needed for the
+# generated VM (preserve_none + musttail); find it once here.
 find_program(CLANG_C_COMPILER NAMES clang)
 if(NOT CLANG_C_COMPILER)
-    message(FATAL_ERROR "clang required to compile calc_stencils.c "
+    message(FATAL_ERROR "clang required for the opgen-way calc VM "
                         "(preserve_none + musttail attributes are clang-specific)")
 endif()
-add_custom_command(
-    OUTPUT ${CALC_STENCILS_O}
-    COMMAND ${CLANG_C_COMPILER} -O2 -fno-stack-protector -fno-asynchronous-unwind-tables
-            -c ${CMAKE_CURRENT_SOURCE_DIR}/example/calc_stencils.c
-            -o ${CALC_STENCILS_O}
-    DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/example/calc_stencils.c
-    COMMENT "compile calc_stencils.c -> calc_stencils.o"
-    VERBATIM
-)
-add_custom_command(
-    OUTPUT ${CALC_STENCIL_TABLE}
-    COMMAND jitterator ${CALC_STENCILS_O} -o ${CALC_STENCIL_TABLE}
-    DEPENDS jitterator ${CALC_STENCILS_O}
-    COMMENT "jitterator: calc_stencils.o -> calc_stencil_table.h"
-    VERBATIM
-)
 
 # ASDL JSON sidecars (consumed by ddcgc + burgc) + asdl-generated
 # C++ headers (CalcAST.h, CalcIR.h). The headers are checked into
@@ -147,7 +142,6 @@ add_library(calc_runner STATIC
     ${CALC_AST_HEADER}
     ${CALC_IR_HEADER}
     ${CALC_COMPILE_H}
-    ${CALC_STENCIL_TABLE}
     ${CMAKE_CURRENT_BINARY_DIR}/CalcMatcher.h
 )
 target_include_directories(calc_runner PUBLIC
@@ -155,14 +149,114 @@ target_include_directories(calc_runner PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/example/frontend
     ${CMAKE_CURRENT_SOURCE_DIR}/runtime
     ${CMAKE_SOURCE_DIR}/pegc/runtime
+    ${CMAKE_SOURCE_DIR}/opgen/runtime                  # bbq_emit.h (generic emitter)
     ${CMAKE_CURRENT_BINARY_DIR}                        # calc_compile.h, CalcMatcher.h
 )
 
-add_executable(calc_jit example/calc_jit.cpp)
-target_link_libraries(calc_jit PRIVATE calc_runner)
-
-# Tests: numeric-result regression + structural IR-shape assertions.
 find_package(GTest REQUIRED)
-add_executable(calc_tests example/calc_tests.cpp)
-target_link_libraries(calc_tests PRIVATE calc_runner GTest::GTest GTest::Main)
-add_test(NAME calc_tests COMMAND calc_tests)
+
+# ──────────────────────────────────────────────────────────────────
+# opgen-way calc: a real two-tier VM (threaded interpreter + copy-and-
+# patch JIT) generated by opgen from one calc.def — "WASM lite". Real
+# parsed calc programs run the whole toolchain end to end:
+#   pegc → ddcg → CPS/ANF IR → cg_jump lowering → opgen 2-tier VM.
+# Both tiers run the SAME generated opcode bodies, so interp == JIT by
+# construction. clang is required (preserve_none + musttail).
+# ──────────────────────────────────────────────────────────────────
+find_program(CLANG_CXX_COMPILER NAMES clang++)
+if(NOT CLANG_CXX_COMPILER)
+    message(FATAL_ERROR "clang++ required for the opgen-way calc VM (musttail)")
+endif()
+
+set(CALC_VM_DIR ${CMAKE_CURRENT_BINARY_DIR}/calc_vm)
+set(CALC_VM_GEN
+    ${CALC_VM_DIR}/gen_interp.c   ${CALC_VM_DIR}/gen_interp.h
+    ${CALC_VM_DIR}/runtime_api.h  ${CALC_VM_DIR}/opcodes.h
+    ${CALC_VM_DIR}/opcode_tables.c ${CALC_VM_DIR}/wasm_stencils.c
+    ${CALC_VM_DIR}/wasm_jit_meta.h ${CALC_VM_DIR}/wasm_jit_symbols.h
+    ${CALC_VM_DIR}/wasm_valtype.h  ${CALC_VM_DIR}/wasm_type_meta.h)
+add_custom_command(
+    OUTPUT ${CALC_VM_GEN}
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${CALC_VM_DIR}
+    COMMAND opgen -i ${CMAKE_CURRENT_SOURCE_DIR}/example/grammar/calc.def -o ${CALC_VM_DIR}
+    DEPENDS opgen
+            ${CMAKE_CURRENT_SOURCE_DIR}/example/grammar/calc.def
+            ${CMAKE_CURRENT_SOURCE_DIR}/example/calc_backend.h
+    COMMENT "opgen: calc.def -> two-tier calc VM"
+    VERBATIM
+)
+
+# Shared include flags: the substrate (calc_backend.h), the bbq_ctx
+# cursor (bbq_runtime.h), the generated VM headers, the JIT runtime,
+# the calc frontend (calc_runner.h / calc_lower.h / CalcIR.h).
+set(CALC_VM_INCS
+    -I${CALC_VM_DIR}
+    -I${CMAKE_CURRENT_SOURCE_DIR}/example
+    -I${CMAKE_CURRENT_SOURCE_DIR}/example/frontend
+    -I${CMAKE_SOURCE_DIR}/backends/c/runtime
+    -I${CMAKE_SOURCE_DIR}/opgen/runtime
+    -I${CMAKE_CURRENT_SOURCE_DIR}/runtime
+    -I${CMAKE_SOURCE_DIR}/pegc/runtime
+    -I${CMAKE_CURRENT_BINARY_DIR})
+
+# Tier 0 — the threaded interpreter object (clang: musttail).
+set(CALC_INTERP_O ${CALC_VM_DIR}/gen_interp.o)
+add_custom_command(
+    OUTPUT ${CALC_INTERP_O}
+    COMMAND ${CLANG_C_COMPILER} -std=c11 -O2 ${CALC_VM_INCS}
+            -c ${CALC_VM_DIR}/gen_interp.c -o ${CALC_INTERP_O}
+    DEPENDS ${CALC_VM_GEN}
+    COMMENT "clang: calc interpreter (gen_interp.c)"
+    VERBATIM
+)
+
+# Tier 1 — the copy-and-patch stencils → jitterator → stencil table.
+set(CALC_VM_STENCILS_O ${CALC_VM_DIR}/wasm_stencils.o)
+add_custom_command(
+    OUTPUT ${CALC_VM_STENCILS_O}
+    COMMAND ${CLANG_C_COMPILER} -std=c11 -O2 -fno-stack-protector
+            -fno-asynchronous-unwind-tables ${CALC_VM_INCS}
+            -c ${CALC_VM_DIR}/wasm_stencils.c -o ${CALC_VM_STENCILS_O}
+    DEPENDS ${CALC_VM_GEN}
+    COMMENT "clang: calc VM stencils (wasm_stencils.c)"
+    VERBATIM
+)
+set(CALC_VM_STENCIL_TABLE ${CALC_VM_DIR}/wasm_stencil_table.h)
+add_custom_command(
+    OUTPUT ${CALC_VM_STENCIL_TABLE}
+    COMMAND jitterator ${CALC_VM_STENCILS_O} -o ${CALC_VM_STENCIL_TABLE}
+    DEPENDS jitterator ${CALC_VM_STENCILS_O}
+    COMMENT "jitterator: calc VM stencils -> wasm_stencil_table.h"
+    VERBATIM
+)
+
+# Tier 0 e2e — real parsed programs (calc_compile) → cg_jump lowering
+# → the generated interpreter.
+set(CALC_VM_E2E ${CALC_VM_DIR}/calc_vm_e2e)
+add_custom_command(
+    OUTPUT ${CALC_VM_E2E}
+    COMMAND ${CLANG_CXX_COMPILER} -std=c++17 ${CALC_VM_INCS}
+            ${CMAKE_CURRENT_SOURCE_DIR}/example/test/calc_e2e_test.cpp
+            $<TARGET_FILE:calc_runner> ${CALC_INTERP_O} -lm -o ${CALC_VM_E2E}
+    DEPENDS ${CALC_INTERP_O} calc_runner
+            ${CMAKE_CURRENT_SOURCE_DIR}/example/test/calc_e2e_test.cpp
+    COMMENT "clang: calc VM e2e (parse -> ddcg -> IR -> bytecode -> interp)"
+    VERBATIM
+)
+add_custom_target(calc_vm_e2e_build ALL DEPENDS ${CALC_VM_E2E})
+add_test(NAME calc_vm_e2e COMMAND ${CALC_VM_E2E})
+
+# Tier 0 == Tier 1 — the same bytecode on interp and JIT must agree.
+set(CALC_VM_JIT ${CALC_VM_DIR}/calc_vm_jit)
+add_custom_command(
+    OUTPUT ${CALC_VM_JIT}
+    COMMAND ${CLANG_C_COMPILER} -std=c11 -O2 ${CALC_VM_INCS}
+            ${CMAKE_CURRENT_SOURCE_DIR}/example/test/calc_vm_test.c
+            ${CALC_INTERP_O} -lm -o ${CALC_VM_JIT}
+    DEPENDS ${CALC_INTERP_O} ${CALC_VM_STENCIL_TABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/example/test/calc_vm_test.c
+    COMMENT "clang: calc VM interp==JIT harness"
+    VERBATIM
+)
+add_custom_target(calc_vm_jit_build ALL DEPENDS ${CALC_VM_JIT})
+add_test(NAME calc_vm_jit COMMAND ${CALC_VM_JIT})

@@ -8,16 +8,26 @@
 #include "Frame.h"
 #include "Machine.h"
 
-using namespace bbq::cek;
+using namespace bbq;        // index runtime: ParseArena, FieldCapture, CaptureType, ...
+using namespace bbq::cek;   // machine IR: Value, CEKMachine, ...
 
 // Test helper: wrap an integer in an IntValue allocated in `arena`.
 // Used by Binding initializers and add_field/add_computed calls in
 // the migrated tests, since the new IR types those slots as `Value*`
 // instead of the old `int64_t`.
-static inline bbq::cek::Value* iv(bbq::cek::ParseArena& arena, int64_t v) {
+static inline bbq::cek::Value* iv(bbq::ParseArena& arena, int64_t v) {
     auto* x = arena.alloc<bbq::cek::IntValue>();
     x->v = v;
     return x;
+}
+
+// Neutral computed scalar for the index builder. The index runtime stores a
+// ComputedValue (no machine-IR dependency), not the machine's Value.
+static inline bbq::ComputedValue* cv(bbq::ParseArena& arena, int64_t v) {
+    auto* c = arena.alloc<bbq::ComputedValue>();
+    c->kind = bbq::ComputedValue::Kind::Int;
+    c->i = v;
+    return c;
 }
 
 // ── ParseArena ─────────────────────────────────────────────
@@ -223,25 +233,25 @@ TEST(CEKEnvironment, Shadowing) {
 TEST(CEKCaptureBuilder, AddField) {
     ParseArena arena;
     CaptureBuilder builder;
-    builder.add_field(nullptr, 0, 1, CaptureType::UInt8, iv(arena, 42));
-    builder.add_field(nullptr, 1, 3, CaptureType::UInt16LE, iv(arena, 0x0201));
+    builder.add_field(nullptr, 0, 1, CaptureType::UInt8, cv(arena, 42));
+    builder.add_field(nullptr, 1, 3, CaptureType::UInt16LE, cv(arena, 0x0201));
     EXPECT_EQ(builder.fields().size(), 2u);
-    EXPECT_EQ(static_cast<bbq::cek::IntValue*>(builder.fields()[0].computed_value)->v, 42);
-    EXPECT_EQ(static_cast<bbq::cek::IntValue*>(builder.fields()[1].computed_value)->v, 0x0201);
+    EXPECT_EQ(builder.fields()[0].computed_value->i, 42);
+    EXPECT_EQ(builder.fields()[1].computed_value->i, 0x0201);
 }
 
 TEST(CEKCaptureBuilder, MarkRestore) {
     ParseArena arena;
     CaptureBuilder builder;
-    builder.add_field(nullptr, 0, 1, CaptureType::UInt8, iv(arena, 1));
+    builder.add_field(nullptr, 0, 1, CaptureType::UInt8, cv(arena, 1));
     auto m = builder.mark();
-    builder.add_field(nullptr, 1, 2, CaptureType::UInt8, iv(arena, 2));
-    builder.add_field(nullptr, 2, 3, CaptureType::UInt8, iv(arena, 3));
+    builder.add_field(nullptr, 1, 2, CaptureType::UInt8, cv(arena, 2));
+    builder.add_field(nullptr, 2, 3, CaptureType::UInt8, cv(arena, 3));
     EXPECT_EQ(builder.fields().size(), 3u);
 
     builder.restore(m);
     EXPECT_EQ(builder.fields().size(), 1u);
-    EXPECT_EQ(static_cast<bbq::cek::IntValue*>(builder.fields()[0].computed_value)->v, 1);
+    EXPECT_EQ(builder.fields()[0].computed_value->i, 1);
 }
 
 TEST(CEKCaptureBuilder, AddComputed) {
@@ -249,7 +259,7 @@ TEST(CEKCaptureBuilder, AddComputed) {
     StringPool pool;
     CaptureBuilder builder;
     const char* nm = pool.intern("derived");
-    builder.add_computed(nm, iv(arena, 0xABCD), /*pos=*/8);
+    builder.add_computed(nm, cv(arena, 0xABCD), /*pos=*/8);
     ASSERT_EQ(builder.fields().size(), 1u);
     const auto& f = builder.fields()[0];
     EXPECT_EQ(f.name, nm);
@@ -257,7 +267,7 @@ TEST(CEKCaptureBuilder, AddComputed) {
     EXPECT_EQ(f.start_offset, 8u);
     EXPECT_EQ(f.end_offset, 8u);   // zero-width at pos
     ASSERT_NE(f.computed_value, nullptr);
-    EXPECT_EQ(static_cast<bbq::cek::IntValue*>(f.computed_value)->v, 0xABCD);
+    EXPECT_EQ(f.computed_value->i, 0xABCD);
     EXPECT_EQ(f.children, nullptr);
     EXPECT_EQ(f.child_count, 0);
 }
@@ -343,7 +353,6 @@ TEST(CEKLayer1IR, SpineKontHasNextField) {
     ParseArena arena;
     auto* halt = arena.alloc<HaltNode>();
     auto* match = arena.alloc<MatchPrimitiveNode>();
-    match->field_name = "x";
     match->next = halt;
     EXPECT_EQ(match->next, halt);
 }
@@ -481,24 +490,6 @@ TEST(CEKLayer2Leaves, Remaining) {
     EXPECT_EQ(static_cast<IntValue*>(r.result)->v, 16);
 }
 
-TEST(CEKLayer2Leaves, AtEndFalseAtStart) {
-    ParseArena arena;
-    auto* k = arena.alloc<AtEndKont>();
-    uint8_t buf[4] = {};
-    auto r = run_leaf(k, arena, buf, 4);
-    ASSERT_NE(r.result, nullptr);
-    ASSERT_EQ(r.result->tag, ValueTag::BoolValue);
-    EXPECT_FALSE(static_cast<BoolValue*>(r.result)->v);
-}
-
-TEST(CEKLayer2Leaves, AtEndTrueOnEmpty) {
-    ParseArena arena;
-    auto* k = arena.alloc<AtEndKont>();
-    auto r = run_leaf(k, arena, nullptr, 0);
-    ASSERT_NE(r.result, nullptr);
-    EXPECT_TRUE(static_cast<BoolValue*>(r.result)->v);
-}
-
 TEST(CEKLayer2Leaves, EOI) {
     ParseArena arena;
     auto* k = arena.alloc<EOIKont>();
@@ -604,10 +595,16 @@ MatchResult run_match_prim(ParseArena& arena, const char* name,
                            const uint8_t* data, size_t length,
                            bool little_endian = true) {
     auto* halt = arena.alloc<HaltNode>();
+    // producer → Capture → StoreEnv → halt
+    auto* st_env = arena.alloc<StoreEnvKont>();
+    st_env->name = name;
+    st_env->next = halt;
+    auto* cap = arena.alloc<CaptureKont>();
+    cap->name = name;
+    cap->next = st_env;
     auto* match = arena.alloc<MatchPrimitiveNode>();
-    match->field_name = name;
     match->prim = prim;
-    match->next = halt;
+    match->next = cap;
 
     CEKMachine m;
     m.arena = &arena;
@@ -787,6 +784,51 @@ TEST(CEKLayer2Binop, AddTypeMismatchFails) {
     auto* k = binop<AddKont>(arena, int_lit(arena, 1), str_lit(arena, "x"));
     auto r = run_expr(k, arena);
     EXPECT_TRUE(r.failed);
+}
+
+// CEK arithmetic must match the SAME C++ expression. C's usual arithmetic conversions
+// are the standard (the C/C++ backends emit native C; the CEK is the conformer). The C++
+// literal on the right is constant-folded = the C-correct answer. Edge cases, not happy path:
+// negative-division/mod truncation, non-commutative ops in both operand orders, comparison
+// boundaries, mixed int/float promotion.
+TEST(CEKLayer2Binop, ArithConformsToC) {
+    ParseArena arena;
+    auto V = [&](KontNode* k) { auto r = run_expr(k, arena); EXPECT_FALSE(r.failed); return r.result; };
+#define II(op, a, b) static_cast<IntValue*>(V(binop<op##Kont>(arena, int_lit(arena, a), int_lit(arena, b))))->v
+#define IF(op, a, b) static_cast<FloatValue*>(V(binop<op##Kont>(arena, int_lit(arena, a), float_lit(arena, b))))->v
+#define FI(op, a, b) static_cast<FloatValue*>(V(binop<op##Kont>(arena, float_lit(arena, a), int_lit(arena, b))))->v
+#define BIF(op, a, b) static_cast<BoolValue*>(V(binop<op##Kont>(arena, int_lit(arena, a), float_lit(arena, b))))->v
+#define BFI(op, a, b) static_cast<BoolValue*>(V(binop<op##Kont>(arena, float_lit(arena, a), int_lit(arena, b))))->v
+
+    // int/int: division truncates toward zero, % sign follows the dividend (C semantics)
+    EXPECT_EQ(II(Div, 7, 2),   7 / 2);
+    EXPECT_EQ(II(Div, -7, 2),  -7 / 2);
+    EXPECT_EQ(II(Mod, -7, 3),  -7 % 3);
+    EXPECT_EQ(II(Mod, 7, -3),  7 % -3);
+
+    // mixed int/float promotes to float; both operand orders for non-commutative ops
+    EXPECT_DOUBLE_EQ(IF(Div, 5, 2.0),  5 / 2.0);
+    EXPECT_DOUBLE_EQ(FI(Div, 5.0, 2),  5.0 / 2);
+    EXPECT_DOUBLE_EQ(IF(Sub, 1, 0.25), 1 - 0.25);
+    EXPECT_DOUBLE_EQ(FI(Sub, 0.25, 1), 0.25 - 1);
+    EXPECT_DOUBLE_EQ(IF(Add, 3, 1.5),  3 + 1.5);
+    EXPECT_DOUBLE_EQ(IF(Mul, -4, 2.5), -4 * 2.5);
+
+    // comparisons across the int/float boundary
+    EXPECT_EQ(BIF(Eq, 3, 3.0), 3 == 3.0);
+    EXPECT_EQ(BIF(Ne, 3, 3.0), 3 != 3.0);
+    EXPECT_EQ(BIF(Lt, 3, 3.0), 3 < 3.0);
+    EXPECT_EQ(BIF(Le, 3, 3.0), 3 <= 3.0);
+    EXPECT_EQ(BFI(Gt, 3.5, 3), 3.5 > 3);
+    EXPECT_EQ(BIF(Ge, 3, 3.5), 3 >= 3.5);
+
+    // genuinely incompatible operands still fail (not coerced)
+    EXPECT_TRUE(run_expr(binop<AddKont>(arena, int_lit(arena, 1), str_lit(arena, "x")), arena).failed);
+#undef II
+#undef IF
+#undef FI
+#undef BIF
+#undef BFI
 }
 
 TEST(CEKLayer2Binop, MulSubDivMod) {
@@ -1044,6 +1086,123 @@ TEST(CEKLayer3, StructWithConstraint) {
     delete r.grammar;
 }
 
+TEST(CEKLayer3, UnderscoreDropsFromOutput) {
+    // `_` is the effect destination: parsed (bytes consumed) but not stored.
+    // Multiple `_` are fine — none of them lands in the output tree.
+    auto r = layer3_compile_and_run(
+        "Hdr = struct { a: uint8, _: uint8, b: uint8, _: uint16le }",
+        "Hdr",
+        {0x01, 0x02, 0x03, 0x04, 0x05});
+    ASSERT_TRUE(r.compiled) << r.error;
+    ASSERT_TRUE(r.success) << r.error;
+    EXPECT_EQ(r.meta.bytes_consumed, 5u);    // all five bytes consumed
+    ASSERT_NE(r.meta.root, nullptr);
+    ASSERT_EQ(r.meta.root->child_count, 2);  // a, b — both `_` dropped
+    EXPECT_STREQ(r.meta.root->children[0].name, "a");
+    EXPECT_STREQ(r.meta.root->children[1].name, "b");
+    delete r.grammar;
+}
+
+TEST(CEKLayer3, UnderscoreVerifyThenDrop) {
+    // The magic-number case: parse, VERIFY via where, consume the bytes, but
+    // keep it out of the struct. A bad value must still fail the parse.
+    const char* spec = "Hdr = struct { _: uint8 where _ == 0x42, x: uint8 }";
+    auto ok = layer3_compile_and_run(spec, "Hdr", {0x42, 0x07});
+    ASSERT_TRUE(ok.compiled) << ok.error;
+    ASSERT_TRUE(ok.success) << ok.error;           // 0x42 verifies
+    EXPECT_EQ(ok.meta.bytes_consumed, 2u);
+    ASSERT_EQ(ok.meta.root->child_count, 1);       // only x; the `_` is dropped
+    EXPECT_STREQ(ok.meta.root->children[0].name, "x");
+    delete ok.grammar;
+
+    auto bad = layer3_compile_and_run(spec, "Hdr", {0x99, 0x07});
+    ASSERT_TRUE(bad.compiled) << bad.error;
+    EXPECT_FALSE(bad.success);                      // 0x99 fails the where
+    delete bad.grammar;
+}
+
+TEST(CEKLayer3, ArrayWithTypeSeparator) {
+    // `array<uint8>(uint8, count(3))`: 3 u8 elements, each pair split by a u8
+    // separator. Bytes [10, FF, 20, FF, 30] → elements at 0,2,4; the FF
+    // separators at 1,3 are parsed and discarded (δ=discard → Drop), never
+    // captured. (Separators are a PEG/CSV bolt-on — not in IPG.)
+    auto r = layer3_compile_and_run(
+        "Arr = array<uint8>(uint8, count(3))",
+        "Arr",
+        {0x10, 0xFF, 0x20, 0xFF, 0x30});
+    ASSERT_TRUE(r.compiled) << r.error;
+    ASSERT_TRUE(r.success) << r.error;
+    EXPECT_EQ(r.meta.bytes_consumed, 5u);          // elements + separators
+    auto& arr = r.meta.root->children[0];
+    EXPECT_EQ(arr.type, CaptureType::Array);
+    ASSERT_EQ(arr.child_count, 3);                 // 3 elements; separators dropped
+    EXPECT_EQ(arr.children[0].start_offset, 0u);
+    EXPECT_EQ(arr.children[1].start_offset, 2u);   // skipped separator at 1
+    EXPECT_EQ(arr.children[2].start_offset, 4u);   // skipped separator at 3
+    delete r.grammar;
+}
+
+TEST(CEKLayer3, ArrayWithVerifiedSeparator) {
+    // A real CSV-style delimiter: `uint8 where _ == 0x2C` (a comma). Each gap is
+    // parsed, VERIFIED to be the delimiter via its where, and dropped from the
+    // array — the separator is `_` for arrays, so it binds under `_` for the
+    // check (pure Drop couldn't resolve `_`) but never captures.
+    const char* spec = "Arr = array<uint8>(uint8 where _ == 0x2C, count(3))";
+    auto ok = layer3_compile_and_run(spec, "Arr", {0x10, 0x2C, 0x20, 0x2C, 0x30});
+    ASSERT_TRUE(ok.compiled) << ok.error;
+    ASSERT_TRUE(ok.success) << ok.error;
+    EXPECT_EQ(ok.meta.bytes_consumed, 5u);
+    auto& arr = ok.meta.root->children[0];
+    ASSERT_EQ(arr.child_count, 3);                  // 3 elements; commas dropped
+    EXPECT_EQ(arr.children[1].start_offset, 2u);
+    delete ok.grammar;
+
+    // A non-comma delimiter (0x3B) fails the separator's where → parse fails.
+    auto bad = layer3_compile_and_run(spec, "Arr", {0x10, 0x3B, 0x20, 0x2C, 0x30});
+    ASSERT_TRUE(bad.compiled) << bad.error;
+    EXPECT_FALSE(bad.success);
+    delete bad.grammar;
+}
+
+// @rest: the size field scopes the remainder of the struct to exactly
+// `size` bytes (a confined, exactly-consumed window).
+static const char* kRestSpec =
+    "Section = struct { id: uint8, size: uint8 @rest, a: uint8, b: uint8 }";
+
+TEST(CEKLayer3, RestExactConsumption) {
+    // size = 2; the two fields after it consume exactly the window.
+    auto r = layer3_compile_and_run(kRestSpec, "Section",
+                                    {0x10, 0x02, 0xAA, 0xBB});
+    ASSERT_TRUE(r.compiled) << r.error;
+    ASSERT_TRUE(r.success) << r.error;
+    EXPECT_EQ(r.meta.bytes_consumed, 4u);
+    ASSERT_NE(r.meta.root, nullptr);
+    ASSERT_EQ(r.meta.root->child_count, 4);
+    delete r.grammar;
+}
+
+TEST(CEKLayer3, RestUnderConsumptionFails) {
+    // size = 3 but the struct's fields consume only 2 bytes of the window —
+    // a size prefix means exactly, so the leftover byte is a parse error.
+    auto r = layer3_compile_and_run(kRestSpec, "Section",
+                                    {0x10, 0x03, 0xAA, 0xBB, 0xCC});
+    ASSERT_TRUE(r.compiled) << r.error;
+    EXPECT_FALSE(r.success);
+    EXPECT_NE(r.error.find("size mismatch"), std::string::npos) << r.error;
+    delete r.grammar;
+}
+
+TEST(CEKLayer3, RestWindowEscapingInputFails) {
+    // size = 5 declares a window past the end of the 4-byte input — confinement
+    // fails it at the size field, never silently clamped.
+    auto r = layer3_compile_and_run(kRestSpec, "Section",
+                                    {0x10, 0x05, 0xAA, 0xBB});
+    ASSERT_TRUE(r.compiled) << r.error;
+    EXPECT_FALSE(r.success);
+    EXPECT_NE(r.error.find("out of range"), std::string::npos) << r.error;
+    delete r.grammar;
+}
+
 TEST(CEKLayer3, ConstraintFails) {
     auto r = layer3_compile_and_run(
         "Magic = struct { ver: uint8 where ver == 1 }",
@@ -1069,8 +1228,8 @@ TEST(CEKLayer3, ComputeField) {
     EXPECT_STREQ(r.meta.root->children[1].name, "twice");
     EXPECT_EQ(r.meta.root->children[1].type, CaptureType::Computed);
     ASSERT_NE(r.meta.root->children[1].computed_value, nullptr);
-    EXPECT_EQ(r.meta.root->children[1].computed_value->tag, ValueTag::IntValue);
-    EXPECT_EQ(static_cast<bbq::cek::IntValue*>(r.meta.root->children[1].computed_value)->v, 14);
+    EXPECT_EQ(r.meta.root->children[1].computed_value->kind, bbq::ComputedValue::Kind::Int);
+    EXPECT_EQ(r.meta.root->children[1].computed_value->i, 14);
     delete r.grammar;
 }
 
@@ -1104,6 +1263,48 @@ TEST(CEKLayer3, OptionalAbsent) {
     delete r.grammar;
 }
 
+TEST(CEKLayer3, OptionalPredicatedSkipsPresentBytes) {
+    // The discriminating case: flag == 0 with element bytes available. A
+    // predicated optional skips the element because the predicate is false —
+    // it does NOT greedily try-parse it. So `tail` reads the byte right after
+    // `flag`, `extra` is absent, and only flag+tail are consumed. (A
+    // constraint-ignoring try/restore would have consumed the uint16le and
+    // left `tail` reading the fourth byte.)
+    auto r = layer3_compile_and_run(
+        "Hdr = struct {\n"
+        "    flag: uint8,\n"
+        "    extra: optional<uint16le> where flag != 0,\n"
+        "    tail: uint8\n"
+        "}",
+        "Hdr",
+        {0x00, 0x11, 0x22, 0x33});
+    ASSERT_TRUE(r.compiled) << r.error;
+    ASSERT_TRUE(r.success) << r.error;
+    EXPECT_EQ(r.meta.bytes_consumed, 2u);  // flag + tail; extra skipped
+    ASSERT_NE(r.meta.root, nullptr);
+    ASSERT_EQ(r.meta.root->child_count, 2);  // flag, tail (extra absent)
+    EXPECT_STREQ(r.meta.root->children[0].name, "flag");
+    EXPECT_STREQ(r.meta.root->children[1].name, "tail");
+    delete r.grammar;
+}
+
+TEST(CEKLayer3, OptionalPredicatedElementMandatory) {
+    // When the predicate holds the element is mandatory: flag != 0 but no bytes
+    // for `extra` is a hard parse failure, not a silent absence. (A try/restore
+    // optional would restore and succeed with extra absent — the wrong answer
+    // once the predicate has committed to the element being present.)
+    auto r = layer3_compile_and_run(
+        "Hdr = struct {\n"
+        "    flag: uint8,\n"
+        "    extra: optional<uint16le> where flag != 0\n"
+        "}",
+        "Hdr",
+        {0x01});  // flag != 0 but no bytes for the uint16le
+    ASSERT_TRUE(r.compiled) << r.error;
+    EXPECT_FALSE(r.success);
+    delete r.grammar;
+}
+
 TEST(CEKLayer3, ArrayFixedCount) {
     auto r = layer3_compile_and_run(
         "Buf = struct {\n"
@@ -1120,7 +1321,6 @@ TEST(CEKLayer3, ArrayFixedCount) {
     EXPECT_EQ(r.meta.root->children[1].child_count, 3);
     delete r.grammar;
 }
-
 TEST(CEKLayer3, ArrayUntilEof) {
     auto r = layer3_compile_and_run(
         "Bytes = array<uint8>(none, eof)",
@@ -1137,7 +1337,7 @@ TEST(CEKLayer3, ArrayUntilEof) {
 
 TEST(CEKLayer3, ArrayUntilCondition) {
     auto r = layer3_compile_and_run(
-        "Stream = array<uint8>(none, until(remaining < 2))",
+        "Stream = array<uint8>(none, until(@remaining < 2))",
         "Stream",
         {0xAA, 0xBB, 0xCC, 0xDD});  // stops when remaining < 2 → after 3rd byte
     ASSERT_TRUE(r.compiled) << r.error;
@@ -1156,6 +1356,114 @@ TEST(CEKLayer3, BitfieldBE) {
     ASSERT_TRUE(r.compiled) << r.error;
     ASSERT_TRUE(r.success) << r.error;
     EXPECT_EQ(r.meta.bytes_consumed, 1u);
+    delete r.grammar;
+}
+
+TEST(CEKLayer3, BitfieldEntryConstraint) {
+    // Per-member `where`: a member's constraint runs after its own
+    // ExtractBits/StoreEnv, against the just-extracted value (resolved by name
+    // through E). Full-width entry → shift 0 either endianness, so the test is
+    // about the constraint, not bit order.
+    const char* spec = "Flags = bitfield<uint8> { v: 8 where v == 0x42 }";
+    auto ok = layer3_compile_and_run(spec, "Flags", {0x42});
+    ASSERT_TRUE(ok.compiled) << ok.error;
+    ASSERT_TRUE(ok.success) << ok.error;
+    EXPECT_EQ(ok.meta.bytes_consumed, 1u);
+    delete ok.grammar;
+
+    auto bad = layer3_compile_and_run(spec, "Flags", {0x99});  // v=0x99 fails the where
+    ASSERT_TRUE(bad.compiled) << bad.error;
+    EXPECT_FALSE(bad.success);
+    delete bad.grammar;
+}
+
+TEST(CEKLayer3, SwitchDefaultRejectMessage) {
+    // `default: reject` and no-default both fail on an unmatched discriminant,
+    // but the no-match message names the cause distinctly.
+    auto rej = layer3_compile_and_run(
+        "Msg = struct {\n"
+        "    tag: uint8,\n"
+        "    body: switch(tag) {\n"
+        "        1: uint16le;\n"
+        "        default: reject;\n"
+        "    }\n"
+        "}",
+        "Msg", {0x99, 0x00, 0x00});       // tag=0x99 → no case, explicit reject
+    ASSERT_TRUE(rej.compiled) << rej.error;
+    EXPECT_FALSE(rej.success);
+    EXPECT_NE(rej.error.find("default: reject"), std::string::npos) << rej.error;
+    delete rej.grammar;
+
+    auto nod = layer3_compile_and_run(
+        "Msg = struct {\n"
+        "    tag: uint8,\n"
+        "    body: switch(tag) {\n"
+        "        1: uint16le;\n"
+        "    }\n"
+        "}",
+        "Msg", {0x99, 0x00, 0x00});       // tag=0x99 → no case, no default
+    ASSERT_TRUE(nod.compiled) << nod.error;
+    EXPECT_FALSE(nod.success);
+    EXPECT_NE(nod.error.find("no default"), std::string::npos) << nod.error;
+    delete nod.grammar;
+}
+
+// Collect RefKonts reachable from a rule body (down the spine + into a `where`
+// expression). Enough node types for the simple grammar below.
+static void collect_refkonts(KontNode* k, std::vector<const KontNode*>& seen,
+                             std::vector<RefKont*>& out) {
+    if (!k) return;
+    for (auto* s : seen) if (s == k) return;
+    seen.push_back(k);
+    if (auto* r = dynamic_cast<RefKont*>(k)) { out.push_back(r); return; }
+    if (auto* e = dynamic_cast<EvalConstraintNode*>(k)) {
+        collect_refkonts(e->constraint_expr, seen, out);
+        collect_refkonts(e->next, seen, out);
+        return;
+    }
+    if (auto* l = dynamic_cast<LtKont*>(k)) {
+        collect_refkonts(l->left, seen, out);
+        collect_refkonts(l->right, seen, out);
+        return;
+    }
+    if (auto* b = dynamic_cast<BeginStructNode*>(k)) { collect_refkonts(b->next, seen, out); return; }
+    if (auto* es = dynamic_cast<EndStructNode*>(k)) { collect_refkonts(es->next, seen, out); return; }
+    if (auto* m = dynamic_cast<MatchPrimitiveNode*>(k)) { collect_refkonts(m->next, seen, out); return; }
+    if (auto* c = dynamic_cast<CaptureKont*>(k)) { collect_refkonts(c->next, seen, out); return; }
+    if (auto* s = dynamic_cast<StoreEnvKont*>(k)) { collect_refkonts(s->next, seen, out); return; }
+}
+
+TEST(CEKLayer3, RefKontCarriesCrossRuleResolution) {
+    // `Inner`'s `where data < len` references `len` from the enclosing `Outer`.
+    // Sema's cross-rule resolution (parent rule + path + depth) must ride on the
+    // RefKont for the static emitter; the same-scope `data` ref stays clean.
+    auto r = layer3_compile_and_run(
+        "Outer = struct { len: uint8, inner: Inner }\n"
+        "Inner = struct { data: uint8 where data < len }",
+        "Outer", {0x05, 0x03});           // len=5; inner.data=3, 3<5 passes
+    ASSERT_TRUE(r.compiled) << r.error;
+    ASSERT_TRUE(r.success) << r.error;
+
+    KontNode* inner = r.grammar->lookup(std::string("Inner"));
+    ASSERT_NE(inner, nullptr);
+    std::vector<const KontNode*> seen;
+    std::vector<RefKont*> refs;
+    collect_refkonts(inner, seen, refs);
+
+    RefKont* len_ref = nullptr;
+    RefKont* data_ref = nullptr;
+    for (auto* rk : refs) {
+        if (std::string(rk->name) == "len") len_ref = rk;
+        if (std::string(rk->name) == "data") data_ref = rk;
+    }
+    ASSERT_NE(len_ref, nullptr) << "no RefKont(len) found";
+    EXPECT_STREQ(len_ref->resolved_parent, "Outer");   // cross-rule: names the parent rule
+    EXPECT_NE(len_ref->resolved_path, nullptr);        // ...and the field path within it
+
+    ASSERT_NE(data_ref, nullptr) << "no RefKont(data) found";
+    EXPECT_EQ(data_ref->resolved_parent, nullptr);     // same-scope: clean, no resolution
+    EXPECT_EQ(data_ref->resolved_path, nullptr);
+
     delete r.grammar;
 }
 
@@ -1207,6 +1515,239 @@ TEST(CEKLayer3, SwitchWithDefault) {
     ASSERT_TRUE(r.success) << r.error;
     EXPECT_EQ(r.meta.bytes_consumed, 2u);
     delete r.grammar;
+}
+
+TEST(CEKLayer3, Leb128Varints) {
+    // uleb128/sleb128 decode to the carrier width and land as Computed captures
+    // holding the decoded IntValue; the byte span consumed is data-dependent.
+    auto r = layer3_compile_and_run(
+        "Msg = struct {\n"
+        "    id: uleb128,\n"      // 0xAC 0x02      → 300
+        "    delta: sleb128,\n"   // 0x7F           → -1
+        "    wide: uleb64,\n"     // 0xE5 0x8E 0x26 → 624485
+        "    tail: uint8\n"       // 0x2A
+        "}",
+        "Msg",
+        {0xAC, 0x02, 0x7F, 0xE5, 0x8E, 0x26, 0x2A});
+    ASSERT_TRUE(r.compiled) << r.error;
+    ASSERT_TRUE(r.success) << r.error;
+    EXPECT_EQ(r.meta.bytes_consumed, 7u);   // exact variable spans consumed
+    ASSERT_NE(r.meta.root, nullptr);
+    ASSERT_EQ(r.meta.root->child_count, 4);
+    auto ival = [](const bbq::FieldCapture& f) {
+        return f.computed_value->i;
+    };
+    EXPECT_EQ(ival(r.meta.root->children[0]), 300);
+    EXPECT_EQ(ival(r.meta.root->children[1]), -1);
+    EXPECT_EQ(ival(r.meta.root->children[2]), 624485);
+    // The id field spans 2 bytes [0,2); delta 1 byte [2,3).
+    EXPECT_EQ(r.meta.root->children[0].start_offset, 0u);
+    EXPECT_EQ(r.meta.root->children[0].end_offset, 2u);
+    EXPECT_EQ(r.meta.root->children[1].end_offset, 3u);
+    delete r.grammar;
+}
+
+TEST(CEKLayer3, Leb128Rejected) {
+    // Overlong/over-wide uleb32: five continuation bytes exceed the 32-bit carrier.
+    auto r = layer3_compile_and_run(
+        "Msg = struct { id: uleb32 }",
+        "Msg",
+        {0x80, 0x80, 0x80, 0x80, 0x80, 0x00});  // 6 bytes, all-continuation → invalid
+    ASSERT_TRUE(r.compiled) << r.error;
+    EXPECT_FALSE(r.success);                     // strict decoder rejects
+    delete r.grammar;
+}
+
+TEST(CEKLayer3, SwitchRangeCases) {
+    // A range case `1..3` is expanded into one match entry per discriminant,
+    // all sharing a single compiled target.
+    const char* spec =
+        "Small = struct { v: uint8 }\n"
+        "Wide  = struct { v: uint16le }\n"
+        "Msg = struct {\n"
+        "    tag: uint8,\n"
+        "    body: switch(tag) {\n"
+        "        1..3: Small;\n"
+        "        10:   Wide;\n"
+        "    }\n"
+        "}";
+    // tag=2 falls inside 1..3 → Small (1-byte body).
+    auto r = layer3_compile_and_run(spec, "Msg", {0x02, 0x2A});
+    ASSERT_TRUE(r.compiled) << r.error;
+    ASSERT_TRUE(r.success) << r.error;
+    EXPECT_EQ(r.meta.bytes_consumed, 2u);
+    delete r.grammar;
+
+    // tag=3 (upper bound of the range) also routes to Small.
+    auto r3 = layer3_compile_and_run(spec, "Msg", {0x03, 0x2A});
+    ASSERT_TRUE(r3.success) << r3.error;
+    EXPECT_EQ(r3.meta.bytes_consumed, 2u);
+    delete r3.grammar;
+
+    // tag=10 routes to Wide (2-byte body); proves the non-range case still matches.
+    auto r10 = layer3_compile_and_run(spec, "Msg", {0x0A, 0x34, 0x12});
+    ASSERT_TRUE(r10.success) << r10.error;
+    EXPECT_EQ(r10.meta.bytes_consumed, 3u);
+    delete r10.grammar;
+}
+
+TEST(CEKLayer3, ArrayElementInterval) {
+    // Per-element random access: element i seeks to base-@index, so the array
+    // reads the input BACKWARD — provable random access, not sequential reads.
+    auto r = layer3_compile_and_run(
+        "M = struct {\n"
+        "    base: uint8,\n"
+        "    items: array<uint8>[3] @ [base - @index, base - @index + 1]\n"
+        "}",
+        "M",
+        {0x03, 0xAA, 0xBB, 0xCC});
+    ASSERT_TRUE(r.compiled) << r.error;
+    ASSERT_TRUE(r.success) << r.error;
+    ASSERT_NE(r.meta.root, nullptr);
+    // root.children = { base, items }; items is an array of 3.
+    ASSERT_EQ(r.meta.root->child_count, 2);
+    auto* items = &r.meta.root->children[1];
+    ASSERT_EQ(items->child_count, 3);
+    // Each element parsed at base-i: 3, 2, 1 — it sought backward each iteration.
+    EXPECT_EQ(items->children[0].start_offset, 3u);
+    EXPECT_EQ(items->children[1].start_offset, 2u);
+    EXPECT_EQ(items->children[2].start_offset, 1u);
+    delete r.grammar;
+
+    // Confinement: an element interval that escapes the input fails the parse.
+    auto bad = layer3_compile_and_run(
+        "M2 = struct {\n"
+        "    base: uint8,\n"
+        "    items: array<uint8>[3] @ [base + @index, base + @index + 1]\n"
+        "}",
+        "M2",
+        {0x02, 0xAA, 0xBB});   // base=2; element 2 seeks to [4,5), past the 3-byte input
+    ASSERT_TRUE(bad.compiled) << bad.error;
+    EXPECT_FALSE(bad.success);
+    delete bad.grammar;
+}
+
+TEST(CEKLayer3, StructLevelWhere) {
+    // A struct-level `where` runs after all fields are parsed and can reference
+    // any of them. Here it requires the two fields to match.
+    const char* spec = "Msg = struct { a: uint8, b: uint8 } where a == b";
+
+    auto ok = layer3_compile_and_run(spec, "Msg", {0x05, 0x05});
+    ASSERT_TRUE(ok.compiled) << ok.error;
+    EXPECT_TRUE(ok.success) << ok.error;          // a == b → passes
+    EXPECT_EQ(ok.meta.bytes_consumed, 2u);
+    delete ok.grammar;
+
+    auto bad = layer3_compile_and_run(spec, "Msg", {0x05, 0x06});
+    ASSERT_TRUE(bad.compiled) << bad.error;
+    EXPECT_FALSE(bad.success);                     // a != b → struct where rejects
+    delete bad.grammar;
+
+    // Probe: does a FIELD-level where reject at the top level?
+    auto fbad = layer3_compile_and_run(
+        "M2 = struct { a: uint8 where a == 1 }", "M2", {0x02});
+    ASSERT_TRUE(fbad.compiled) << fbad.error;
+    EXPECT_FALSE(fbad.success);                    // field where rejection
+    delete fbad.grammar;
+
+    // Probe: a struct where on a builtin (pos), no field refs.
+    auto pbad = layer3_compile_and_run(
+        "M3 = struct { a: uint8, b: uint8 } where pos > 100", "M3", {0x01, 0x02});
+    ASSERT_TRUE(pbad.compiled) << pbad.error;
+    EXPECT_FALSE(pbad.success);                    // pos==2, not >100
+    delete pbad.grammar;
+
+    // Probe: single-field struct-level where (closest to field-level shape).
+    auto s1 = layer3_compile_and_run(
+        "M4 = struct { a: uint8 } where a == 1", "M4", {0x02});
+    ASSERT_TRUE(s1.compiled) << s1.error;
+    EXPECT_FALSE(s1.success);                       // a==2 != 1
+    delete s1.grammar;
+
+    // Probe: literal false — does the struct EvalConstraint fire at all?
+    auto lf = layer3_compile_and_run(
+        "M5 = struct { a: uint8 } where false", "M5", {0x01});
+    ASSERT_TRUE(lf.compiled) << lf.error;
+    EXPECT_FALSE(lf.success);
+    delete lf.grammar;
+}
+
+// A registered `where` verification function called with the same arguments as the
+// codegen backends — `buffer` (the construct's byte interval, a FieldCaptureValue
+// here) and the parsed `checksum`. Reads the header bytes over buffer's [start, end)
+// and validates the IPv4 checksum. The .bbq spec is byte-identical across backends.
+static void cek_ipv4_checksum_ok(bbq::cek::CEKMachine* m, bbq::cek::Value** args) {
+    auto* buf = static_cast<bbq::cek::FieldCaptureValue*>(args[0]);
+    size_t start = buf->capture->start_offset;
+    size_t end   = buf->capture->end_offset;
+    int64_t stored = static_cast<bbq::cek::IntValue*>(args[1])->v;
+    uint32_t sum = 0;
+    for (size_t i = start; i + 1 < end; i += 2) {
+        uint32_t w = ((uint32_t)m->input[i] << 8) | m->input[i + 1];
+        if (i - start == 10) w = 0;    // skip the checksum field itself
+        sum += w;
+    }
+    while (sum >> 16) sum = (sum & 0xFFFF) + (sum >> 16);
+    auto* r = m->arena->alloc<bbq::cek::BoolValue>();
+    r->v = ((uint16_t)(~sum) == (uint16_t)stored);
+    m->result = r;
+}
+
+TEST(CEKLayer3, StructWhereCallsFunction) {
+    // A struct-level `where` that calls a user-registered function — the CEK
+    // counterpart of the C/C++ IPv4 checksum tests.
+    const char* spec =
+        "@endian big\n"
+        "IPv4Header = struct {\n"
+        "    ver_ihl: uint8, dscp_ecn: uint8, total_length: uint16,\n"
+        "    identification: uint16, flags_offset: uint16, ttl: uint8,\n"
+        "    protocol: uint8, checksum: uint16, src_addr: uint32, dst_addr: uint32\n"
+        "} where ipv4_checksum_ok(@buffer, checksum)";
+
+    auto* parser = new ::Parser();
+    parser->init(spec, static_cast<int>(strlen(spec)));
+    ASSERT_TRUE(parser->parse());
+    bbqgen::ErrorReporter rep;
+    bbqgen::Sema sema(rep);
+    sema.analyze(parser->ast);
+    ASSERT_FALSE(rep.has_errors());
+    ::bbq::Compiler compiler;
+    CompiledGrammar* g = compiler.compile_grammar(parser->ast);
+    ASSERT_NE(g, nullptr);
+
+    // Register the verifier in a builtin table (name interned in the grammar's pool
+    // so the call site matches by pointer).
+    bbq::cek::BuiltinFnTable table;
+    auto* entries = static_cast<bbq::cek::BuiltinFnTable::Entry*>(
+        g->arena.allocate(sizeof(bbq::cek::BuiltinFnTable::Entry),
+                          alignof(bbq::cek::BuiltinFnTable::Entry)));
+    entries[0] = {g->strings.intern("ipv4_checksum_ok"), 2, &cek_ipv4_checksum_ok};
+    table.entries = entries;
+    table.count = 1;
+
+    KontNode* entry = g->lookup(std::string("IPv4Header"));
+    ASSERT_NE(entry, nullptr);
+    auto run = [&](const std::vector<uint8_t>& bytes) {
+        CEKMachine m;
+        m.arena = &g->arena;
+        m.builtins = &table;
+        auto meta = m.execute_from(entry, bytes.data(), bytes.size(),
+                                   g->default_little_endian);
+        return !m.failed && meta.success;
+    };
+
+    std::vector<uint8_t> good = {
+        0x45,0x00,0x00,0x73,0x00,0x00,0x40,0x00,
+        0x40,0x11,0xb8,0x61,0xc0,0xa8,0x00,0x01,
+        0xc0,0xa8,0x00,0xc7
+    };
+    EXPECT_TRUE(run(good));           // valid checksum → where passes
+
+    std::vector<uint8_t> bad = good;
+    bad[12] ^= 0xFF;                  // corrupt → checksum fails
+    EXPECT_FALSE(run(bad));           // where rejects
+
+    delete g;
 }
 
 TEST(CEKLayer3, RuleAlternatives) {
@@ -1325,6 +1866,34 @@ TEST(CEKLayer3, ResyncWithUntilIsRejected) {
     if (r.grammar) delete r.grammar;
 }
 
+TEST(CEKLayer3, ResyncCountedCollectsExactly) {
+    // `array<Item>[n] resync` collects exactly n elements, skipping junk between
+    // them. n=2 over {0x42, junk, 0x42} captures the two records.
+    auto r = layer3_compile_and_run(
+        "Item = struct { magic: uint8 where magic == 0x42 }\n"
+        "Doc  = struct { n: uint8, items: array<Item>[n] resync }",
+        "Doc",
+        {0x02, 0x42, 0xFF, 0x42});
+    ASSERT_TRUE(r.compiled) << r.error;
+    ASSERT_TRUE(r.success) << r.error;
+    EXPECT_EQ(r.meta.root->children[1].child_count, 2);
+    delete r.grammar;
+}
+
+TEST(CEKLayer3, ResyncCountedFailsUnderCount) {
+    // A declared count `[n]` that cannot be met before EOF is a malformed structure
+    // (IPG correct-by-construction): the parse FAILS, never silently returns fewer.
+    // n=3 but only two 0x42 records exist → fail.
+    auto r = layer3_compile_and_run(
+        "Item = struct { magic: uint8 where magic == 0x42 }\n"
+        "Doc  = struct { n: uint8, items: array<Item>[n] resync }",
+        "Doc",
+        {0x03, 0x42, 0xFF, 0x42});
+    ASSERT_TRUE(r.compiled) << r.error;
+    EXPECT_FALSE(r.success) << "under-count resync must fail, not return fewer";
+    delete r.grammar;
+}
+
 TEST(CEKLayer3, BytesWithLength) {
     auto r = layer3_compile_and_run(
         "TLV = struct {\n"
@@ -1423,18 +1992,16 @@ TEST(CEKLayer2EndToEnd, StructWithThreeFields) {
     auto* halt = arena.alloc<HaltNode>();
     auto* end_st = arena.alloc<EndStructNode>();
     end_st->next = halt;
-    auto* m_z = arena.alloc<MatchPrimitiveNode>();
-    m_z->field_name = pool.intern("z");
-    m_z->prim = p_bool;
-    m_z->next = end_st;
-    auto* m_y = arena.alloc<MatchPrimitiveNode>();
-    m_y->field_name = pool.intern("y");
-    m_y->prim = p_u16le;
-    m_y->next = m_z;
-    auto* m_x = arena.alloc<MatchPrimitiveNode>();
-    m_x->field_name = pool.intern("x");
-    m_x->prim = p_u8;
-    m_x->next = m_y;
+    // Each field: producer → Capture → StoreEnv. z chains to end_st.
+    auto* se_z = arena.alloc<StoreEnvKont>(); se_z->name = pool.intern("z"); se_z->next = end_st;
+    auto* cap_z = arena.alloc<CaptureKont>(); cap_z->name = pool.intern("z"); cap_z->next = se_z;
+    auto* m_z = arena.alloc<MatchPrimitiveNode>(); m_z->prim = p_bool; m_z->next = cap_z;
+    auto* se_y = arena.alloc<StoreEnvKont>(); se_y->name = pool.intern("y"); se_y->next = m_z;
+    auto* cap_y = arena.alloc<CaptureKont>(); cap_y->name = pool.intern("y"); cap_y->next = se_y;
+    auto* m_y = arena.alloc<MatchPrimitiveNode>(); m_y->prim = p_u16le; m_y->next = cap_y;
+    auto* se_x = arena.alloc<StoreEnvKont>(); se_x->name = pool.intern("x"); se_x->next = m_y;
+    auto* cap_x = arena.alloc<CaptureKont>(); cap_x->name = pool.intern("x"); cap_x->next = se_x;
+    auto* m_x = arena.alloc<MatchPrimitiveNode>(); m_x->prim = p_u8; m_x->next = cap_x;
     auto* begin_st = arena.alloc<BeginStructNode>();
     begin_st->struct_name = pool.intern("S");
     begin_st->next = m_x;

@@ -1,0 +1,130 @@
+{# BBQ C++ ZCow writer — the grammar-ENFORCEMENT layer on bbq::emit(). ZCow knows only
+   bytes; this walks the grammar (the burg op-list) over the edited document (the zcow
+   overlay) and recomputes the derived fields that edits invalidated — array `count`s and
+   `@rest` window sizes — into the overlay, then hands off to emit(), which serializes (and
+   already handles add/delete by reserializing the overlay). The walk DESCENDS into array
+   element bodies (looping each effective element) so nested derived fields are enforced too;
+   the stencils navigate + recompute, they do NOT write bytes. <Rule>_write sets up the
+   writer, runs the walk, then returns emit(). #}
+#pragma once
+
+#include <cstdint>
+#include <cstddef>
+#include <vector>
+#include "bbq_writer.h"
+
+{% if has_ns %}
+namespace {{ namespace }} {
+{% endif %}
+
+{% for fn in functions %}
+{% for o in fn.ops %}
+static bool {{ fn.kpfx }}_w{{ o.id }}(bbq::writer& w);
+{% endfor %}
+{% endfor %}
+{# Per-rule enforcement entry: walk the rule's fields from the CURRENT scope (an invoke
+   calls this; the top-level <Rule>_write sets up the writer over the document root). #}
+{% for fn in functions %}
+static bool {{ fn.kpfx }}_w_entry(bbq::writer& w) { return {{ fn.kpfx }}_w{{ fn.entry }}(w); }
+{% endfor %}
+
+{% for fn in functions %}
+std::vector<uint8_t> {{ fn.name }}(const bbq::FieldCapture* root, const uint8_t* buf, size_t len, bbq::zcow* zc) {
+    bbq::writer w(root, buf, len, zc);
+    if (!{{ fn.kpfx }}_w_entry(w)) return {};   // enforce derived fields into the overlay
+    return w.emit_bytes();                       // ZCow serializes the now-consistent overlay
+}
+{% endfor %}
+
+{% for fn in functions %}
+{% for o in fn.ops %}
+static bool {{ fn.kpfx }}_w{{ o.id }}(bbq::writer& w) {
+    (void)w;
+{% if o.op == "read" %}
+{% if existsIn(o, "count_reserve") %}
+    w.mark_count({{ o.count_id }}, "{{ o.target }}");   // remember the count field; the array sets it
+{% else if existsIn(o, "rest_reserve") %}
+    w.mark_rest("{{ o.target }}");   // remember the @rest size field; the window's close recomputes it
+{% endif %}
+    return {{ fn.kpfx }}_w{{ o.next }}(w);
+{% else if o.op == "begin_struct" %}
+    w.enter_struct("{{ o.name }}");
+    return {{ fn.kpfx }}_w{{ o.next }}(w);
+{% else if o.op == "end_struct" %}
+    w.leave();
+    return {{ fn.kpfx }}_w{{ o.next }}(w);
+{% else if o.op == "array_begin" or o.op == "array_begin_grow" %}
+{% if existsIn(o, "count_patch") %}
+    w.set_count({{ o.count_id }}, w.eff_count_of("{{ o.field }}"), {% if o.count_prim.enc == "uleb" %}bbq::znode::Enc::Uleb{% else if o.count_prim.enc == "sleb" %}bbq::znode::Enc::Sleb{% else %}bbq::znode::Enc::Fixed{% endif %});   // count = effective child count
+{% endif %}
+    // Descend the element bodies (enforce nested derived fields); emit() still serializes them.
+    { int64_t _n = w.begin_array("{{ o.field }}");
+      if (_n == 0) { w.end_array(); return {{ fn.kpfx }}_w{{ o.end }}(w); }
+      w.push_loop(_n); }
+    return {{ fn.kpfx }}_w{{ o.body }}(w);
+{% else if o.op == "array_next" or o.op == "array_next_grow" or o.op == "array_next_count" %}
+    if (w.loop_next()) return {{ fn.kpfx }}_w{{ o.body }}(w);
+    w.pop_loop(); w.end_array();
+    return {{ fn.kpfx }}_w{{ o.end }}(w);
+{% else if o.op == "array_begin_resync" %}
+    // resync element bodies terminate in array_elem_done (return true), so the loop is driven
+    // here (one body call per effective element) rather than tail-cycled through array_next.
+{% if existsIn(o, "count_patch") %}
+    w.set_count({{ o.count_id }}, w.eff_count_of("{{ o.field }}"), {% if o.count_prim.enc == "uleb" %}bbq::znode::Enc::Uleb{% else if o.count_prim.enc == "sleb" %}bbq::znode::Enc::Sleb{% else %}bbq::znode::Enc::Fixed{% endif %});
+{% endif %}
+    { int64_t _n = w.begin_array("{{ o.field }}");
+      w.push_loop(_n);
+      for (int64_t _i = 0; _i < _n; _i++) {
+          if (!{{ fn.kpfx }}_w{{ o.body }}(w)) { w.pop_loop(); w.end_array(); return false; }
+          w.loop_next();
+      }
+      w.pop_loop(); w.end_array(); }
+    return {{ fn.kpfx }}_w{{ o.end }}(w);
+{% else if o.op == "end_array" %}
+    return {{ fn.kpfx }}_w{{ o.next }}(w);
+{% else if o.op == "pop_interval" %}
+{% if existsIn(o, "rest") %}
+    w.set_rest({% if o.prim.enc == "uleb" %}bbq::znode::Enc::Uleb{% else if o.prim.enc == "sleb" %}bbq::znode::Enc::Sleb{% else %}bbq::znode::Enc::Fixed{% endif %});   // @rest size = the (edited) window's serialized length
+{% endif %}
+    return {{ fn.kpfx }}_w{{ o.next }}(w);
+{% else if o.op == "switch" %}
+    switch (w.variant_tag("{{ o.tag_target }}")) {
+{% for c in o.cases %}
+    case {{ c.ordinal }}: return {{ fn.kpfx }}_w{{ c.target }}(w);
+{% endfor %}
+{% if o.has_default %}
+    default: return {{ fn.kpfx }}_w{{ o.default_target }}(w);
+{% else %}
+    default: return false;
+{% endif %}
+    }
+{% else if o.op == "optional" %}
+    if (w.has("{{ o.target }}")) return {{ fn.kpfx }}_w{{ o.present }}(w);
+    return {{ fn.kpfx }}_w{{ o.absent }}(w);
+{% else if o.op == "begin_optional" %}
+    if (w.has("{{ o.target }}")) { if (!{{ fn.kpfx }}_w{{ o.inner }}(w)) return false; }
+    return {{ fn.kpfx }}_w{{ o.next }}(w);
+{% else if o.op == "optional_prim" %}
+    return {{ fn.kpfx }}_w{{ o.next }}(w);
+{% else if o.op == "invoke" %}
+    if (!{{ o.fn }}_w_entry(w)) return false;   // enforce the sub-rule's fields in this scope
+    return {{ fn.kpfx }}_w{{ o.next }}(w);
+{% else if o.op == "choice" %}
+    // union/alternatives: the matched arm is the named variant child the index recorded.
+{% for arm in o.arms %}
+    if (w.has("{{ arm.name }}")) { w.enter_struct("{{ arm.name }}"); bool _o = {{ arm.fn }}_w_entry(w); w.leave(); return _o; }
+{% endfor %}
+    return false;
+{% else if o.op == "end_optional" or o.op == "return" or o.op == "array_elem_done" %}
+    return true;
+{% else %}
+    // compute/constraint/read_bytes/extern/bitfield/seek/push_interval/set_endian: no derived
+    // field to fix here (emit() serializes the value/span; a non-@rest interval is read-only).
+    return {{ fn.kpfx }}_w{{ o.next }}(w);
+{% endif %}
+}
+{% endfor %}
+{% endfor %}
+{% if has_ns %}
+}  // namespace {{ namespace }}
+{% endif %}

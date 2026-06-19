@@ -7,14 +7,14 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "Capture.h"  // bbq::FieldCapture — the shared index runtime that
+                      // FieldCaptureValue references (resolved by outer-namespace
+                      // lookup from bbq::cek). The runtime does NOT depend back.
+
 namespace bbq::cek {
 
 // Forward declaration for the runtime that consumes nodes.
 struct CEKMachine;
-
-// FieldCapture lives in Capture.h. Forward-declare so FieldCaptureValue
-// can reference it without a header dependency.
-struct FieldCapture;
 
 // ── Primitive type descriptor ───────────────────────────────
 
@@ -22,12 +22,18 @@ enum class PrimWidth : uint8_t { W8, W16, W32, W64 };
 enum class PrimSign  : uint8_t { Unsigned, Signed };
 enum class PrimEndian : uint8_t { Little, Big, Native };
 enum class PrimKind : uint8_t { Integer, Float, Bool };
+// Integer byte encoding: a fixed-width field, or a variable-length LEB128 varint
+// (unsigned ULEB / signed SLEB). LEB128 is decoded at read time into the carrier
+// width (W32/W64) and recorded as a Computed capture (it is not re-decodable from a
+// fixed-width byte span). Mirrors BBQ::Encoding in the AST.
+enum class PrimEncoding : uint8_t { Fixed, Uleb, Sleb };
 
 struct PrimitiveInfo {
     PrimKind kind = PrimKind::Integer;
     PrimWidth width = PrimWidth::W8;
     PrimSign sign = PrimSign::Unsigned;
     PrimEndian endian = PrimEndian::Native;
+    PrimEncoding encoding = PrimEncoding::Fixed;
 
     size_t byte_count() const {
         if (kind == PrimKind::Bool) return 1;
@@ -74,6 +80,36 @@ struct {{def.name}};
 {% endif %}
 {% endfor %}
 
+// ── Kont kind tag ───────────────────────────────────────────
+//
+// One value per kont variant. This is what burg matches on
+// (BURG_NODE_OP) and what the source lowering / generated accessors
+// switch over. Emitted straight from the asdl variant list so it can
+// never drift from the IR.
+
+enum class KontKind : int {
+{% for def in definitions %}
+{% if def.name == "static_kont" or def.name == "dynamic_kont" %}
+{% for type in def.types %}
+    {{type.name}},
+{% endfor %}
+{% endif %}
+{% endfor %}
+};
+
+inline const char* kont_kind_name(KontKind k) {
+    switch (k) {
+{% for def in definitions %}
+{% if def.name == "static_kont" or def.name == "dynamic_kont" %}
+{% for type in def.types %}
+    case KontKind::{{type.name}}: return "{{type.name}}";
+{% endfor %}
+{% endif %}
+{% endfor %}
+    }
+    return "?";
+}
+
 // ── KontNode root ───────────────────────────────────────────
 //
 // The shared root for static_kont and dynamic_kont variants.
@@ -85,6 +121,21 @@ struct {{def.name}};
 
 struct KontNode {
     virtual ~KontNode() = default;
+
+    // The variant tag — burg's BURG_NODE_OP, and what the source
+    // lowering / generated accessors switch on. Every kont variant
+    // overrides it (generated below).
+    virtual KontKind kind() const = 0;
+
+    // Graph-walk axes for burg / the source lowering. Operands are the
+    // tiled value sub-trees (BURG_NODE_CHILD, the `kont_expr` fields);
+    // successors are the spine/control edges (BURG_NODE_SUCC, the
+    // `kont_node` fields + switch-case targets). Static konts override
+    // these (generated); dynamic konts keep the no-edge defaults.
+    virtual int child_count() const { return 0; }
+    virtual KontNode* child(int) const { return nullptr; }
+    virtual int succ_count() const { return 0; }
+    virtual KontNode* succ(int) const { return nullptr; }
 
 private:
     friend struct CEKMachine;
@@ -169,6 +220,38 @@ struct {{type.name}} : public {{type.base}} {
     {{get_type(field.type)}} {{safe_name(field.name)}}{};
 {% endif %}
 {% endfor %}
+
+    KontKind kind() const override { return KontKind::{{type.name}}; }
+    // Plain-int form of the kind tag — burg TERM ids (BURG_NODE_OP), since
+    // KontKind is an enum class and won't implicitly convert to int.
+    static constexpr int kind_value = static_cast<int>(KontKind::{{type.name}});
+{% if def.name == "static_kont" %}
+
+    int child_count() const override {
+        return 0{% for f in type.fields %}{% if f.type == "kont_expr" and f.flag != "sequence" %} + 1{% else if f.type == "kont_expr" and f.flag == "sequence" %} + {{safe_name(f.name)}}_count{% endif %}{% endfor %};
+    }
+    KontNode* child(int i) const override {
+        KontNode* fixed[] = { {% for f in type.fields %}{% if f.type == "kont_expr" and f.flag != "sequence" %}this->{{safe_name(f.name)}}, {% endif %}{% endfor %}nullptr };
+        int nf = (int)(sizeof(fixed) / sizeof(fixed[0])) - 1;
+        if (i >= 0 && i < nf) return fixed[i];
+{% for f in type.fields %}{% if f.type == "kont_expr" and f.flag == "sequence" %}
+        if (i >= nf && i < nf + this->{{safe_name(f.name)}}_count) return this->{{safe_name(f.name)}}[i - nf];
+{% endif %}{% endfor %}
+        return nullptr;
+    }
+    int succ_count() const override {
+        return 0{% for f in type.fields %}{% if f.type == "kont_node" %} + 1{% else if f.type == "switch_case" %} + {{safe_name(f.name)}}_count{% endif %}{% endfor %};
+    }
+    KontNode* succ(int i) const override {
+        KontNode* fixed[] = { {% for f in type.fields %}{% if f.type == "kont_node" %}this->{{safe_name(f.name)}}, {% endif %}{% endfor %}nullptr };
+        int nf = (int)(sizeof(fixed) / sizeof(fixed[0])) - 1;
+        if (i >= 0 && i < nf) return fixed[i];
+{% for f in type.fields %}{% if f.type == "switch_case" %}
+        if (i >= nf && i < nf + this->{{safe_name(f.name)}}_count) return this->{{safe_name(f.name)}}[i - nf].target;
+{% endif %}{% endfor %}
+        return nullptr;
+    }
+{% endif %}
 
 private:
     void invoke(CEKMachine* m) const override;

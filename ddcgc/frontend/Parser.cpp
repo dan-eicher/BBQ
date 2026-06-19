@@ -1437,32 +1437,41 @@ bool Parser::parse_Relational(DdcgAst::Expr* * result) {
     for (;;) {
         auto _m0 = save();
         if (![&]() -> bool {
-            skip();
-            if (peek_at("<=")) {
-                skip();
-                if (!match("<=")) return false;
-                skip();
-                if (!parse_Additive(&rhs)) return false;
-                auto* b = new DdcgAst::BinOp("<=", *result, rhs);
+            {
+                auto _m1 = save();
+                if ([&]() -> bool {
+                    skip();
+                    if (!match("<=")) return false;
+                    skip();
+                    if (!parse_Additive(&rhs)) return false;
+                    auto* b = new DdcgAst::BinOp("<=", *result, rhs);
            b->loc = rhs->loc;
            *result = b;
-            } else             if (peek_at(">=")) {
-                skip();
-                if (!match(">=")) return false;
-                skip();
-                if (!parse_Additive(&rhs)) return false;
-                auto* b = new DdcgAst::BinOp(">=", *result, rhs);
+                    return true;
+                }()) {} else {
+                restore(_m1);
+                if ([&]() -> bool {
+                    skip();
+                    if (!match(">=")) return false;
+                    skip();
+                    if (!parse_Additive(&rhs)) return false;
+                    auto* b = new DdcgAst::BinOp(">=", *result, rhs);
            b->loc = rhs->loc;
            *result = b;
-            } else             if (peek_at("<")) {
-                skip();
-                if (!match("<")) return false;
-                skip();
-                if (!parse_Additive(&rhs)) return false;
-                auto* b = new DdcgAst::BinOp("<", *result, rhs);
+                    return true;
+                }()) {} else {
+                restore(_m1);
+                if ([&]() -> bool {
+                    skip();
+                    if (!match("<")) return false;
+                    skip();
+                    if (!parse_Additive(&rhs)) return false;
+                    auto* b = new DdcgAst::BinOp("<", *result, rhs);
            b->loc = rhs->loc;
            *result = b;
-            } else {
+                    return true;
+                }()) {} else {
+                restore(_m1);
                 skip();
                 if (!match(">")) return false;
                 skip();
@@ -1470,6 +1479,9 @@ bool Parser::parse_Relational(DdcgAst::Expr* * result) {
                 auto* b = new DdcgAst::BinOp(">", *result, rhs);
            b->loc = rhs->loc;
            *result = b;
+                }
+                }
+                }
             }
             return true;
         }()) { restore(_m0); break; }

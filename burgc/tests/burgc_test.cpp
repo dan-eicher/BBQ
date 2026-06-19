@@ -485,6 +485,44 @@ TEST(BurgCppBackend, EmitsRuleLookup) {
     EXPECT_NE(code.find("burg_nt_name"), std::string::npos);
 }
 
+// A leaf pattern (arity 0) and an operand pattern (arity N) for the SAME terminal
+// must disambiguate by arity — matching trees by operator + arity is BURG's job.
+// Regression: the leaf rule was emitted with no `child_count` guard, so it matched
+// higher-arity nodes too and, being cheapest, won — e.g. `Node` would steal a
+// `Node(val,val)` node. The leaf rule must guard `child_count == 0`.
+TEST(BurgCppBackend, LeafRuleGuardsArity) {
+    const char* input =
+        "TERM Lit = 1\n"
+        "TERM Node = 2\n"
+        "START val\n"
+        "RULES\n"
+        "val : Lit            = 1;\n"
+        "val : Node           = 1;\n"
+        "val : Node(val, val) = 1;\n";
+    std::string code = gen_cpp(input);
+    ASSERT_FALSE(code.empty());
+    EXPECT_NE(code.find("child_count == 0"), std::string::npos)
+        << "leaf rule emitted with no arity guard — it would over-match arity-N nodes";
+}
+
+// The inverse of LeafRuleGuardsArity: a terminal with ONLY a leaf rule must NOT be
+// arity-guarded. In slot-based IRs the operands are virtual and child_count is
+// unrelated to the pattern, so a `child_count == 0` check would wrongly reject real
+// nodes that carry children. The guard is emitted only to disambiguate a terminal
+// that has BOTH a leaf and an operand rule. (Regression: a blanket leaf guard
+// segfaulted slot-based consumers like the jitterator calc.)
+TEST(BurgCppBackend, LeafOnlyTerminalUnguarded) {
+    const char* input =
+        "TERM Op = 1\n"
+        "START val\n"
+        "RULES\n"
+        "val : Op = 1;\n";
+    std::string code = gen_cpp(input);
+    ASSERT_FALSE(code.empty());
+    EXPECT_EQ(code.find("child_count == 0"), std::string::npos)
+        << "leaf-only terminal wrongly arity-guarded — breaks slot-based IRs";
+}
+
 TEST(BurgCppBackend, NontermNameTable) {
     BurgGenerator gen;
     auto* spec = gen.parse(source_path("tests/data/chain.burg"));

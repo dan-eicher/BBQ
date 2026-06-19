@@ -1,0 +1,228 @@
+{# BBQ c-lite (C view) reader — the C twin of reader_view_cpp.inja. Each spine kont is
+   a musttail stencil that advances the SHARED cursor (bbq_read.h) and records a span
+   into the bbq_capture_builder (bbq_lite.h), then tail-calls its successor. Same burg
+   op-records as the C-owning reader and the C++ view; only the spelling (record-span
+   into a C index, decode-on-access) differs. ctx is a bbq_view_ctx_t* (cursor + builder
+   + caller arena). Read-only: no writer, no types header. #}
+
+{# extern read functions are user-supplied (the index records only the consumed span).
+   Forward-declared with the view ABI so the generated parser links. #}
+{% for e in externs %}
+bool {{ e }}(const uint8_t* data, size_t len, size_t* consumed);
+{% endfor %}
+
+{% for fn in functions %}
+{% for o in fn.ops %}
+static bool {{ fn.kpfx }}_k{{ o.id }}(bbq_view_ctx_t* ctx);
+{% endfor %}
+{% endfor %}
+{# Per-rule entry: runs the rule's body into the SHARED ctx (an invoke calls this, not
+   the top-level <Rule>_read which would make a separate index). #}
+{% for fn in functions %}
+static bool {{ fn.kpfx }}_entry(bbq_view_ctx_t* ctx) { return {{ fn.kpfx }}_k{{ fn.entry }}(ctx); }
+{% endfor %}
+
+{% for fn in functions %}
+bbq_capture_metadata {{ fn.name }}(const uint8_t* data, size_t len, bbq_arena* arena) {
+    bbq_view_ctx_t ctx; bbq_view_ctx_init(&ctx, data, len, arena);
+    ctx.cur.little_endian = {% if default_le %}true{% else %}false{% endif %}; ctx.cur.endian_seeded = true;
+    bool _ok = {{ fn.kpfx }}_entry(&ctx);
+    bbq_capture_metadata _meta = bbq_view_finish(&ctx, _ok);
+    bbq_view_build_free(&ctx);
+    return _meta;
+}
+{% endfor %}
+
+{% for fn in functions %}
+{% for o in fn.ops %}
+static bool {{ fn.kpfx }}_k{{ o.id }}(bbq_view_ctx_t* ctx) {
+    (void)ctx;
+{% if o.op == "read" %}
+{% if o.prim.enc == "uleb" %}
+    if (!bbq_view_uleb_capture(ctx, "{{ o.target }}", {{ o.prim.w }})) return false;   /* variable-length varint */
+{% else if o.prim.enc == "sleb" %}
+    if (!bbq_view_sleb_capture(ctx, "{{ o.target }}", {{ o.prim.w }})) return false;
+{% else %}
+    { size_t _s = ctx->cur.pos;
+      if (!bbq_advance(&ctx->cur, {{ prim_bytes(o.prim) }})) return bbq_fail(&ctx->cur, "{{ o.msg }}");
+      bbq_cap_add_field(&ctx->builder, "{{ o.target }}", _s, ctx->cur.pos, {{ capture_expr(o.prim) }}, NULL); }
+{% endif %}
+    BBQ_MUSTTAIL return {{ fn.kpfx }}_k{{ o.next }}(ctx);
+{% else if o.op == "read_bytes" %}
+    { size_t _s = ctx->cur.pos;
+      if (!bbq_advance(&ctx->cur, (size_t)({{ o.len }}))) return bbq_fail(&ctx->cur, "{{ o.msg }}");
+      bbq_cap_add_field(&ctx->builder, "{{ o.target }}", _s, ctx->cur.pos, {% if o.is_string %}BBQ_CT_String{% else %}BBQ_CT_Bytes{% endif %}, NULL); }
+    BBQ_MUSTTAIL return {{ fn.kpfx }}_k{{ o.next }}(ctx);
+{% else if o.op == "constraint" %}
+    if (!({{ o.expr }})) return bbq_fail(&ctx->cur, "{{ o.msg }}");
+    BBQ_MUSTTAIL return {{ fn.kpfx }}_k{{ o.next }}(ctx);
+{% else if o.op == "compute" %}
+    bbq_view_add_computed_val(ctx, "{{ o.target }}", ({{ o.expr }}));   /* kind from the C expr type (_Generic) */
+    BBQ_MUSTTAIL return {{ fn.kpfx }}_k{{ o.next }}(ctx);
+{% else if o.op == "bitfield" %}
+    { size_t _s = ctx->cur.pos;
+      if (!bbq_advance(&ctx->cur, {{ prim_bytes(o.prim) }})) return bbq_fail(&ctx->cur, "{{ o.msg }}");
+      uint64_t _bf = bbq_view_read_at(ctx, _s, {{ prim_bytes(o.prim) }}, {{ o.prim.be }}, {{ o.prim.native }});
+{% for m in o.members %}
+      bbq_view_add_computed_int(ctx, "{{ m.target }}", (int64_t)((_bf >> {{ m.shift }}) & {{ m.mask }}));
+{% endfor %}
+    }
+    BBQ_MUSTTAIL return {{ fn.kpfx }}_k{{ o.next }}(ctx);
+{% else if o.op == "seek" %}
+    if (!bbq_seek_checked(&ctx->cur, (size_t)({{ o.expr }}))) return false;
+    BBQ_MUSTTAIL return {{ fn.kpfx }}_k{{ o.next }}(ctx);
+{% else if o.op == "push_interval" %}
+    if (!bbq_push_interval_checked(&ctx->cur, (size_t)({% if o.relative %}ctx->cur.pos + {% endif %}({{ o.expr }})))) return false;
+    BBQ_MUSTTAIL return {{ fn.kpfx }}_k{{ o.next }}(ctx);
+{% else if o.op == "pop_interval" %}
+{% if o.checked %}
+    if (!bbq_pop_interval_checked(&ctx->cur)) return false;
+{% else %}
+    bbq_pop_interval(&ctx->cur);
+{% endif %}
+    BBQ_MUSTTAIL return {{ fn.kpfx }}_k{{ o.next }}(ctx);
+{% else if o.op == "set_endian" %}
+    ctx->cur.little_endian = ({{ o.expr }}) ? true : false;
+    BBQ_MUSTTAIL return {{ fn.kpfx }}_k{{ o.next }}(ctx);
+{% else if o.op == "extern" %}
+    /* The user extern consumes bytes from the cursor; the index records only the
+       consumed span (BBQ_CT_External) — the typed interpretation is the extern's,
+       decoded on access. ABI: bool fn(const uint8_t*, size_t, size_t*). */
+    { size_t _s = ctx->cur.pos, _c = 0;
+      if (!{{ o.func }}(ctx->cur.data + ctx->cur.pos, bbq_remaining(&ctx->cur), &_c)) return bbq_fail(&ctx->cur, "{{ o.msg }}");
+      if (ctx->cur.pos + _c > bbq_effective_end(&ctx->cur)) return bbq_fail(&ctx->cur, "{{ o.msg }}");
+      ctx->cur.pos += _c;
+      bbq_cap_add_field(&ctx->builder, "{{ o.target }}", _s, ctx->cur.pos, BBQ_CT_External, NULL); }
+    BBQ_MUSTTAIL return {{ fn.kpfx }}_k{{ o.next }}(ctx);
+{% else if o.op == "optional_prim" %}
+    if ({{ o.cond }}) {
+{% if o.prim.enc == "uleb" %}
+        if (!bbq_view_uleb_capture(ctx, "{{ o.target }}", {{ o.prim.w }})) return false;
+{% else if o.prim.enc == "sleb" %}
+        if (!bbq_view_sleb_capture(ctx, "{{ o.target }}", {{ o.prim.w }})) return false;
+{% else %}
+        size_t _s = ctx->cur.pos;
+        if (!bbq_advance(&ctx->cur, {{ prim_bytes(o.prim) }})) return bbq_fail(&ctx->cur, "{{ o.msg }}");
+        bbq_cap_add_field(&ctx->builder, "{{ o.target }}", _s, ctx->cur.pos, {{ capture_expr(o.prim) }}, NULL);
+{% endif %}
+    }
+    BBQ_MUSTTAIL return {{ fn.kpfx }}_k{{ o.next }}(ctx);
+{% else if o.op == "optional" %}
+    if ({{ o.cond }}) { BBQ_MUSTTAIL return {{ fn.kpfx }}_k{{ o.present }}(ctx); }
+    BBQ_MUSTTAIL return {{ fn.kpfx }}_k{{ o.absent }}(ctx);
+{% else if o.op == "begin_optional" %}
+    /* Bare optional<T>: try the inner under a checkpoint; on failure rewind (dropping
+       any partial capture) so the field is simply absent. */
+    { bbq_view_checkpoint_t _cp = bbq_view_save(ctx);
+      if (!{{ fn.kpfx }}_k{{ o.inner }}(ctx)) bbq_view_restore(ctx, _cp); }
+    BBQ_MUSTTAIL return {{ fn.kpfx }}_k{{ o.next }}(ctx);
+{% else if o.op == "end_optional" %}
+    return true;
+{% else if o.op == "begin_struct" %}
+    bbq_cap_begin_struct(&ctx->builder, "{{ o.name }}", ctx->cur.pos);
+    BBQ_MUSTTAIL return {{ fn.kpfx }}_k{{ o.next }}(ctx);
+{% else if o.op == "end_struct" %}
+    bbq_cap_end_struct(&ctx->builder, ctx->cur.pos);
+    BBQ_MUSTTAIL return {{ fn.kpfx }}_k{{ o.next }}(ctx);
+{% else if o.op == "array_begin" %}
+    { int64_t _n = (int64_t)({{ o.count }});   /* count decode-on-access, before the scope opens */
+      bbq_cap_begin_array(&ctx->builder, "{{ o.field }}", ctx->cur.pos);
+      if (_n == 0) { BBQ_MUSTTAIL return {{ fn.kpfx }}_k{{ o.end }}(ctx); }  /* EndArray closes it */
+      bbq_push_loop_n(&ctx->cur, _n); }
+    BBQ_MUSTTAIL return {{ fn.kpfx }}_k{{ o.body }}(ctx);
+{% else if o.op == "array_next" %}
+    if (bbq_loop_next(&ctx->cur)) { BBQ_MUSTTAIL return {{ fn.kpfx }}_k{{ o.body }}(ctx); }
+    bbq_pop_loop(&ctx->cur);
+    BBQ_MUSTTAIL return {{ fn.kpfx }}_k{{ o.end }}(ctx);
+{% else if o.op == "array_next_count" %}
+    /* count(N): re-evaluate the bound each iteration (vs array_next's fixed limit). */
+    bbq_loop_advance(&ctx->cur);
+    if (bbq_loop_index(&ctx->cur) < (int64_t)({{ o.count }})) { BBQ_MUSTTAIL return {{ fn.kpfx }}_k{{ o.body }}(ctx); }
+    bbq_pop_loop(&ctx->cur);
+    BBQ_MUSTTAIL return {{ fn.kpfx }}_k{{ o.end }}(ctx);
+{% else if o.op == "array_begin_grow" %}
+    bbq_cap_begin_array(&ctx->builder, "{{ o.field }}", ctx->cur.pos);
+{% if o.mode == "eof" %}
+    if (ctx->cur.pos >= bbq_effective_end(&ctx->cur)) { BBQ_MUSTTAIL return {{ fn.kpfx }}_k{{ o.end }}(ctx); }
+{% endif %}
+    bbq_push_loop_unbounded(&ctx->cur);
+    BBQ_MUSTTAIL return {{ fn.kpfx }}_k{{ o.body }}(ctx);
+{% else if o.op == "array_next_grow" %}
+    bbq_loop_advance(&ctx->cur);
+    if ({{ o.cond }}) { BBQ_MUSTTAIL return {{ fn.kpfx }}_k{{ o.body }}(ctx); }
+    bbq_pop_loop(&ctx->cur);
+    BBQ_MUSTTAIL return {{ fn.kpfx }}_k{{ o.end }}(ctx);
+{% else if o.op == "array_begin_resync" %}
+    /* resync: parse each element under a checkpoint; on failure rewind (dropping the
+       partial capture), skip one byte, retry. counted collects exactly `count`
+       (eof-before-count fails); uncounted stops at the window end. */
+{% if o.counted %}
+    { int64_t _n = (int64_t)({{ o.count }});   /* decode count in the PARENT scope */
+      bbq_cap_begin_array(&ctx->builder, "{{ o.field }}", ctx->cur.pos);
+      bbq_push_loop_n(&ctx->cur, _n);
+      for (;;) {
+          if (bbq_loop_index(&ctx->cur) >= _n) break;
+          if (ctx->cur.pos >= bbq_effective_end(&ctx->cur)) { bbq_pop_loop(&ctx->cur); return bbq_fail(&ctx->cur, "{{ o.msg }}"); }
+          bbq_view_checkpoint_t _cp = bbq_view_save(ctx);
+          if ({{ fn.kpfx }}_k{{ o.body }}(ctx)) { bbq_loop_advance(&ctx->cur); }
+          else { bbq_view_restore(ctx, _cp); ctx->cur.pos++; }
+      }
+      bbq_pop_loop(&ctx->cur); }
+{% else %}
+    bbq_cap_begin_array(&ctx->builder, "{{ o.field }}", ctx->cur.pos);
+    bbq_push_loop_unbounded(&ctx->cur);
+    for (;;) {
+        if (ctx->cur.pos >= bbq_effective_end(&ctx->cur)) break;
+        bbq_view_checkpoint_t _cp = bbq_view_save(ctx);
+        if ({{ fn.kpfx }}_k{{ o.body }}(ctx)) { bbq_loop_advance(&ctx->cur); }
+        else { bbq_view_restore(ctx, _cp); ctx->cur.pos++; }
+    }
+    bbq_pop_loop(&ctx->cur);
+{% endif %}
+    BBQ_MUSTTAIL return {{ fn.kpfx }}_k{{ o.end }}(ctx);
+{% else if o.op == "array_elem_done" %}
+    return true;
+{% else if o.op == "end_array" %}
+    bbq_cap_end_array(&ctx->builder, ctx->cur.pos);
+    BBQ_MUSTTAIL return {{ fn.kpfx }}_k{{ o.next }}(ctx);
+{% else if o.op == "switch" %}
+    switch ((int64_t)({{ o.disc }})) {
+{% for c in o.cases %}
+{% for l in c.labels %}
+    case {{ l }}:
+{% endfor %}
+        bbq_cap_set_pending_variant_tag(&ctx->builder, {{ c.ordinal }});   /* record which arm matched */
+        BBQ_MUSTTAIL return {{ fn.kpfx }}_k{{ c.target }}(ctx);
+{% endfor %}
+    default:
+{% if o.has_default %}
+        bbq_cap_set_pending_variant_tag(&ctx->builder, {{ o.default_ordinal }});
+        BBQ_MUSTTAIL return {{ fn.kpfx }}_k{{ o.default_target }}(ctx);
+{% else %}
+        return bbq_fail(&ctx->cur, "switch: no matching case");
+{% endif %}
+    }
+{% else if o.op == "invoke" %}
+    /* Build the sub-rule into the shared ctx (its begin_struct scope is already open). */
+    if (!{{ kfn(o.fn) }}_v_entry(ctx)) return bbq_fail(&ctx->cur, "{{ o.msg }}");
+    BBQ_MUSTTAIL return {{ fn.kpfx }}_k{{ o.next }}(ctx);
+{% else if o.op == "choice" %}
+    /* union/alternatives: try each variant under a checkpoint; the match is captured
+       under its variant name + variant_tag (the index records which arm matched). */
+{% for arm in o.arms %}
+    {
+        bbq_view_checkpoint_t _cp = bbq_view_save(ctx);
+        bbq_cap_begin_variant(&ctx->builder, "{{ arm.name }}", ctx->cur.pos, {{ arm.tag }});
+        if ({{ kfn(arm.fn) }}_v_entry(ctx)) { bbq_cap_end_struct(&ctx->builder, ctx->cur.pos); return true; }
+        bbq_view_restore(ctx, _cp);
+    }
+{% endfor %}
+    return bbq_fail(&ctx->cur, "{{ o.msg }}");
+{% else if o.op == "return" %}
+    return true;
+{% else %}
+#error view parser: unhandled stencil op {{ o.op }}
+{% endif %}
+}
+{% endfor %}
+{% endfor %}

@@ -92,7 +92,7 @@ AUXILIARIES
   // call_op rule. Looks up the function table, gens each arg as a
   // value sub-tree, returns Call value sub-tree (which the rule
   // wraps via cg_deliver per outer δ/γ — same as any binop value).
-  compile_call          : (ident, list<ast.expr>, rho, ir_root) -> ir_root
+  compile_call          : (ident, list<ast.expr>, rho, delta, gamma, ir_root) -> ir_root
 
 MEMBERS (.
     SourceLoc current_loc;
@@ -119,8 +119,17 @@ MEMBERS (.
                              std::vector<calc_ir::Node*> args, int fs) {
         return new calc_ir::Call(target, std::move(args), fs);
     }
+    // Wrap a node in a Nop landing pad if it isn't already one — the
+    // yoctojc ddcg_label convention. A branch target must be a Nop so
+    // codegen records its PC at the arm's ENTRY (before the value-
+    // bearing node emits); the post-burg peephole strips the Nop and
+    // any goto whose target is the next PC.
+    calc_ir::Node* ddcg_label(calc_ir::Node* n) {
+        if (dynamic_cast<calc_ir::Nop*>(n)) return n;
+        return new calc_ir::Nop(n);
+    }
     calc_ir::Node* make_branch(calc_ir::Node* t, calc_ir::Node* th, calc_ir::Node* el) {
-        return new calc_ir::Branch(t, th, el);
+        return new calc_ir::Branch(t, ddcg_label(th), ddcg_label(el));
     }
     calc_ir::Node* make_goto(calc_ir::Node* t)                         { return new calc_ir::Goto(t); }
     calc_ir::Node* make_leave(calc_ir::Node* v)                        { return new calc_ir::Leave(v); }
@@ -131,25 +140,37 @@ MEMBERS (.
     // unknown name asserts (dev error, not a sema pass).
     std::unordered_map<std::string, std::pair<calc_ir::Node*, int>> fn_table;
 
-    // Internal-only: call_op rule delegates here. Builds a Call
-    // value sub-tree (args = list of value sub-trees, each gen'd as
-    // δ=ac). The BURG chain rule `stack_reg: reg = 1 (push_stack)`
-    // auto-pushes each arg before the call stencil; per-arity Call
-    // rules drive the lowering. Same shape as any binop value:
-    // Call(target, args, fs) is consumed by the caller's cg_deliver.
+    // Internal-only: call_op rule delegates here. The paper's CG for a
+    // call (Dybvig §3.2), the way yoctojc's compiler.ddcg does it: each
+    // arg is evaluated to a fresh temp (the Location class), the
+    // evaluations sequenced on the spine, and the Call reads the temps
+    // back as LoadLocal atoms. The per-arity BURG Call rules push those
+    // loaded args before OP_CALL. The call's value is delivered through
+    // the OUTER δ/γ — that continuation IS the reified return point.
     calc_ir::Node* compile_call(std::string name,
                                 std::vector<calc::Expr*> args,
-                                rho_t rho, calc_ir::Node* Lnext) {
+                                rho_t rho, delta_t delta, gamma_t gamma,
+                                calc_ir::Node* Lnext) {
         auto it = fn_table.find(name);
         assert(it != fn_table.end() && "compile_call: unknown function");
-        std::vector<calc_ir::Node*> arg_trees;
-        arg_trees.reserve(args.size());
-        for (auto* a : args) {
-            arg_trees.push_back(compile_expr(a, rho, ac(),
-                                              jump(Lnext), Lnext));
+        std::vector<int> t_args;
+        std::vector<calc_ir::Node*> arg_loads;
+        for (size_t i = 0; i < args.size(); i++) {
+            int ts = alloc_local();
+            t_args.push_back(ts);
+            arg_loads.push_back(make_load_local(ts));
         }
-        return new calc_ir::Call(it->second.first, std::move(arg_trees),
-                                 it->second.second);
+        calc_ir::Node* call = make_call(it->second.first,
+                                        std::move(arg_loads), it->second.second);
+        calc_ir::Node* after = cg_deliver(call, delta, gamma, Lnext);
+        // Sequence the args right-to-left so arg[0] runs first. γ AND
+        // L_next are the SAME `after`: the destination is the
+        // continuation, so cg_jump falls through — no goto emitted.
+        for (int i = (int)args.size() - 1; i >= 0; i--) {
+            after = compile_expr(args[i], rho, local(t_args[i]),
+                                 jump(after), after);
+        }
+        return after;
     }
 
     // Forward-reference placeholder. fresh_kont() returns a Nop with a
@@ -247,76 +268,116 @@ rule if_two : ast.If(test: t, then_: th, else_: el) {
 }
 
 // =============================================================
-// Figure 8 — binary operations. In CEK-tree shape, ONE rule per
-// binop: gen both operands as value sub-trees (δ=ac with the L==Lnext
-// peephole returns the value alone), build the producer node, deliver
-// per outer δ/γ. BURG owns paper figure 8's case 1-4 dispatch at
-// lowering time — it sees the literal tree shape (LoadLocal vs
-// LoadConst vs complex sub-tree) and picks the appropriate stencil.
+// Figure 8 — binary operations, in ANF. Each operand is evaluated
+// to a fresh temp on the spine (δ=local), and the producer reads the
+// temps back as LoadLocal atoms, delivered per the outer δ/γ. Because
+// the operands are atomic, an operand that carries spine effects (a
+// call — its arg evaluations and the control transfer) sequences
+// cleanly on the spine; nothing has to nest a control transfer inside
+// a value sub-tree, which is what the paper's Location class is for.
 //
-// No case specializations in DDCG. No constant folds (paper §4).
-// No commutative-vs-non-commutative carve-outs (BURG handles via
-// per-shape rules, including the cmp-swap identity and rev_sub for
-// Sub).
+// Operands are sequenced right-then-left so the left runs first; at
+// each step γ AND L_next are the same continuation, so cg_jump falls
+// through with no goto. BURG owns figure 8's case dispatch at lowering
+// time over the LoadLocal/op shape; no case specializations, constant
+// folds, or commutativity carve-outs in DDCG.
 // =============================================================
 
 rule bin_op_add : ast.BinOp(op: Add, left: l, right: r) {
-    let lv = gen(l, rho, ac, jump(Lnext), Lnext);
-    let rv = gen(r, rho, ac, jump(Lnext), Lnext);
-    cg_deliver(build ir.Add(lv, rv), delta, gamma, Lnext);
+    let tl = alloc_local();
+    let tr = alloc_local();
+    let ll = make_load_local(tl);
+    let lr = make_load_local(tr);
+    let after = cg_deliver(build ir.Add(ll, lr), delta, gamma, Lnext);
+    let after_r = gen(r, rho, local(tr), jump(after), after);
+    gen(l, rho, local(tl), jump(after_r), after_r);
 }
 
 rule bin_op_sub : ast.BinOp(op: Sub, left: l, right: r) {
-    let lv = gen(l, rho, ac, jump(Lnext), Lnext);
-    let rv = gen(r, rho, ac, jump(Lnext), Lnext);
-    cg_deliver(build ir.Sub(lv, rv), delta, gamma, Lnext);
+    let tl = alloc_local();
+    let tr = alloc_local();
+    let ll = make_load_local(tl);
+    let lr = make_load_local(tr);
+    let after = cg_deliver(build ir.Sub(ll, lr), delta, gamma, Lnext);
+    let after_r = gen(r, rho, local(tr), jump(after), after);
+    gen(l, rho, local(tl), jump(after_r), after_r);
 }
 
 rule bin_op_mul : ast.BinOp(op: Mul, left: l, right: r) {
-    let lv = gen(l, rho, ac, jump(Lnext), Lnext);
-    let rv = gen(r, rho, ac, jump(Lnext), Lnext);
-    cg_deliver(build ir.Mul(lv, rv), delta, gamma, Lnext);
+    let tl = alloc_local();
+    let tr = alloc_local();
+    let ll = make_load_local(tl);
+    let lr = make_load_local(tr);
+    let after = cg_deliver(build ir.Mul(ll, lr), delta, gamma, Lnext);
+    let after_r = gen(r, rho, local(tr), jump(after), after);
+    gen(l, rho, local(tl), jump(after_r), after_r);
 }
 
 rule neg_op : ast.NegOp(operand: e) {
-    let ev = gen(e, rho, ac, jump(Lnext), Lnext);
-    cg_deliver(build ir.Neg(ev), delta, gamma, Lnext);
+    let te = alloc_local();
+    let le = make_load_local(te);
+    let after = cg_deliver(build ir.Neg(le), delta, gamma, Lnext);
+    gen(e, rho, local(te), jump(after), after);
 }
 
 rule cmp_eq : ast.CmpEq(left: l, right: r) {
-    let lv = gen(l, rho, ac, jump(Lnext), Lnext);
-    let rv = gen(r, rho, ac, jump(Lnext), Lnext);
-    cg_deliver(build ir.CmpEq(lv, rv), delta, gamma, Lnext);
+    let tl = alloc_local();
+    let tr = alloc_local();
+    let ll = make_load_local(tl);
+    let lr = make_load_local(tr);
+    let after = cg_deliver(build ir.CmpEq(ll, lr), delta, gamma, Lnext);
+    let after_r = gen(r, rho, local(tr), jump(after), after);
+    gen(l, rho, local(tl), jump(after_r), after_r);
 }
 
 rule cmp_neq : ast.CmpNeq(left: l, right: r) {
-    let lv = gen(l, rho, ac, jump(Lnext), Lnext);
-    let rv = gen(r, rho, ac, jump(Lnext), Lnext);
-    cg_deliver(build ir.CmpNeq(lv, rv), delta, gamma, Lnext);
+    let tl = alloc_local();
+    let tr = alloc_local();
+    let ll = make_load_local(tl);
+    let lr = make_load_local(tr);
+    let after = cg_deliver(build ir.CmpNeq(ll, lr), delta, gamma, Lnext);
+    let after_r = gen(r, rho, local(tr), jump(after), after);
+    gen(l, rho, local(tl), jump(after_r), after_r);
 }
 
 rule cmp_lt : ast.CmpLt(left: l, right: r) {
-    let lv = gen(l, rho, ac, jump(Lnext), Lnext);
-    let rv = gen(r, rho, ac, jump(Lnext), Lnext);
-    cg_deliver(build ir.CmpLt(lv, rv), delta, gamma, Lnext);
+    let tl = alloc_local();
+    let tr = alloc_local();
+    let ll = make_load_local(tl);
+    let lr = make_load_local(tr);
+    let after = cg_deliver(build ir.CmpLt(ll, lr), delta, gamma, Lnext);
+    let after_r = gen(r, rho, local(tr), jump(after), after);
+    gen(l, rho, local(tl), jump(after_r), after_r);
 }
 
 rule cmp_le : ast.CmpLe(left: l, right: r) {
-    let lv = gen(l, rho, ac, jump(Lnext), Lnext);
-    let rv = gen(r, rho, ac, jump(Lnext), Lnext);
-    cg_deliver(build ir.CmpLe(lv, rv), delta, gamma, Lnext);
+    let tl = alloc_local();
+    let tr = alloc_local();
+    let ll = make_load_local(tl);
+    let lr = make_load_local(tr);
+    let after = cg_deliver(build ir.CmpLe(ll, lr), delta, gamma, Lnext);
+    let after_r = gen(r, rho, local(tr), jump(after), after);
+    gen(l, rho, local(tl), jump(after_r), after_r);
 }
 
 rule cmp_gt : ast.CmpGt(left: l, right: r) {
-    let lv = gen(l, rho, ac, jump(Lnext), Lnext);
-    let rv = gen(r, rho, ac, jump(Lnext), Lnext);
-    cg_deliver(build ir.CmpGt(lv, rv), delta, gamma, Lnext);
+    let tl = alloc_local();
+    let tr = alloc_local();
+    let ll = make_load_local(tl);
+    let lr = make_load_local(tr);
+    let after = cg_deliver(build ir.CmpGt(ll, lr), delta, gamma, Lnext);
+    let after_r = gen(r, rho, local(tr), jump(after), after);
+    gen(l, rho, local(tl), jump(after_r), after_r);
 }
 
 rule cmp_ge : ast.CmpGe(left: l, right: r) {
-    let lv = gen(l, rho, ac, jump(Lnext), Lnext);
-    let rv = gen(r, rho, ac, jump(Lnext), Lnext);
-    cg_deliver(build ir.CmpGe(lv, rv), delta, gamma, Lnext);
+    let tl = alloc_local();
+    let tr = alloc_local();
+    let ll = make_load_local(tl);
+    let lr = make_load_local(tr);
+    let after = cg_deliver(build ir.CmpGe(ll, lr), delta, gamma, Lnext);
+    let after_r = gen(r, rho, local(tr), jump(after), after);
+    gen(l, rho, local(tl), jump(after_r), after_r);
 }
 
 // Paper page 10 — CG[loop E] (Lbreak,m) effect γ ⇒
@@ -403,12 +464,11 @@ rule not_op : ast.Not(operand: e) {
     };
 }
 
-// Paper page 14 CG[call f E1..En] ρ δ γ ⇒
-//   gen each Ei with δ=stack, then `calls $n,f`, then CG_store ac δ γ.
-// CEK-tree shape: each arg is a value sub-tree pulled into Call.args
-// (no separate PushStack IR node — JIT lowering emits push_stack
-// stencils inline at codegen time). cg_deliver wraps the call value
-// per outer δ/γ.
+// Paper page 14 CG[call f E1..En] ρ δ γ ⇒ gen each Ei to a temp, then
+// the call (reading the temps back), then CG_store the result per δ/γ.
+// compile_call sequences the arg evaluations on the spine (ANF), so a
+// call is a clean spine citizen in any context — argument, operand, or
+// tail. The call's value is delivered through the outer δ/γ.
 rule call_op : ast.Call(name: n, args: as) {
-    cg_deliver(compile_call(n, as, rho, Lnext), delta, gamma, Lnext);
+    compile_call(n, as, rho, delta, gamma, Lnext);
 }

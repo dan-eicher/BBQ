@@ -1,0 +1,636 @@
+// =============================================================
+// Opgen PEG Grammar
+//
+// Parses the opcode-spec DSL (`opcodes.def`) into the typed C++
+// AST defined in opgen.asdl (namespace opgen, tag-dispatched).
+// Generated as C++ via the pegc C++ frames (grammar/frames/).
+// =============================================================
+
+COMPILER Opgen
+
+(.
+#include "opgen_ast.h"
+#include <cstring>
+#include <cstdlib>
+
+// ── Helpers ─────────────────────────────────────────────────
+//
+// Strings live as `const char*` interned in the AST arena (so the
+// salvaged emitters keep `fprintf("%s", node->field)`). `dup` is a
+// verbatim span copy — matching the C `odup`, string-literal quotes
+// preserved; do NOT unescape (that would change emitted bytes).
+
+static inline const char* opgen_dup(peg::Span s) {
+    char* d = (char*)opgen::ASTNode::get_arena().allocate((size_t)s.len + 1);
+    std::memcpy(d, s.ptr, (size_t)s.len);
+    d[s.len] = '\0';
+    return d;
+}
+
+static inline const char* opgen_intern(const std::string& s) {
+    char* d = (char*)opgen::ASTNode::get_arena().allocate(s.size() + 1);
+    std::memcpy(d, s.data(), s.size());
+    d[s.size()] = '\0';
+    return d;
+}
+
+// Trim leading/trailing whitespace then intern — matches the C otrim_dup.
+static inline const char* opgen_trim_intern(const std::string& s) {
+    size_t b = 0, e = s.size();
+    while (b < e && (s[b]==' '||s[b]=='\t'||s[b]=='\r'||s[b]=='\n')) b++;
+    while (e > b && (s[e-1]==' '||s[e-1]=='\t'||s[e-1]=='\r'||s[e-1]=='\n')) e--;
+    return opgen_intern(s.substr(b, e - b));
+}
+
+static inline int64_t opgen_parse_int(peg::Span s) {
+    int64_t v = 0; int i = 0; int base = 10;
+    if (s.len >= 2 && s.ptr[0] == '0' && (s.ptr[1] == 'x' || s.ptr[1] == 'X')) {
+        base = 16; i = 2;
+    }
+    for (; i < s.len; i++) {
+        char c = s.ptr[i];
+        int d = (c <= '9') ? c - '0'
+              : (c <= 'F') ? c - 'A' + 10
+              :              c - 'a' + 10;
+        v = v * base + d;
+    }
+    return v;
+}
+
+static inline double opgen_parse_float(peg::Span s) {
+    char buf[64]; int n = s.len < 63 ? s.len : 63;
+    std::memcpy(buf, s.ptr, (size_t)n); buf[n] = '\0';
+    return std::strtod(buf, nullptr);
+}
+
+// Wrap a possibly-null pointer into an optional (nullopt when null) —
+// preserves the C "NULL means absent" convention for `?` fields.
+template <class T>
+static inline std::optional<T*> opgen_opt(T* p) {
+    return p ? std::optional<T*>(p) : std::nullopt;
+}
+.)
+
+CHARACTERS
+    letter         = 'a'..'z' + 'A'..'Z' + '_' .
+    digit          = '0'..'9' .
+    hex_digit      = digit + 'a'..'f' + 'A'..'F' .
+    ident_continue = letter + digit .
+
+TOKENS
+    ident      = letter { ident_continue } .
+    integer    = '0' ( 'x' | 'X' ) hex_digit { hex_digit }
+               | digit { digit } .
+    floating   = digit { digit } '.' digit { digit } .
+    string_lit = '"' { '\\' ANY | !'"' !'\\' !'\r' !'\n' ANY } '"' .
+
+COMMENTS FROM "#" TO "\n"
+
+IGNORE '\r' + '\n' + '\t' + ' '
+
+PRODUCTIONS
+
+// ═══════════════════════════════════════════════════════════════
+// Top level
+// ═══════════════════════════════════════════════════════════════
+
+Opgen
+    (. std::vector<const char*> headers;
+       std::vector<opgen::Opcode*> ops;
+       opgen::Opcode* op = nullptr;
+       std::vector<opgen::MethodDecl*> methods;
+       std::optional<opgen::StatusDecl*> status;
+       std::vector<opgen::TypeDecl*> types;
+       std::optional<const char*> body_c;
+       std::optional<const char*> backend;
+       std::string hdr; .)
+    = { "(."
+        (. if (!scan_to("." ")", hdr)) return false;
+           headers.push_back(opgen_intern(hdr)); .)
+      }
+      { StatusDecl<status>
+      | BackendDecl<backend>
+      | TypeDecl<types>
+      | MethodDecl<methods>
+      | FamilyDef<ops>
+      | OpcodeDef<op>
+        (. ops.push_back(op); .)
+      }
+      [ "%%"
+        (. /* Everything from here to EOF becomes `body_c`,
+            * emitted verbatim at the end of opcode_tables.c. */
+           const char* bstart = pos();
+           while (!at_end()) advance();
+           peg::Span bspan{ bstart, (int)(pos() - bstart) };
+           body_c = opgen_dup(bspan); .)
+      ]
+      (. skip(); if (!at_end()) return false; .)
+    (. ast = new opgen::Module(std::move(ops), std::move(methods), status,
+           std::move(types), std::move(headers), body_c, backend); .)
+.
+
+// ═══════════════════════════════════════════════════════════════
+// One opcode entry
+// ═══════════════════════════════════════════════════════════════
+
+OpcodeDef <. opgen::Opcode*& result .>
+    (. peg::Span ms; peg::Span isp; int64_t opcode_val = 0;
+       peg::Span ssp; int32_t subop = -1;
+       const char* mnemonic = nullptr;
+       std::vector<opgen::OperandParam*> operands;
+       std::vector<opgen::StackParam*> stack_in, stack_out;
+       std::vector<opgen::ErrorCase*> errors;
+       std::vector<const char*> flags;
+       std::optional<opgen::LocalValueDecl*> local_value;
+       std::vector<opgen::SemStmt*> sem_body; .)
+    = ident<ms>          (. mnemonic = opgen_dup(ms); .)
+      integer<isp>       (. opcode_val = opgen_parse_int(isp); .)
+      [ integer<ssp>     (. subop = (int32_t)opgen_parse_int(ssp); .) ]   /* prefixed opcode: 0xFC <subop> */
+      [ "[" [ OperandParam<operands>
+              { "," OperandParam<operands> } ] "]" ]
+      "(" [ StackParam<stack_in>
+            { "," StackParam<stack_in> } ]
+      "--" [ StackParam<stack_out>
+             { "," StackParam<stack_out> } ]
+      ")"
+      { Annotation<errors, flags, local_value> }
+      [ SemBody<sem_body> ]
+      (. result = new opgen::Opcode(
+             mnemonic, (int32_t)opcode_val, subop,
+             std::move(operands), std::move(stack_in), std::move(stack_out),
+             std::move(errors), std::move(flags), local_value,
+             std::move(sem_body)); .)
+.
+
+// ═══════════════════════════════════════════════════════════════
+// Type-family template — one entry expands to N typed opcodes.
+//   family ( T a, T b -- T result ) <annotations> (. body .) {
+//       i32 iadd 0x60   i64 ladd 0x61   f32 fadd 0x62   f64 dadd 0x63
+//   }
+// Stack params written `T x` take the member's value type; concrete types
+// (e.g. `i32 amount` for shifts) stay fixed. The body + annotations are
+// type-agnostic and shared verbatim across members (jtype-driven lowering
+// specializes them). Expands at parse time into ordinary opcode nodes, so
+// derive/emit never see a family.
+// ═══════════════════════════════════════════════════════════════
+
+FamilyDef <. std::vector<opgen::Opcode*>& ops .>
+    (. std::vector<opgen::OperandParam*> operands;
+       std::vector<opgen::StackParam*> tin, tout;
+       std::vector<int> in_var, out_var;
+       std::vector<opgen::ErrorCase*> errors;
+       std::vector<const char*> flags;
+       std::optional<opgen::LocalValueDecl*> local_value;
+       std::vector<opgen::SemStmt*> sem_body;
+       std::vector<opgen::ValueType> mvts; std::vector<const char*> mnames;
+       std::vector<int64_t> mhexes; std::vector<int64_t> msubs; .)
+    = "family" !ident_continue
+      [ "[" [ OperandParam<operands>
+              { "," OperandParam<operands> } ] "]" ]
+      "(" [ FamilyStackParam<tin, in_var>
+            { "," FamilyStackParam<tin, in_var> } ]
+      "--" [ FamilyStackParam<tout, out_var>
+             { "," FamilyStackParam<tout, out_var> } ]
+      ")"
+      { Annotation<errors, flags, local_value> }
+      [ SemBody<sem_body> ]
+      "{"
+        FamilyMember<mvts, mnames, mhexes, msubs>
+        { FamilyMember<mvts, mnames, mhexes, msubs> }
+      "}"
+      (. for (size_t m = 0; m < mnames.size(); m++) {
+             std::vector<opgen::StackParam*> nin;
+             for (size_t i = 0; i < tin.size(); i++) {
+                 opgen::ValueType ty = in_var[i] ? mvts[m] : tin[i]->ty;
+                 nin.push_back(new opgen::StackParam(ty, tin[i]->name, tin[i]->sem_expr));
+             }
+             std::vector<opgen::StackParam*> nout;
+             for (size_t i = 0; i < tout.size(); i++) {
+                 opgen::ValueType ty = out_var[i] ? mvts[m] : tout[i]->ty;
+                 nout.push_back(new opgen::StackParam(ty, tout[i]->name, tout[i]->sem_expr));
+             }
+             ops.push_back(new opgen::Opcode(
+                 mnames[m], (int32_t)mhexes[m], (int32_t)msubs[m],
+                 operands, std::move(nin), std::move(nout),
+                 errors, flags, local_value,
+                 sem_body));
+         } .)
+.
+
+// One family stack parameter: `T name` (member-typed) or `<ValueType> name`.
+FamilyStackParam <. std::vector<opgen::StackParam*>& list, std::vector<int>& var_flags .>
+    (. opgen::ValueType ty = opgen::ValueType::TyI32; peg::Span ns; peg::Span es;
+       const char* sem_expr = nullptr; int isvar = 0; .)
+    = ( "T" !ident_continue   (. isvar = 1; .)
+      | ValueType<ty>
+      )
+      ident<ns>
+      [ "=" string_lit<es>   (. sem_expr = opgen_dup(es); .) ]
+      (. var_flags.push_back(isvar);
+         list.push_back(new opgen::StackParam(ty, opgen_dup(ns), opgen_opt(sem_expr))); .)
+.
+
+// One family member: <ValueType> <mnemonic> <opcode> [<subop>]. The optional second
+// integer is the prefixed sub-opcode (e.g. SIMD `0xfd 174`); absent → -1 (1-byte op).
+FamilyMember <. std::vector<opgen::ValueType>& mvts, std::vector<const char*>& mnames,
+                std::vector<int64_t>& mhexes, std::vector<int64_t>& msubs .>
+    (. opgen::ValueType ty; peg::Span ms; peg::Span hs; peg::Span hs2; int has_sub = 0; .)
+    = ValueType<ty> ident<ms> integer<hs> [ integer<hs2> (. has_sub = 1; .) ]
+      (. mvts.push_back(ty); mnames.push_back(opgen_dup(ms));
+         mhexes.push_back(opgen_parse_int(hs));
+         msubs.push_back(has_sub ? opgen_parse_int(hs2) : -1); .)
+.
+
+// ═══════════════════════════════════════════════════════════════
+// Parameters
+// ═══════════════════════════════════════════════════════════════
+
+OperandParam <. std::vector<opgen::OperandParam*>& list .>
+    (. opgen::ValueType ty; peg::Span ns; bool cp_ref = false; .)
+    = ValueType<ty> ident<ns>
+      [ "cp_ref" !ident_continue (. cp_ref = true; .) ]
+      (. list.push_back(new opgen::OperandParam(ty, opgen_dup(ns), cp_ref)); .)
+.
+
+StackParam <. std::vector<opgen::StackParam*>& list .>
+    (. opgen::ValueType ty; peg::Span ns; peg::Span es;
+       const char* sem_expr = nullptr; .)
+    = ValueType<ty> ident<ns>
+      [ "=" string_lit<es>  (. sem_expr = opgen_dup(es); .) ]
+      (. list.push_back(new opgen::StackParam(ty, opgen_dup(ns), opgen_opt(sem_expr))); .)
+.
+
+// ═══════════════════════════════════════════════════════════════
+// Enum productions — each is a fixed keyword set parsed by pegc.
+// Word-boundary `!ident_continue` after every literal so e.g.
+// "static" doesn't eat "static_method".
+// ═══════════════════════════════════════════════════════════════
+
+ValueType <. opgen::ValueType& out .>
+    = "dword" !ident_continue (. out = opgen::ValueType::TyDword; .)
+    | "word"  !ident_continue (. out = opgen::ValueType::TyWord;  .)
+    | "ref"   !ident_continue (. out = opgen::ValueType::TyRef;   .)
+    | "i64"   !ident_continue (. out = opgen::ValueType::TyI64;   .)
+    | "i32"   !ident_continue (. out = opgen::ValueType::TyI32;   .)
+    | "i16"   !ident_continue (. out = opgen::ValueType::TyI16;   .)
+    | "i8"    !ident_continue (. out = opgen::ValueType::TyI8;    .)
+    | "u16"   !ident_continue (. out = opgen::ValueType::TyU16;   .)
+    | "u8"    !ident_continue (. out = opgen::ValueType::TyU8;    .)
+    | "f64"   !ident_continue (. out = opgen::ValueType::TyF64;   .)
+    | "f32"   !ident_continue (. out = opgen::ValueType::TyF32;   .)
+    | "i8x16" !ident_continue (. out = opgen::ValueType::TyI8x16; .)
+    | "i16x8" !ident_continue (. out = opgen::ValueType::TyI16x8; .)
+    | "i32x4" !ident_continue (. out = opgen::ValueType::TyI32x4; .)
+    | "i64x2" !ident_continue (. out = opgen::ValueType::TyI64x2; .)
+    | "f32x4" !ident_continue (. out = opgen::ValueType::TyF32x4; .)
+    | "f64x2" !ident_continue (. out = opgen::ValueType::TyF64x2; .)
+    | "v128"  !ident_continue (. out = opgen::ValueType::TyV128;  .)
+    | "funcref"   !ident_continue (. out = opgen::ValueType::TyFuncRef;   .)
+    | "externref" !ident_continue (. out = opgen::ValueType::TyExternRef; .)
+    | "i31ref"    !ident_continue (. out = opgen::ValueType::TyI31Ref;    .)
+    | "uleb128"   !ident_continue (. out = opgen::ValueType::TyUleb32; .)
+    | "uleb64"    !ident_continue (. out = opgen::ValueType::TyUleb64; .)
+    | "uleb32"    !ident_continue (. out = opgen::ValueType::TyUleb32; .)
+    | "sleb128"   !ident_continue (. out = opgen::ValueType::TySleb32; .)
+    | "sleb64"    !ident_continue (. out = opgen::ValueType::TySleb64; .)
+    | "sleb32"    !ident_continue (. out = opgen::ValueType::TySleb32; .)
+    | "memarg"    !ident_continue (. out = opgen::ValueType::TyMemarg; .)
+    | "any"   !ident_continue (. out = opgen::ValueType::TyAny;   .)
+.
+
+LocalValueKind <. opgen::LocalValueKind& out .>
+    = "short"  !ident_continue (. out = opgen::LocalValueKind::LvShort;  .)
+    | "int"    !ident_continue (. out = opgen::LocalValueKind::LvInt;    .)
+    | "ref"    !ident_continue (. out = opgen::LocalValueKind::LvRef;    .)
+    | "long"   !ident_continue (. out = opgen::LocalValueKind::LvLong;   .)
+    | "float"  !ident_continue (. out = opgen::LocalValueKind::LvFloat;  .)
+    | "double" !ident_continue (. out = opgen::LocalValueKind::LvDouble; .)
+.
+
+// ═══════════════════════════════════════════════════════════════
+// Annotations
+// ═══════════════════════════════════════════════════════════════
+
+Annotation <. std::vector<opgen::ErrorCase*>& errs,
+              std::vector<const char*>& flags,
+              std::optional<opgen::LocalValueDecl*>& local_value .>
+    (. peg::Span s1; peg::Span fname;
+       opgen::LocalValueKind lvk;
+       const char* cond = nullptr; .)
+    = "error:" [ string_lit<s1> "->" (. cond = opgen_dup(s1); .) ]
+        ident<fname>
+        (. errs.push_back(new opgen::ErrorCase(opgen_opt(cond), opgen_dup(fname))); .)
+
+    | "flag:" ident<fname>
+        (. flags.push_back(opgen_dup(fname)); .)
+
+    | "local_value:" LocalValueKind<lvk>
+        (. local_value = new opgen::LocalValueDecl(lvk); .)
+.
+
+// ═══════════════════════════════════════════════════════════════
+// Semantic action language — the Java block-statement grammar
+//
+// A "(. ... .)" body is the interior of one method: straight-line and
+// conditional statements over the full Java expression language, with
+// object/field/array/invoke effects written as built-in calls. This IS
+// the action language — opcode bodies are a subset of it, not its
+// definition. A body that does not parse is a hard error; there is no
+// raw-C escape.
+//
+// Deliberately excluded (documented carve-outs, not usage-driven
+// omissions):
+//   * loops (for/while/do), switch, labels, break/continue,
+//     try/catch/finally, synchronized — control-flow with no role in a
+//     single opcode's straight-line action, and the misuse vectors a
+//     faithful action language should not offer;
+//   * `this`/`super`/`new`/`instanceof`/dotted field access — these name
+//     the class/type/name machinery an opcode action does not have;
+//     object/field/array/new/cast effects go through built-in calls
+//     (get_field(o,ref), new(ref), checkcast(o,ref), array_load(a,i), …);
+//   * ++/-- and compound assignment (+=, …) — side-effecting expression
+//     sugar; bodies write the explicit form (x = x + 1).
+// Casts are to Java primitive types; reference casts are the checkcast
+// built-in. Assignment lives at statement level, so an expression is the
+// Java conditional-expression and below.
+// ═══════════════════════════════════════════════════════════════
+
+SemBody <. std::vector<opgen::SemStmt*>& body .>
+    = "(" "." { SemBlockStmt<body> }
+      ( "." ")" | (. return false; .) )
+.
+
+// One statement position inside a block: a local declaration (which may
+// bind several declarators) or a single statement. Empty statements drop.
+SemBlockStmt <. std::vector<opgen::SemStmt*>& list .>
+    (. opgen::SemStmt* st = nullptr; .)
+    = SemLocalDecl<list>
+    | SemStmt<st> (. if (st) list.push_back(st); .)
+.
+
+SemLocalDecl <. std::vector<opgen::SemStmt*>& list .>
+    (. const char* ty = nullptr; .)
+    = JavaPrimType<ty> SemDeclarator<list, ty>
+      { "," SemDeclarator<list, ty> } ";"
+.
+
+SemDeclarator <. std::vector<opgen::SemStmt*>& list, const char* ty .>
+    (. peg::Span ns; opgen::SemExpr* init = nullptr; .)
+    = ident<ns> [ "=" !'=' SemExpr<init> ]
+      (. list.push_back(new opgen::SLocalDecl(ty, opgen_dup(ns), opgen_opt(init))); .)
+.
+
+SemStmt <. opgen::SemStmt*& out .>
+    (. opgen::SemExpr* cond = nullptr; opgen::SemStmt* then_ = nullptr;
+       opgen::SemStmt* els = nullptr;
+       opgen::SemStmt* init = nullptr; opgen::SemStmt* upd = nullptr; .)
+    = SemBlock<out>
+    | "if" !ident_continue "(" SemExpr<cond> ")" SemStmt<then_>
+        [ "else" !ident_continue SemStmt<els> ]
+        (. out = new opgen::SIf(cond, then_, opgen_opt(els)); .)
+    | "while" !ident_continue "(" SemExpr<cond> ")" SemStmt<then_>
+        (. out = new opgen::SWhile(cond, then_); .)
+    | "for" !ident_continue "("
+        ForClause<init> ";" [ SemExpr<cond> ] ";" ForClause<upd>
+      ")" SemStmt<then_>
+        (. out = new opgen::SFor(opgen_opt(init), opgen_opt(cond), opgen_opt(upd), then_); .)
+    | ";" (. out = nullptr; .)
+    | "trap" !ident_continue ";" (. out = new opgen::STrap(); .)
+    | SemSimpleStmt<out>
+.
+
+// One clause of a for-header (init or update), with no trailing ';': either a
+// typed local declaration, an assignment, or empty.
+ForClause <. opgen::SemStmt*& out .>
+    (. const char* ty = nullptr; peg::Span ns; opgen::SemExpr* init = nullptr;
+       opgen::SemExpr* lhs = nullptr; opgen::SemExpr* rhs = nullptr; .)
+    = JavaPrimType<ty> ident<ns> [ "=" !'=' SemExpr<init> ]
+        (. out = new opgen::SLocalDecl(ty, opgen_dup(ns), opgen_opt(init)); .)
+    | SemExpr<lhs> "=" !'=' SemExpr<rhs>
+        (. out = new opgen::SAssign(lhs, rhs); .)
+    | (. out = nullptr; .)
+.
+
+SemBlock <. opgen::SemStmt*& out .>
+    (. std::vector<opgen::SemStmt*> blk; .)
+    = "{" { SemBlockStmt<blk> } "}"
+      (. out = new opgen::SBlock(std::move(blk)); .)
+.
+
+// Assignment or a bare expression statement (a built-in call). Both start
+// with an expression; a trailing "=" makes it an assignment whose left
+// side must be an lvalue (an ident or an index).
+SemSimpleStmt <. opgen::SemStmt*& out .>
+    (. opgen::SemExpr* lhs = nullptr; opgen::SemExpr* rhs = nullptr; .)
+    = SemExpr<lhs>
+      ( "=" !'=' SemExpr<rhs> ";" (. out = new opgen::SAssign(lhs, rhs); .)
+      | ";"                        (. out = new opgen::SExprStmt(lhs); .) )
+.
+
+// Expression cascade (PEG iteration form, built left-associatively).
+SemExpr <. opgen::SemExpr*& out .>
+    = SemTernary<out>
+.
+
+SemTernary <. opgen::SemExpr*& out .>
+    (. opgen::SemExpr* c = nullptr; opgen::SemExpr* t = nullptr; opgen::SemExpr* e = nullptr; .)
+    = SemCondOr<c>
+      [ "?" SemExpr<t> ":" SemTernary<e> (. c = new opgen::STernary(c, t, e); .) ]
+      (. out = c; .)
+.
+
+SemCondOr <. opgen::SemExpr*& out .>
+    (. opgen::SemExpr* acc = nullptr; opgen::SemExpr* rhs = nullptr; .)
+    = SemCondAnd<acc>
+      { "||" SemCondAnd<rhs> (. acc = new opgen::SBinOp("||", acc, rhs); .) }
+      (. out = acc; .)
+.
+
+SemCondAnd <. opgen::SemExpr*& out .>
+    (. opgen::SemExpr* acc = nullptr; opgen::SemExpr* rhs = nullptr; .)
+    = SemBinOr<acc>
+      { "&&" SemBinOr<rhs> (. acc = new opgen::SBinOp("&&", acc, rhs); .) }
+      (. out = acc; .)
+.
+
+SemBinOr <. opgen::SemExpr*& out .>
+    (. opgen::SemExpr* acc = nullptr; opgen::SemExpr* rhs = nullptr; .)
+    = SemBinXor<acc>
+      { "|" !'|' SemBinXor<rhs> (. acc = new opgen::SBinOp("|", acc, rhs); .) }
+      (. out = acc; .)
+.
+
+SemBinXor <. opgen::SemExpr*& out .>
+    (. opgen::SemExpr* acc = nullptr; opgen::SemExpr* rhs = nullptr; .)
+    = SemBinAnd<acc>
+      { "^" SemBinAnd<rhs> (. acc = new opgen::SBinOp("^", acc, rhs); .) }
+      (. out = acc; .)
+.
+
+SemBinAnd <. opgen::SemExpr*& out .>
+    (. opgen::SemExpr* acc = nullptr; opgen::SemExpr* rhs = nullptr; .)
+    = SemEq<acc>
+      { "&" !'&' SemEq<rhs> (. acc = new opgen::SBinOp("&", acc, rhs); .) }
+      (. out = acc; .)
+.
+
+SemEq <. opgen::SemExpr*& out .>
+    (. opgen::SemExpr* acc = nullptr; opgen::SemExpr* rhs = nullptr; const char* op = nullptr; .)
+    = SemRel<acc>
+      { ( "==" (. op = "=="; .) | "!=" (. op = "!="; .) )
+        SemRel<rhs> (. acc = new opgen::SBinOp(op, acc, rhs); .) }
+      (. out = acc; .)
+.
+
+SemRel <. opgen::SemExpr*& out .>
+    (. opgen::SemExpr* acc = nullptr; opgen::SemExpr* rhs = nullptr; const char* op = nullptr; .)
+    = SemShift<acc>
+      { ( "<=" (. op = "<="; .) | ">=" (. op = ">="; .)
+        | "<" !'<' (. op = "<"; .) | ">" !'>' (. op = ">"; .) )
+        SemShift<rhs> (. acc = new opgen::SBinOp(op, acc, rhs); .) }
+      (. out = acc; .)
+.
+
+SemShift <. opgen::SemExpr*& out .>
+    (. opgen::SemExpr* acc = nullptr; opgen::SemExpr* rhs = nullptr; const char* op = nullptr; .)
+    = SemAdd<acc>
+      { ( ">>>" (. op = ">>>"; .) | ">>" (. op = ">>"; .) | "<<" (. op = "<<"; .) )
+        SemAdd<rhs> (. acc = new opgen::SBinOp(op, acc, rhs); .) }
+      (. out = acc; .)
+.
+
+SemAdd <. opgen::SemExpr*& out .>
+    (. opgen::SemExpr* acc = nullptr; opgen::SemExpr* rhs = nullptr; const char* op = nullptr; .)
+    = SemMul<acc>
+      { ( "+" (. op = "+"; .) | "-" (. op = "-"; .) )
+        SemMul<rhs> (. acc = new opgen::SBinOp(op, acc, rhs); .) }
+      (. out = acc; .)
+.
+
+SemMul <. opgen::SemExpr*& out .>
+    (. opgen::SemExpr* acc = nullptr; opgen::SemExpr* rhs = nullptr; const char* op = nullptr; .)
+    = SemUnary<acc>
+      { ( "*" (. op = "*"; .) | "/" (. op = "/"; .) | "%" (. op = "%"; .) )
+        SemUnary<rhs> (. acc = new opgen::SBinOp(op, acc, rhs); .) }
+      (. out = acc; .)
+.
+
+SemUnary <. opgen::SemExpr*& out .>
+    (. opgen::SemExpr* e = nullptr; const char* op = nullptr; const char* ct = nullptr; .)
+    = ( "-" (. op = "-"; .) | "~" (. op = "~"; .) | "!" !'=' (. op = "!"; .) )
+        SemUnary<e> (. out = new opgen::SUnary(op, e); .)
+    | "(" JavaPrimType<ct> ")" SemUnary<e>
+        (. out = new opgen::SCast(ct, e); .)
+    | SemPostfix<out>
+.
+
+// Postfix: array indexing. Method invocation is handled at the primary
+// level; dotted field access is not part of the action language.
+SemPostfix <. opgen::SemExpr*& out .>
+    (. opgen::SemExpr* e = nullptr; opgen::SemExpr* idx = nullptr; .)
+    = SemPrimary<e>
+      { "[" SemExpr<idx> "]" (. e = new opgen::SIndex(e, idx); .) }
+      (. out = e; .)
+.
+
+SemPrimary <. opgen::SemExpr*& out .>
+    (. peg::Span is; peg::Span fs; peg::Span ns; opgen::SemExpr* inner = nullptr;
+       std::vector<opgen::SemExpr*> args; opgen::SemExpr* arg = nullptr; .)
+    = floating<fs>           (. out = new opgen::SFloat(opgen_parse_float(fs)); .)
+    | integer<is>            (. out = new opgen::SInt(opgen_parse_int(is)); .)
+    | "null"  !ident_continue (. out = new opgen::SInt(0); .)
+    | "true"  !ident_continue (. out = new opgen::SInt(1); .)
+    | "false" !ident_continue (. out = new opgen::SInt(0); .)
+    | ident<ns> "("
+        [ SemExpr<arg>
+            (. args.push_back(arg); .)
+          { "," SemExpr<arg>
+            (. args.push_back(arg); .) } ]
+        ")" (. out = new opgen::SCall(opgen_dup(ns), std::move(args)); .)
+    | ident<ns>              (. out = new opgen::SIdent(opgen_dup(ns)); .)
+    | "(" SemExpr<inner> ")" (. out = inner; .)
+.
+
+// ═══════════════════════════════════════════════════════════════
+// Method declarations — the built-in vocabulary (and pure helpers)
+//
+// A `native` method is a built-in (ddcgc's Aux): signature here, C body in the
+// runtime, called by name. A method with a body is a helper (ddcgc's Fun),
+// defined in the action language. Both use the JLS method-declaration rule.
+// Distinguished from an opcode entry by the leading `native`/type keyword
+// (an opcode entry starts with a mnemonic ident).
+// ═══════════════════════════════════════════════════════════════
+
+MethodType <. const char*& out .>
+    = "void"   !ident_continue (. out = "void";   .)
+    | "status" !ident_continue (. out = "status"; .)
+    | "ref"    !ident_continue (. out = "ref";    .)
+    | "any"    !ident_continue (. out = "any";    .)
+    | "v128"   !ident_continue (. out = "v128";   .)
+    | JavaPrimType<out>
+.
+
+MethodParam <. std::vector<opgen::MethodParam*>& list .>
+    (. const char* ty = nullptr; peg::Span ns; .)
+    = MethodType<ty> ident<ns>
+      (. list.push_back(new opgen::MethodParam(ty, opgen_dup(ns))); .)
+.
+
+// status <c-type> <ok> <err> <halt> — the control-flow status vocabulary,
+// so no target identifiers are baked into the generator.
+StatusDecl <. std::optional<opgen::StatusDecl*>& out .>
+    (. peg::Span ty; peg::Span ok; peg::Span er; peg::Span ha; .)
+    = "status" !ident_continue
+      ident<ty> ident<ok> ident<er> ident<ha>
+      (. out = new opgen::StatusDecl(opgen_dup(ty), opgen_dup(ok),
+                                     opgen_dup(er), opgen_dup(ha)); .)
+.
+
+// backend "<header>" — the substrate header (frame_t/vm_t/heap_t) the consumer
+// supplies. opgen #includes it at the value-model's substrate point in
+// runtime_api.h instead of the default self-test frame, so a real VM's frame is
+// spec-declared (one source) — no per-translation-unit -D macro to keep in sync.
+BackendDecl <. std::optional<const char*>& out .>
+    (. peg::Span hdr; .)
+    = "backend" !ident_continue string_lit<hdr>
+      (. out = opgen_dup(hdr); .)
+.
+
+// type <value-type> <c-scalar> <c-unsigned> <slots> <field> — a slot/type-table
+// row, so the slot model (JCVM 16-bit vs JVM 32-bit word) swaps per target.
+TypeDecl <. std::vector<opgen::TypeDecl*>& list .>
+    (. opgen::ValueType ty; peg::Span sc; peg::Span usc; peg::Span fld; peg::Span sl; .)
+    = "type" !ident_continue
+      ValueType<ty> ident<sc> ident<usc> integer<sl> ident<fld>
+      (. list.push_back(new opgen::TypeDecl(ty, opgen_dup(sc), opgen_dup(usc),
+             (int32_t)opgen_parse_int(sl), opgen_dup(fld))); .)
+.
+
+MethodDecl <. std::vector<opgen::MethodDecl*>& list .>
+    (. bool native = false; const char* rty = nullptr; peg::Span ns;
+       std::vector<opgen::MethodParam*> params;
+       std::vector<opgen::SemStmt*> body; .)
+    = [ "native" !ident_continue (. native = true; .) ]
+      MethodType<rty> ident<ns>
+      "(" [ MethodParam<params> { "," MethodParam<params> } ] ")"
+      ( ";"
+      | "{" { SemBlockStmt<body> } "}" )
+      (. list.push_back(new opgen::MethodDecl(native, rty, opgen_dup(ns),
+             std::move(params), std::move(body))); .)
+.
+
+JavaPrimType <. const char*& out .>
+    = "boolean" !ident_continue (. out = "boolean"; .)
+    | "byte"    !ident_continue (. out = "byte";    .)
+    | "short"   !ident_continue (. out = "short";   .)
+    | "char"    !ident_continue (. out = "char";    .)
+    | "int"     !ident_continue (. out = "int";     .)
+    | "long"    !ident_continue (. out = "long";    .)
+    | "uint"    !ident_continue (. out = "uint";    .)
+    | "ulong"   !ident_continue (. out = "ulong";   .)
+    | "float"   !ident_continue (. out = "float";   .)
+    | "double"  !ident_continue (. out = "double";  .)
+    | "unsigned" !ident_continue (. out = "unsigned"; .)
+    | "signed"   !ident_continue (. out = "signed";   .)
+.
+END Opgen.

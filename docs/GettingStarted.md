@@ -305,46 +305,68 @@ int(result.header.magic)  # only this field's bytes are read
 
 ## C++ Code Generation
 
-`bbqc` compiles a `.bbq` spec into three standalone C++ files:
+`bbqc -backend cpp` compiles a `.bbq` spec into header-only C++ files of
+**zero-copy view** types — a parse records offsets into the input and copies
+nothing; field accessors decode lazily, and `emit()` writes back:
 
 ```sh
-./build/bbqc examples/header.bbq -o gen/ -frames backends/cpp/frames/
-# Produces: gen/headerTypes.h, gen/headerParser.h, gen/headerParser.cpp
+./build/bbqc -backend cpp examples/header.bbq -o gen/ \
+    -templates backends/render/templates -prefix header -namespace hdr
+# Produces: gen/headerTypes.h, gen/headerReader.h, gen/headerWriter.h
 ```
 
 Options:
 
 | Flag | Default | Description |
 |------|---------|-------------|
+| `-backend <c\|cpp\|c-lite>` | `cpp` | Backend: `c` = owning C (read+write), `cpp` = C++ ZCow view (read+write+edit), `c-lite` = read-only zero-copy C view reader |
 | `-o <dir>` | `.` | Output directory |
-| `-frames <dir>` | `./frames` | Frame template directory |
+| `-templates <dir>` | — | inja template directory (`backends/render/templates`) |
 | `-prefix <name>` | from input filename | Generated file prefix |
 | `-namespace <ns>` | none | C++ namespace for generated code |
 
-The generated parser depends on `BBQContext.h` (in `backends/cpp/runtime/`),
-a header-only runtime that provides the parse context, reader, and error
-handling. Copy it into your project alongside the generated files.
+The generated headers depend only on the C++ view runtime in
+`backends/cpp/runtime/` (`bbq_node.h`, `bbq_reader.h`, `bbq_writer.h` and the index/
+decode headers they include: `Capture.h`, `CaptureDecode.h`, `CaptureCow.h`,
+`ParseArena.h`, `bbq_machine.h`). Compile against that one include dir and link
+`backends/cpp/runtime/CaptureDecode.cpp`; nothing else is needed (no `bbq::cek`).
 
-Minimal usage:
+Minimal usage — `<Rule>_read` builds the index, a handle is a typed view over it,
+and `<Rule>_write` serializes the (optionally edited) overlay back to bytes:
 
 ```cpp
-#include "headerTypes.h"
-#include "headerParser.h"
+#include "headerTypes.h"     // typed handles (hdr::Header)
+#include "headerReader.h"    // hdr::Header_read
+#include "headerWriter.h"    // hdr::Header_write
+#include <cstdio>
+#include <vector>
 
 int main() {
     const uint8_t data[] = {0x89, 'P', 'N', 'G', 0x03, 0x00,
                             0x01, 0x0a, 0x00, 0x00, 0x00};
-    BBQContext ctx(data, sizeof(data));
-    Header header;
-    if (parse_Header(ctx, header)) {
-        printf("magic: 0x%08x\n", header.magic);
-        printf("version: %d\n", header.version);
-    }
+    bbq::ParseArena arena;
+    auto vm = hdr::Header_read(data, sizeof data, arena);   // zero-copy parse → index
+    if (!vm.success) return 1;
+
+    hdr::Header h(vm.root, data, nullptr);   // typed view over `data` (no edits)
+    printf("magic: 0x%08x\n", h.magic());
+    printf("version: %d\n", h.version());
+
+    // Mutate through a copy-on-write overlay, then write the edited bytes back.
+    bbq::zcow zc;
+    hdr::Header edit(vm.root, data, &zc);
+    edit.set_version(2);
+    std::vector<uint8_t> out = hdr::Header_write(vm.root, data, sizeof data, &zc);
 }
 ```
 
-For the full design, codegen patterns, and runtime API, see
-[StaticCodegen.md](StaticCodegen.md).
+```sh
+g++ -std=c++17 -I gen -I backends/cpp/runtime \
+    main.cpp backends/cpp/runtime/CaptureDecode.cpp -o demo
+```
+
+The view borrows `data`, so the input buffer must outlive the handles and any
+`*_write` call.
 
 ## Real-World Examples
 

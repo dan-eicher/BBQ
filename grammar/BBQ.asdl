@@ -11,9 +11,18 @@
 module BBQ {
 
     // Top level
-    grammar       = Grammar(directive* directives, rule* rules)
+    grammar       = Grammar(directive* directives, rule* rules,
+                            code_block* codes)
 
     directive     = EndianDirective(endianness endian)
+
+    // Verbatim user code, emitted into the generated output. HeaderBlock
+    // lands in the types header (after the generated type definitions, so
+    // it can reference them); SourceBlock lands in the reader implementation
+    // file (so it can call the generated readers — e.g. an extern body).
+    code_block    = CodeBlock(code_section section, string code)
+
+    code_section  = HeaderBlock | SourceBlock | WriterBlock
 
     rule          = Rule(identifier name, type_expr body)
 
@@ -30,7 +39,7 @@ module BBQ {
     //RuleRef:      reference to another rule
 
     type_expr     = Alternatives(type_expr* alts)
-                  | Struct(field* fields)
+                  | Struct(field* fields, expr? constraint)
                   | Union(variant* variants)
                   | Array(type_expr element, array_spec spec,
                           expr? constraint, interval? interval,
@@ -45,7 +54,7 @@ module BBQ {
                               expr? constraint, interval? interval)
                   | RuleRef(identifier name,
                             expr? constraint, interval? interval)
-                  | Extern(string func_name, string cpp_type,
+                  | Extern(string func_name, string write_func, string cpp_type,
                            expr? constraint, interval? interval)
                   | Bitfield(primitive_kind container, bitfield_entry* entries)
                   | EndianSwitch(expr endian_expr)
@@ -83,6 +92,7 @@ module BBQ {
                                    bool is_reject)
 
     case_value    = IntValue(int64 value)
+                  | RangeValue(int64 lo, int64 hi)
                   | StrValue(string value)
                   | IdentValue(identifier name)
                   | RefValue(identifier* path)
@@ -99,7 +109,7 @@ module BBQ {
     // Covers all binary read types: integers (signed/unsigned, 8-64 bit),
     //floats (32/64 bit), raw bytes, strings, booleans.
     //Endianness is per-field: Little, Big, or Default (resolved by @endian).
-    primitive_kind = IntegerKind(width width, signedness sign, endianness endian)
+    primitive_kind = IntegerKind(width width, signedness sign, endianness endian, encoding encoding)
                    | FloatKind(width width, endianness endian)
                    | BytesKind
                    | StringKind
@@ -110,6 +120,12 @@ module BBQ {
     signedness    = Unsigned | Signed
 
     endianness    = Little | Big | Default
+
+    // Integer byte encoding: a plain fixed-width little/big-endian field, or a
+    // variable-length LEB128 varint (unsigned ULEB / signed SLEB). LEB128 is
+    // inherently LSB-first, so it ignores endianness. `width` is the carrier
+    // (decoded) width — W32 or W64.
+    encoding      = Fixed | Uleb | Sleb
 
     // Expression language (unified arithmetic + boolean + bitwise)
     expr          = BinOp(expr left, binop op, expr right)
@@ -123,6 +139,11 @@ module BBQ {
                   | Call(identifier func, expr* args)
                   | EndianLit(endianness value)
                   | EOI
+                  // Context builtin, written `@name` (e.g. @pos, @start, @end,
+                  // @index, @buffer, @remaining). A reserved namespace distinct
+                  // from format fields — the parser provides these, the format
+                  // does not. See the "interval environment" model in the README.
+                  | Builtin(identifier name)
 
     // Reference paths (field access chains)
     ref_path      = Simple(identifier name, identifier? resolved_path, identifier? resolved_parent, int64 resolved_depth)

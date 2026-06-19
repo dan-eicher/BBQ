@@ -1,0 +1,49 @@
+# Functional-test fixture: a tiny integer VM. opgen generates the interpreter
+# from this; test/calc_interp.c compiles it (clang — the handlers musttail) and
+# EXECUTES real bytecode, checking each opcode computes the specified result.
+# This tests the tool end-to-end: lowering, the slot model, operand decode,
+# threaded dispatch, locals.
+
+type i32 int32_t uint32_t 1 i
+
+iconst 0x01 [ i32 v ] ( -- i32 r )
+    (. r = v; .)
+
+iadd 0x02 (i32 a, i32 b -- i32 r)
+    (. r = a + b; .)
+
+isub 0x03 (i32 a, i32 b -- i32 r)
+    (. r = a - b; .)
+
+imul 0x04 (i32 a, i32 b -- i32 r)
+    (. r = a * b; .)
+
+ineg 0x05 (i32 a -- i32 r)
+    (. r = -a; .)
+
+iand 0x06 (i32 a, i32 b -- i32 r)
+    (. r = a & b; .)
+
+ior 0x07 (i32 a, i32 b -- i32 r)
+    (. r = a | b; .)
+
+ishl 0x08 (i32 a, i32 b -- i32 r)
+    (. r = a << b; .)
+
+ishr 0x09 (i32 a, i32 b -- i32 r)
+    (. r = a >> b; .)
+
+iushr 0x0A (i32 a, i32 b -- i32 r)
+    (. r = (unsigned)a >> b; .)
+
+istore 0x0B [ i8 idx ] (i32 v -- )
+    local_value: int
+    (. locals[idx] = v; .)
+
+iload 0x0C [ i8 idx ] ( -- i32 r )
+    local_value: int
+    (. r = locals[idx]; .)
+
+idiv 0x0D (i32 a, i32 b -- i32 r)
+    error: "divisor must be non-zero" -> DivByZero
+    (. r = a / b; .)

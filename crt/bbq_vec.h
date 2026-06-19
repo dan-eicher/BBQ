@@ -54,6 +54,10 @@ static inline void* bbq__vec_grow(void* v, size_t elem_size) {
 #define bbq_vec_clear(v) \
     do { if (v) bbq__vec_hdr(v)->len = 0; } while(0)
 
+/* Shrink the length to n (n <= current len); keeps capacity. */
+#define bbq_vec_truncate(v, n) \
+    do { if (v) bbq__vec_hdr(v)->len = (int)(n); } while(0)
+
 /* Cast helper: __typeof__ in C/GCC, decltype in C++ */
 #ifdef __cplusplus
 #define bbq__vec_cast(v) (decltype(v))

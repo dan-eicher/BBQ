@@ -23,6 +23,16 @@ enum class ExprType {
     Unknown    // extern, optional, unresolvable — permissive, never errors
 };
 
+// Resolved discriminator label for one switch case (shape side-data). The
+// CaseValue AST classification lives once here; backends render it differently
+// (the enum value vs the C `case` lines, where a Range expands to many).
+struct SwitchCaseLabel {
+    enum class Kind { Int, Range, Ident, Ref, Positional } kind = Kind::Positional;
+    int64_t lo = 0, hi = 0;   // Int: value in lo; Range: [lo, hi]
+    std::string name;         // Ident: the constant; Ref: the joined path
+    int index = 0;            // case ordinal (the positional fallback)
+};
+
 // Scope for type checking within a struct
 struct TypeCheckScope {
     std::unordered_map<std::string, ExprType> types;       // field name → ExprType
@@ -47,6 +57,38 @@ public:
         auto it = rule_map_.find(name);
         return (it != rule_map_.end()) ? it->second : nullptr;
     }
+
+    // Resolved fact (shape side-data): does this type own heap memory that needs
+    // a _free? Derived from the AST + rule table, memoized so backends read it
+    // instead of re-deriving ownership per render. AST-only — no CEK dependency.
+    bool type_needs_free(BBQ::TypeExpr* type);
+
+    // Resolved fact (shape side-data): a field's classified type, computed during
+    // check_types and ATTACHED here instead of discarded. Backends (and the
+    // c-view/cpp-zcow decode-on-access profiles) read it instead of re-deriving.
+    // Returns ExprType::Unknown for a field never type-checked.
+    ExprType field_type(BBQ::Field* field) const {
+        auto it = field_types_.find(field);
+        return it != field_types_.end() ? it->second : ExprType::Unknown;
+    }
+
+    // Resolved fact (shape side-data): the inline (anonymous nested) structs, in
+    // declaration order (innermost first), with their synthesized base name
+    // (`Rule_field` path). Computed once during analyze. The C namer spells these;
+    // backends that emit inline defs iterate them. Replaces CTypeMapper's per-
+    // instance walk so the set is computed once, not per backend.
+    const std::vector<std::pair<std::string, BBQ::Struct*>>& inline_structs() const {
+        return inline_structs_;
+    }
+    std::string inline_struct_name(BBQ::Struct* st) const {
+        auto it = inline_struct_name_.find(st);
+        return it != inline_struct_name_.end() ? it->second : "";
+    }
+
+    // Resolved fact (shape side-data): the discriminator label per switch case,
+    // in order. The CaseValue classification is done once here; backends render
+    // it. Memoized per Switch. AST-only — no CEK dependency.
+    const std::vector<SwitchCaseLabel>& switch_case_labels(BBQ::Switch* sw);
 
 
 private:
@@ -124,6 +166,11 @@ private:
     // Constraint helpers
     static bool body_has_constraint(BBQ::TypeExpr* body);
 
+    // Inline-struct registration (shape side-data): synthesize nested-struct
+    // names in declaration order, innermost first. `base` is the accumulated
+    // Rule_field path (NOT the CLI prefix — the C namer applies that).
+    void register_inline_structs(const std::string& base, BBQ::Struct* st);
+
     // Phase 8: resolve cross-rule references
     // Populates Simple::resolved_path for refs that aren't local fields
     void resolve_cross_refs();
@@ -136,6 +183,11 @@ private:
 
     ErrorReporter& errors_;
     std::unordered_map<std::string, BBQ::Rule*> rule_map_;
+    std::unordered_map<BBQ::TypeExpr*, bool> needs_free_;     // ownership memo (shape side-data)
+    std::unordered_map<BBQ::Field*, ExprType> field_types_;   // resolved field types (shape side-data)
+    std::vector<std::pair<std::string, BBQ::Struct*>> inline_structs_;     // order (shape side-data)
+    std::unordered_map<BBQ::Struct*, std::string> inline_struct_name_;     // Struct* -> base name
+    std::unordered_map<BBQ::Switch*, std::vector<SwitchCaseLabel>> switch_labels_;  // case labels (shape side-data)
     std::unordered_map<std::string, std::unordered_set<std::string>> deps_;
     std::vector<BBQ::Rule*> sorted_;
     BBQ::Endianness default_endian_ = BBQ::Endianness::Little;

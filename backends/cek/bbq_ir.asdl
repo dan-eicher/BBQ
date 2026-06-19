@@ -42,16 +42,32 @@ module bbq_ir {
     // variant uniformly.
     type kont_node      = "KontNode*"
 
+    // kont_expr — same C++ type as kont_node (KontNode*), but marks an
+    // operand sub-tree (a value the producer tiles: BURG_NODE_CHILD) as
+    // distinct from a spine/control successor (BURG_NODE_SUCC). The
+    // template reads this to generate the burg accessors; the CEK machine
+    // sees only KontNode* and is unaffected.
+    type kont_expr      = "KontNode*"
+
+    // kont_ref — also KontNode*, but a CROSS-rule reference (a callee's
+    // entry, a caller's failure target) that is neither an operand sub-tree
+    // nor a spine successor of THIS rule. The template generates no child()
+    // or succ() accessor for it, so burg's tiling and RPO spine-walk never
+    // traverse into another rule's graph; the CEK reaches it via invoke.
+    type kont_ref       = "KontNode*"
+
     // ── Enums ────────────────────────────────────────────────
 
     // EOF_ not EOF — EOF is a <cstdio> macro.
     array_mode = FixedCount | EOF_ | Count | Until
 
+
     // ── Sub-products (inline structs nested inside KontNodes) ──
 
-    // Switch case: typed match value (Int or String) + branch target.
-    switch_case   = (value match_value, kont_node target)
-    bitfield_entry = (interned name, int width_bits)
+    // Switch case: typed match value (Int or String) + branch target + the
+    // original case ordinal (shared across range-expanded entries) so the runtime
+    // records which arm matched in the capture (read side reads it, not re-derives).
+    switch_case   = (value match_value, kont_node target, int ordinal)
 
     // ── Value sum (typed accumulator + binding + capture values) ──
 
@@ -65,18 +81,46 @@ module bbq_ir {
 
     static_kont
         // Spine / structural — `next` field threads the spine.
-        = MatchPrimitiveNode(interned field_name, primitive_info prim, kont_node next)
+        // MatchPrimitive reads `prim` bytes and yields the value to ac (WHAT to
+        // read); the concrete store kont that follows does WHERE it goes.
+        = MatchPrimitiveNode(primitive_info prim, kont_node next)
+        // Concrete destinations (CPS/ANF — each node IS its operation, no tag to
+        // branch on). The producer's value in ac is consumed by the store kont
+        // that follows it: Capture(name) records it in the output tree (the IPG
+        // tree node / Data); StoreEnv(name) binds it in E (the IPG attribute,
+        // referenceable by where/compute). The field's NAME picks the combination
+        // — a real name gets both; `_` gets StoreEnv only (parse + verify, but
+        // never in the output). Placement is the IPG tree/attribute axis, kept
+        // orthogonal to δ. Each node's inverse is the writer (read tree / read E).
+        | CaptureKont(interned name, kont_node next)
+        | StoreEnvKont(interned name, kont_node next)
         | BeginStructNode(interned struct_name, kont_node next)
+        // A union/alternatives arm scope: like BeginStruct (a named capture
+        // scope, paired with EndStruct), but additionally carries the variant
+        // ordinal so the tagged-union backends emit `tag = variant_tag` and
+        // place the arm's captures under `u.<variant_name>`. The capture-tree
+        // backends (CEK/Python) treat it as begin_struct(variant_name) and
+        // ignore variant_tag (the tag is a C-layout concern).
+        | BeginVariantNode(interned variant_name, int variant_tag, kont_node next)
         | EndStructNode(kont_node next)
-        | EvalConstraintNode(kont_node constraint_expr, kont_node on_false, kont_node next)
-        | BindComputeNode(interned field_name, kont_node compute_expr, kont_node next)
+        // Interval region konts. Each carries the offset expression it evaluates;
+        // invoke pushes [apply-consumer, expr] (the MatchBytes discipline), the expr
+        // delivers to ac, then the consumer reads it. SeekKont sets pos (an
+        // @[start,end] seek); PushInterval sets the end bound (absolute, or pos+len
+        // when relative for @[length]); PopInterval unwinds it. Reads inside the
+        // region bounds-check against effective_end().
+        | SeekKont(kont_expr expr, kont_node next)
+        | PushIntervalNode(bool relative, kont_expr expr, kont_node next)
+        | PopIntervalNode(bool checked, kont_node next)
+        | EvalConstraintNode(kont_expr constraint_expr, kont_node on_false, kont_node next)
+        | BindComputeNode(kont_expr compute_expr, kont_node next)
         // caller_fail_target — the caller's static failure
         // destination, captured at emit time via
         // find_backtrack_target(rho) and copied into ReturnFrame at
         // runtime so AbortRuleKont can reach it. Null when the call
         // sits at the rule's top level with no enclosing backtrack
         // scope.
-        | InvokeRuleNode(interned rule_name, kont_node entry, kont_node caller_fail_target, kont_node next)
+        | InvokeRuleNode(interned rule_name, kont_ref entry, kont_ref caller_fail_target, kont_node next)
         | ReturnRuleNode(kont_node next)
         // Failure-handler link. compile_alternatives / compile_optional
         // build a chain at compile time; BeginChoice / BeginOptional
@@ -107,15 +151,26 @@ module bbq_ir {
         // with on_fail_target = resync_target, ArrayNext refreshes its
         // saved state per iteration, EndArray pops it. Per-element
         // failure routes through ResyncKont (advance pos, retry body).
-        | BeginArrayNode(interned array_name, array_mode mode, kont_node count_expr, kont_node end_node, kont_node resync_target, kont_node next)
-        | ArrayNextNode(array_mode mode, kont_node count_expr, kont_node until_expr, kont_node end_node, kont_node body_entry, bool resync)
+        | BeginArrayNode(interned array_name, array_mode mode, kont_expr count_expr, kont_node end_node, kont_node resync_target, kont_node next)
+        // count_expr/until_expr are kont_ref: the loop's bound is reconstructed
+        // from BeginArray by the codegen, so burg neither tiles nor traverses
+        // ArrayNext's operands (until_expr is null in Count mode). The CEK reads
+        // the fields directly for its per-iteration check.
+        | ArrayNextNode(array_mode mode, kont_ref count_expr, kont_ref until_expr, kont_node end_node, kont_node body_entry, bool resync)
         | EndArrayNode(bool resync, kont_node next)
         | ResyncKont(kont_node body_entry, kont_node end_node)
-        | SwitchDispatchNode(kont_node discriminator_expr, switch_case* cases, kont_node default_target)
-        | BitfieldReadNode(primitive_info container, bitfield_entry* entries, kont_node next)
-        | SetEndianNode(kont_node endian_expr, kont_node next)
-        | ExternalCallNode(interned func_name, interned field_name, kont_node next)
-        | MatchBytesNode(interned field_name, kont_node length_expr, bool is_string, kont_node next)
+        | SwitchDispatchNode(kont_expr discriminator_expr, switch_case* cases, kont_node default_target, bool default_reject)
+        // A bitfield defunctionalizes into one ExtractBits producer per member
+        // (all sharing the container's interval, each with its width + bit offset)
+        // followed by one AdvancePos past the container. ExtractBits reads the
+        // container bytes in place (does NOT advance pos), shift+masks out its
+        // value, and yields it; its inverse is a member-wise insert into the
+        // shared container bytes (write-back in place).
+        | ExtractBitsNode(primitive_info container, int width_bits, int offset_before, kont_node next)
+        | AdvancePosNode(int by, kont_node next)
+        | SetEndianNode(kont_expr endian_expr, kont_node next)
+        | ExternalCallNode(interned func_name, interned write_func, kont_node next)
+        | MatchBytesNode(kont_expr length_expr, bool is_string, kont_node next)
         | HaltNode
 
         // Expression leaves — write a Value to ac, push nothing.
@@ -123,55 +178,61 @@ module bbq_ir {
         | BoolLitKont(bool v)
         | FloatLitKont(float v)
         | StrLitKont(interned v)
-        | RefKont(interned name)
+        // Sema's cross-rule resolution rides along for the static emitter (scope
+        // cast): resolved_parent/path/depth name the enclosing rule + field path
+        // a cross-rule reference resolves to. Null/0 for a same-scope ref. The
+        // CEK resolves by name through E and ignores these.
+        | RefKont(interned name, interned resolved_path, interned resolved_parent, int resolved_depth)
         | PosKont
         | RemainingKont
-        | AtEndKont
         | EOIKont
         | LoopVarKont
+        | BufferKont
+        | StartKont
+        | EndKont
 
         // Unary operators — operand sub-tree.
-        | NegKont(kont_node operand)
-        | BitNotKont(kont_node operand)
-        | NotKont(kont_node operand)
+        | NegKont(kont_expr operand)
+        | BitNotKont(kont_expr operand)
+        | NotKont(kont_expr operand)
 
         // Binary arithmetic operators — left and right sub-trees.
-        | AddKont(kont_node left, kont_node right)
-        | SubKont(kont_node left, kont_node right)
-        | MulKont(kont_node left, kont_node right)
-        | DivKont(kont_node left, kont_node right)
-        | ModKont(kont_node left, kont_node right)
+        | AddKont(kont_expr left, kont_expr right)
+        | SubKont(kont_expr left, kont_expr right)
+        | MulKont(kont_expr left, kont_expr right)
+        | DivKont(kont_expr left, kont_expr right)
+        | ModKont(kont_expr left, kont_expr right)
 
         // Binary bitwise operators.
-        | BitAndKont(kont_node left, kont_node right)
-        | BitOrKont(kont_node left, kont_node right)
-        | BitXorKont(kont_node left, kont_node right)
-        | ShlKont(kont_node left, kont_node right)
-        | ShrKont(kont_node left, kont_node right)
+        | BitAndKont(kont_expr left, kont_expr right)
+        | BitOrKont(kont_expr left, kont_expr right)
+        | BitXorKont(kont_expr left, kont_expr right)
+        | ShlKont(kont_expr left, kont_expr right)
+        | ShrKont(kont_expr left, kont_expr right)
 
         // Binary comparison operators.
-        | EqKont(kont_node left, kont_node right)
-        | NeKont(kont_node left, kont_node right)
-        | LtKont(kont_node left, kont_node right)
-        | LeKont(kont_node left, kont_node right)
-        | GtKont(kont_node left, kont_node right)
-        | GeKont(kont_node left, kont_node right)
+        | EqKont(kont_expr left, kont_expr right)
+        | NeKont(kont_expr left, kont_expr right)
+        | LtKont(kont_expr left, kont_expr right)
+        | LeKont(kont_expr left, kont_expr right)
+        | GtKont(kont_expr left, kont_expr right)
+        | GeKont(kont_expr left, kont_expr right)
 
         // Logical short-circuit operators.
-        | LogicalAndKont(kont_node left, kont_node right)
-        | LogicalOrKont(kont_node left, kont_node right)
+        | LogicalAndKont(kont_expr left, kont_expr right)
+        | LogicalOrKont(kont_expr left, kont_expr right)
 
         // Ternary.
-        | TernaryKont(kont_node cond, kont_node then_, kont_node else_)
+        | TernaryKont(kont_expr cond, kont_expr then_, kont_expr else_)
 
         // Function call.
-        | CallKont(interned func_name, kont_node* args)
+        | CallKont(interned func_name, kont_expr* args)
 
         // Path navigation.
         | PathStartKont(interned name)
-        | FieldAccessKont(interned field, kont_node base)
-        | IndexAccessKont(kont_node index_expr, kont_node base)
-        | CaptureValueKont(kont_node path)
+        | FieldAccessKont(interned field, kont_expr base)
+        | IndexAccessKont(kont_expr index_expr, kont_expr base)
+        | CaptureValueKont(kont_expr path)
 
     // ── Dynamic konts (runtime-allocated; live in per-parse arena) ──
 
@@ -226,11 +287,15 @@ module bbq_ir {
         // Site consumers — read ac after the site's expression
         // evaluates and act accordingly.
         | EvalConstraintCheckKont(kont_node on_false, kont_node next)
-        | SwitchSelectKont(switch_case* cases, kont_node default_target)
-        | BindComputeStoreKont(interned field_name, kont_node next)
+        | SwitchSelectKont(switch_case* cases, kont_node default_target, bool default_reject)
+        | BindComputeStoreKont(kont_node next)
         | BeginArrayWithLimitKont(interned array_name, array_mode mode, kont_node end_node, kont_node resync_target, kont_node next)
         | ArrayCountCheckKont(kont_node end_node, kont_node body_entry)
         | ArrayUntilCheckKont(kont_node end_node, kont_node body_entry)
-        | MatchBytesApplyKont(interned field_name, bool is_string, kont_node next)
+        | MatchBytesApplyKont(bool is_string, kont_node next)
         | SetEndianApplyKont(kont_node next)
+        // Interval consumers — read ac (the evaluated offset) after Seek/PushInterval's
+        // expression runs. SeekApply sets pos; PushIntervalApply sets the end bound.
+        | SeekApplyKont(kont_node next)
+        | PushIntervalApplyKont(bool relative, kont_node next)
 }

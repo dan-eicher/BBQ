@@ -486,10 +486,12 @@ TEST(Sema, BuiltinRemainingIsInteger) {
     EXPECT_TRUE(sema.analyze(g));
 }
 
-TEST(Sema, BuiltinAtEndIsBoolean) {
+TEST(Sema, UntilRemainingIsBoolean) {
+    // `@remaining == 0` is the end-of-input until condition (the dropped `at_end`
+    // builtin is derivable from `@remaining`).
     auto* g = parse(
         "Entry = struct { x: uint8 }\n"
-        "Items = array<Entry>(none, until(at_end))");
+        "Items = array<Entry>(none, until(@remaining == 0))");
     ASSERT_NE(g, nullptr);
     ErrorReporter errors;
     Sema sema(errors);
@@ -681,11 +683,11 @@ TEST(Sema, NonBooleanUntilErrors) {
     EXPECT_TRUE(has_error_containing(errors, "until condition must be boolean"));
 }
 
-TEST(Sema, UntilAtEndValid) {
+TEST(Sema, UntilRemainingValid) {
     auto* g = parse(
         "Entry = struct { x: uint8 }\n"
         "H = struct {\n"
-        "    items: array<Entry>(none, until(at_end))\n"
+        "    items: array<Entry>(none, until(@remaining == 0))\n"
         "}");
     ASSERT_NE(g, nullptr);
     ErrorReporter errors;
@@ -1207,7 +1209,7 @@ TEST(Sema, ElementIntervalWithIValid) {
     auto* g = parse(
         "Entry = struct { x: uint8 }\n"
         "H = struct {\n"
-        "    entries: array<Entry>[3] @ [i * 4, (i + 1) * 4]\n"
+        "    entries: array<Entry>[3] @ [@index * 4, (@index + 1) * 4]\n"
         "}");
     ASSERT_NE(g, nullptr);
     ErrorReporter errors;
@@ -1221,26 +1223,26 @@ TEST(Sema, ElementIntervalWithIValid) {
 TEST(Sema, LoopVarOutsideArrayErrors) {
     auto* g = parse(
         "H = struct {\n"
-        "    x: uint8 where i > 0\n"
+        "    x: uint8 where @index > 0\n"
         "}");
     ASSERT_NE(g, nullptr);
     ErrorReporter errors;
     Sema sema(errors);
     EXPECT_FALSE(sema.analyze(g));
-    EXPECT_TRUE(has_error_containing(errors, "loop index 'i' referenced outside"));
+    EXPECT_TRUE(has_error_containing(errors, "@index referenced outside"));
 }
 
 TEST(Sema, LoopVarInElementIntervalValid) {
     auto* g = parse(
         "Entry = struct { x: uint8 }\n"
         "H = struct {\n"
-        "    entries: array<Entry>[3] @ [i * 2, (i + 1) * 2]\n"
+        "    entries: array<Entry>[3] @ [@index * 2, (@index + 1) * 2]\n"
         "}");
     ASSERT_NE(g, nullptr);
     ErrorReporter errors;
     Sema sema(errors);
     EXPECT_TRUE(sema.analyze(g));
-    EXPECT_FALSE(has_error_containing(errors, "loop index 'i' referenced outside"));
+    EXPECT_FALSE(has_error_containing(errors, "@index referenced outside"));
 }
 
 // === Cross-rule scope resolution ===

@@ -1,17 +1,16 @@
 #include <gtest/gtest.h>
 #include "Parser.h"
-#include "BBQ_AST.h"
 #include "Sema.h"
-#include "CTypeEmitter.h"
-#include "CReaderEmitter.h"
-#include "CWriterEmitter.h"
+#include "CompilerCtx.h"
+#include "RenderEmit.h"
+#include "RenderTypes.h"
+#include "bbq_compile.h"
 #include <fstream>
 #include <cstdlib>
 #include <cstdio>
 
 using namespace BBQ;
 using namespace bbqgen;
-using namespace bbqgen_c;
 
 // Generate C code from a BBQ spec, compile it with a test harness,
 // run the binary, and check the exit code.
@@ -40,39 +39,44 @@ static bool run_c_e2e(const char* bbq_spec,
     std::string mkdir_cmd = "mkdir -p " + tmpdir;
     system(mkdir_cmd.c_str());
 
-    CTypeEmitter types(*sema);
-    CReaderEmitter reader(*sema, types);
-    CWriterEmitter writer(*sema, types);
+    // The compiler context — the shared home the backend phases consume.
+    bbq::render::CompilerCtx ctx{parser->ast, sema, nullptr, ""};
 
-    // Types
-    { std::ofstream f(tmpdir + "/testTypes.h"); f << types.emit(parser->ast); }
+    // Types — render backend (flat type model -> inja).
+    std::string types_tmpl = std::string(SOURCE_DIR) + "/backends/render/templates/types_c.inja";
+    { std::ofstream f(tmpdir + "/testTypes.h"); f << bbq::render::render_types_c(ctx, types_tmpl); }
 
-    // Reader
+    // Reader — the destination-driven render backend: kont graph -> op-list -> inja.
+    ::bbq::Compiler compiler;
+    auto* g = compiler.compile_grammar(parser->ast);
+    ctx.ir = g;  // accumulate the IR for the reader phases
+    std::string reader_tmpl = std::string(SOURCE_DIR) + "/backends/render/templates";
     {
         std::ofstream f(tmpdir + "/testReader.h");
         f << "#ifndef TEST_READER_H\n#define TEST_READER_H\n";
         f << "#include \"testTypes.h\"\n#include \"bbq_runtime.h\"\n";
-        f << reader.emit_decls(parser->ast);
+        f << bbq::render::render_reader_decls(ctx);
         f << "\n#endif\n";
     }
     {
         std::ofstream f(tmpdir + "/testReader.c");
         f << "#include \"testReader.h\"\n#include <stdlib.h>\n#include <string.h>\n";
-        f << reader.emit_impls(parser->ast);
+        f << bbq::render::render_reader_c(ctx, reader_tmpl);
     }
 
-    // Writer
+    // Writer — the burg-driven OwningCWriter (dual of the reader over the same lowering).
+    std::string writer_tmpl = std::string(SOURCE_DIR) + "/backends/render/templates";
     {
         std::ofstream f(tmpdir + "/testWriter.h");
         f << "#ifndef TEST_WRITER_H\n#define TEST_WRITER_H\n";
         f << "#include \"testTypes.h\"\n#include \"bbq_runtime.h\"\n";
-        f << writer.emit_decls(parser->ast);
+        f << bbq::render::render_writer_decls(ctx);
         f << "\n#endif\n";
     }
     {
         std::ofstream f(tmpdir + "/testWriter.c");
-        f << "#include \"testWriter.h\"\n";
-        f << writer.emit_impls(parser->ast);
+        f << "#include \"testWriter.h\"\n#include <string.h>\n";
+        f << bbq::render::render_writer_c(ctx, writer_tmpl);
     }
 
     // Test harness
@@ -287,7 +291,7 @@ int main(int argc, char** argv) {
     ASSERT_TRUE(run_c_e2e(spec, harness, data, sizeof(data), &err)) << err;
 }
 
-// ── Bytes field (zero-copy) ──
+// ── Bytes field (owned copy) ──
 
 TEST(CBackendE2E, BytesFieldRoundTrip) {
     const char* spec =
@@ -320,8 +324,13 @@ int main(int argc, char** argv) {
     assert(pkt.payload.length == 4);
     assert(pkt.payload.data[0] == 0x01);
     assert(pkt.payload.data[3] == 0x04);
-    // Zero-copy: payload.data points into buf
-    assert(pkt.payload.data == buf + 3);
+    // Owned copy: payload.data is the struct's own storage, not a borrow of buf,
+    // so the struct outlives the input buffer and packet_free releases it.
+    assert(pkt.payload.data != buf + 3);
+    memset(buf + 3, 0xFF, 4);                  // clobber the input: the copy is unaffected
+    assert(pkt.payload.data[0] == 0x01);
+    assert(pkt.payload.data[3] == 0x04);
+    memcpy(buf + 3, pkt.payload.data, 4);      // restore for the byte-compare below
 
     uint8_t out[256];
     bbq_write_ctx_t wctx;
@@ -329,6 +338,7 @@ int main(int argc, char** argv) {
     assert(packet_write(&wctx, &pkt));
     assert(wctx.pos == (size_t)sz);
     assert(memcmp(buf, out, sz) == 0);
+    packet_free(&pkt);
 
     printf("OK: bytes round-trip (%ld bytes)\n", sz);
     return 0;
@@ -1519,6 +1529,239 @@ int main(int argc, char** argv) {
         0x02,                     // outer count = 2
         0x02, 0xAA, 0xBB,        // inner[0]: len=2, data=[AA,BB]
         0x01, 0xCC                // inner[1]: len=1, data=[CC]
+    };
+    std::string err;
+    ASSERT_TRUE(run_c_e2e(spec, harness, data, sizeof(data), &err)) << err;
+}
+
+// ── LEB128 varints ──
+
+TEST(CBackendE2E, Leb128RoundTrip) {
+    const char* spec =
+        "Msg = struct {\n"
+        "    id: uleb128,\n"
+        "    delta: sleb128,\n"
+        "    wide: uleb64,\n"
+        "    tail: uint8\n"
+        "}";
+
+    const char* harness = R"(
+#include "testReader.h"
+#include "testWriter.h"
+#include <stdio.h>
+#include <string.h>
+#include <assert.h>
+
+int main(int argc, char** argv) {
+    (void)argc;
+    FILE* f = fopen(argv[1], "rb");
+    fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
+    uint8_t buf[256]; fread(buf, 1, sz, f); fclose(f);
+
+    bbq_ctx_t ctx;
+    bbq_ctx_init(&ctx, buf, sz);
+    msg_t msg;
+    assert(msg_read(&ctx, &msg));
+    assert(msg.id == 300);          // uleb 0xAC 0x02
+    assert(msg.delta == -1);        // sleb 0x7F
+    assert(msg.wide == 624485u);    // uleb 0xE5 0x8E 0x26
+    assert(msg.tail == 0x2A);
+    assert(ctx.pos == (size_t)sz);  // consumed exactly the variable spans
+
+    uint8_t out[256];
+    bbq_write_ctx_t wctx;
+    bbq_write_ctx_init(&wctx, out, sizeof(out));
+    assert(msg_write(&wctx, &msg));
+    // Canonical re-encode reproduces the (canonical) input byte-for-byte.
+    assert(wctx.pos == (size_t)sz);
+    assert(memcmp(buf, out, wctx.pos) == 0);
+
+    printf("OK: leb128 round-trip\n");
+    return 0;
+}
+)";
+
+    uint8_t data[] = {
+        0xAC, 0x02,              // id    = 300  (uleb128)
+        0x7F,                    // delta = -1   (sleb128)
+        0xE5, 0x8E, 0x26,        // wide  = 624485 (uleb64)
+        0x2A                     // tail  = 42
+    };
+    std::string err;
+    ASSERT_TRUE(run_c_e2e(spec, harness, data, sizeof(data), &err)) << err;
+}
+
+// ── Switch range cases (lo..hi) ──
+
+TEST(CBackendE2E, SwitchRangeRoundTrip) {
+    const char* spec =
+        "@endian big\n"
+        "Small = struct { v: uint8 }\n"
+        "Wide  = struct { v: uint16be }\n"
+        "Msg = struct {\n"
+        "    tag: uint8,\n"
+        "    body: switch(tag) {\n"
+        "        1..3: Small;\n"
+        "        10:   Wide;\n"
+        "    }\n"
+        "}";
+
+    const char* harness = R"(
+#include "testReader.h"
+#include "testWriter.h"
+#include <stdio.h>
+#include <string.h>
+#include <assert.h>
+
+int main(int argc, char** argv) {
+    (void)argc;
+    FILE* f = fopen(argv[1], "rb");
+    fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
+    uint8_t buf[256]; fread(buf, 1, sz, f); fclose(f);
+
+    bbq_ctx_t ctx;
+    bbq_ctx_init(&ctx, buf, sz);
+    msg_t msg;
+    assert(msg_read(&ctx, &msg));
+    assert(msg.tag == 2);            // tag 2 falls in range 1..3
+    assert(msg.body.tag == 2);       // tag holds the actual matched discriminant
+    assert(msg.body.u.case_0.v == 0x2A);
+
+    uint8_t out[256];
+    bbq_write_ctx_t wctx;
+    bbq_write_ctx_init(&wctx, out, sizeof(out));
+    assert(msg_write(&wctx, &msg));  // writer dispatches via expanded range labels
+    assert(memcmp(buf, out, wctx.pos) == 0);
+
+    printf("OK: switch range round-trip\n");
+    return 0;
+}
+)";
+
+    uint8_t data[] = { 0x02, 0x2A };   // tag=2 (range 1..3) → Small{v=42}
+    std::string err;
+    ASSERT_TRUE(run_c_e2e(spec, harness, data, sizeof(data), &err)) << err;
+}
+
+// ── Verbatim @header / @source / @writer code blocks ──
+
+TEST(CBackendE2E, UserCodeBlocks) {
+    // @header → types header (visible to all TUs); @source → reader .c;
+    // @writer → writer .c. Declaring in @header and defining in @source/@writer
+    // proves each block landed in the right translation unit (cross-TU linkage).
+    const char* spec =
+        "@header (. int reader_side(void); int writer_side(void); .)\n"
+        "@source (. int reader_side(void) { return 42; } .)\n"
+        "@writer (. int writer_side(void) { return 99; } .)\n"
+        "Header = struct { x: uint8 }";
+
+    const char* harness = R"(
+#include "testReader.h"
+#include "testWriter.h"
+#include <stdio.h>
+#include <assert.h>
+
+int main(int argc, char** argv) {
+    (void)argc;
+    FILE* f = fopen(argv[1], "rb");
+    fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
+    uint8_t buf[256]; fread(buf, 1, sz, f); fclose(f);
+
+    bbq_ctx_t ctx;
+    bbq_ctx_init(&ctx, buf, sz);
+    header_t h;
+    assert(header_read(&ctx, &h));
+    assert(h.x == 0x11);
+    assert(reader_side() == 42);     // defined in @source (testReader.c)
+    assert(writer_side() == 99);     // defined in @writer (testWriter.c)
+
+    printf("OK: user code blocks\n");
+    return 0;
+}
+)";
+
+    uint8_t data[] = { 0x11 };
+    std::string err;
+    ASSERT_TRUE(run_c_e2e(spec, harness, data, sizeof(data), &err)) << err;
+}
+
+// ── Struct-level `where` calling an external verification function ──
+//
+// The IPv4 header checksum is a property of the whole header, so it is a
+// struct-level `where` that calls a user function. The function is supplied
+// via code blocks; `buffer` resolves to the header's raw bytes and `checksum`
+// to the parsed field — both figured out by the where environment.
+
+TEST(CBackendE2E, IPv4ChecksumWhere) {
+    const char* spec =
+        "@endian big\n"
+        "@header (.\n"
+        "/* One's-complement IPv4 header checksum: recompute over `buf` with the\n"
+        "   checksum field (bytes 10-11) treated as zero, and compare to the parsed\n"
+        "   `stored` value. Returns true iff the header checksum is valid. */\n"
+        "static inline bool ipv4_checksum_ok(bbq_bytes_t buf, uint16_t stored) {\n"
+        "    uint32_t sum = 0;\n"
+        "    for (size_t i = 0; i + 1 < buf.length; i += 2) {\n"
+        "        uint32_t w = ((uint32_t)buf.data[i] << 8) | buf.data[i+1];\n"
+        "        if (i == 10) w = 0;            /* skip the checksum field itself */\n"
+        "        sum += w;\n"
+        "    }\n"
+        "    while (sum >> 16) sum = (sum & 0xFFFF) + (sum >> 16);\n"
+        "    return (uint16_t)(~sum) == stored;\n"
+        "} .)\n"
+        "IPv4Header = struct {\n"
+        "    ver_ihl:        uint8,\n"
+        "    version:        compute((ver_ihl >> 4) & 0x0F : uint8),\n"
+        "    ihl:            compute(ver_ihl & 0x0F : uint8),\n"
+        "    dscp_ecn:       uint8,\n"
+        "    total_length:   uint16,\n"
+        "    identification: uint16,\n"
+        "    flags_offset:   uint16,\n"
+        "    ttl:            uint8,\n"
+        "    protocol:       uint8,\n"
+        "    checksum:       uint16,\n"
+        "    src_addr:       uint32,\n"
+        "    dst_addr:       uint32\n"
+        "} where ipv4_checksum_ok(@buffer, checksum)";
+
+    const char* harness = R"(
+#include "testReader.h"
+#include <stdio.h>
+#include <string.h>
+#include <assert.h>
+
+int main(int argc, char** argv) {
+    (void)argc;
+    FILE* f = fopen(argv[1], "rb");
+    fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
+    uint8_t buf[64]; fread(buf, 1, sz, f); fclose(f);
+
+    // Valid header → the struct-level where (checksum) passes.
+    bbq_ctx_t ctx;
+    bbq_ctx_init(&ctx, buf, sz);
+    i_pv4_header_t h;
+    assert(i_pv4_header_read(&ctx, &h));
+    assert(h.ver_ihl == 0x45);
+    assert(h.checksum == 0xb861);
+
+    // Corrupt a header byte → checksum no longer matches → the where rejects it.
+    uint8_t bad[64]; memcpy(bad, buf, sz);
+    bad[12] ^= 0xFF;                 // flip part of src_addr
+    bbq_ctx_t ctx2;
+    bbq_ctx_init(&ctx2, bad, sz);
+    i_pv4_header_t h2;
+    assert(!i_pv4_header_read(&ctx2, &h2));   // constraint failure
+
+    printf("OK: ipv4 checksum where-clause\n");
+    return 0;
+}
+)";
+
+    // Canonical valid IPv4 header (checksum 0xb861).
+    uint8_t data[] = {
+        0x45, 0x00, 0x00, 0x73, 0x00, 0x00, 0x40, 0x00,
+        0x40, 0x11, 0xb8, 0x61, 0xc0, 0xa8, 0x00, 0x01,
+        0xc0, 0xa8, 0x00, 0xc7
     };
     std::string err;
     ASSERT_TRUE(run_c_e2e(spec, harness, data, sizeof(data), &err)) << err;

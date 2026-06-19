@@ -48,6 +48,7 @@ struct Savepoint : Frame {
     size_t saved_pos = 0;
     bool saved_endian = true;
     size_t saved_kont_size = 0;
+    int saved_interval_depth = 0;   // unwind any intervals opened inside the arm
     CaptureBuilder::Mark capture_mark{};
     KontNode* on_fail_target = nullptr;
 

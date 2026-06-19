@@ -1,0 +1,158 @@
+/*
+ * calc_codegen.h — the calc IR → opgen-bytecode codegen surface that
+ * calc.burg drives. Holds the BURG node accessors (so the matcher can
+ * tile the CEK-tree IR) and the cg_jump helper (Dybvig DDCG p.13) that
+ * each spine rule calls to thread its continuation. The emit backend is
+ * calc_emit.h's Emit (absolute-PC branches + backpatch).
+ *
+ * This is the lean replacement for the old register-JIT compiler.h:
+ * the same BURG_NODE_* accessors, but the rule actions emit opgen
+ * stack-machine bytecode instead of selecting copy-and-patch stencils.
+ */
+#ifndef CALC_CODEGEN_H
+#define CALC_CODEGEN_H
+
+#include "frontend/CalcIR.h"
+#include "calc_emit.h"     // the calc opcode set (calc::OP_*)
+#include "bbq_emit.h"      // the generic bytecode emitter (bbq::Emit)
+
+namespace calc {
+
+// ── BURG node access (CEK-tree IR) ──────────────────────────────
+// Operands are value sub-trees (BURG_NODE_CHILD); successors are the
+// spine continuation edges (BURG_NODE_SUCC). Producers expose their
+// value sub-tree(s); consumers expose their value input + spine `next`.
+
+static inline int ir_tag(const calc_ir::Node* n) { return static_cast<int>(n->tag); }
+
+static inline int operand_count(const calc_ir::Node* n) {
+    using T = calc_ir::NodeTag;
+    switch (n->tag) {
+    case T::Add: case T::Sub: case T::Mul:
+    case T::CmpEq: case T::CmpNeq:
+    case T::CmpLt: case T::CmpLe: case T::CmpGt: case T::CmpGe:
+        return 2;
+    case T::Neg:
+        return 1;
+    case T::StoreLocal: case T::ExprEffect:
+    case T::Branch: case T::Leave: case T::Halt:
+        return 1;
+    case T::Call:
+        return (int)static_cast<const calc_ir::Call*>(n)->args.size();
+    case T::LoadConst: case T::LoadLocal:
+    case T::Goto: case T::Nop:
+        return 0;
+    }
+    return 0;
+}
+
+static inline calc_ir::Node* operand_producer(const calc_ir::Node* n, int i) {
+    using T = calc_ir::NodeTag;
+    switch (n->tag) {
+    case T::Add:       return i == 0 ? static_cast<const calc_ir::Add*  >(n)->left
+                                     : static_cast<const calc_ir::Add*  >(n)->right;
+    case T::Sub:       return i == 0 ? static_cast<const calc_ir::Sub*  >(n)->left
+                                     : static_cast<const calc_ir::Sub*  >(n)->right;
+    case T::Mul:       return i == 0 ? static_cast<const calc_ir::Mul*  >(n)->left
+                                     : static_cast<const calc_ir::Mul*  >(n)->right;
+    case T::CmpEq:     return i == 0 ? static_cast<const calc_ir::CmpEq* >(n)->left
+                                     : static_cast<const calc_ir::CmpEq* >(n)->right;
+    case T::CmpNeq:    return i == 0 ? static_cast<const calc_ir::CmpNeq*>(n)->left
+                                     : static_cast<const calc_ir::CmpNeq*>(n)->right;
+    case T::CmpLt:     return i == 0 ? static_cast<const calc_ir::CmpLt* >(n)->left
+                                     : static_cast<const calc_ir::CmpLt* >(n)->right;
+    case T::CmpLe:     return i == 0 ? static_cast<const calc_ir::CmpLe* >(n)->left
+                                     : static_cast<const calc_ir::CmpLe* >(n)->right;
+    case T::CmpGt:     return i == 0 ? static_cast<const calc_ir::CmpGt* >(n)->left
+                                     : static_cast<const calc_ir::CmpGt* >(n)->right;
+    case T::CmpGe:     return i == 0 ? static_cast<const calc_ir::CmpGe* >(n)->left
+                                     : static_cast<const calc_ir::CmpGe* >(n)->right;
+    case T::Neg:       return static_cast<const calc_ir::Neg*       >(n)->operand;
+    case T::StoreLocal:return static_cast<const calc_ir::StoreLocal*>(n)->value;
+    case T::ExprEffect:return static_cast<const calc_ir::ExprEffect*>(n)->value;
+    case T::Branch:    return static_cast<const calc_ir::Branch*    >(n)->test;
+    case T::Leave:     return static_cast<const calc_ir::Leave*     >(n)->value;
+    case T::Halt:      return static_cast<const calc_ir::Halt*      >(n)->value;
+    case T::Call:      return static_cast<const calc_ir::Call*      >(n)->args[i];
+    default: return nullptr;
+    }
+}
+
+static inline int successor_count(const calc_ir::Node* n) {
+    using T = calc_ir::NodeTag;
+    switch (n->tag) {
+    case T::Halt:       return 0;
+    case T::Leave:      return 0;
+    case T::Branch:     return 2;   // then_, else_
+    case T::Call:       return 1;   // target (function entry)
+    case T::StoreLocal: return 1;
+    case T::ExprEffect: return 1;
+    case T::Goto:       return 1;
+    case T::Nop:        return 1;
+    default:            return 0;   // producers — sub-tree only
+    }
+}
+
+static inline calc_ir::Node* successor(const calc_ir::Node* n, int i) {
+    using T = calc_ir::NodeTag;
+    switch (n->tag) {
+    case T::Branch: {
+        auto* b = static_cast<const calc_ir::Branch*>(n);
+        return i == 0 ? b->then_ : b->else_;
+    }
+    case T::Call:       return static_cast<const calc_ir::Call*      >(n)->target;
+    case T::Goto:       return static_cast<const calc_ir::Goto*      >(n)->target;
+    case T::Nop:        return static_cast<const calc_ir::Nop*       >(n)->next;
+    case T::StoreLocal: return static_cast<const calc_ir::StoreLocal*>(n)->next;
+    case T::ExprEffect: return static_cast<const calc_ir::ExprEffect*>(n)->next;
+    default:            return nullptr;
+    }
+}
+
+// ── cg_jump (Dybvig DDCG p.13) ──────────────────────────────────
+// After a spine stmt emits, thread its structural continuation: emit a
+// goto ONLY when that continuation is a Nop — Nops are the IR's label
+// anchors (branch landing pads / merge points; emit_label registers
+// their PC). A non-Nop `next` is always the next sequentially-emitted
+// spine node (the ddcg builds linear chains this way), so natural
+// fall-through handles it without a goto. The post-burg peephole
+// strips the emitted goto when the Nop's PC is the next physical PC.
+// Mirrors yoctojc codegen.burg's cg_jump_next.
+static inline void cg_jump(bbq::Emit& e, calc_ir::Node* n) {
+    calc_ir::Node* next = successor(n, 0);
+    if (next && next->tag == calc_ir::NodeTag::Nop) e.branch(OP_GOTO, next);
+}
+
+// ── Call lowering ───────────────────────────────────────────────
+// Args are emitted postorder (the burg reduces the reg children first,
+// so they land on the eval stack); then OP_CALL branches to the
+// callee's entry landing-pad (Call->target, a Nop the matcher labels
+// when it lowers that function inline) and carries the arg count. The
+// calc_call native saves the caller frame, moves the args into the
+// callee's locals, and seeks to the entry — the threaded loop runs on.
+static inline void emit_call(bbq::Emit& e, calc_ir::Node* n) {
+    auto* c = static_cast<calc_ir::Call*>(n);
+    e.branch(OP_CALL, c->target);
+    e.u8((uint8_t)c->args.size());
+}
+
+// ── Peephole config for the calc opcode set ─────────────────────
+// The opcode-set knowledge the generic peephole needs: GOTO is the
+// unconditional jump, BR_IF↔BR_IFZ is the only invertible conditional
+// (so branch-reversal can fire), and RET is the 1-byte terminator a
+// goto can merge into.
+inline bool calc_is_terminator(uint8_t op) { return op == OP_RET; }
+
+inline const bbq::Peephole& calc_peephole() {
+    static const bbq::Peephole cfg = [] {
+        static uint8_t inv[256] = {};
+        inv[OP_BR_IF]  = OP_BR_IFZ;
+        inv[OP_BR_IFZ] = OP_BR_IF;
+        return bbq::Peephole{ OP_GOTO, inv, &calc_is_terminator };
+    }();
+    return cfg;
+}
+
+} // namespace calc
+
+#endif

@@ -1,0 +1,235 @@
+// ============================================================
+// opgen AST — Auto-generated from opgen.asdl
+//
+// Do not edit by hand. Re-generate with:
+//   asdl -i opgen.asdl -t templates/opgen_ast.inja -o opgen_ast.h
+//
+// Tag-dispatched variant of the grammar AST: multi-constructor
+// sum types carry a `…Tag tag` discriminator (set per subtype via
+// `static constexpr kind`), so consumers `switch (n->tag)` and
+// `as<T>(n)` rather than walk a visitor / dynamic_cast chain.
+// ============================================================
+#ifndef {{upper(name)}}_AST_H
+#define {{upper(name)}}_AST_H
+
+#include <vector>
+#include <string>
+#include <optional>
+#include <memory>
+#include <cstdint>
+#include <cstdlib>
+#include <stdexcept>
+
+namespace {{name}} {
+
+// ── Enum types ──────────────────────────────────────────────
+
+{% for def in definitions %}
+{% if existsIn(def, "is_enum") and def.is_enum %}
+enum class {{camelcase(def.name)}} {
+{% for type in def.types %}
+    {{type.name}}{% if not loop.is_last %},{% endif %}
+
+{% endfor %}
+};
+
+{% endif %}
+{% endfor %}
+// ── Forward declarations ────────────────────────────────────
+
+{% for base in bases %}
+struct {{base}};
+{% endfor %}
+{% for def in definitions %}
+{% if def.type == "sum" and not (existsIn(def, "is_enum") and def.is_enum) %}
+{% for type in def.types %}
+struct {{type.name}};
+{% endfor %}
+{% endif %}
+{% if def.type == "product" %}
+struct {{def.name}};
+{% endif %}
+{% endfor %}
+
+// ── Source location ─────────────────────────────────────────
+
+struct SourceLoc {
+    const char* file = nullptr;
+    int line   = 0;
+    int column = 0;
+};
+
+// ── Arena allocator ─────────────────────────────────────────
+
+class Arena {
+public:
+    explicit Arena(size_t block_size = 4096)
+        : default_block_size_(align_up(block_size, kAlignment)) {}
+
+    ~Arena() {
+        for (auto* b : blocks_) std::free(b);
+    }
+
+    Arena(const Arena&) = delete;
+    Arena& operator=(const Arena&) = delete;
+
+    void* allocate(size_t size) {
+        if (size == 0) return nullptr;
+        size_t aligned = align_up(offset_, kAlignment);
+        if (!current_ || aligned + size > capacity_) {
+            grow(std::max(size + kAlignment, default_block_size_));
+            aligned = align_up(offset_, kAlignment);
+        }
+        void* ptr = current_ + aligned;
+        offset_ = aligned + size;
+        return ptr;
+    }
+
+    void reset() {
+        for (auto* b : blocks_) std::free(b);
+        blocks_.clear();
+        current_ = nullptr;
+        offset_ = capacity_ = 0;
+    }
+
+private:
+    static constexpr size_t kAlignment = alignof(std::max_align_t);
+
+    static size_t align_up(size_t v, size_t a) noexcept {
+        return (v + a - 1) & ~(a - 1);
+    }
+
+    void grow(size_t min_size) {
+        size_t sz = align_up(min_size, kAlignment);
+        auto* blk = static_cast<char*>(std::malloc(sz));
+        if (!blk) throw std::bad_alloc();
+        blocks_.push_back(blk);
+        current_ = blk;
+        offset_ = 0;
+        capacity_ = sz;
+    }
+
+    std::vector<char*> blocks_;
+    char*  current_  = nullptr;
+    size_t offset_   = 0;
+    size_t capacity_ = 0;
+    size_t default_block_size_;
+};
+
+// ── AST node base ───────────────────────────────────────────
+//
+// Non-polymorphic: dispatch is tag-based (see `as<T>` below), so
+// no vtable is needed. Arena-allocated; never deleted.
+
+struct ASTNode {
+    SourceLoc loc;
+
+    void* operator new(size_t size) {
+        return get_arena().allocate(size);
+    }
+    void operator delete(void*) noexcept {}
+
+    static Arena& get_arena() {
+        static Arena arena;
+        return arena;
+    }
+};
+
+// Tag-checked downcast: returns the derived pointer when `n`'s tag
+// matches `T::kind`, else nullptr. `T` is a sum subtype; `Node` is
+// its sum base.
+template <class T, class Node>
+inline T* as(Node* n) {
+    return (n && n->tag == T::kind) ? static_cast<T*>(n) : nullptr;
+}
+
+// ── Sum types (tag-dispatched hierarchies) ──────────────────
+
+{% for def in definitions %}
+{% if def.type == "sum" and not (existsIn(def, "is_enum") and def.is_enum) %}
+{% if length(def.types) > 1 %}
+// {{def.name}}
+enum class {{camelcase(def.name)}}Tag {
+{% for type in def.types %}
+    {{type.name}}{% if not loop.is_last %},{% endif %}
+
+{% endfor %}
+};
+
+struct {{camelcase(def.name)}} : public ASTNode {
+    {{camelcase(def.name)}}Tag tag;
+    explicit {{camelcase(def.name)}}({{camelcase(def.name)}}Tag t) : tag(t) {}
+};
+
+{% for type in def.types %}
+struct {{type.name}} : public {{camelcase(def.name)}} {
+    static constexpr {{camelcase(def.name)}}Tag kind = {{camelcase(def.name)}}Tag::{{type.name}};
+
+    {{type.name}}({% for field in type.fields %}
+{% if field.flag == "optional" %}std::optional<{{get_type(field.type)}}> {{safe_name(field.name)}}{% if not loop.is_last %}, {% endif %}{% else if field.flag == "sequence" %}std::vector<{{get_type(field.type)}}> {{safe_name(field.name)}}{% if not loop.is_last %}, {% endif %}{% else %}{{get_type(field.type)}} {{safe_name(field.name)}}{% if not loop.is_last %}, {% endif %}{% endif %}{% endfor %})
+        : {{camelcase(def.name)}}(kind){% for field in type.fields %}, {{safe_name(field.name)}}{% if field.flag == "none" %}({{safe_name(field.name)}}){% else %}(std::move({{safe_name(field.name)}})){% endif %}{% endfor %} {}
+
+{% for field in type.fields %}
+{% if field.flag == "sequence" %}
+    std::vector<{{get_type(field.type)}}> {{safe_name(field.name)}};
+{% else if field.flag == "optional" %}
+    std::optional<{{get_type(field.type)}}> {{safe_name(field.name)}};
+{% else %}
+    {{get_type(field.type)}} {{safe_name(field.name)}};
+{% endif %}
+{% endfor %}
+};
+
+{% endfor %}
+{% else %}
+{# single-constructor sum: one struct off ASTNode, no tag #}
+{% for type in def.types %}
+struct {{type.name}} : public ASTNode {
+{% if length(type.fields) > 0 %}
+    {{type.name}}({% for field in type.fields %}
+{% if field.flag == "optional" %}std::optional<{{get_type(field.type)}}> {{safe_name(field.name)}}{% if not loop.is_last %}, {% endif %}{% else if field.flag == "sequence" %}std::vector<{{get_type(field.type)}}> {{safe_name(field.name)}}{% if not loop.is_last %}, {% endif %}{% else %}{{get_type(field.type)}} {{safe_name(field.name)}}{% if not loop.is_last %}, {% endif %}{% endif %}{% endfor %})
+        : {% for field in type.fields %}{{safe_name(field.name)}}{% if field.flag == "none" %}({{safe_name(field.name)}}){% else %}(std::move({{safe_name(field.name)}})){% endif %}{% if not loop.is_last %}, {% endif %}{% endfor %} {}
+{% endif %}
+
+{% for field in type.fields %}
+{% if field.flag == "sequence" %}
+    std::vector<{{get_type(field.type)}}> {{safe_name(field.name)}};
+{% else if field.flag == "optional" %}
+    std::optional<{{get_type(field.type)}}> {{safe_name(field.name)}};
+{% else %}
+    {{get_type(field.type)}} {{safe_name(field.name)}};
+{% endif %}
+{% endfor %}
+};
+
+{% endfor %}
+{% endif %}
+{% endif %}
+{% endfor %}
+// ── Product types ───────────────────────────────────────────
+
+{% for def in definitions %}
+{% if def.type == "product" %}
+struct {{def.name}} : public ASTNode {
+{% if length(def.fields) > 0 %}
+    {{def.name}}({% for field in def.fields %}
+{% if field.flag == "optional" %}std::optional<{{get_type(field.type)}}> {{safe_name(field.name)}}{% if not loop.is_last %}, {% endif %}{% else if field.flag == "sequence" %}std::vector<{{get_type(field.type)}}> {{safe_name(field.name)}}{% if not loop.is_last %}, {% endif %}{% else %}{{get_type(field.type)}} {{safe_name(field.name)}}{% if not loop.is_last %}, {% endif %}{% endif %}{% endfor %})
+        : {% for field in def.fields %}{{safe_name(field.name)}}{% if field.flag == "none" %}({{safe_name(field.name)}}){% else %}(std::move({{safe_name(field.name)}})){% endif %}{% if not loop.is_last %}, {% endif %}{% endfor %} {}
+{% endif %}
+
+{% for field in def.fields %}
+{% if field.flag == "sequence" %}
+    std::vector<{{get_type(field.type)}}> {{safe_name(field.name)}};
+{% else if field.flag == "optional" %}
+    std::optional<{{get_type(field.type)}}> {{safe_name(field.name)}};
+{% else %}
+    {{get_type(field.type)}} {{safe_name(field.name)}};
+{% endif %}
+{% endfor %}
+};
+
+{% endif %}
+{% endfor %}
+} // namespace {{name}}
+
+#endif // {{upper(name)}}_AST_H

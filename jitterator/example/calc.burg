@@ -1,34 +1,20 @@
-// calc.burg — BURG spec for calc JIT stencil selection
+// calc.burg — lower the calc CEK-tree IR to opgen stack-machine
+// bytecode, the cg_jump way (Dybvig DDCG p.13). This is the same role
+// yoctojc's patterns/codegen.burg plays for the JCVM: burg tiles the
+// value sub-trees (BURG_NODE_CHILD) and walks the spine
+// (BURG_NODE_SUCC); each consumer rule emits its opcode then calls
+// cg_jump to thread its continuation.
 //
-// CEK-tree IR (Phase 9R): producers carry sub-tree operand fields,
-// consumers thread the spine via `next` and take value sub-trees.
+// Producers emit postorder (the matcher reduces children before the
+// parent's action), so `reg: Add(reg, reg)` lands its two operands on
+// the eval stack first, then OP_ADD — a plain stack machine. No
+// register/F8 cases: the opgen VM is a stack VM, so the lowering is
+// the simple postorder, not the copy-and-patch register selection the
+// old stencil burg did.
 //
-// Two value-result nonterminals make paper figure 8 expressible:
-//   reg        — value sits in ctx.ac after the stencil chain
-//   stack_reg  — value sits on the eval stack (frame[sp-1]); chain
-//                rule `stack_reg: reg = 1` inserts a push_stack
-//                stencil between, automatically lifting any reg into
-//                stack_reg whenever a binop's left operand needs to
-//                be spilled (paper F8 case 4).
-//
-// Per-binop rules then spell out paper F8 cases 2/3/4 directly:
-//   reg: Op(LoadLocal, reg)         — F8 case 2 (S op E): emit one
-//                                     binop stencil reading frame
-//                                     slot for left + ac for right.
-//   reg: Op(reg, LoadLocal)         — F8 case 3 (E op S): commutative
-//                                     ops use the same slot-on-left
-//                                     stencil; non-commutative use
-//                                     either rev_sub (Sub) or the
-//                                     swapped-sense cmp (Lt↔Gt, Le↔Ge).
-//   reg: Op(stack_reg, reg)         — F8 case 4: catchall via chain
-//                                     rule. Pops eval-stack + ac into
-//                                     ac via *_pop stencil.
-//
-// Case 1 (S₁ op S₂) is not specialized — it falls through case 2,
-// so left's LoadLocal is read directly and right's LoadLocal auto-
-// recurses to load_local + ac. Two stencils total. Adding a fused
-// case-1 stencil would only save one stencil per occurrence; not
-// worth the new stencil for now.
+// The emit backend is calc_emit.h's Emit (held in MEMBERS): absolute
+// byte-PC branch targets + a single backpatch pass, so the bytecode is
+// correct regardless of the order the matcher tiles a branch's arms.
 
 TERM LoadConst  = calc_ir::LoadConst::kind_value
 TERM LoadLocal  = calc_ir::LoadLocal::kind_value
@@ -42,7 +28,6 @@ TERM CmpLt      = calc_ir::CmpLt::kind_value
 TERM CmpLe      = calc_ir::CmpLe::kind_value
 TERM CmpGt      = calc_ir::CmpGt::kind_value
 TERM CmpGe      = calc_ir::CmpGe::kind_value
-TERM Call       = calc_ir::Call::kind_value
 TERM StoreLocal = calc_ir::StoreLocal::kind_value
 TERM ExprEffect = calc_ir::ExprEffect::kind_value
 TERM Branch     = calc_ir::Branch::kind_value
@@ -50,111 +35,74 @@ TERM Goto       = calc_ir::Goto::kind_value
 TERM Nop        = calc_ir::Nop::kind_value
 TERM Halt       = calc_ir::Halt::kind_value
 TERM Leave      = calc_ir::Leave::kind_value
+TERM Call       = calc_ir::Call::kind_value
 
-(. #include "compiler.h"
+MEMBERS (. bbq::Emit emit; .)
 
-   #define BURG_NODE_TYPE        calc_ir::Node*
-   #define BURG_NODE_OP(n)       (ir_tag(n))
-   #define BURG_NODE_ARITY(n)    (operand_count(n))
-   #define BURG_NODE_CHILD(n,i)  (operand_producer(n, i))
-   #define BURG_NODE_ID(n)       ((void*)(n))
+(. #include "calc_codegen.h"
+   using namespace calc;
+   #define E emit
+
+   #define BURG_NODE_TYPE          calc_ir::Node*
+   #define BURG_NODE_OP(n)         (ir_tag(n))
+   #define BURG_NODE_ARITY(n)      (operand_count(n))
+   #define BURG_NODE_CHILD(n,i)    (operand_producer(n, i))
+   #define BURG_NODE_ID(n)         ((void*)(n))
    #define BURG_NODE_SUCC_COUNT(n) (successor_count(n))
-   #define BURG_NODE_SUCC(n,i)   (successor(n, i))
+   #define BURG_NODE_SUCC(n,i)     (successor(n, i))
 .)
 
 START stmt
 
 RULES
 
-// ── Value-producer leaves (value → ctx.ac) ──────────────────
-reg: LoadConst                         = 1 (. jit_emit_load_const(node); .);
-reg: LoadLocal                         = 1 (. jit_emit_load_local(node); .);
+// ── Value producers (postorder → eval stack) ────────────────
+reg: LoadConst = 1 (. E.op(OP_CONST); E.sleb(static_cast<calc_ir::LoadConst*>(node)->value); .);
+reg: LoadLocal = 1 (. E.op(OP_LOAD);  E.u8((uint8_t)static_cast<calc_ir::LoadLocal*>(node)->src); .);
 
-// ── Eval-stack chain (paper §3.1 stack class) ───────────────
-// Lifts any reg into stack_reg by inserting a push_stack stencil.
-// Used by binop case-4 catchalls AND by Call args (each arg is
-// auto-recursed as stack_reg via the per-arity Call rules below).
-stack_reg: reg                         = 1 (. jit_emit_push_stack(node); .);
+reg: Add(reg, reg) = 1 (. E.op(OP_ADD); .);
+reg: Sub(reg, reg) = 1 (. E.op(OP_SUB); .);
+reg: Mul(reg, reg) = 1 (. E.op(OP_MUL); .);
+reg: Neg(reg)      = 1 (. E.op(OP_NEG); .);
 
-// ── Binops — paper figure 8 ─────────────────────────────────
-// For each Op, specialized rules handle case 2 (S op E) and case 3
-// (E op S); the chain-rule + Op(stack_reg, reg) handles case 4.
+reg: CmpEq(reg, reg)  = 1 (. E.op(OP_EQ); .);
+reg: CmpNeq(reg, reg) = 1 (. E.op(OP_NE); .);
+reg: CmpLt(reg, reg)  = 1 (. E.op(OP_LT); .);
+reg: CmpLe(reg, reg)  = 1 (. E.op(OP_LE); .);
+reg: CmpGt(reg, reg)  = 1 (. E.op(OP_GT); .);
+reg: CmpGe(reg, reg)  = 1 (. E.op(OP_GE); .);
 
-// Add (commutative — case 3 reuses the slot-on-left stencil)
-reg: Add(LoadLocal, reg)               = 1 (. jit_emit_add_lhs_local(node); .);
-reg: Add(reg, LoadLocal)               = 1 (. jit_emit_add_rhs_local(node); .);
-reg: Add(stack_reg, reg)               = 1 (. jit_emit_add_pop(node); .);
+// Call (value producer): args reduced postorder → eval stack, then
+// OP_CALL to the callee entry. Per-arity rules (the where-clause pins
+// each to its child count, else burgc's labeler lets arity-0 win on
+// cost for any Call). The result lands on the stack after calc_ret.
+reg: Call where (. operand_count(node) == 0 .)                                = 1 (. emit_call(E, node); .);
+reg: Call(reg) where (. operand_count(node) == 1 .)                           = 1 (. emit_call(E, node); .);
+reg: Call(reg, reg) where (. operand_count(node) == 2 .)                      = 1 (. emit_call(E, node); .);
+reg: Call(reg, reg, reg) where (. operand_count(node) == 3 .)                 = 1 (. emit_call(E, node); .);
+reg: Call(reg, reg, reg, reg) where (. operand_count(node) == 4 .)            = 1 (. emit_call(E, node); .);
 
-// Sub (non-commutative — case 3 needs rev_sub: ac - frame[fp+rhs])
-reg: Sub(LoadLocal, reg)               = 1 (. jit_emit_sub_lhs_local(node); .);
-reg: Sub(reg, LoadLocal)               = 1 (. jit_emit_rev_sub_rhs_local(node); .);
-reg: Sub(stack_reg, reg)               = 1 (. jit_emit_sub_pop(node); .);
+// ── Spine consumers (emit op, then cg_jump to continuation) ──
+// Branch targets are Nop landing pads (ddcg_label wraps them), so only
+// the Nop rule records a PC; the value-bearing consumers are never
+// branch targets and need no label. cg_jump emits a goto only when the
+// continuation is a Nop.
+stmt: StoreLocal(reg) = 1 (. E.op(OP_STORE);
+        E.u8((uint8_t)static_cast<calc_ir::StoreLocal*>(node)->dest); cg_jump(E, node); .);
+stmt: ExprEffect(reg) = 1 (. E.op(OP_POP); cg_jump(E, node); .);
 
-// Mul (commutative)
-reg: Mul(LoadLocal, reg)               = 1 (. jit_emit_mul_lhs_local(node); .);
-reg: Mul(reg, LoadLocal)               = 1 (. jit_emit_mul_rhs_local(node); .);
-reg: Mul(stack_reg, reg)               = 1 (. jit_emit_mul_pop(node); .);
+// Branch: test value is the reg child (already on the stack). BR_IF
+// jumps to the then_ landing pad when true; a goto threads the else_
+// (false) landing pad. Both are Nops, labeled at their entry.
+stmt: Branch(reg) = 1 (. { auto* b = static_cast<calc_ir::Branch*>(node);
+          E.branch(OP_BR_IF, b->then_); E.branch(OP_GOTO, b->else_); } .);
 
-// Neg (unary — operand to ac, then negate; no spill)
-reg: Neg(reg)                          = 1 (. jit_emit_neg(node); .);
+stmt: Goto = 1 (. E.branch(OP_GOTO, static_cast<calc_ir::Goto*>(node)->target); .);
 
-// CmpEq / CmpNeq (commutative)
-reg: CmpEq(LoadLocal, reg)             = 1 (. jit_emit_cmp_eq_lhs_local(node); .);
-reg: CmpEq(reg, LoadLocal)             = 1 (. jit_emit_cmp_eq_rhs_local(node); .);
-reg: CmpEq(stack_reg, reg)             = 1 (. jit_emit_cmp_eq_pop(node); .);
+// Halt / Leave deliver the value (on the stack) and return.
+stmt: Halt(reg)  = 1 (. E.op(OP_RET); .);
+stmt: Leave(reg) = 1 (. E.op(OP_RET); .);
 
-reg: CmpNeq(LoadLocal, reg)            = 1 (. jit_emit_cmp_neq_lhs_local(node); .);
-reg: CmpNeq(reg, LoadLocal)            = 1 (. jit_emit_cmp_neq_rhs_local(node); .);
-reg: CmpNeq(stack_reg, reg)            = 1 (. jit_emit_cmp_neq_pop(node); .);
-
-// CmpLt / CmpLe / CmpGt / CmpGe (non-commutative — case 3 swaps the
-// comparison: CmpLt(E, S) ≡ CmpGt(S, E), Le↔Ge, Gt↔Lt, Ge↔Le).
-// Each *_rhs_local fn is templated on the SOURCE op (so it casts
-// the node correctly and reads op->right's slot) but emits the
-// SWAPPED-sense stencil internally.
-reg: CmpLt(LoadLocal, reg)             = 1 (. jit_emit_cmp_lt_lhs_local(node); .);
-reg: CmpLt(reg, LoadLocal)             = 1 (. jit_emit_cmp_lt_rhs_local(node); .);
-reg: CmpLt(stack_reg, reg)             = 1 (. jit_emit_cmp_lt_pop(node); .);
-
-reg: CmpLe(LoadLocal, reg)             = 1 (. jit_emit_cmp_le_lhs_local(node); .);
-reg: CmpLe(reg, LoadLocal)             = 1 (. jit_emit_cmp_le_rhs_local(node); .);
-reg: CmpLe(stack_reg, reg)             = 1 (. jit_emit_cmp_le_pop(node); .);
-
-reg: CmpGt(LoadLocal, reg)             = 1 (. jit_emit_cmp_gt_lhs_local(node); .);
-reg: CmpGt(reg, LoadLocal)             = 1 (. jit_emit_cmp_gt_rhs_local(node); .);
-reg: CmpGt(stack_reg, reg)             = 1 (. jit_emit_cmp_gt_pop(node); .);
-
-reg: CmpGe(LoadLocal, reg)             = 1 (. jit_emit_cmp_ge_lhs_local(node); .);
-reg: CmpGe(reg, LoadLocal)             = 1 (. jit_emit_cmp_ge_rhs_local(node); .);
-reg: CmpGe(stack_reg, reg)             = 1 (. jit_emit_cmp_ge_pop(node); .);
-
-// Paper page 14 CG[call] — value-producer with args at destination
-// stack_reg. BURG auto-recurses each arg via the chain rule
-// (push_stack per arg), then jit_emit_call emits the call stencil.
-// Per-arity rules cover practical cases; add more if a test needs
-// >4 args. Result lives in ctx.ac after cpu RET — same destination
-// as any binop, so cg_deliver wraps it via the caller's outer δ/γ.
-// `where (operand_count(node) == N)` constrains each arity rule to
-// match only Call nodes with N args; without it burgc's labeler
-// would let the arity-0 rule win on cost for any Call regardless
-// of child_count.
-reg: Call where (. operand_count(node) == 0 .)                                = 1 (. jit_emit_call(node); .);
-reg: Call(stack_reg) where (. operand_count(node) == 1 .)                     = 1 (. jit_emit_call(node); .);
-reg: Call(stack_reg, stack_reg) where (. operand_count(node) == 2 .)          = 1 (. jit_emit_call(node); .);
-reg: Call(stack_reg, stack_reg, stack_reg) where (. operand_count(node) == 3 .) = 1 (. jit_emit_call(node); .);
-reg: Call(stack_reg, stack_reg, stack_reg, stack_reg) where (. operand_count(node) == 4 .) = 1 (. jit_emit_call(node); .);
-
-// ── Consumers (spine — take value sub-tree as `reg`) ────────
-stmt: StoreLocal(reg)                  = 1 (. jit_emit_store_local(node); .);
-stmt: ExprEffect(reg)                  = 1 (. jit_emit_expr_effect(node); .);
-stmt: Branch(reg)                      = 1 (. jit_emit_branch(node); .);
-stmt: Leave(reg)                       = 1 (. jit_emit_leave(node); .);
-stmt: Halt(reg)                        = 1 (. jit_emit_halt(node); .);
-
-// Goto / Nop are pure spine — no value to emit.
-stmt: Goto                             = 1 (. jit_emit_goto(node); .);
-// Nop is a forward-reference placeholder allocated by fresh_kont().
-// Cost 0, no stencil — backpatch_all's resolve walks past it via
-// successor() to find the next emitted node.
-stmt: Nop                              = 0;
-stmt: reg                              = 0;
+// Nop is the label anchor (a kont landing pad) — records its PC at the
+// arm's entry, emits no opcode, threads its continuation.
+stmt: Nop = 0 (. E.label(node); cg_jump(E, node); .);

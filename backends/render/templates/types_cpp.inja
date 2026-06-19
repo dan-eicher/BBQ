@@ -1,0 +1,108 @@
+{# BBQ C++ typed-view header — rendered from the type model. Each rule is a
+   handle over a FieldCapture node + input buffer + a CoW store; accessors decode
+   lazily (or read the CoW override), setters detach to Owned. The store is
+   shared down to sub-handles so nested mutations propagate. #}
+#pragma once
+
+#include <cstdint>
+#include <cstddef>
+#include <string_view>
+#include <vector>
+#include "bbq_node.h"
+
+{% if has_ns %}
+namespace {{ namespace }} {
+{% endif %}
+
+{% for name in forward %}
+class {{ name }};
+{% endfor %}
+
+{% for c in classes %}
+class {{ c.name }} {
+    const bbq::FieldCapture* n_;
+    const uint8_t* buf_;
+    bbq::zcow* zc_;
+public:
+    {{ c.name }}(const bbq::FieldCapture* n, const uint8_t* buf, bbq::zcow* zc = nullptr)
+        : n_(n), buf_(buf), zc_(zc) {}
+
+{% if existsIn(c, "value_class") %}
+{% if c.is_optional %}
+    bool has_value() const { return n_->child_count > 0; }
+{% endif %}
+    {{ c.value_ctype }} value() const { return {{ c.value_expr }}; }
+{% else %}
+{% for f in c.fields %}
+{% if f.type.t == "scalar" and f.type.prim.kind == "bytes" %}
+    bbq::bytes_view {{ f.name }}() const { auto* _c = bbq::node_child(n_, "{{ f.name }}"); if (zc_) { if (auto* _o = zc_->get_bytes(_c)) return { _o->data(), _o->size() }; } return { buf_ + _c->start_offset, (size_t)(_c->end_offset - _c->start_offset) }; }
+    void set_{{ f.name }}(const uint8_t* _d, size_t _n) { zc_->set_bytes(bbq::node_child(n_, "{{ f.name }}"), std::vector<uint8_t>(_d, _d + _n)); }
+{% else if f.type.t == "scalar" and f.type.prim.kind == "string" %}
+    std::string_view {{ f.name }}() const { auto* _c = bbq::node_child(n_, "{{ f.name }}"); if (zc_) { if (auto* _o = zc_->get_bytes(_c)) return { (const char*)_o->data(), _o->size() }; } return { (const char*)(buf_ + _c->start_offset), (size_t)(_c->end_offset - _c->start_offset) }; }
+    void set_{{ f.name }}(std::string_view _s) { zc_->set_bytes(bbq::node_child(n_, "{{ f.name }}"), std::vector<uint8_t>(_s.begin(), _s.end())); }
+{% else if f.type.t == "scalar" and f.type.prim.kind == "float" %}
+    {{ cpp_type(f.type) }} {{ f.name }}() const { auto* _c = bbq::node_child(n_, "{{ f.name }}"); if (zc_) { if (auto* _o = zc_->get_float(_c)) return ({{ cpp_type(f.type) }})*_o; } return ({{ cpp_type(f.type) }})bbq::node_float(_c, buf_); }
+    void set_{{ f.name }}({{ cpp_type(f.type) }} _v) { zc_->set_float(bbq::node_child(n_, "{{ f.name }}"), (double)_v); }
+{% else if f.type.t == "scalar" %}
+    {{ cpp_type(f.type) }} {{ f.name }}() const { auto* _c = bbq::node_child(n_, "{{ f.name }}"); if (zc_) { if (auto* _o = zc_->get_int(_c)) return ({{ cpp_type(f.type) }})*_o; } return ({{ cpp_type(f.type) }})bbq::node_int(_c, buf_); }
+    void set_{{ f.name }}({{ cpp_type(f.type) }} _v) { zc_->set_int(bbq::node_child(n_, "{{ f.name }}"), (int64_t)_v); }
+{% else if f.type.t == "computed" %}
+    {{ cpp_type(f.type) }} {{ f.name }}() const { return bbq::node_computed_val<{{ cpp_type(f.type) }}>(bbq::node_child(n_, "{{ f.name }}")); }
+{% else if f.type.t == "ruleref" %}
+    {{ f.type.rule }} {{ f.name }}() const { return {{ f.type.rule }}(bbq::node_child(n_, "{{ f.name }}"), buf_, zc_); }
+{% else if f.type.t == "named" %}
+    {{ f.type.name }} {{ f.name }}() const { return {{ f.type.name }}(bbq::node_child(n_, "{{ f.name }}"), buf_, zc_); }
+{% else if f.type.t == "array" %}
+    {{ cpp_type(f.type) }} {{ f.name }}() const { return { bbq::node_child(n_, "{{ f.name }}"), buf_, zc_ }; }
+{% else if f.type.t == "optional" %}
+    {{ cpp_type(f.type) }} {{ f.name }}() const { return { bbq::node_child(n_, "{{ f.name }}"), buf_, zc_ }; }
+{% else if f.type.t == "tagged_inline" %}
+    int {{ f.name }}_which() const { auto* _c = bbq::node_child(n_, "{{ f.name }}"); return _c ? _c->variant_tag : -1; }
+{% for m in f.type.members %}
+    {{ cpp_type(m.type) }} {{ f.name }}_{{ m.name }}() const { return {{ cpp_decode_child(m.type, f.name) }}; }
+{% endfor %}
+{% else if f.type.t == "verbatim" %}
+    bbq::bytes_view {{ f.name }}() const { auto* _c = bbq::node_child(n_, "{{ f.name }}"); return { buf_ + _c->start_offset, (size_t)(_c->end_offset - _c->start_offset) }; }
+{% else %}
+#error unsupported C++ field type {{ f.type.t }}
+{% endif %}
+{% endfor %}
+{% endif %}
+};
+
+{% endfor %}
+{# Tagged-union handles (union/alternatives): the matched arm is a named child that
+   records variant_tag. which() reads the recorded decision; is_<v>()/<v>() expose
+   each variant (only valid when present). #}
+{% for c in tagged_classes %}
+class {{ c.name }} {
+    const bbq::FieldCapture* n_;
+    const uint8_t* buf_;
+    bbq::zcow* zc_;
+public:
+    {{ c.name }}(const bbq::FieldCapture* n, const uint8_t* buf, bbq::zcow* zc = nullptr)
+        : n_(n), buf_(buf), zc_(zc) {}
+
+{% if c.variant_named %}
+    int which() const {
+{% for v in c.variants %}
+        if (auto* _c = bbq::node_child(n_, "{{ v.member }}")) return _c->variant_tag;
+{% endfor %}
+        return -1;
+    }
+{% for v in c.variants %}
+    bool is_{{ v.member }}() const { return bbq::node_child(n_, "{{ v.member }}") != nullptr; }
+    {{ cpp_type(v.type) }} {{ v.member }}() const { return {{ cpp_decode_child(v.type, v.member) }}; }
+{% endfor %}
+{% else %}
+    int which() const { return n_->child_count ? n_->children[0].variant_tag : -1; }
+{% for v in c.variants %}
+    {{ cpp_type(v.type) }} {{ v.member }}() const { return {{ cpp_decode_first(v.type) }}; }
+{% endfor %}
+{% endif %}
+};
+
+{% endfor %}
+{% if has_ns %}
+}  // namespace {{ namespace }}
+{% endif %}

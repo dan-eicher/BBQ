@@ -1,0 +1,99 @@
+# ZCow C++ ↔ CEK parity fixture — the matrix-driven test bed, NOT an elf64 subset.
+#
+# The parity test (render_types_cpp_parity_test) CEK-parses bytes against this
+# grammar and asserts the generated C++ handle decodes the SAME value the CEK
+# index holds — the prototype-in-Python → compile-to-C++ guarantee, mechanized.
+#
+# This fixture is driven by the C++-zcow PARITY MATRIX, never by what any one
+# consumer (elf64/jitterator/calc) happens to use. It MUST grow to cover every
+# matrix cell: each time a gate opens (step 4.2 — array-of-prim, string, optional,
+# bitfield, switch/union, ...) this fixture gains a field for it + bytes + an
+# assertion, flipping the matrix cell ✗→✓. A gated feature throws at generation
+# time, so it physically cannot live here until its gate opens — "fixture grows"
+# and "matrix fills" are the same event, by construction. Today it covers only the
+# currently-ungated cells; that is the green baseline, not the finish line.
+@endian little
+
+Inner = struct {
+    a: uint8,
+    b: uint16le
+}
+
+Flat = struct {
+    u8:    uint8,
+    u16:   uint16le,
+    u32:   uint32le,
+    be16:  uint16be,
+    i8:    int8,
+    i16:   int16le,
+    i32:   int32le,
+    flag:  bool,
+    f32:   float32le,
+    f64:   float64le,
+    raw:   bytes[2],
+    s:     string[3],
+    hi:    compute((u8 >> 4) & 0x0F : uint8),
+    inner: Inner,
+    n:     uint8,
+    items: array<Inner>[n],
+    m:     uint8,
+    nums:  array<uint16le>[m]
+}
+
+Opt = struct {
+    pflag:  uint8,
+    pmaybe: optional<uint16le> where pflag == 1,
+    rflag:  uint8,
+    rmaybe: optional<Inner> where rflag == 1
+}
+
+Bits = bitfield<uint8> { hi: 4, lo: 4 }
+
+Nest = struct {
+    hdr: struct { a: uint8, b: uint16le },
+    c:   uint8
+}
+
+InlineBits = struct {
+    lead:  uint8,
+    flags: bitfield<uint8> { hi: 4, lo: 4 },
+    tail:  uint8
+}
+
+Pair = struct { p: uint8, q: uint8 }
+
+# union/alternatives: the matched arm is captured under its variant name AND records
+# variant_tag, so the handle reads which() from the recorded decision.
+U = union { asInner: Inner, asPair: Pair }
+
+Alts = Inner | Pair
+
+# switch field: the arm captures under the field name "body" + records the case
+# ordinal; which() reads it, body_case_N() decodes the arm.
+Sw = struct {
+    tag:  uint8,
+    body: switch(tag) { 1: uint16le; 2: Inner; default: uint8; }
+}
+
+# top-level switch RULE (like wasm.bbq's Table = switch(peek())): the matched arm is
+# the root's anonymous first child + variant_tag. which() reads it; case_N() decodes it.
+TopSw = switch(peek()) { 1: Inner; default: uint8; }
+
+# optional bytes/string (span_opt borrows the span).
+OptSpan = struct {
+    n:  uint8,
+    ob: optional<bytes[2]> where n == 1,
+    os: optional<string[3]> where n == 1
+}
+
+# extern field — the index records only the consumed span (CaptureType::External);
+# the ZCow read is that span as bytes_view.
+Ext = struct { tag: uint8, blob: extern("readit", "uint32_t"), tail: uint8 }
+
+# nested array<array> — element containers compose (seq<prim_seq<uint8>>).
+Matrix = struct { rows: uint8, cols: uint8, data: array<array<uint8>[cols]>[rows] }
+
+# top-level non-struct rules: value() over the root (children[0] for typedef/optional).
+TyByte  = uint8
+TyInner = Inner
+OptTop  = optional<uint8>

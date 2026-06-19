@@ -319,59 +319,33 @@ calc_ir::Node* calc_compile(const char* input, int* main_frame_size) {
     return root;
 }
 
-int64_t calc_run(const char* input, bool* ok) {
-    int main_frame_size = 0;
-    calc_ir::Node* ir = calc_compile(input, &main_frame_size);
-    if (!ir) {
-        if (ok) *ok = false;
-        return 0;
-    }
+std::vector<uint8_t> lower(calc_ir::Node* ir) {
+    // The burg matcher tiles the value sub-trees and walks the spine,
+    // emitting opgen calc bytecode via cg_jump (CalcMatcher.h's rule
+    // actions over calc::Emit). backpatch resolves every branch's
+    // absolute byte target once the landing-pad PCs are known.
+    BurgMatcher m;
+    m.burg_rewrite(ir);                       // main
 
-    JitContext jctx;
-    jit_ctx = &jctx;
-    jctx.emit_entry();
-    BurgMatcher matcher;
-
-    // Lower main first so entry → emitted[0] lands in main's first
-    // stencil. Function bodies (independent IR roots reached via
-    // Call.target) get lowered after; backpatch_all resolves each
-    // Call's _HOLE_target via first_in_tree(target).
-    matcher.burg_rewrite(ir);
-    {
-        std::unordered_set<calc_ir::Node*> seen;
-        std::unordered_set<calc_ir::Node*> fn_entries_seen;
-        std::vector<calc_ir::Node*> stack{ir};
-        std::vector<calc_ir::Node*> fn_entries;
-        while (!stack.empty()) {
-            auto* n = stack.back(); stack.pop_back();
-            if (!n || !seen.insert(n).second) continue;
-            if (n->tag == calc_ir::NodeTag::Call) {
-                auto* tgt = static_cast<calc_ir::Call*>(n)->target;
-                if (fn_entries_seen.insert(tgt).second) {
-                    fn_entries.push_back(tgt);
-                }
-            }
-            int oc = operand_count(n);
-            for (int i = 0; i < oc; i++) stack.push_back(operand_producer(n, i));
-            int sc = successor_count(n);
-            for (int i = 0; i < sc; i++) stack.push_back(successor(n, i));
+    // Lower each reachable function body. A Call's target is the
+    // callee's entry Nop — a separate IR root, not on main's spine — so
+    // lower it explicitly; its entry label lets the CALL backpatch to it.
+    std::unordered_set<calc_ir::Node*> seen, fn_seen;
+    std::vector<calc_ir::Node*> stack{ir}, fns;
+    while (!stack.empty()) {
+        auto* n = stack.back(); stack.pop_back();
+        if (!n || !seen.insert(n).second) continue;
+        if (n->tag == calc_ir::NodeTag::Call) {
+            auto* t = static_cast<calc_ir::Call*>(n)->target;
+            if (t && fn_seen.insert(t).second) fns.push_back(t);
         }
-        for (auto* fn_entry : fn_entries) {
-            matcher.burg_rewrite(fn_entry);
-        }
+        for (int i = 0; i < operand_count(n); i++) stack.push_back(operand_producer(n, i));
+        for (int i = 0; i < successor_count(n); i++) stack.push_back(successor(n, i));
     }
-    jctx.backpatch_all();
+    for (auto* fn : fns) m.burg_rewrite(fn);
 
-    auto* fn = (void(*)(Ctx*))jctx.buf.finalize();
-    Ctx ctx{};
-    // Initialize sp past main's locals so eval-stack temps don't
-    // clobber them. (Function calls handle this internally via the
-    // call stencil's sp arithmetic; main has no caller to do it.)
-    ctx.sp = main_frame_size;
-    fn(&ctx);
-
-    if (ok) *ok = true;
-    return ctx.ac;
+    m.emit.finalize(calc::calc_peephole());   // the Tanenbaum control-flow peephole
+    return m.emit.code;
 }
 
 int count_node_kind(calc_ir::Node* ir, calc_ir::NodeTag kind) {

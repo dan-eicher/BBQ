@@ -154,7 +154,18 @@ public:
             ::bbq::rho_t rho = root();
             bbq::cek::StaticKont* body_head = nullptr;
             if (auto* st = dynamic_cast<BBQ::Struct*>(rule->body)) {
-                body_head = compile_fields(st->fields, rho, exit_static);
+                // Top-level structs inline their fields directly (no BeginStruct
+                // wrapper). A struct-level `where` still applies: it runs after the
+                // fields, before ReturnRule. (struct_def handles the nested case.)
+                bbq::cek::StaticKont* tail = wrap_struct_where(st->constraint, rho, exit_static);
+                body_head = compile_fields(st->fields, rho, tail);
+            } else if (auto* bf = dynamic_cast<BBQ::Bitfield*>(rule->body)) {
+                // Top-level bitfields inline their members directly into the rule
+                // struct (no BeginStruct wrapper), the same shape as top-level
+                // structs. bitfield_def handles the nested (inline field) case,
+                // where the members must sit under their own sub-struct scope.
+                bbq::cek::PrimitiveInfo prim = to_prim_info(bf->container);
+                body_head = compile_bitfield(prim, bf->entries, rho, exit_static);
             } else {
                 body_head = compile_type_expr(
                     rule->body, rho, ::bbq::effect(),
@@ -209,7 +220,7 @@ private:
     // ─── PRIVATE (verbatim) ─────────────────────
 
     // Allocation arena for IR konts, owned by the compiled grammar.
-    bbq::cek::ParseArena* arena_ = nullptr;
+    bbq::ParseArena* arena_ = nullptr;
     bbq::cek::StringPool* strings_ = nullptr;
 
     // Rule entry table — populated as each rule finishes compiling.
@@ -273,20 +284,99 @@ private:
 
     // ── make_X allocators ─────────────────────────────────────
 
-    bbq::cek::StaticKont* make_match_primitive(const std::string& nm, bbq::cek::PrimitiveInfo p, bbq::cek::StaticKont* nx) {
+    bbq::cek::StaticKont* make_match_primitive(bbq::cek::PrimitiveInfo p, bbq::cek::StaticKont* nx) {
         auto* k = arena_->alloc<bbq::cek::MatchPrimitiveNode>();
-        k->field_name = nm.empty() ? nullptr : strings_->intern(nm); k->prim = p; k->next = nx;
+        k->prim = p; k->next = nx;
         return k;
+    }
+    // Concrete store konts: each consumes the producer's value in ac and does its
+    // one thing. Capture → record an output-tree node; StoreEnv → bind in E; Drop
+    // → discard. The name (the WHERE) lives on the store, not the producer.
+    bbq::cek::StaticKont* make_capture(const std::string& nm, bbq::cek::StaticKont* nx) {
+        auto* k = arena_->alloc<bbq::cek::CaptureKont>();
+        k->name = nm.empty() ? nullptr : strings_->intern(nm); k->next = nx;
+        return k;
+    }
+    bbq::cek::StaticKont* make_store_env(const std::string& nm, bbq::cek::StaticKont* nx) {
+        auto* k = arena_->alloc<bbq::cek::StoreEnvKont>();
+        k->name = nm.empty() ? nullptr : strings_->intern(nm); k->next = nx;
+        return k;
+    }
+    // A field's name picks its placement. Any real name Captures into the output
+    // tree AND binds in E. `_` skips Capture — never in the output struct — but
+    // StoreEnv stays (under the name `_`), because a `_` field's own `where` (and
+    // a `_` length sizing a later array) read the value back through E; a
+    // separator is `_` for arrays, so the same path verifies a delimiter. "Don't
+    // store in the struct" = skip Capture; the binding is internal plumbing kept
+    // for verification. (There is no pure-discard placement: every "don't store"
+    // case still wants the binding.)
+    bbq::cek::StaticKont* field_dest(const std::string& nm, bbq::cek::StaticKont* tail) {
+        if (nm == "_") return make_store_env(nm, tail);
+        return make_capture(nm, make_store_env(nm, tail));
     }
     bbq::cek::StaticKont* make_begin_struct(const std::string& nm, bbq::cek::StaticKont* nx) {
         auto* k = arena_->alloc<bbq::cek::BeginStructNode>();
         k->struct_name = strings_->intern(nm); k->next = nx;
         return k;
     }
+    bbq::cek::StaticKont* make_begin_variant(const std::string& nm, int tag,
+                                             bbq::cek::StaticKont* nx) {
+        auto* k = arena_->alloc<bbq::cek::BeginVariantNode>();
+        k->variant_name = strings_->intern(nm); k->variant_tag = tag; k->next = nx;
+        return k;
+    }
     bbq::cek::StaticKont* make_end_struct(bbq::cek::StaticKont* nx) {
         auto* k = arena_->alloc<bbq::cek::EndStructNode>();
         k->next = nx;
         return k;
+    }
+    bbq::cek::StaticKont* make_seek(bbq::cek::StaticKont* expr, bbq::cek::StaticKont* nx) {
+        auto* k = arena_->alloc<bbq::cek::SeekKont>();
+        k->expr = expr; k->next = nx; return k;
+    }
+    bbq::cek::StaticKont* make_push_interval(bool relative, bbq::cek::StaticKont* expr,
+                                             bbq::cek::StaticKont* nx) {
+        auto* k = arena_->alloc<bbq::cek::PushIntervalNode>();
+        k->relative = relative; k->expr = expr; k->next = nx; return k;
+    }
+    bbq::cek::StaticKont* make_pop_interval(bool checked, bbq::cek::StaticKont* nx) {
+        auto* k = arena_->alloc<bbq::cek::PopIntervalNode>();
+        k->checked = checked; k->next = nx; return k;
+    }
+
+    // Wrap a body (already chained into a PopInterval) with the interval entry
+    // sequence. StartEnd: eval(start) -> Seek -> eval(end) -> PushInterval(abs) -> body.
+    // Length: eval(len) -> PushInterval(rel = pos+len) -> body (no seek). The start/end
+    // expressions deliver to the accumulator (ac) that Seek/PushInterval consume.
+    bbq::cek::StaticKont* interval_entry(BBQ::Interval* iv, ::bbq::rho_t r,
+                                         bbq::cek::StaticKont* body) {
+        if (auto* se = dynamic_cast<BBQ::StartEnd*>(iv)) {
+            // Seek(start) -> PushInterval(abs end) -> body. Each kont carries its
+            // offset expression and triggers it (gamma is a placeholder — the apply
+            // consumer is pushed below the expr, so the expr's own continuation is
+            // never taken).
+            auto* end_e = compile_expr(se->end, r, ::bbq::ac(), ::bbq::jump(body), body);
+            auto* push = make_push_interval(false, end_e, body);
+            auto* start_e = compile_expr(se->start, r, ::bbq::ac(), ::bbq::jump(push), push);
+            return make_seek(start_e, push);
+        }
+        if (auto* len = dynamic_cast<BBQ::Length*>(iv)) {
+            auto* len_e = compile_expr(len->length, r, ::bbq::ac(), ::bbq::jump(body), body);
+            return make_push_interval(true, len_e, body);
+        }
+        return body;
+    }
+
+    BBQ::Interval* interval_of(BBQ::TypeExpr* node) {
+        if (auto* p  = dynamic_cast<BBQ::Primitive*>(node))
+            return p->interval.has_value() ? p->interval.value() : nullptr;
+        if (auto* rr = dynamic_cast<BBQ::RuleRef*>(node))
+            return rr->interval.has_value() ? rr->interval.value() : nullptr;
+        if (auto* a  = dynamic_cast<BBQ::Array*>(node))
+            return a->interval.has_value() ? a->interval.value() : nullptr;
+        if (auto* e  = dynamic_cast<BBQ::Extern*>(node))
+            return e->interval.has_value() ? e->interval.value() : nullptr;
+        return nullptr;
     }
     bbq::cek::StaticKont* make_eval_constraint(bbq::cek::StaticKont* e,
                                                bbq::cek::StaticKont* on_false,
@@ -295,9 +385,9 @@ private:
         k->constraint_expr = e; k->on_false = on_false; k->next = nx;
         return k;
     }
-    bbq::cek::StaticKont* make_bind_compute(const std::string& nm, bbq::cek::StaticKont* e, bbq::cek::StaticKont* nx) {
+    bbq::cek::StaticKont* make_bind_compute(bbq::cek::StaticKont* e, bbq::cek::StaticKont* nx) {
         auto* k = arena_->alloc<bbq::cek::BindComputeNode>();
-        k->field_name = nm.empty() ? nullptr : strings_->intern(nm); k->compute_expr = e; k->next = nx;
+        k->compute_expr = e; k->next = nx;
         return k;
     }
     bbq::cek::StaticKont* make_invoke_rule(const std::string& nm,
@@ -354,6 +444,30 @@ private:
         k->next = nx;
         return k;
     }
+    bbq::cek::StaticKont*
+    compile_optional(BBQ::TypeExpr* e, std::optional<BBQ::Expr*> constraint,
+                     ::bbq::rho_t r, bbq::cek::StaticKont* Lnext) {
+        if (constraint.has_value() && constraint.value()) {
+            // Predicated: `if (cond) parse element else absent`. No Savepoint —
+            // the predicate decides presence, so a present element that fails is
+            // a hard failure, propagating to the enclosing backtrack frame via r
+            // (hence the element parses under r, not in_optional), exactly like
+            // the static backends' `if (cond) { read } else { nullopt }`.
+            // EvalConstraint is the boolean branch: false routes to Lnext (absent).
+            auto* inner = compile_type_expr(e, r, ::bbq::effect(),
+                                            ::bbq::jump(Lnext), Lnext);
+            auto* cond = compile_expr(constraint.value(), r, ::bbq::ac(),
+                                      ::bbq::jump(Lnext), Lnext);
+            return make_eval_constraint(cond, Lnext, inner);
+        }
+        // Try/restore: the skip link restores the Savepoint, pops it (no
+        // retries), and continues past the optional with the element absent.
+        auto* end = make_end_optional(Lnext);
+        auto* skip = make_on_fail(Lnext, nullptr, /*pop_frame=*/true);
+        auto* inner = compile_type_expr(e, in_optional(skip, r),
+                                        ::bbq::effect(), ::bbq::jump(end), end);
+        return make_begin_optional(skip, inner, Lnext);
+    }
     bbq::cek::StaticKont* make_begin_array(const std::string& nm, bbq::cek::ArrayMode mode,
                                          bbq::cek::StaticKont* count_expr,
                                          bbq::cek::StaticKont* end_node,
@@ -393,9 +507,11 @@ private:
     }
     bbq::cek::StaticKont* make_switch_dispatch(bbq::cek::StaticKont* disc,
                                              std::vector<bbq::cek::switch_case> cases,
-                                             bbq::cek::StaticKont* dflt) {
+                                             bbq::cek::StaticKont* dflt,
+                                             bool default_reject) {
         auto* k = arena_->alloc<bbq::cek::SwitchDispatchNode>();
         k->discriminator_expr = disc;
+        k->default_reject = default_reject;
         if (!cases.empty()) {
             auto* buf = static_cast<bbq::cek::switch_case*>(
                 arena_->allocate(cases.size() * sizeof(bbq::cek::switch_case),
@@ -407,37 +523,74 @@ private:
         k->default_target = dflt;
         return k;
     }
-    bbq::cek::StaticKont* make_bitfield_read(bbq::cek::PrimitiveInfo container,
-                                           std::vector<bbq::cek::bitfield_entry> entries,
-                                           bbq::cek::StaticKont* nx) {
-        auto* k = arena_->alloc<bbq::cek::BitfieldReadNode>();
+    bbq::cek::StaticKont* make_extract_bits(bbq::cek::PrimitiveInfo container,
+                                            int width_bits, int offset_before,
+                                            bbq::cek::StaticKont* nx) {
+        auto* k = arena_->alloc<bbq::cek::ExtractBitsNode>();
         k->container = container;
-        if (!entries.empty()) {
-            auto* buf = static_cast<bbq::cek::bitfield_entry*>(
-                arena_->allocate(entries.size() * sizeof(bbq::cek::bitfield_entry),
-                                 alignof(bbq::cek::bitfield_entry)));
-            for (size_t i = 0; i < entries.size(); ++i) buf[i] = entries[i];
-            k->entries = buf;
-            k->entries_count = static_cast<int>(entries.size());
-        }
+        k->width_bits = width_bits;
+        k->offset_before = offset_before;
         k->next = nx;
         return k;
+    }
+    bbq::cek::StaticKont* make_advance_pos(int by, bbq::cek::StaticKont* nx) {
+        auto* k = arena_->alloc<bbq::cek::AdvancePosNode>();
+        k->by = by; k->next = nx;
+        return k;
+    }
+    // A bitfield = one ExtractBits → Capture → StoreEnv per member, sharing the
+    // container interval, then one AdvancePos past the container. The members
+    // flatten into the enclosing scope (no Bitfield wrapper); pos stays at the
+    // container start while each member reads it in place, then advances once.
+    bbq::cek::StaticKont*
+    compile_bitfield(bbq::cek::PrimitiveInfo container,
+                     std::vector<BBQ::BitfieldEntry*> entries,
+                     ::bbq::rho_t r,
+                     bbq::cek::StaticKont* Lnext) {
+        bbq::cek::StaticKont* chain = make_advance_pos(
+            static_cast<int>(container.byte_count()), Lnext);
+        // offset_before(e_i) = sum of widths of e_0..e_{i-1} (declaration order).
+        std::vector<int> offset_before(entries.size(), 0);
+        int cum = 0;
+        for (size_t i = 0; i < entries.size(); ++i) {
+            offset_before[i] = cum;
+            cum += static_cast<int>(entries[i]->width);
+        }
+        // Build in reverse so each member's `next` chains to the rest. A member's
+        // `where` runs after its StoreEnv (value bound under the member name), so
+        // it can check itself or an earlier member; on failure it backtracks via
+        // the bitfield field's ρ-resolved target.
+        for (size_t i = entries.size(); i-- > 0; ) {
+            const std::string& nm = entries[i]->name;
+            bbq::cek::StaticKont* tail = chain;
+            if (entries[i]->constraint.has_value() && entries[i]->constraint.value()) {
+                auto* expr_ir = compile_expr(entries[i]->constraint.value(), r,
+                                             ::bbq::ac(), ::bbq::jump(chain), chain);
+                bbq::cek::StaticKont* on_false = find_backtrack_target(r);
+                if (!on_false) on_false = make_abort_rule();
+                tail = make_eval_constraint(expr_ir, on_false, chain);
+            }
+            chain = make_extract_bits(container, static_cast<int>(entries[i]->width),
+                                      offset_before[i],
+                                      field_dest(nm, tail));
+        }
+        return chain;
     }
     bbq::cek::StaticKont* make_set_endian(bbq::cek::StaticKont* e, bbq::cek::StaticKont* nx) {
         auto* k = arena_->alloc<bbq::cek::SetEndianNode>();
         k->endian_expr = e; k->next = nx;
         return k;
     }
-    bbq::cek::StaticKont* make_external_call(const std::string& fn, const std::string& field, bbq::cek::StaticKont* nx) {
+    bbq::cek::StaticKont* make_external_call(const std::string& fn, const std::string& wf,
+                                             bbq::cek::StaticKont* nx) {
         auto* k = arena_->alloc<bbq::cek::ExternalCallNode>();
         k->func_name = strings_->intern(fn);
-        k->field_name = strings_->intern(field);
+        k->write_func = wf.empty() ? nullptr : strings_->intern(wf);
         k->next = nx;
         return k;
     }
-    bbq::cek::StaticKont* make_match_bytes(const std::string& fn, bbq::cek::StaticKont* len, bool is_str, bbq::cek::StaticKont* nx) {
+    bbq::cek::StaticKont* make_match_bytes(bbq::cek::StaticKont* len, bool is_str, bbq::cek::StaticKont* nx) {
         auto* k = arena_->alloc<bbq::cek::MatchBytesNode>();
-        k->field_name = strings_->intern(fn);
         k->length_expr = len;
         k->is_string = is_str;
         k->next = nx;
@@ -470,7 +623,21 @@ private:
     }
     bbq::cek::StaticKont* make_pos()       { return arena_->alloc<bbq::cek::PosKont>(); }
     bbq::cek::StaticKont* make_remaining() { return arena_->alloc<bbq::cek::RemainingKont>(); }
-    bbq::cek::StaticKont* make_at_end()    { return arena_->alloc<bbq::cek::AtEndKont>(); }
+    bbq::cek::StaticKont* make_buffer()    { return arena_->alloc<bbq::cek::BufferKont>(); }
+    bbq::cek::StaticKont* make_start()     { return arena_->alloc<bbq::cek::StartKont>(); }
+    bbq::cek::StaticKont* make_end()       { return arena_->alloc<bbq::cek::EndKont>(); }
+
+    // @name context builtin → leaf kont (the `@` sigil is stripped by the parser).
+    bbq::cek::StaticKont* make_builtin(const std::string& n) {
+        if (n == "pos")       return make_pos();
+        if (n == "start")     return make_start();
+        if (n == "end")       return make_end();
+        if (n == "remaining") return make_remaining();
+        if (n == "index")     return make_loop_var();
+        if (n == "buffer")    return make_buffer();
+        // Sema rejects unknown @names before compile; defensive fallback.
+        return make_pos();
+    }
     bbq::cek::StaticKont* make_eoi()       { return arena_->alloc<bbq::cek::EOIKont>(); }
     bbq::cek::StaticKont* make_loop_var()  { return arena_->alloc<bbq::cek::LoopVarKont>(); }
 
@@ -575,6 +742,11 @@ private:
                 case BBQ::Endianness::Big:     p.endian = bbq::cek::PrimEndian::Big; break;
                 case BBQ::Endianness::Default: p.endian = bbq::cek::PrimEndian::Native; break;
             }
+            switch (ik->encoding) {
+                case BBQ::Encoding::Fixed: p.encoding = bbq::cek::PrimEncoding::Fixed; break;
+                case BBQ::Encoding::Uleb:  p.encoding = bbq::cek::PrimEncoding::Uleb;  break;
+                case BBQ::Encoding::Sleb:  p.encoding = bbq::cek::PrimEncoding::Sleb;  break;
+            }
         } else if (auto* fk = dynamic_cast<BBQ::FloatKind*>(kind)) {
             p.kind = bbq::cek::PrimKind::Float;
             p.width = (fk->width == BBQ::Width::W32) ? bbq::cek::PrimWidth::W32 : bbq::cek::PrimWidth::W64;
@@ -597,6 +769,7 @@ private:
     bbq::cek::StaticKont*
     compile_array(BBQ::TypeExpr* element,
                   BBQ::ArraySpec* spec,
+                  BBQ::Interval* element_interval,
                   bool resync,
                   ::bbq::rho_t r,
                   bbq::cek::StaticKont* Lnext) {
@@ -657,79 +830,130 @@ private:
         // on_false — the same target the runtime Savepoint uses.
         std::string array_name = intern_field_or_anon(r);
         ::bbq::rho_t elem_rho = in_array_elem(resync_kont, r);
-        bbq::cek::StaticKont* body_head = compile_type_expr(
-            element, elem_rho, ::bbq::effect(),
-            ::bbq::jump(array_next), array_next);
-        array_next->body_entry = body_head;
-        if (resync_kont) resync_kont->body_entry = body_head;
+        bbq::cek::StaticKont* body_head;
+        if (element_interval) {
+            // Per-element `@[start,end]` random access (e.g. elf64's section
+            // headers at e_shoff + i*entsize). The interval references @index, which
+            // is live inside the loop body, so seek+bound is re-evaluated each
+            // iteration. The body chains to a Pop, which then advances the loop.
+            auto* pop = make_pop_interval(false, array_next);
+            auto* elem_body = compile_type_expr(
+                element, elem_rho, ::bbq::effect(), ::bbq::jump(pop), pop);
+            body_head = interval_entry(element_interval, elem_rho, elem_body);
+        } else {
+            body_head = compile_type_expr(
+                element, elem_rho, ::bbq::effect(),
+                ::bbq::jump(array_next), array_next);
+        }
+        // Separator (a PEG/CSV bolt-on, not in IPG — IPG arrays are counted
+        // `for` loops): parsed between elements and treated as `_` for arrays —
+        // compiled under the name `_`, so it binds in E (a `uint8 where _ == 0x2C`
+        // delimiter check resolves `_`) but skips Capture, never landing in the
+        // array. It precedes every element after the first, so it lives on the
+        // loop-back entry (array_next/resync), never on begin_array's first element.
+        bbq::cek::StaticKont* loop_entry = body_head;
+        if (auto* st = dynamic_cast<BBQ::SepTerm*>(spec)) {
+            if (auto* ts = dynamic_cast<BBQ::TypeSep*>(st->sep)) {
+                loop_entry = compile_type_expr(ts->sep_type,
+                                               in_field("_", elem_rho),
+                                               ::bbq::effect(),
+                                               ::bbq::jump(body_head), body_head);
+            }
+        }
+        array_next->body_entry = loop_entry;
+        if (resync_kont) resync_kont->body_entry = loop_entry;
 
         return make_begin_array(array_name, mode,
                                 count_expr, end_kont,
                                 resync_kont, body_head);
     }
 
+    // One choice arm: a BeginVariant(name, tag) scope wrapping the variant body,
+    // closed by EndStruct → success_cont. Both union variants and (A|B)
+    // alternatives are tagged unions in the output (`tag` + `u.<name>`), so both
+    // route through here — only the names differ (variant names vs alt_0/alt_1).
+    // A RuleRef body becomes a bare InvokeRule capturing into the variant scope
+    // (the sub-rule owns its where-checks and fails softly); any other body is
+    // compiled so its captures land directly in the scope (no extra wrapper).
+    bbq::cek::StaticKont*
+    build_variant_arm(const std::string& name, BBQ::TypeExpr* body, int tag,
+                      ::bbq::rho_t arm_rho, bbq::cek::StaticKont* success_cont) {
+        bbq::cek::StaticKont* end_st = make_end_struct(success_cont);
+        bbq::cek::StaticKont* inner;
+        if (auto* rr = dynamic_cast<BBQ::RuleRef*>(body)) {
+            inner = make_invoke_rule(rr->name, find_backtrack_target(arm_rho), end_st);
+        } else {
+            inner = compile_type_expr(body, arm_rho, ::bbq::effect(),
+                                      ::bbq::jump(end_st), end_st);
+        }
+        return make_begin_variant(name, tag, inner);
+    }
+
+    // Build the backtracking choice spine over named arms (the shared core of
+    // unions and alternatives). Each non-last arm's success threads through
+    // CommitChoice (pops the Savepoint, chains to Lnext); the last arm chains
+    // to Lnext directly — the "exhausted" OnFailKont pops the Savepoint and
+    // fails if it too fails. Arms compile right-to-left so each OnFailKont link
+    // knows the next arm's entry; the same link is both the runtime
+    // Savepoint.on_fail_target (byte-fails) and the static in_alt.next_arm
+    // (where-fails via on_false).
+    bbq::cek::StaticKont*
+    compile_choice(std::vector<std::string> names,
+                   std::vector<BBQ::TypeExpr*> bodies,
+                   ::bbq::rho_t r, bbq::cek::StaticKont* Lnext) {
+        if (bodies.empty()) return Lnext;
+        if (bodies.size() == 1) {
+            // Single arm — still a tagged union (tag 0, u.<name>), no backtracking.
+            return build_variant_arm(names[0], bodies[0], 0, r, Lnext);
+        }
+        auto* commit = make_commit_choice(Lnext);
+        bbq::cek::StaticKont* exhausted =
+            make_on_fail(nullptr, nullptr, /*pop_frame=*/true);
+        int last = static_cast<int>(bodies.size()) - 1;
+        bbq::cek::StaticKont* last_entry =
+            build_variant_arm(names[last], bodies[last], last, r, Lnext);
+        bbq::cek::StaticKont* next_link = exhausted;
+        bbq::cek::StaticKont* next_target = last_entry;
+        for (int i = last - 1; i >= 1; --i) {
+            bbq::cek::StaticKont* link =
+                make_on_fail(next_target, next_link, /*pop_frame=*/false);
+            ::bbq::rho_t arm_rho = in_alt(link, r);
+            bbq::cek::StaticKont* arm =
+                build_variant_arm(names[i], bodies[i], i, arm_rho, commit);
+            next_link = link;
+            next_target = arm;
+        }
+        bbq::cek::StaticKont* head_link =
+            make_on_fail(next_target, next_link, /*pop_frame=*/false);
+        ::bbq::rho_t arm0_rho = in_alt(head_link, r);
+        bbq::cek::StaticKont* first =
+            build_variant_arm(names[0], bodies[0], 0, arm0_rho, commit);
+        return make_begin_choice(head_link, first);
+    }
+
     bbq::cek::StaticKont*
     compile_alternatives(std::vector<BBQ::TypeExpr*> alts,
                          ::bbq::rho_t r,
                          bbq::cek::StaticKont* Lnext) {
-        if (alts.empty()) return Lnext;
-        if (alts.size() == 1) {
-            // Single alternative — no choice, just compile it.
-            return compile_type_expr(alts[0], r, ::bbq::effect(),
-                                     ::bbq::jump(Lnext), Lnext);
-        }
-        // Each non-last arm's success path threads through CommitChoice
-        // (pops the Savepoint and chains to Lnext). The last arm
-        // chains directly to Lnext — the Savepoint pops via the
-        // "exhausted" OnFailKont if the last arm itself fails.
-        auto* commit = make_commit_choice(Lnext);
-
-        // Compile arms right-to-left so each link in the OnFailKont
-        // chain knows the next arm's entry. The same link serves as
-        // (a) the runtime Savepoint.on_fail_target for byte-fails and
-        // (b) the static in_alt.next_arm for where-fails routed via
-        // on_false. Both paths converge on the same OnFailKont.
-        bbq::cek::StaticKont* exhausted =
-            make_on_fail(nullptr, nullptr, /*pop_frame=*/true);
-        bbq::cek::StaticKont* last_entry = compile_type_expr(
-            alts.back(), r, ::bbq::effect(),
-            ::bbq::jump(Lnext), Lnext);
-        bbq::cek::StaticKont* next_link = exhausted;
-        bbq::cek::StaticKont* next_target = last_entry;
-        // Walk N-2..1 (skip 0; first arm is BeginChoice.next).
-        for (size_t i = alts.size() - 1; i-- > 1; ) {
-            bbq::cek::StaticKont* link =
-                make_on_fail(next_target, next_link, /*pop_frame=*/false);
-            // Push in_alt with this arm's failure target so any
-            // where-check inside the arm body resolves on_false to
-            // `link` via find_backtrack_target.
-            ::bbq::rho_t arm_rho = in_alt(link, r);
-            bbq::cek::StaticKont* arm_entry = compile_type_expr(
-                alts[i], arm_rho, ::bbq::effect(),
-                ::bbq::jump(commit), commit);
-            next_link = link;
-            next_target = arm_entry;
-        }
-        // Arm 0's failure target = head link of the chain. The arm
-        // sees in_alt(head_link, parent) as its ρ.
-        bbq::cek::StaticKont* head_link =
-            make_on_fail(next_target, next_link, /*pop_frame=*/false);
-        ::bbq::rho_t arm0_rho = in_alt(head_link, r);
-        bbq::cek::StaticKont* first = compile_type_expr(
-            alts[0], arm0_rho, ::bbq::effect(),
-            ::bbq::jump(commit), commit);
-        return make_begin_choice(head_link, first);
+        // `(A | B)` alternatives are an anonymous tagged union: positional
+        // variant names alt_0, alt_1, ... (matching the C type layout).
+        std::vector<std::string> names;
+        names.reserve(alts.size());
+        for (size_t i = 0; i < alts.size(); ++i)
+            names.push_back("alt_" + std::to_string(i));
+        return compile_choice(names, alts, r, Lnext);
     }
 
     bbq::cek::StaticKont*
     compile_union(std::vector<BBQ::Variant*> variants,
                   ::bbq::rho_t r,
                   bbq::cek::StaticKont* Lnext) {
-        // Each variant has a body type_expr; treat them as alternatives.
-        std::vector<BBQ::TypeExpr*> alts;
-        alts.reserve(variants.size());
-        for (auto* v : variants) alts.push_back(v->body);
-        return compile_alternatives(alts, r, Lnext);
+        std::vector<std::string> names;
+        std::vector<BBQ::TypeExpr*> bodies;
+        names.reserve(variants.size());
+        bodies.reserve(variants.size());
+        for (auto* v : variants) { names.push_back(v->name); bodies.push_back(v->body); }
+        return compile_choice(names, bodies, r, Lnext);
     }
 
     bbq::cek::StaticKont*
@@ -777,13 +1001,14 @@ private:
                 // a defensive default.
                 length_expr = make_int_lit(0);
             }
-            return make_match_bytes(intern_field_or_anon(r),
-                                    length_expr, is_string, tail);
+            std::string bnm = intern_field_or_anon(r);
+            return make_match_bytes(length_expr, is_string, field_dest(bnm, tail));
         }
 
         // Other primitives → MatchPrimitive.
         bbq::cek::PrimitiveInfo prim = to_prim_info(kind);
-        return make_match_primitive(intern_field_or_anon(r), prim, tail);
+        std::string nm = intern_field_or_anon(r);
+        return make_match_primitive(prim, field_dest(nm, tail));
     }
 
     // Walk ρ to the innermost in_field, returning its name.
@@ -845,12 +1070,22 @@ private:
         return nullptr;
     }
 
-    bbq::cek::StaticKont* make_ref_or_builtin(const std::string& n) {
-        if (n == "i")         return make_loop_var();
-        if (n == "pos")       return make_pos();
-        if (n == "remaining") return make_remaining();
-        if (n == "at_end")    return make_at_end();
-        return make_ref(n);
+    // A bare identifier is ALWAYS a field reference. Context builtins are reached
+    // only via the `@` sigil (ast.Builtin -> make_builtin), so a spec field may be
+    // named `pos`, `i`, `buffer`, etc. without colliding.
+    bbq::cek::StaticKont* make_ref_or_builtin(const std::string& n,
+                                              const std::optional<std::string>& rp,
+                                              const std::optional<std::string>& rpar,
+                                              int64_t rd) {
+        // Carry Sema's cross-rule resolution onto the node for the static emitter
+        // (scope cast). The CEK resolves by name at runtime and ignores these; a
+        // same-scope reference leaves them null/0.
+        auto* k = arena_->alloc<bbq::cek::RefKont>();
+        k->name = strings_->intern(n);
+        k->resolved_path = rp.has_value() ? strings_->intern(rp.value()) : nullptr;
+        k->resolved_parent = rpar.has_value() ? strings_->intern(rpar.value()) : nullptr;
+        k->resolved_depth = static_cast<int>(rd);
+        return k;
     }
 
     // ── Helper implementations ────────────────────────
@@ -873,6 +1108,23 @@ private:
         return out;
     }
 
+    // Wrap `Lnext` with a struct-level `where` check, if present. The check runs
+    // after all fields are parsed (after EndStruct), so it sees every field in the
+    // environment — e.g. a header checksum. Mirrors compile_primitive's constraint
+    // handling: failure routes to the ρ-resolved backtrack target, or AbortRule at
+    // the rule boundary when no backtrackable frame is in scope.
+    bbq::cek::StaticKont*
+    wrap_struct_where(std::optional<BBQ::Expr*> constraint,
+                      ::bbq::rho_t r, bbq::cek::StaticKont* Lnext) {
+        if (!(constraint.has_value() && constraint.value()))
+            return Lnext;
+        auto* expr_ir = compile_expr(constraint.value(), r,
+                                     ::bbq::ac(), ::bbq::jump(Lnext), Lnext);
+        bbq::cek::StaticKont* on_false = find_backtrack_target(r);
+        if (!on_false) on_false = make_abort_rule();
+        return make_eval_constraint(expr_ir, on_false, Lnext);
+    }
+
     bbq::cek::StaticKont*
     compile_fields(std::vector<BBQ::Field*> fields, ::bbq::rho_t r,
                    bbq::cek::StaticKont* tail) {
@@ -880,28 +1132,51 @@ private:
         // the already-compiled tail. Each field body sees its own ρ
         // frame in_field(name, parent=r); the parent link preserves any
         // backtrack frame visible at struct entry.
-        bbq::cek::StaticKont* chain = tail;
+        //
+        // A field marked @rest declares its value as the byte length of the
+        // remainder of the struct: the fields after it parse inside a window
+        // [pos, pos + value] that the struct must consume exactly. The window
+        // opens (relative PushInterval, confined to the parent by
+        // PushIntervalApply) right after the size field reads; the matching
+        // checked PopInterval sits at struct end, so it wraps the initial tail.
+        bool has_rest = false;
+        for (auto* f : fields) if (f->scopes_rest) { has_rest = true; break; }
+        bbq::cek::StaticKont* chain = has_rest ? make_pop_interval(true, tail) : tail;
         for (auto it = fields.rbegin(); it != fields.rend(); ++it) {
             BBQ::Field* f = *it;
-            chain = compile_type_expr(
-                f->body, in_field(f->name, r),
-                ::bbq::effect(), ::bbq::jump(chain), chain);
+            if (f->scopes_rest) {
+                auto* push = make_push_interval(true, make_ref(f->name), chain);
+                chain = compile_type_expr(
+                    f->body, in_field(f->name, r),
+                    ::bbq::effect(), ::bbq::jump(push), push);
+                continue;
+            }
+            // The interval may be on the field (struct/union body) or on the body
+            // node (Primitive/RuleRef/Array @[...]). A body-node Length on a
+            // bytes/string primitive is sized by compile_primitive, so only wrap a
+            // body-node interval when it's a StartEnd random access.
+            BBQ::Interval* iv = nullptr;
+            if (f->interval.has_value() && f->interval.value()) {
+                iv = f->interval.value();
+            } else if (auto* bi = interval_of(f->body)) {
+                if (dynamic_cast<BBQ::StartEnd*>(bi)) iv = bi;
+            }
+            if (iv) {
+                // seek+bound around the body, popping when the body completes.
+                auto* pop = make_pop_interval(false, chain);
+                auto* body = compile_type_expr(
+                    f->body, in_field(f->name, r),
+                    ::bbq::effect(), ::bbq::jump(pop), pop);
+                chain = interval_entry(iv, r, body);
+            } else {
+                chain = compile_type_expr(
+                    f->body, in_field(f->name, r),
+                    ::bbq::effect(), ::bbq::jump(chain), chain);
+            }
         }
         return chain;
     }
 
-    std::vector<bbq::cek::bitfield_entry>
-    compile_bitfield_entries(std::vector<BBQ::BitfieldEntry*> entries) {
-        std::vector<bbq::cek::bitfield_entry> out;
-        out.reserve(entries.size());
-        for (auto* e : entries) {
-            bbq::cek::bitfield_entry b{};
-            b.name = strings_->intern(e->name);
-            b.width_bits = static_cast<int>(e->width);
-            out.push_back(b);
-        }
-        return out;
-    }
 
     bbq::cek::StaticKont*
     compile_switch_default(std::optional<BBQ::SwitchDefault*> dflt, ::bbq::rho_t r,
@@ -916,16 +1191,40 @@ private:
                                  ::bbq::jump(Lnext), Lnext);
     }
 
+    bool switch_default_is_reject(std::optional<BBQ::SwitchDefault*> dflt) {
+        return dflt.has_value() && dflt.value() && dflt.value()->is_reject;
+    }
+
     std::vector<bbq::cek::switch_case>
     compile_switch_cases(std::vector<BBQ::SwitchCase*> cases, ::bbq::rho_t r,
                          bbq::cek::StaticKont* Lnext) {
         std::vector<bbq::cek::switch_case> out;
         out.reserve(cases.size());
-        for (auto* c : cases) {
+        for (size_t ci = 0; ci < cases.size(); ci++) {
+            BBQ::SwitchCase* c = cases[ci];
+            bbq::cek::StaticKont* target =
+                compile_type_expr(c->target, r, ::bbq::effect(),
+                                  ::bbq::jump(Lnext), Lnext);
+            if (auto* rv = dynamic_cast<BBQ::RangeValue*>(c->value)) {
+                // An inclusive range is one variant matched by several discriminants:
+                // emit one entry per value, all sharing the single compiled target
+                // AND the one case ordinal (mirrors the C/C++ backends expanding a
+                // range into case labels under one union arm).
+                for (int64_t v = rv->lo; v <= rv->hi; v++) {
+                    bbq::cek::switch_case sc{};
+                    auto* mv = arena_->alloc<bbq::cek::IntValue>();
+                    mv->v = v;
+                    sc.match_value = mv;
+                    sc.target = target;
+                    sc.ordinal = static_cast<int>(ci);
+                    out.push_back(sc);
+                }
+                continue;
+            }
             bbq::cek::switch_case sc{};
             sc.match_value = case_value_to_value(c->value);
-            sc.target = compile_type_expr(c->target, r, ::bbq::effect(),
-                                          ::bbq::jump(Lnext), Lnext);
+            sc.target = target;
+            sc.ordinal = static_cast<int>(ci);
             out.push_back(sc);
         }
         return out;
@@ -1049,10 +1348,17 @@ private:
         if (auto* _n0 = dynamic_cast<BBQ::EOI*>(node)) {
             return cg_deliver(make_eoi(), delta, gamma, Lnext);
         }
+        if (auto* _n0 = dynamic_cast<BBQ::Builtin*>(node)) {
+            auto n = _n0->name;
+            return cg_deliver(make_builtin(n), delta, gamma, Lnext);
+        }
         if (auto* _n0 = dynamic_cast<BBQ::Ref*>(node)) {
             if (auto* _n1 = dynamic_cast<BBQ::Simple*>(_n0->path)) {
                 auto n = _n1->name;
-                return cg_deliver(make_ref_or_builtin(n), delta, gamma, Lnext);
+                auto rp = _n1->resolved_path;
+                auto rpar = _n1->resolved_parent;
+                auto rd = _n1->resolved_depth;
+                return cg_deliver(make_ref_or_builtin(n, rp, rpar, rd), delta, gamma, Lnext);
             }
         }
         if (auto* _n0 = dynamic_cast<BBQ::Ref*>(node)) {
@@ -1297,8 +1603,10 @@ private:
         current_loc = node->loc;
         if (auto* _n0 = dynamic_cast<BBQ::Struct*>(node)) {
             auto fs = _n0->fields;
+            auto cn = _n0->constraint.has_value() ? *_n0->constraint : nullptr;
             bbq_ir::StaticKont* end_kont = make_end_struct(Lnext);
-            bbq_ir::StaticKont* fields_chain = compile_fields(fs, rho, end_kont);
+            bbq_ir::StaticKont* checked = wrap_struct_where(cn, rho, end_kont);
+            bbq_ir::StaticKont* fields_chain = compile_fields(fs, rho, checked);
             return cg_deliver(make_begin_struct(intern_field_or_anon(rho), fields_chain), delta, gamma, Lnext);
         }
         if (auto* _n0 = dynamic_cast<BBQ::Primitive*>(node)) {
@@ -1316,11 +1624,12 @@ private:
         if (auto* _n0 = dynamic_cast<BBQ::Compute*>(node)) {
             auto e = _n0->expression;
             bbq_ir::StaticKont* expr_ir = compile_expr(e, rho, ac(), jump(Lnext), Lnext);
-            return cg_deliver(make_bind_compute(intern_field_or_anon(rho), expr_ir, Lnext), delta, gamma, Lnext);
+            return cg_deliver(make_bind_compute(expr_ir, field_dest(intern_field_or_anon(rho), Lnext)), delta, gamma, Lnext);
         }
         if (auto* _n0 = dynamic_cast<BBQ::Extern*>(node)) {
             auto f = _n0->func_name;
-            return cg_deliver(make_external_call(f, intern_field_or_anon(rho), Lnext), delta, gamma, Lnext);
+            auto w = _n0->write_func;
+            return cg_deliver(make_external_call(f, w, field_dest(intern_field_or_anon(rho), Lnext)), delta, gamma, Lnext);
         }
         if (auto* _n0 = dynamic_cast<BBQ::EndianSwitch*>(node)) {
             auto e = _n0->endian_expr;
@@ -1331,15 +1640,14 @@ private:
             auto c = _n0->container;
             auto es = _n0->entries;
             auto prim = to_prim_info(c);
-            std::vector<bbq_ir::bitfield_entry> entry_list = compile_bitfield_entries(es);
-            return cg_deliver(make_bitfield_read(prim, entry_list, Lnext), delta, gamma, Lnext);
+            bbq_ir::StaticKont* end_st = make_end_struct(Lnext);
+            bbq_ir::StaticKont* inner = compile_bitfield(prim, es, rho, end_st);
+            return cg_deliver(make_begin_struct(intern_field_or_anon(rho), inner), delta, gamma, Lnext);
         }
         if (auto* _n0 = dynamic_cast<BBQ::Optional*>(node)) {
             auto e = _n0->element;
-            bbq_ir::StaticKont* end = make_end_optional(Lnext);
-            bbq_ir::StaticKont* skip = make_on_fail(Lnext, nullptr, true);
-            bbq_ir::StaticKont* inner = compile_type_expr(e, in_optional(skip, rho), effect(), jump(end), end);
-            return cg_deliver(make_begin_optional(skip, inner, Lnext), delta, gamma, Lnext);
+            auto cn = _n0->constraint.has_value() ? *_n0->constraint : nullptr;
+            return cg_deliver(compile_optional(e, cn, rho, Lnext), delta, gamma, Lnext);
         }
         if (auto* _n0 = dynamic_cast<BBQ::Switch*>(node)) {
             auto d = _n0->discriminator;
@@ -1348,7 +1656,8 @@ private:
             std::vector<bbq_ir::switch_case> cs_list = compile_switch_cases(cs, rho, Lnext);
             bbq_ir::StaticKont* disc = compile_expr(d, rho, ac(), jump(Lnext), Lnext);
             bbq_ir::StaticKont* default_target = compile_switch_default(dflt, rho, Lnext);
-            return cg_deliver(make_switch_dispatch(disc, cs_list, default_target), delta, gamma, Lnext);
+            bool is_reject = switch_default_is_reject(dflt);
+            return cg_deliver(make_switch_dispatch(disc, cs_list, default_target, is_reject), delta, gamma, Lnext);
         }
         if (auto* _n0 = dynamic_cast<BBQ::Alternatives*>(node)) {
             auto a = _n0->alts;
@@ -1361,8 +1670,9 @@ private:
         if (auto* _n0 = dynamic_cast<BBQ::Array*>(node)) {
             auto e = _n0->element;
             auto s = _n0->spec;
+            auto ei = _n0->element_interval.has_value() ? *_n0->element_interval : nullptr;
             auto rs = _n0->resync;
-            return cg_deliver(compile_array(e, s, rs, rho, Lnext), delta, gamma, Lnext);
+            return cg_deliver(compile_array(e, s, ei, rs, rho, Lnext), delta, gamma, Lnext);
         }
         return {};
     }

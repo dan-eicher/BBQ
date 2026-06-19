@@ -113,7 +113,26 @@ void cg_choice(Ctx* ctx, Choice* ch, std::ostream& out, int indent) {
         }
     }
 
-    if (all_literal_starts && n <= 8) {
+    // Predictive dispatch is sound ONLY when the alternative heads are pairwise
+    // prefix-disjoint: peek_at(L) is true whenever the input starts with L, so if
+    // one head is a prefix of another (e.g. two alternatives both starting "(") the
+    // peek cannot tell them apart and would wrongly commit to the earlier one — when
+    // it then fails deeper, PEG ordered-choice requires falling through to the rest,
+    // which predictive dispatch cannot do. Otherwise use the general backtracking choice.
+    bool prefix_disjoint = all_literal_starts && n <= 8;
+    for (int i = 0; i < n && prefix_disjoint; i++) {
+        const std::string& a = first_literal(ch->alternatives[i])->value;
+        for (int j = 0; j < n; j++) {
+            if (i == j) continue;
+            const std::string& b = first_literal(ch->alternatives[j])->value;
+            if (a.size() <= b.size() && b.compare(0, a.size(), a) == 0) {
+                prefix_disjoint = false;
+                break;
+            }
+        }
+    }
+
+    if (prefix_disjoint) {
         // Head-fail optimization: peek tests determine which alternative
         // to commit to. No save/restore needed.
         // Skip whitespace before peeking so we test the actual next token.

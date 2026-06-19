@@ -1,0 +1,238 @@
+{# BBQ C++ ZCow (view) reader — the compiled CEK that BUILDS the index. Each spine
+   kont is a stencil that advances the cursor and records a span into the
+   bbq::reader's CaptureBuilder, then calls its successor. Same burg op-records as
+   the C-owning reader; the spelling (record-span vs copy-into-struct) is the only
+   difference. The result is the same FieldCapture index the CEK builds and the
+   generated handle classes read. #}
+#pragma once
+
+#include <cstdint>
+#include <cstddef>
+#include "bbq_reader.h"
+
+{# extern read functions are user-supplied (the index records only the consumed
+   span). Forward-declared here with the view ABI so the generated parser links. #}
+{% for e in externs %}
+bool {{ e }}(const uint8_t* data, size_t len, size_t* consumed);
+{% endfor %}
+
+{% if has_ns %}
+namespace {{ namespace }} {
+{% endif %}
+
+{% for fn in functions %}
+{% for o in fn.ops %}
+static bool {{ fn.kpfx }}_k{{ o.id }}(bbq::reader& r);
+{% endfor %}
+{% endfor %}
+{# Per-rule entry: runs the rule's body into the SHARED reader (an invoke calls
+   this, not the top-level <Rule>_read which would make a separate index). #}
+{% for fn in functions %}
+static bool {{ fn.kpfx }}_entry(bbq::reader& r) { return {{ fn.kpfx }}_k{{ fn.entry }}(r); }
+{% endfor %}
+
+{% for fn in functions %}
+bbq::CaptureMetadata {{ fn.name }}(const uint8_t* data, size_t len, bbq::ParseArena& arena) {
+    bbq::reader r(data, len, arena);
+    r.little_endian = {% if default_le %}true{% else %}false{% endif %}; r.endian_seeded = true;
+    bool _ok = {{ fn.kpfx }}_entry(r);
+    return r.finish(_ok);
+}
+{% endfor %}
+
+{% for fn in functions %}
+{% for o in fn.ops %}
+static bool {{ fn.kpfx }}_k{{ o.id }}(bbq::reader& r) {
+    (void)r;
+{% if o.op == "read" %}
+{% if o.prim.enc == "uleb" %}
+    if (!r.uleb_capture("{{ o.target }}", {{ o.prim.w }})) return false;   // variable-length varint
+{% else if o.prim.enc == "sleb" %}
+    if (!r.sleb_capture("{{ o.target }}", {{ o.prim.w }})) return false;
+{% else %}
+    { size_t _s = r.pos;
+      if (!r.advance({{ prim_bytes(o.prim) }})) return r.fail("{{ o.msg }}");
+      r.builder.add_field("{{ o.target }}", _s, r.pos, {{ capture_expr(o.prim) }}); }
+{% endif %}
+    return {{ fn.kpfx }}_k{{ o.next }}(r);
+{% else if o.op == "read_bytes" %}
+    { size_t _s = r.pos;
+      if (!r.advance((size_t)({{ o.len }}))) return r.fail("{{ o.msg }}");
+      r.builder.add_field("{{ o.target }}", _s, r.pos, {% if o.is_string %}bbq::CaptureType::String{% else %}bbq::CaptureType::Bytes{% endif %}); }
+    return {{ fn.kpfx }}_k{{ o.next }}(r);
+{% else if o.op == "constraint" %}
+    if (!({{ o.expr }})) return r.fail("{{ o.msg }}");
+    return {{ fn.kpfx }}_k{{ o.next }}(r);
+{% else if o.op == "compute" %}
+    r.add_computed_val("{{ o.target }}", ({{ o.expr }}));   // natural C++ type → matching ComputedValue kind
+    return {{ fn.kpfx }}_k{{ o.next }}(r);
+{% else if o.op == "bitfield" %}
+    { size_t _s = r.pos;
+      if (!r.advance({{ prim_bytes(o.prim) }})) return r.fail("{{ o.msg }}");
+      uint64_t _bf = r.read_at(_s, {{ prim_bytes(o.prim) }}, {{ o.prim.be }}, {{ o.prim.native }});
+{% for m in o.members %}
+      r.add_computed_int("{{ m.target }}", (int64_t)((_bf >> {{ m.shift }}) & {{ m.mask }}));
+{% endfor %}
+    }
+    return {{ fn.kpfx }}_k{{ o.next }}(r);
+{% else if o.op == "seek" %}
+    if (!r.seek_checked((size_t)({{ o.expr }}))) return false;
+    return {{ fn.kpfx }}_k{{ o.next }}(r);
+{% else if o.op == "push_interval" %}
+    if (!r.push_interval_checked((size_t)({% if o.relative %}r.pos + {% endif %}({{ o.expr }})))) return false;
+    return {{ fn.kpfx }}_k{{ o.next }}(r);
+{% else if o.op == "pop_interval" %}
+{% if o.checked %}
+    if (!r.pop_interval_checked()) return false;
+{% else %}
+    r.pop_interval();
+{% endif %}
+    return {{ fn.kpfx }}_k{{ o.next }}(r);
+{% else if o.op == "set_endian" %}
+    r.little_endian = ({{ o.expr }}) ? true : false;
+    return {{ fn.kpfx }}_k{{ o.next }}(r);
+{% else if o.op == "extern" %}
+    // The user extern consumes bytes from the cursor; the index records only the
+    // consumed span (CaptureType::External) — the typed interpretation is the
+    // extern's, decoded on access. ABI: bool fn(const uint8_t*, size_t, size_t*).
+    { size_t _s = r.pos, _c = 0;
+      if (!{{ o.func }}(r.data + r.pos, r.remaining(), &_c)) return r.fail("{{ o.msg }}");
+      if (r.pos + _c > r.effective_end()) return r.fail("{{ o.msg }}");
+      r.pos += _c;
+      r.builder.add_field("{{ o.target }}", _s, r.pos, bbq::CaptureType::External); }
+    return {{ fn.kpfx }}_k{{ o.next }}(r);
+{% else if o.op == "optional_prim" %}
+    if ({{ o.cond }}) {
+{% if o.prim.enc == "uleb" %}
+        if (!r.uleb_capture("{{ o.target }}", {{ o.prim.w }})) return false;
+{% else if o.prim.enc == "sleb" %}
+        if (!r.sleb_capture("{{ o.target }}", {{ o.prim.w }})) return false;
+{% else %}
+        size_t _s = r.pos;
+        if (!r.advance({{ prim_bytes(o.prim) }})) return r.fail("{{ o.msg }}");
+        r.builder.add_field("{{ o.target }}", _s, r.pos, {{ capture_expr(o.prim) }});
+{% endif %}
+    }
+    return {{ fn.kpfx }}_k{{ o.next }}(r);
+{% else if o.op == "optional" %}
+    if ({{ o.cond }}) return {{ fn.kpfx }}_k{{ o.present }}(r);
+    return {{ fn.kpfx }}_k{{ o.absent }}(r);
+{% else if o.op == "begin_optional" %}
+    // Bare optional<T>: try the inner under a checkpoint; on failure rewind (dropping
+    // any partial capture) so the field is simply absent.
+    { bbq::reader::checkpoint _cp = r.save();
+      if (!{{ fn.kpfx }}_k{{ o.inner }}(r)) r.restore(_cp); }
+    return {{ fn.kpfx }}_k{{ o.next }}(r);
+{% else if o.op == "end_optional" %}
+    return true;
+{% else if o.op == "begin_struct" %}
+    r.builder.begin_struct("{{ o.name }}", r.pos);
+    return {{ fn.kpfx }}_k{{ o.next }}(r);
+{% else if o.op == "end_struct" %}
+    r.builder.end_struct(r.pos);
+    return {{ fn.kpfx }}_k{{ o.next }}(r);
+{% else if o.op == "array_begin" %}
+    { int64_t _n = (int64_t)({{ o.count }});   // count decode-on-access, before the scope opens
+      r.begin_array("{{ o.field }}");
+      if (_n == 0) return {{ fn.kpfx }}_k{{ o.end }}(r);  // EndArray closes it
+      r.push_loop(_n); }
+    return {{ fn.kpfx }}_k{{ o.body }}(r);
+{% else if o.op == "array_next" %}
+    if (r.loop_next()) return {{ fn.kpfx }}_k{{ o.body }}(r);
+    r.pop_loop();
+    return {{ fn.kpfx }}_k{{ o.end }}(r);
+{% else if o.op == "array_next_count" %}
+    // count(N): re-evaluate the bound each iteration (vs array_next's fixed limit).
+    r.loop_advance();
+    if (r.loop_index() < (int64_t)({{ o.count }})) return {{ fn.kpfx }}_k{{ o.body }}(r);
+    r.pop_loop();
+    return {{ fn.kpfx }}_k{{ o.end }}(r);
+{% else if o.op == "array_begin_grow" %}
+    r.begin_array("{{ o.field }}");
+{% if o.mode == "eof" %}
+    if (r.pos >= r.effective_end()) return {{ fn.kpfx }}_k{{ o.end }}(r);
+{% endif %}
+    r.push_loop_unbounded();
+    return {{ fn.kpfx }}_k{{ o.body }}(r);
+{% else if o.op == "array_next_grow" %}
+    r.loop_advance();
+    if ({{ o.cond }}) return {{ fn.kpfx }}_k{{ o.body }}(r);
+    r.pop_loop();
+    return {{ fn.kpfx }}_k{{ o.end }}(r);
+{% else if o.op == "array_begin_resync" %}
+    // resync: parse each element under a checkpoint; on failure rewind (dropping the
+    // partial capture), skip one byte, and retry. counted collects exactly `count`
+    // (eof-before-count fails); uncounted stops at the window end.
+{% if o.counted %}
+    int64_t _n = (int64_t)({{ o.count }});   // decode count in the PARENT scope, before the array opens
+    r.begin_array("{{ o.field }}");
+    r.push_loop(_n);
+    for (;;) {
+        if (r.loop_index() >= _n) break;
+        if (r.pos >= r.effective_end()) { r.pop_loop(); return r.fail("{{ o.msg }}"); }
+        bbq::reader::checkpoint _cp = r.save();
+        if ({{ fn.kpfx }}_k{{ o.body }}(r)) { r.loop_advance(); }
+        else { r.restore(_cp); r.pos++; }
+    }
+    r.pop_loop();
+{% else %}
+    r.begin_array("{{ o.field }}");
+    r.push_loop_unbounded();
+    for (;;) {
+        if (r.pos >= r.effective_end()) break;
+        bbq::reader::checkpoint _cp = r.save();
+        if ({{ fn.kpfx }}_k{{ o.body }}(r)) { r.loop_advance(); }
+        else { r.restore(_cp); r.pos++; }
+    }
+    r.pop_loop();
+{% endif %}
+    return {{ fn.kpfx }}_k{{ o.end }}(r);
+{% else if o.op == "array_elem_done" %}
+    return true;
+{% else if o.op == "end_array" %}
+    r.end_array();
+    return {{ fn.kpfx }}_k{{ o.next }}(r);
+{% else if o.op == "switch" %}
+    switch ((int64_t)({{ o.disc }})) {
+{% for c in o.cases %}
+{% for l in c.labels %}
+    case {{ l }}:
+{% endfor %}
+        r.builder.set_pending_variant_tag({{ c.ordinal }});   // record which arm matched
+        return {{ fn.kpfx }}_k{{ c.target }}(r);
+{% endfor %}
+    default:
+{% if o.has_default %}
+        r.builder.set_pending_variant_tag({{ o.default_ordinal }});
+        return {{ fn.kpfx }}_k{{ o.default_target }}(r);
+{% else %}
+        return r.fail("switch: no matching case");
+{% endif %}
+    }
+{% else if o.op == "invoke" %}
+    // Build the sub-rule into the shared reader (its begin_struct scope is already open).
+    if (!{{ o.fn }}_v_entry(r)) return r.fail("{{ o.msg }}");
+    return {{ fn.kpfx }}_k{{ o.next }}(r);
+{% else if o.op == "choice" %}
+    // union/alternatives: try each variant under a checkpoint; the match is captured
+    // under its variant name + variant_tag (the index records which arm matched).
+{% for arm in o.arms %}
+    {
+        bbq::reader::checkpoint _cp = r.save();
+        r.builder.begin_variant("{{ arm.name }}", r.pos, {{ arm.tag }});
+        if ({{ arm.fn }}_v_entry(r)) { r.builder.end_struct(r.pos); return true; }
+        r.restore(_cp);
+    }
+{% endfor %}
+    return r.fail("{{ o.msg }}");
+{% else if o.op == "return" %}
+    return true;
+{% else %}
+#error view parser: unhandled stencil op {{ o.op }}
+{% endif %}
+}
+{% endfor %}
+{% endfor %}
+{% if has_ns %}
+}  // namespace {{ namespace }}
+{% endif %}

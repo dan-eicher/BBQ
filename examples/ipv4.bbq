@@ -1,5 +1,35 @@
 @endian big
 
+# The IPv4 header checksum covers the whole header, so it is verified by a
+# struct-level `where` that calls an external function. `buffer` is the header's
+# raw bytes and `checksum` the parsed field — both resolved by the where
+# environment. The verifier is supplied as a code block: declared in the types
+# header (@header) and defined in the reader implementation (@source), so the
+# generated reader can call it.
+#
+# Generate with `-lang c` — the verifier body below is C (it takes the C runtime's
+# bbq_bytes_t). The C++ backend uses the same construct with a bbq::bytes_view
+# verifier; the CEK backend registers the verifier as a callback. See the tests.
+
+@header (.
+bool ipv4_checksum_ok(bbq_bytes_t buf, uint16_t stored);
+.)
+
+@source (.
+/* One's-complement IPv4 header checksum: recompute over `buf` with the
+   checksum field (bytes 10-11) treated as zero, and compare to `stored`. */
+bool ipv4_checksum_ok(bbq_bytes_t buf, uint16_t stored) {
+    uint32_t sum = 0;
+    for (size_t i = 0; i + 1 < buf.length; i += 2) {
+        uint32_t w = ((uint32_t)buf.data[i] << 8) | buf.data[i + 1];
+        if (i == 10) w = 0;            /* skip the checksum field itself */
+        sum += w;
+    }
+    while (sum >> 16) sum = (sum & 0xFFFF) + (sum >> 16);
+    return (uint16_t)(~sum) == stored;
+}
+.)
+
 IPv4Header = struct {
     ver_ihl:        uint8,
     version:        compute((ver_ihl >> 4) & 0x0F : uint8),
@@ -15,4 +45,4 @@ IPv4Header = struct {
     checksum:       uint16,
     src_addr:       uint32,
     dst_addr:       uint32
-}
+} where ipv4_checksum_ok(@buffer, checksum)

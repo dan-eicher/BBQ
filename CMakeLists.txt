@@ -21,6 +21,7 @@ add_library(bbq_frontend STATIC
     frontend/Errors.cpp
     frontend/Sema.cpp
     frontend/FrameProcessor.cpp
+    frontend/Names.cpp
     frontend/BBQ_AST.h
     frontend/Parser.h
 )
@@ -28,26 +29,29 @@ target_include_directories(bbq_frontend PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/frontend
     ${CMAKE_CURRENT_SOURCE_DIR}/pegc/runtime)
 
-# --- C++ backend library ---
-add_library(bbq_cpp_backend STATIC
-    backends/cpp/TypeEmitter.cpp
-    backends/cpp/ParserEmitter.cpp
+# --- canonical C type-name mapping (shared by the render + writer backends) ---
+add_library(bbq_ctypes STATIC
+    backends/c/CTypeMapper.cpp
 )
-target_include_directories(bbq_cpp_backend PUBLIC
-    ${CMAKE_CURRENT_SOURCE_DIR}/backends/cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/backends/cpp/runtime)
-target_link_libraries(bbq_cpp_backend PUBLIC bbq_frontend)
-
-# --- C backend library ---
-add_library(bbq_c_backend STATIC
-    backends/c/CTypeEmitter.cpp
-    backends/c/CReaderEmitter.cpp
-    backends/c/CWriterEmitter.cpp
-)
-target_include_directories(bbq_c_backend PUBLIC
+target_include_directories(bbq_ctypes PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/backends/c
     ${CMAKE_CURRENT_SOURCE_DIR}/backends/c/runtime)
-target_link_libraries(bbq_c_backend PUBLIC bbq_frontend)
+target_link_libraries(bbq_ctypes PUBLIC bbq_frontend)
+
+# --- shared C++ index runtime (zero-copy FieldCapture index + decoders + CoW) ---
+# The neutral runtime that BOTH the CEK machine and generated C++ parsers depend
+# on. It has NO dependency on the machine IR (KontNode.h) — generated code names
+# only bbq::, never bbq::cek::. This is the C++ analogue of backends/c/runtime.
+add_library(bbq_index_runtime STATIC
+    backends/cpp/runtime/CaptureDecode.cpp
+    backends/cpp/runtime/Capture.h
+    backends/cpp/runtime/CaptureDecode.h
+    backends/cpp/runtime/CaptureCow.h
+    backends/cpp/runtime/ParseArena.h
+    backends/cpp/runtime/bbq_node.h
+)
+target_include_directories(bbq_index_runtime PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/backends/cpp/runtime)
 
 # --- CEK backend library ---
 add_library(bbq_cek_backend STATIC
@@ -57,30 +61,113 @@ add_library(bbq_cek_backend STATIC
 )
 target_include_directories(bbq_cek_backend PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/backends/cek)
-target_link_libraries(bbq_cek_backend PUBLIC bbq_frontend)
+target_link_libraries(bbq_cek_backend PUBLIC bbq_frontend bbq_index_runtime)
+
+# --- shape generator (the type model) — the SHAPE half of the contract ---
+# The neutral type model, derived from the AST + Sema resolved facts ONLY. This
+# lib does NOT link the CEK backend and has NO backends/cek on its include path,
+# so the tool's shape path is structurally decoupled from the machine — a stray
+# cek reference won't compile, not just "happens to build because cek is in the
+# tree." Behavior generators (the parsers) are NOT here: they consume the kont IR
+# and live with the readers below.
+add_library(bbq_shapegen STATIC
+    backends/render/RenderTypes.cpp
+)
+target_include_directories(bbq_shapegen PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/backends/render
+    ${CMAKE_CURRENT_SOURCE_DIR}/lib/third_party
+    ${CMAKE_CURRENT_SOURCE_DIR}/lib/third_party/inja)
+target_link_libraries(bbq_shapegen PUBLIC bbq_frontend bbq_ctypes)
+
+# --- behavior generators (the parsers) — the BEHAVIOR half, IR consumers ---
+# Both readers are burg profiles over the kont IR: the C reader (c-owning) and the
+# C++ view reader (cpp-zcow) are the same lowering under two ReaderProfiles. Behavior,
+# so they live on the IR side and link the CEK backend.
+add_library(bbq_render STATIC
+    backends/render/RenderEmit.cpp
+    backends/render/CompilerCtx.cpp
+    ${CMAKE_CURRENT_BINARY_DIR}/BbqMatcher.h
+)
+target_include_directories(bbq_render PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/backends/render
+    ${CMAKE_CURRENT_BINARY_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/lib/third_party
+    ${CMAKE_CURRENT_SOURCE_DIR}/lib/third_party/inja)
+target_link_libraries(bbq_render PUBLIC bbq_cek_backend bbq_ctypes bbq_shapegen)
 
 # --- bbqc code generator ---
 add_executable(bbqc tools/bbqc.cpp)
-target_link_libraries(bbqc PRIVATE bbq_cpp_backend bbq_c_backend)
+target_link_libraries(bbqc PRIVATE bbq_ctypes bbq_render)
+
+# bbqc C-backend smoke test: the CLI generates C from a spec, which is then
+# compiled (-Werror) and round-tripped. Gates the otherwise-untested CLI.
+add_test(NAME bbqc_c_smoke
+    COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test/bbqc_c_smoke.sh
+            $<TARGET_FILE:bbqc> ${CMAKE_CURRENT_SOURCE_DIR})
 
 # --- tests ---
 find_package(GTest REQUIRED)
 enable_testing()
 
+# C++ ZCow parity fixture: bbqc generates the handle classes from the matrix-driven
+# fixture grammar, compiled INTO the test so the parity test reads real values
+# through them (not g++ -fsyntax-only). Regenerated when the grammar/template change.
+set(ZCOW_PARITY_TYPES ${CMAKE_CURRENT_BINARY_DIR}/ZcowParityTypes.h)
+add_custom_command(
+    OUTPUT ${ZCOW_PARITY_TYPES}
+    COMMAND bbqc -backend cpp
+                 -prefix ZcowParity -namespace zp
+                 -templates ${CMAKE_CURRENT_SOURCE_DIR}/backends/render/templates
+                 -o ${CMAKE_CURRENT_BINARY_DIR}
+                 ${CMAKE_CURRENT_SOURCE_DIR}/test/fixtures/zcow_parity.bbq
+    DEPENDS bbqc
+            ${CMAKE_CURRENT_SOURCE_DIR}/test/fixtures/zcow_parity.bbq
+            ${CMAKE_CURRENT_SOURCE_DIR}/backends/render/templates/types_cpp.inja
+    COMMENT "bbqc: zcow_parity.bbq -> ZcowParityTypes.h (C++ ZCow parity fixture)"
+    VERBATIM
+)
+
+# cpp-zcow view parser fixture: bbqc generates the handle classes AND the view
+# parser (the index-builder), both compiled into the test so the parser's index is
+# parity-checked against the CEK. Grows with the view profile.
+set(ZCOW_READER_HDRS ${CMAKE_CURRENT_BINARY_DIR}/ZcowReaderTypes.h
+                     ${CMAKE_CURRENT_BINARY_DIR}/ZcowReaderReader.h
+                     ${CMAKE_CURRENT_BINARY_DIR}/ZcowReaderWriter.h)
+add_custom_command(
+    OUTPUT ${ZCOW_READER_HDRS}
+    COMMAND bbqc -backend cpp
+                 -prefix ZcowReader -namespace zr
+                 -templates ${CMAKE_CURRENT_SOURCE_DIR}/backends/render/templates
+                 -o ${CMAKE_CURRENT_BINARY_DIR}
+                 ${CMAKE_CURRENT_SOURCE_DIR}/test/fixtures/zcow_reader.bbq
+    DEPENDS bbqc
+            ${CMAKE_CURRENT_SOURCE_DIR}/test/fixtures/zcow_reader.bbq
+            ${CMAKE_CURRENT_SOURCE_DIR}/backends/render/templates/types_cpp.inja
+            ${CMAKE_CURRENT_SOURCE_DIR}/backends/render/templates/reader_view_cpp.inja
+            ${CMAKE_CURRENT_SOURCE_DIR}/backends/render/templates/writer_view_cpp.inja
+    COMMENT "bbqc: zcow_reader.bbq -> ZcowReader{Types,Reader,Writer}.h (C++ view parser + writer)"
+    VERBATIM
+)
+
 add_executable(bbq_tests
     test/parse_test.cpp
     test/sema_test.cpp
-    test/context_test.cpp
-    test/type_emitter_test.cpp
-    test/parser_emitter_test.cpp
-    test/integration_test.cpp
-    test/codegen_compile_test.cpp
     test/cek_test.cpp
-    test/c_type_emitter_test.cpp
+    test/c_writer_emitter_test.cpp
     test/c_backend_e2e_test.cpp
+    test/render_c_test.cpp
+    test/render_types_test.cpp
+    test/render_types_cpp_test.cpp
+    test/render_types_cpp_parity_test.cpp
+    test/bbq_reader_test.cpp
+    test/render_view_parser_test.cpp
+    test/cross_backend_test.cpp
     test/crt_test.cpp
+    ${ZCOW_PARITY_TYPES}
+    ${ZCOW_READER_HDRS}
 )
-target_link_libraries(bbq_tests PRIVATE bbq_cpp_backend bbq_c_backend bbq_cek_backend bbq_crt GTest::GTest GTest::Main)
+target_link_libraries(bbq_tests PRIVATE bbq_ctypes bbq_cek_backend bbq_render bbq_crt GTest::GTest GTest::Main)
+target_include_directories(bbq_tests PRIVATE ${CMAKE_CURRENT_BINARY_DIR})  # generated ZcowParityTypes.h
 target_compile_definitions(bbq_tests PRIVATE
     SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
 add_test(NAME bbq_tests COMMAND bbq_tests)
@@ -94,10 +181,10 @@ add_test(NAME lib_tests COMMAND lib_tests)
 find_package(Python3 COMPONENTS Development)
 if(Python3_FOUND)
     # Static libs linked into the .so need PIC
-    set_target_properties(bbq_frontend bbq_cek_backend PROPERTIES
+    set_target_properties(bbq_frontend bbq_cek_backend bbq_index_runtime PROPERTIES
         POSITION_INDEPENDENT_CODE ON)
 
-    add_library(bbq_python MODULE bindings/python/bbq_python.cpp)
+    add_library(bbq_python MODULE bindings/python/bbq_python.cpp bindings/python/bbq_build.cpp)
     target_link_libraries(bbq_python PRIVATE bbq_frontend bbq_cek_backend Python3::Python)
     set_target_properties(bbq_python PROPERTIES
         PREFIX ""
@@ -106,12 +193,21 @@ if(Python3_FOUND)
 
     find_package(Python3 COMPONENTS Interpreter)
     if(Python3_Interpreter_FOUND)
+        # The python test imports bbq.so (the bbq_python module). add_test does not
+        # depend on a target, so without this it would run against a stale/absent
+        # module — a stale-artifact false pass. A setup-fixture test rebuilds the
+        # module first, wiring the test to its artifact in the build graph.
+        add_test(NAME bbq_python_build
+            COMMAND ${CMAKE_COMMAND} --build ${CMAKE_CURRENT_BINARY_DIR} --target bbq_python)
+        set_tests_properties(bbq_python_build PROPERTIES FIXTURES_SETUP bbq_python_module)
+
         add_test(NAME bbq_python_tests
             COMMAND ${Python3_EXECUTABLE} -m pytest
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/test_bbq_python.py
                 --tb=short
             WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
         set_tests_properties(bbq_python_tests PROPERTIES
+            FIXTURES_REQUIRED bbq_python_module
             ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_BINARY_DIR}")
     endif()
 endif()
@@ -124,6 +220,9 @@ add_subdirectory(asdl)
 
 # --- burgc subproject ---
 add_subdirectory(burgc)
+
+# --- opgen subproject (opcode-spec -> VM/tables/headers generator) ---
+add_subdirectory(opgen)
 
 # --- jitterator subproject ---
 add_subdirectory(jitterator)
@@ -157,6 +256,21 @@ add_custom_command(
             ${CMAKE_CURRENT_SOURCE_DIR}/backends/cek/bbq_ir.asdl
             ${CMAKE_CURRENT_SOURCE_DIR}/backends/cek/templates/bbq_ir.inja
     COMMENT "Generating KontNode.h + bbq_ir.json from bbq_ir.asdl"
+)
+
+# --- Auto-generate BbqMatcher.h from bbq.burg (the C reader lowering) ---
+# burgc lowers the kont-graph IR (bbq_ir.json) to the continuation-stencil
+# records the backend templates render; bbq_render's RenderEmit includes it.
+add_custom_command(
+    OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/BbqMatcher.h
+    COMMAND burgc -i ${CMAKE_CURRENT_SOURCE_DIR}/backends/render/bbq.burg
+                  -asdl ${CMAKE_CURRENT_BINARY_DIR}/bbq_ir.json
+                  -frames ${CMAKE_CURRENT_SOURCE_DIR}/burgc/frames
+                  -o ${CMAKE_CURRENT_BINARY_DIR}/BbqMatcher.h
+    DEPENDS burgc
+            ${CMAKE_CURRENT_SOURCE_DIR}/backends/render/bbq.burg
+            ${CMAKE_CURRENT_BINARY_DIR}/bbq_ir.json
+    COMMENT "Generating BbqMatcher.h from bbq.burg"
 )
 
 # --- Auto-regenerate bbq.json (AST schema sidecar for ddcgc) ---

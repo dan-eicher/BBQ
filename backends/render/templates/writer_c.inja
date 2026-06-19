@@ -1,0 +1,170 @@
+{# BBQ C writer — the second refunctionalization of the same kont graph. The reader
+   consumes input → stores &out->f; the writer loads in->f → emits bytes, over the
+   SAME neutral op records (after the owning fold). Flat-stencil form, uniform with
+   the reader: one write-stencil per kont tail-calling its successor; the control is
+   structure-driven (the stored count / tag / has_value decides, never the input).
+   begin_struct/end_struct/end_array are folded into the compile-time path and dropped
+   (owning fold), so they never reach this template. #}
+{% for fn in functions %}
+{% for o in fn.ops %}
+static bool {{ fn.kpfx }}_w{{ o.id }}(bbq_write_ctx_t* ctx, const {{ fn.type }}* in);
+{% endfor %}
+{% endfor %}
+{% for fn in functions %}
+bool {{ fn.name }}(bbq_write_ctx_t* ctx, const {{ fn.type }}* in) {
+    if (!ctx->endian_seeded) { ctx->little_endian = {% if default_le %}true{% else %}false{% endif %}; ctx->endian_seeded = true; }
+    bbq_w_push_loop_base(ctx, bbq_w_loop_depth(ctx));
+    bool _ok = {{ fn.kpfx }}_w{{ fn.entry }}(ctx, in);
+    bbq_w_pop_loop_base(ctx);
+    return _ok;
+}
+{% endfor %}
+{% for fn in functions %}
+{% for o in fn.ops %}
+static bool {{ fn.kpfx }}_w{{ o.id }}(bbq_write_ctx_t* ctx, const {{ fn.type }}* in) {
+    (void)ctx; (void)in;
+{% if o.op == "read" %}
+{% if existsIn(o, "rest_reserve") %}
+    bbq_w_push_rest(ctx);  // @rest size: computed from the rest's bytes at pop, not stored
+{% else if existsIn(o, "count_reserve") %}
+    if (!bbq_w_reserve_count(ctx, {{ o.count_id }}, {{ o.prim.w }})) return false;  // count: array length, not stored
+{% else %}
+    if (!{{ write_fn(o.prim) }}(ctx, {{ o.target }})) return false;
+{% endif %}
+    BBQ_MUSTTAIL return {{ fn.kpfx }}_w{{ o.next }}(ctx, in);
+{% else if o.op == "read_bytes" %}
+{% if o.is_string %}
+    if (!bbq_write_string(ctx, {{ o.target }}.data, {{ o.target }}.length)) return false;
+{% else %}
+    if (!bbq_write_bytes(ctx, {{ o.target }}.data, {{ o.target }}.length)) return false;
+{% endif %}
+    BBQ_MUSTTAIL return {{ fn.kpfx }}_w{{ o.next }}(ctx, in);
+{% else if o.op == "compute" %}
+    /* derived on read — not serialized */
+    BBQ_MUSTTAIL return {{ fn.kpfx }}_w{{ o.next }}(ctx, in);
+{% else if o.op == "constraint" %}
+    /* checked on read — nothing to write */
+    BBQ_MUSTTAIL return {{ fn.kpfx }}_w{{ o.next }}(ctx, in);
+{% else if o.op == "invoke" %}
+    bbq_w_push_scope(ctx, in);
+    if (!{{ kfn(o.fn) }}_write(ctx, &{{ o.target }})) return false;
+    bbq_w_pop_scope(ctx);
+    BBQ_MUSTTAIL return {{ fn.kpfx }}_w{{ o.next }}(ctx, in);
+{% else if o.op == "advance" %}
+    if (!bbq_w_advance(ctx, {{ o.by }})) return false;
+    BBQ_MUSTTAIL return {{ fn.kpfx }}_w{{ o.next }}(ctx, in);
+{% else if o.op == "seek" %}
+    if (!bbq_w_seek(ctx, (size_t)({{ o.expr }}))) return false;
+    BBQ_MUSTTAIL return {{ fn.kpfx }}_w{{ o.next }}(ctx, in);
+{% else if o.op == "set_endian" %}
+    bbq_write_set_endian(ctx, ({{ o.expr }}) ? true : false);
+    BBQ_MUSTTAIL return {{ fn.kpfx }}_w{{ o.next }}(ctx, in);
+{% else if o.op == "extern" %}
+{% if existsIn(o, "write_func") and o.write_func != "" %}
+    if (!{{ o.write_func }}(ctx, &{{ o.target }})) return false;
+    BBQ_MUSTTAIL return {{ fn.kpfx }}_w{{ o.next }}(ctx, in);
+{% else %}
+    return false; /* extern has no write function (use extern("read","write","ctype")) */
+{% endif %}
+{% else if o.op == "begin_optional" %}
+    if ({{ o.target }}.has_value) {
+        if (!{{ fn.kpfx }}_w{{ o.inner }}(ctx, in)) return false;
+    }
+    BBQ_MUSTTAIL return {{ fn.kpfx }}_w{{ o.next }}(ctx, in);
+{% else if o.op == "end_optional" %}
+    return true;
+{% else if o.op == "optional" %}
+    if ({{ o.target }}.has_value) { BBQ_MUSTTAIL return {{ fn.kpfx }}_w{{ o.present }}(ctx, in); }
+    BBQ_MUSTTAIL return {{ fn.kpfx }}_w{{ o.absent }}(ctx, in);
+{% else if o.op == "optional_prim" %}
+    if ({{ o.target }}.has_value) {
+        if (!{{ write_fn(o.prim) }}(ctx, {{ o.target }}.value)) return false;
+    }
+    BBQ_MUSTTAIL return {{ fn.kpfx }}_w{{ o.next }}(ctx, in);
+{% else if o.op == "push_interval" %}
+{% if existsIn(o, "rest") %}
+    // @rest: the rest defines its own extent; the size prefix is inserted at pop_interval.
+{% else %}
+    if (!bbq_w_push_interval(ctx, (size_t)({% if o.relative %}bbq_write_pos(ctx) + {% endif %}({{ o.expr }})))) return false;
+{% endif %}
+    BBQ_MUSTTAIL return {{ fn.kpfx }}_w{{ o.next }}(ctx, in);
+{% else if o.op == "pop_interval" %}
+{% if existsIn(o, "rest") %}
+    if (!bbq_w_patch_rest(ctx, {{ o.prim.w }}, {% if o.prim.enc == "uleb" %}true{% else %}false{% endif %}, {% if o.prim.be %}false{% else %}true{% endif %})) return false;
+{% else %}
+    if (!bbq_w_pop_interval(ctx)) return false;
+{% endif %}
+    BBQ_MUSTTAIL return {{ fn.kpfx }}_w{{ o.next }}(ctx, in);
+{% else if o.op == "switch" %}
+    switch ((int64_t)({{ o.tag_target }}.tag)) {
+{% for c in o.cases %}
+{% for l in c.labels %}
+    case {{ l }}:
+{% endfor %}
+        BBQ_MUSTTAIL return {{ fn.kpfx }}_w{{ c.target }}(ctx, in);
+{% endfor %}
+{% if o.has_default %}
+    default: BBQ_MUSTTAIL return {{ fn.kpfx }}_w{{ o.default_target }}(ctx, in);
+{% else %}
+    default: return false;
+{% endif %}
+    }
+{% else if o.op == "choice" %}
+    switch ((int64_t)({{ o.tag_target }})) {
+{% for arm in o.arms %}
+    case {{ arm.tag }}:
+        if (!{{ kfn(arm.fn) }}_write(ctx, &{{ arm.target }})) return false;
+        return true;
+{% endfor %}
+    default: return false;
+    }
+{% else if o.op == "array_begin" or o.op == "array_begin_grow" %}
+{% if existsIn(o, "count_patch") %}
+    if (!bbq_w_patch_count(ctx, {{ o.count_id }}, (uint64_t)({{ o.field }}.count), {{ o.count_prim.w }}, {% if o.count_prim.be %}false{% else %}true{% endif %})) return false;
+{% endif %}
+    { size_t _n = (size_t)({{ o.field }}.count);
+      if (_n == 0) { BBQ_MUSTTAIL return {{ fn.kpfx }}_w{{ o.end }}(ctx, in); }
+      bbq_w_push_loop_n(ctx, (int64_t)_n); }
+    BBQ_MUSTTAIL return {{ fn.kpfx }}_w{{ o.body }}(ctx, in);
+{% else if o.op == "array_next" or o.op == "array_next_grow" or o.op == "array_next_count" %}
+    if (bbq_w_loop_next(ctx)) { BBQ_MUSTTAIL return {{ fn.kpfx }}_w{{ o.body }}(ctx, in); }
+    bbq_w_pop_loop(ctx);
+{% if existsIn(o, "pad_after") and o.pad_after > 0 %}
+    // Reserve the trailing context a buffer-terminal `until(@remaining)` terminator needs
+    // to stop after exactly this many elements on re-read (the strayed bytes are unread).
+    for (int _p = 0; _p < {{ o.pad_after }}; _p++) if (!bbq_write_u8(ctx, 0)) return false;
+{% endif %}
+    BBQ_MUSTTAIL return {{ fn.kpfx }}_w{{ o.end }}(ctx, in);
+{% else if o.op == "array_begin_resync" %}
+    // resync element bodies terminate in array_elem_done (return true), so the loop is
+    // driven here (sub-call per element) rather than tail-cycled through array_next.
+{% if existsIn(o, "count_patch") %}
+    if (!bbq_w_patch_count(ctx, {{ o.count_id }}, (uint64_t)({{ o.field }}.count), {{ o.count_prim.w }}, {% if o.count_prim.be %}false{% else %}true{% endif %})) return false;
+{% endif %}
+    { size_t _n = (size_t)({{ o.field }}.count);
+      bbq_w_push_loop_n(ctx, (int64_t)_n);
+      for (size_t _i = 0; _i < _n; _i++) {
+          if (!{{ fn.kpfx }}_w{{ o.body }}(ctx, in)) { bbq_w_pop_loop(ctx); return false; }
+          bbq_w_loop_next(ctx);
+      }
+      bbq_w_pop_loop(ctx); }
+    BBQ_MUSTTAIL return {{ fn.kpfx }}_w{{ o.end }}(ctx, in);
+{% else if o.op == "array_elem_done" %}
+    return true;
+{% else if o.op == "bitfield" %}
+    {
+        {{ ctype(o.prim) }} _bf = 0;
+{% for m in o.members %}
+        _bf |= (({{ ctype(o.prim) }})({{ m.target }}) & {{ m.mask }}) << {{ m.shift }};
+{% endfor %}
+        if (!{{ write_fn(o.prim) }}(ctx, _bf)) return false;
+    }
+    BBQ_MUSTTAIL return {{ fn.kpfx }}_w{{ o.next }}(ctx, in);
+{% else if o.op == "return" %}
+    return true;
+{% else %}
+#error unhandled writer stencil op {{ o.op }}
+{% endif %}
+}
+{% endfor %}
+{% endfor %}

@@ -26,8 +26,14 @@
 #include "bbq_compile.h"
 #include "Machine.h"
 #include "Capture.h"
+#include "CaptureDecode.h"
+#include "CaptureCow.h"
 
-using namespace bbq::cek;
+// bbq.build — the grammar-free byte-construction submodule (its own translation unit)
+#include "bbq_build.h"
+
+using namespace bbq;        // index runtime: FieldCapture, CaptureType, decoders, zcow
+using namespace bbq::cek;   // machine IR: Value, FieldCaptureValue, ...
 
 
 // ── Forward declarations ────────────────────────────────────────────────────
@@ -68,6 +74,7 @@ struct PyBBQResult {
     Py_buffer view;
     PyBBQSpec* spec;
     bool view_valid;
+    bbq::zcow* zcow;   // copy-on-write overlay, lazily created on first mutation
 };
 
 struct PyBBQNode {
@@ -119,131 +126,153 @@ static const char* capture_type_name(CaptureType type) {
     return "unknown";
 }
 
+// Thin Python wrappers over the shared Borrowed-leaf decoders
+// (backends/cpp/runtime/CaptureDecode.h) — the offset→value logic lives there, shared
+// with the compiled C++ face; here we only widen to a Python object / raise.
 static PyObject* decode_int(const FieldCapture* cap, const uint8_t* data) {
-    size_t off = cap->start_offset;
-    switch (cap->type) {
-        case CaptureType::UInt8:
-            return PyLong_FromUnsignedLong(data[off]);
-        case CaptureType::UInt16LE:
-            return PyLong_FromUnsignedLong(
-                (uint32_t)data[off] | ((uint32_t)data[off+1] << 8));
-        case CaptureType::UInt16BE:
-            return PyLong_FromUnsignedLong(
-                ((uint32_t)data[off] << 8) | (uint32_t)data[off+1]);
-        case CaptureType::UInt32LE:
-            return PyLong_FromUnsignedLong(
-                (uint32_t)data[off]       | ((uint32_t)data[off+1] << 8) |
-                ((uint32_t)data[off+2] << 16) | ((uint32_t)data[off+3] << 24));
-        case CaptureType::UInt32BE:
-            return PyLong_FromUnsignedLong(
-                ((uint32_t)data[off] << 24) | ((uint32_t)data[off+1] << 16) |
-                ((uint32_t)data[off+2] << 8) | (uint32_t)data[off+3]);
-        case CaptureType::UInt64LE: {
-            uint64_t v = 0;
-            for (int i = 0; i < 8; i++) v |= (uint64_t)data[off+i] << (i * 8);
-            return PyLong_FromUnsignedLongLong(v);
-        }
-        case CaptureType::UInt64BE: {
-            uint64_t v = 0;
-            for (int i = 0; i < 8; i++) v |= (uint64_t)data[off+i] << ((7-i) * 8);
-            return PyLong_FromUnsignedLongLong(v);
-        }
-        case CaptureType::Int8:
-            return PyLong_FromLong((int8_t)data[off]);
-        case CaptureType::Int16LE: {
-            uint16_t raw = (uint16_t)data[off] | ((uint16_t)data[off+1] << 8);
-            return PyLong_FromLong((int16_t)raw);
-        }
-        case CaptureType::Int16BE: {
-            uint16_t raw = ((uint16_t)data[off] << 8) | (uint16_t)data[off+1];
-            return PyLong_FromLong((int16_t)raw);
-        }
-        case CaptureType::Int32LE: {
-            uint32_t raw = (uint32_t)data[off]       | ((uint32_t)data[off+1] << 8) |
-                          ((uint32_t)data[off+2] << 16) | ((uint32_t)data[off+3] << 24);
-            return PyLong_FromLong((int32_t)raw);
-        }
-        case CaptureType::Int32BE: {
-            uint32_t raw = ((uint32_t)data[off] << 24) | ((uint32_t)data[off+1] << 16) |
-                          ((uint32_t)data[off+2] << 8) | (uint32_t)data[off+3];
-            return PyLong_FromLong((int32_t)raw);
-        }
-        case CaptureType::Int64LE: {
-            uint64_t v = 0;
-            for (int i = 0; i < 8; i++) v |= (uint64_t)data[off+i] << (i * 8);
-            return PyLong_FromLongLong((int64_t)v);
-        }
-        case CaptureType::Int64BE: {
-            uint64_t v = 0;
-            for (int i = 0; i < 8; i++) v |= (uint64_t)data[off+i] << ((7-i) * 8);
-            return PyLong_FromLongLong((int64_t)v);
-        }
-        case CaptureType::Bool:
-            return PyLong_FromLong(data[off] ? 1 : 0);
-        case CaptureType::Computed: {
-            // computed_value is a typed Value* in the new IR. Dispatch
-            // on the Value tag — IntValue/BoolValue → int, FloatValue
-            // → float (truncated to int for back-compat with this
-            // function's int-typed return path), other types fail.
-            if (!cap->computed_value) return PyLong_FromLong(0);
-            switch (cap->computed_value->tag) {
-                case bbq::cek::ValueTag::IntValue:
-                    return PyLong_FromLongLong(
-                        static_cast<bbq::cek::IntValue*>(cap->computed_value)->v);
-                case bbq::cek::ValueTag::BoolValue:
-                    return PyLong_FromLong(
-                        static_cast<bbq::cek::BoolValue*>(cap->computed_value)->v ? 1 : 0);
-                case bbq::cek::ValueTag::FloatValue:
-                    return PyLong_FromLongLong(static_cast<int64_t>(
-                        static_cast<bbq::cek::FloatValue*>(cap->computed_value)->v));
-                default:
-                    PyErr_SetString(PyExc_TypeError,
-                                    "computed value is not numeric");
-                    return NULL;
-            }
-        }
-        default:
+    int64_t bits; bool is_signed;
+    if (!bbq::decode_int(cap, data, &bits, &is_signed)) {
+        if (cap->type == CaptureType::Computed)
+            PyErr_SetString(PyExc_TypeError, "computed value is not numeric");
+        else
             PyErr_Format(PyExc_TypeError, "cannot convert %s to int",
-                        capture_type_name(cap->type));
-            return NULL;
+                         capture_type_name(cap->type));
+        return NULL;
     }
+    return is_signed ? PyLong_FromLongLong(bits)
+                     : PyLong_FromUnsignedLongLong((uint64_t)bits);
 }
 
 static PyObject* decode_float(const FieldCapture* cap, const uint8_t* data) {
-    size_t off = cap->start_offset;
-    switch (cap->type) {
-        case CaptureType::Float32LE: {
-            uint32_t raw = (uint32_t)data[off]       | ((uint32_t)data[off+1] << 8) |
-                          ((uint32_t)data[off+2] << 16) | ((uint32_t)data[off+3] << 24);
-            float f; memcpy(&f, &raw, sizeof(f));
-            return PyFloat_FromDouble(f);
-        }
-        case CaptureType::Float32BE: {
-            uint32_t raw = ((uint32_t)data[off] << 24) | ((uint32_t)data[off+1] << 16) |
-                          ((uint32_t)data[off+2] << 8) | (uint32_t)data[off+3];
-            float f; memcpy(&f, &raw, sizeof(f));
-            return PyFloat_FromDouble(f);
-        }
-        case CaptureType::Float64LE: {
-            uint64_t raw = 0;
-            for (int i = 0; i < 8; i++) raw |= (uint64_t)data[off+i] << (i * 8);
-            double d; memcpy(&d, &raw, sizeof(d));
-            return PyFloat_FromDouble(d);
-        }
-        case CaptureType::Float64BE: {
-            uint64_t raw = 0;
-            for (int i = 0; i < 8; i++) raw |= (uint64_t)data[off+i] << ((7-i) * 8);
-            double d; memcpy(&d, &raw, sizeof(d));
-            return PyFloat_FromDouble(d);
-        }
-        default:
-            PyErr_Format(PyExc_TypeError, "cannot convert %s to float",
-                        capture_type_name(cap->type));
-            return NULL;
+    double d;
+    if (!bbq::decode_float(cap, data, &d)) {
+        PyErr_Format(PyExc_TypeError, "cannot convert %s to float",
+                     capture_type_name(cap->type));
+        return NULL;
     }
+    return PyFloat_FromDouble(d);
+}
+
+// A ZCow integer override for `cap` as a PyLong, or null if the field is
+// unmutated. The dynamic face of the same overlay the C++ handles use.
+static PyObject* zcow_int_override(const FieldCapture* cap, PyBBQResult* result) {
+    if (result->zcow)
+        if (auto* o = result->zcow->get_int(cap))
+            return PyLong_FromLongLong(*o);
+    return nullptr;
+}
+
+// Write `value` into leaf node `cap` via the ZCow overlay, dispatched on the
+// field's grammar type so every leaf kind round-trips (not just integers).
+static int zcow_set_capture(const FieldCapture* cap, PyBBQResult* result, PyObject* value) {
+    if (!result->zcow) result->zcow = new bbq::zcow();
+    CaptureType t = cap->type;
+    if (is_float_type(t)) {
+        double d = PyFloat_AsDouble(value);
+        if (d == -1.0 && PyErr_Occurred()) return -1;
+        result->zcow->set_float(cap, d);
+        return 0;
+    }
+    if (t == CaptureType::Bytes || t == CaptureType::External) {
+        if (!PyBytes_Check(value)) {
+            PyErr_SetString(PyExc_TypeError, "expected bytes for a bytes field"); return -1;
+        }
+        const char* p = PyBytes_AS_STRING(value);
+        result->zcow->set_bytes(cap, std::vector<uint8_t>(p, p + PyBytes_GET_SIZE(value)));
+        return 0;
+    }
+    if (t == CaptureType::String) {
+        if (PyBytes_Check(value)) {
+            const char* p = PyBytes_AS_STRING(value);
+            result->zcow->set_bytes(cap, std::vector<uint8_t>(p, p + PyBytes_GET_SIZE(value)));
+        } else {
+            Py_ssize_t n = 0;
+            const char* s = PyUnicode_AsUTF8AndSize(value, &n);
+            if (!s) return -1;
+            result->zcow->set_bytes(cap, std::vector<uint8_t>(s, s + n));
+        }
+        return 0;
+    }
+    if (t == CaptureType::Bool) {
+        int b = PyObject_IsTrue(value);
+        if (b < 0) return -1;
+        result->zcow->set_int(cap, b ? 1 : 0);
+        return 0;
+    }
+    if (t == CaptureType::Struct || t == CaptureType::Array || t == CaptureType::Computed) {
+        PyErr_Format(PyExc_TypeError, "cannot assign directly to a %s field", capture_type_name(t));
+        return -1;
+    }
+    int64_t v = PyLong_AsLongLong(value);   // integer leaf types
+    if (v == -1 && PyErr_Occurred()) return -1;
+    result->zcow->set_int(cap, v);
+    return 0;
+}
+
+// Set struct field `key` of `cap` via the ZCow overlay (any leaf type).
+static int zcow_set_field(const FieldCapture* cap, PyBBQResult* result,
+                          const char* key, PyObject* value) {
+    for (int i = 0; i < cap->child_count; i++) {
+        if (cap->children[i].name && strcmp(cap->children[i].name, key) == 0)
+            return zcow_set_capture(&cap->children[i], result, value);
+    }
+    PyErr_Format(PyExc_AttributeError, "no field '%s'", key);
+    return -1;
+}
+
+// Build a raw znode from a Python value for append/splice — ZCow is byte-level, so
+// there is no grammar typing here. bytes/str become a Bytes node (verbatim); a number
+// becomes a fixed-width Scalar at `type_src`'s recorded type (an existing sibling
+// element, pure data). Variable-width (LEB/computed), spans, and composite shapes have
+// no by-value form — supply bytes for those. Returns null + sets an error otherwise.
+static std::unique_ptr<bbq::znode> znode_from_pyvalue(PyObject* value, const FieldCapture* type_src) {
+    auto z = std::make_unique<bbq::znode>();
+    if (bbq_build_is_value(value)) {   // a bbq.build object enters as its serialized bytes
+        std::vector<uint8_t> out;
+        if (!bbq_build_serialize(value, out)) return nullptr;
+        z->kind = bbq::znode::Kind::Bytes;
+        z->bval = std::move(out);
+        return z;
+    }
+    if (PyBytes_Check(value)) {
+        const char* p = PyBytes_AS_STRING(value);
+        z->kind = bbq::znode::Kind::Bytes;
+        z->bval.assign(p, p + PyBytes_GET_SIZE(value));
+        return z;
+    }
+    if (PyUnicode_Check(value)) {
+        Py_ssize_t n = 0; const char* s = PyUnicode_AsUTF8AndSize(value, &n);
+        if (!s) return nullptr;
+        z->kind = bbq::znode::Kind::Bytes;
+        z->bval.assign(s, s + n);
+        return z;
+    }
+    CaptureType t = type_src ? type_src->type : CaptureType::Struct;
+    if (!is_float_type(t) && t != CaptureType::Bool && leaf_width(t) == 0) {
+        PyErr_SetString(PyExc_TypeError,
+            "append/splice: a non-bytes value needs an existing fixed-width element to "
+            "take its type from; supply bytes for a composite or variable-width element");
+        return nullptr;
+    }
+    z->kind = bbq::znode::Kind::Scalar;
+    z->type = t;
+    if (is_float_type(t)) {
+        double d = PyFloat_AsDouble(value);
+        if (d == -1.0 && PyErr_Occurred()) return nullptr;
+        z->fval = d;
+    } else if (t == CaptureType::Bool) {
+        int b = PyObject_IsTrue(value); if (b < 0) return nullptr;
+        z->ival = b ? 1 : 0;
+    } else {
+        int64_t v = PyLong_AsLongLong(value);
+        if (v == -1 && PyErr_Occurred()) return nullptr;
+        z->ival = v;
+    }
+    return z;
 }
 
 static PyObject* decode_auto_value(const FieldCapture* cap, PyBBQResult* result) {
+    if (PyObject* ov = zcow_int_override(cap, result)) return ov;
     const uint8_t* data = (const uint8_t*)result->view.buf;
 
     switch (cap->type) {
@@ -253,8 +282,21 @@ static PyObject* decode_auto_value(const FieldCapture* cap, PyBBQResult* result)
         case CaptureType::Int8:     case CaptureType::Int16LE:  case CaptureType::Int16BE:
         case CaptureType::Int32LE:  case CaptureType::Int32BE:
         case CaptureType::Int64LE:  case CaptureType::Int64BE:
-        case CaptureType::Computed:
             return decode_int(cap, data);
+
+        case CaptureType::Computed: {
+            // A Computed leaf carries a typed value (compute(...)/leb/bitfield). Project
+            // it to the matching Python type — not always int.
+            auto* cv = cap->computed_value;
+            if (!cv) return PyLong_FromLongLong(0);
+            switch (cv->kind) {
+                case bbq::ComputedValue::Kind::Int:    return PyLong_FromLongLong(cv->i);
+                case bbq::ComputedValue::Kind::Bool:   return PyBool_FromLong(cv->b ? 1 : 0);
+                case bbq::ComputedValue::Kind::Float:  return PyFloat_FromDouble(cv->f);
+                case bbq::ComputedValue::Kind::String: return PyUnicode_FromString(cv->s ? cv->s : "");
+            }
+            return PyLong_FromLongLong(0);
+        }
 
         case CaptureType::Float32LE: case CaptureType::Float32BE:
         case CaptureType::Float64LE: case CaptureType::Float64BE:
@@ -332,9 +374,18 @@ static PyObject* PyBBQNode_getattro(PyBBQNode* self, PyObject* name) {
     return NULL;  // keep AttributeError
 }
 
+// `node.field = v` → detach that field to Owned in the ZCow overlay.
+static int PyBBQNode_setattro(PyBBQNode* self, PyObject* name, PyObject* value) {
+    if (!value) { PyErr_SetString(PyExc_TypeError, "cannot delete a BBQ field"); return -1; }
+    const char* key = PyUnicode_AsUTF8(name);
+    if (!key) return -1;
+    return zcow_set_field(self->capture, self->result, key, value);
+}
+
 // ── Number protocol ──
 
 static PyObject* PyBBQNode_nb_int(PyBBQNode* self) {
+    if (PyObject* ov = zcow_int_override(self->capture, self->result)) return ov;
     return decode_int(self->capture, (const uint8_t*)self->result->view.buf);
 }
 
@@ -374,13 +425,9 @@ static int PyBBQNode_nb_bool(PyBBQNode* self) {
             // by-value, others → consider present-ness.
             auto* v = self->capture->computed_value;
             if (!v) return 0;
-            if (v->tag == bbq::cek::ValueTag::IntValue) {
-                return static_cast<bbq::cek::IntValue*>(v)->v != 0 ? 1 : 0;
-            }
-            if (v->tag == bbq::cek::ValueTag::BoolValue) {
-                return static_cast<bbq::cek::BoolValue*>(v)->v ? 1 : 0;
-            }
-            return 1;  // any other typed value present → truthy
+            if (v->kind == bbq::ComputedValue::Kind::Int)  return v->i != 0 ? 1 : 0;
+            if (v->kind == bbq::ComputedValue::Kind::Bool) return v->b ? 1 : 0;
+            return 1;  // any other present scalar → truthy
         }
         default: {
             PyObject* val = decode_auto_value(self->capture, self->result);
@@ -435,8 +482,12 @@ static PyNumberMethods PyBBQNode_as_number = {
 
 static Py_ssize_t PyBBQNode_mp_length(PyBBQNode* self) {
     CaptureType type = self->capture->type;
-    if (type == CaptureType::Struct || type == CaptureType::Array)
-        return self->capture->child_count;
+    if (type == CaptureType::Struct || type == CaptureType::Array) {
+        // Live like a Python list: reflect overlay appends/deletes when the container
+        // was structurally edited, else the baseline child count.
+        int o = self->result->zcow ? self->result->zcow->overlay_child_count(self->capture) : -1;
+        return o >= 0 ? o : self->capture->child_count;
+    }
     PyErr_Format(PyExc_TypeError,
                  "object of type 'bbq.Node' (%s) has no len()",
                  capture_type_name(type));
@@ -516,10 +567,64 @@ static PyObject* PyBBQNode_mp_subscript(PyBBQNode* self, PyObject* key) {
     return NULL;
 }
 
+// node[i] = v / node[name] = v (CoW-detach the child), or del node[i] (remove).
+static int PyBBQNode_mp_ass_subscript(PyBBQNode* self, PyObject* key, PyObject* value) {
+    const FieldCapture* cap = self->capture;
+    if (cap->type != CaptureType::Struct && cap->type != CaptureType::Array) {
+        PyErr_Format(PyExc_TypeError, "'bbq.Node' (%s) does not support item assignment",
+                     capture_type_name(cap->type));
+        return -1;
+    }
+    const FieldCapture* child = nullptr;
+    Py_ssize_t index = -1;
+    if (PyIndex_Check(key)) {
+        index = PyNumber_AsSsize_t(key, PyExc_IndexError);
+        if (index == -1 && PyErr_Occurred()) return -1;
+        if (index < 0) index += cap->child_count;
+        if (index < 0 || index >= cap->child_count) {
+            PyErr_SetString(PyExc_IndexError, "index out of range"); return -1;
+        }
+        child = &cap->children[index];
+    } else if (PyUnicode_Check(key)) {
+        const char* name = PyUnicode_AsUTF8(key);
+        if (!name) return -1;
+        for (int i = 0; i < cap->child_count; i++)
+            if (cap->children[i].name && strcmp(cap->children[i].name, name) == 0) {
+                child = &cap->children[i]; index = i; break;
+            }
+        if (!child) { PyErr_SetObject(PyExc_KeyError, key); return -1; }
+    } else {
+        PyErr_Format(PyExc_TypeError, "indices must be integers or strings, not %.200s",
+                     Py_TYPE(key)->tp_name);
+        return -1;
+    }
+    if (value == NULL) {   // del node[index]
+        if (!self->result->zcow) self->result->zcow = new bbq::zcow();
+        if (!self->result->zcow->remove_index(cap, (size_t)index)) {
+            PyErr_SetString(PyExc_IndexError, "cannot delete"); return -1;
+        }
+        return 0;
+    }
+    // Splice: replacing a composite array element (`arr[i] = b"..."`) sets a raw byte
+    // subtree via the ZCow splice (CoW path-copy + re-serialize on emit) — ZCow is
+    // byte-level, so the replacement is supplied as bytes. Leaf elements fall through
+    // to the per-type leaf setter.
+    if (cap->type == CaptureType::Array &&
+        (child->type == CaptureType::Struct || child->type == CaptureType::Array)) {
+        PyBBQResult* res = self->result;
+        std::unique_ptr<bbq::znode> elem = znode_from_pyvalue(value, nullptr);
+        if (!elem) return -1;
+        if (!res->zcow) res->zcow = new bbq::zcow();
+        res->zcow->set_node(child, std::move(elem));
+        return 0;
+    }
+    return zcow_set_capture(child, self->result, value);
+}
+
 static PyMappingMethods PyBBQNode_as_mapping = {
     (lenfunc)      PyBBQNode_mp_length,
     (binaryfunc)   PyBBQNode_mp_subscript,
-    (objobjargproc)NULL,
+    (objobjargproc)PyBBQNode_mp_ass_subscript,
 };
 
 // ── Sequence protocol ──
@@ -787,9 +892,30 @@ static PyObject* PyBBQNode_items(PyBBQNode* self, PyObject*) {
     return list;
 }
 
+// node.append(value): add an element to an array. ZCow is byte-level — a number takes
+// the array's existing element type (a sibling, pure data); bytes/str append verbatim
+// (the form for a composite or variable-width element). The array's child count updates
+// live (like a Python list); any format count field is a separate byte the caller owns.
+static PyObject* PyBBQNode_append(PyBBQNode* self, PyObject* value) {
+    const FieldCapture* cap = self->capture;
+    if (cap->type != CaptureType::Array) {
+        PyErr_SetString(PyExc_TypeError, "append() requires an array node");
+        return NULL;
+    }
+    PyBBQResult* res = self->result;
+    const FieldCapture* sib = (cap->child_count > 0) ? &cap->children[0] : nullptr;
+    std::unique_ptr<bbq::znode> elem = znode_from_pyvalue(value, sib);
+    if (!elem) return NULL;
+    if (!res->zcow) res->zcow = new bbq::zcow();
+    res->zcow->append(cap, std::move(elem));
+    Py_RETURN_NONE;
+}
+
 static PyMethodDef PyBBQNode_methods[] = {
     {"__format__", (PyCFunction)PyBBQNode_format, METH_VARARGS,
      "Format node value with format spec."},
+    {"append",     (PyCFunction)PyBBQNode_append, METH_O,
+     "append(value): add an element to an array node (typed from the grammar)."},
     {"__dir__",    (PyCFunction)PyBBQNode_dir,    METH_NOARGS,
      "List attributes including child field names."},
     {"keys",       (PyCFunction)PyBBQNode_keys,   METH_NOARGS,
@@ -830,6 +956,14 @@ static PyObject* PyBBQNode_get_value(PyBBQNode* self, void*) {
     return decode_auto_value(self->capture, self->result);
 }
 
+// The arm/case ordinal the parser recorded for a union/alternatives/switch node
+// (0 = first arm, 1 = second, …), or None when this node is not a variant. Pure
+// data off the parsed capture — like offset/capture_type, not a grammar query.
+static PyObject* PyBBQNode_get_variant_tag(PyBBQNode* self, void*) {
+    if (self->capture->variant_tag < 0) Py_RETURN_NONE;
+    return PyLong_FromLong(self->capture->variant_tag);
+}
+
 static PyGetSetDef PyBBQNode_getset[] = {
     {(char*)"offset",       (getter)PyBBQNode_get_offset,       NULL,
      (char*)"(start, end) byte offset tuple", NULL},
@@ -841,6 +975,8 @@ static PyGetSetDef PyBBQNode_getset[] = {
      (char*)"field name or None", NULL},
     {(char*)"value",        (getter)PyBBQNode_get_value,        NULL,
      (char*)"auto-materialized Python value", NULL},
+    {(char*)"variant_tag",  (getter)PyBBQNode_get_variant_tag,  NULL,
+     (char*)"union/switch arm ordinal, or None if not a variant", NULL},
     {NULL, NULL, NULL, NULL, NULL}
 };
 
@@ -864,7 +1000,7 @@ PyTypeObject PyBBQNode_Type = {
     NULL,                                   // tp_call
     (reprfunc)PyBBQNode_tp_str,             // tp_str
     (getattrofunc)PyBBQNode_getattro,       // tp_getattro
-    NULL,                                   // tp_setattro
+    (setattrofunc)PyBBQNode_setattro,       // tp_setattro
     &PyBBQNode_as_buffer,                   // tp_as_buffer
     Py_TPFLAGS_DEFAULT | Py_TPFLAGS_HAVE_GC, // tp_flags
     NULL,                                   // tp_doc
@@ -967,6 +1103,7 @@ PyTypeObject PyBBQNodeIter_Type = {
 
 static void PyBBQResult_dealloc(PyBBQResult* self) {
     PyObject_GC_UnTrack((PyObject*)self);
+    delete self->zcow;
     delete self->arena;
     if (self->view_valid)
         PyBuffer_Release(&self->view);
@@ -1008,6 +1145,15 @@ static PyObject* PyBBQResult_getattro(PyBBQResult* self, PyObject* name) {
         }
     }
     return NULL;  // keep AttributeError
+}
+
+// `result.field = v` → detach that top-level field to Owned in the overlay.
+static int PyBBQResult_setattro(PyBBQResult* self, PyObject* name, PyObject* value) {
+    if (!value) { PyErr_SetString(PyExc_TypeError, "cannot delete a BBQ field"); return -1; }
+    if (!self->meta.root) { PyErr_SetString(PyExc_AttributeError, "no parse tree"); return -1; }
+    const char* key = PyUnicode_AsUTF8(name);
+    if (!key) return -1;
+    return zcow_set_field(self->meta.root, self, key, value);
 }
 
 // ── Result repr ──
@@ -1101,9 +1247,49 @@ static PyObject* PyBBQResult_dir(PyBBQResult* self, PyObject*) {
     return list;
 }
 
+static PyObject* PyBBQResult_emit(PyBBQResult* self, PyObject*) {
+    // Serialize the overlay exactly as it stands — ZCow knows only bytes. Format
+    // fields (counts/lengths) are ordinary scalar bytes; matching them to the
+    // edited container is the caller's job (reparse to check). No grammar here.
+    bbq::zcow empty;
+    const bbq::zcow& z = self->zcow ? *self->zcow : empty;
+    const uint8_t* b = self->view_valid ? (const uint8_t*)self->view.buf : nullptr;
+    size_t l = self->view_valid ? (size_t)self->view.len : 0;
+    std::vector<uint8_t> out = bbq::emit(b, l, z);
+    return PyBytes_FromStringAndSize((const char*)out.data(), (Py_ssize_t)out.size());
+}
+
+// The structured delta set since parse: a list of dicts
+// {path, offset:(start,end), old, new} — a typed, path-addressed diff.
+static PyObject* PyBBQResult_deltas(PyBBQResult* self, PyObject*) {
+    PyObject* list = PyList_New(0);
+    if (!list || !self->zcow) return list;
+    auto ds = bbq::deltas((const uint8_t*)self->view.buf, *self->zcow);
+    for (const auto& d : ds) {
+        PyObject* old_o = d.is_bytes
+            ? PyBytes_FromStringAndSize((const char*)d.old_bytes.data(), (Py_ssize_t)d.old_bytes.size())
+            : PyLong_FromLongLong(d.old_int);
+        PyObject* new_o = d.is_bytes
+            ? PyBytes_FromStringAndSize((const char*)d.new_bytes.data(), (Py_ssize_t)d.new_bytes.size())
+            : PyLong_FromLongLong(d.new_int);
+        PyObject* item = Py_BuildValue("{s:s,s:(nn),s:O,s:O}",
+            "path", d.path.c_str(),
+            "offset", (Py_ssize_t)d.start, (Py_ssize_t)d.end,
+            "old", old_o, "new", new_o);
+        Py_XDECREF(old_o); Py_XDECREF(new_o);
+        if (item) { PyList_Append(list, item); Py_DECREF(item); }
+    }
+    return list;
+}
+
 static PyMethodDef PyBBQResult_methods[] = {
     {"__dir__", (PyCFunction)PyBBQResult_dir, METH_NOARGS,
      "List attributes including parsed field names."},
+    {"emit", (PyCFunction)PyBBQResult_emit, METH_NOARGS,
+     "Serialize back to bytes: blit the input, patch any mutated fields "
+     "(byte-identical to the input if nothing was changed)."},
+    {"deltas", (PyCFunction)PyBBQResult_deltas, METH_NOARGS,
+     "The structured diff since parse: list of {path, offset, old, new}."},
     {NULL, NULL, 0, NULL}
 };
 
@@ -1245,7 +1431,7 @@ PyTypeObject PyBBQResult_Type = {
     NULL,                                  // tp_call
     NULL,                                  // tp_str
     (getattrofunc)PyBBQResult_getattro,    // tp_getattro
-    NULL,                                  // tp_setattro
+    (setattrofunc)PyBBQResult_setattro,    // tp_setattro
     NULL,                                  // tp_as_buffer
     Py_TPFLAGS_DEFAULT | Py_TPFLAGS_HAVE_GC, // tp_flags
     NULL,                                  // tp_doc
@@ -1397,6 +1583,7 @@ static PyObject* do_parse(PyBBQSpec* self, Py_buffer* view, const char* rule_nam
     result->meta = meta;
     result->view = *view;       // transfer buffer ownership
     result->view_valid = true;
+    result->zcow = nullptr;     // created on first mutation
     Py_INCREF(self);
     result->spec = self;
     PyObject_GC_Track((PyObject*)result);
@@ -1716,6 +1903,17 @@ PyInit_bbq(void)
 
     Py_INCREF(PyBBQParseError);
     PyModule_AddObject(m, (char*) "ParseError", PyBBQParseError);
+
+    /* Attach the 'bbq.build' construction submodule */
+
+    PyObject* build_mod = bbq_build_create_module();
+    if (!build_mod) {
+        return NULL;
+    }
+    if (PyModule_AddObject(m, (char*) "build", build_mod) < 0) {
+        Py_DECREF(build_mod);
+        return NULL;
+    }
 
     return m;
 }

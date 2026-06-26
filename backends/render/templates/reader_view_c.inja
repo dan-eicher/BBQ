@@ -5,6 +5,13 @@
    into a C index, decode-on-access) differs. ctx is a bbq_view_ctx_t* (cursor + builder
    + caller arena). Read-only: no writer, no types header. #}
 
+{# Backend marker: lets grammar @source blocks #ifndef out owning-only ones (the c-lite
+   reader has no generated structs). The grammar's @header (e.g. a shared #include) and
+   @source are emitted here, at the top, so the rules below see them. #}
+#define BBQ_LITE_READER 1
+{{ user_source_header }}
+{{ user_source }}
+
 {# extern read functions are user-supplied (the index records only the consumed span).
    Forward-declared with the view ABI so the generated parser links. #}
 {% for e in externs %}

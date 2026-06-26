@@ -31,6 +31,7 @@ struct CommentSpec {
     const char* open;
     const char* close;
     bool nested;
+    bool structured = false;   // skip a balanced ()-nested, string-aware token group (annotations); language-specific awareness is a backend override
 };
 
 // ── Zero-copy span (pointer into input buffer) ──────────────
@@ -313,7 +314,34 @@ protected:
         }
     }
 
+    // A STRUCTURED skip element (e.g. (@id … ) annotations): from `open`, walk to the matching
+    // close counting generic ()-nesting, treating "…" string literals (with \-escapes) as opaque
+    // so their parens don't perturb the balance. The `close` delimiter is unused (paren depth ends
+    // it). Language-specific awareness (inner comments, identifier validation) is a backend override.
+    bool skip_structured(const CommentSpec& spec) {
+        int open_len = static_cast<int>(strlen(spec.open));
+        if (pos_ + open_len > end_) return false;
+        if (memcmp(pos_, spec.open, open_len) != 0) return false;
+        for (int i = 0; i < open_len; i++) advance();
+        int depth = 1;
+        while (pos_ < end_ && depth > 0) {
+            char c = *pos_;
+            if (c == '"') {                              // string literal: skip with \-escapes
+                advance();
+                while (pos_ < end_ && *pos_ != '"') {
+                    if (*pos_ == '\\' && pos_ + 1 < end_) advance();
+                    advance();
+                }
+                if (pos_ < end_) advance();
+            } else if (c == '(') { depth++; advance(); }
+            else if (c == ')') { depth--; advance(); }
+            else advance();
+        }
+        return true;
+    }
+
     bool skip_comment(const CommentSpec& spec) {
+        if (spec.structured) return skip_structured(spec);
         int open_len = static_cast<int>(strlen(spec.open));
         if (pos_ + open_len > end_) return false;
         if (memcmp(pos_, spec.open, open_len) != 0) return false;
@@ -321,6 +349,9 @@ protected:
         for (int i = 0; i < open_len; i++) advance();
 
         int close_len = static_cast<int>(strlen(spec.close));
+        // A single-LF close is the line-comment idiom; a line ends at LF or CR (or CRLF),
+        // so such a comment terminates on a bare CR too — standard line-comment behavior.
+        bool line_close = (close_len == 1 && spec.close[0] == '\n');
         int depth = 1;
 
         while (pos_ < end_ && depth > 0) {
@@ -328,6 +359,9 @@ protected:
                 memcmp(pos_, spec.open, open_len) == 0) {
                 for (int i = 0; i < open_len; i++) advance();
                 depth++;
+            } else if (line_close && (*pos_ == '\n' || *pos_ == '\r')) {
+                advance();
+                depth--;
             } else if (pos_ + close_len <= end_ &&
                        memcmp(pos_, spec.close, close_len) == 0) {
                 for (int i = 0; i < close_len; i++) advance();

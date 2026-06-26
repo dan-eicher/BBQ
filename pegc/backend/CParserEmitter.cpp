@@ -234,7 +234,8 @@ void CParserEmitter::emit_skip_setup(Grammar* grammar, std::ostream& out) {
     for (auto* c : grammar->comments) {
         out << "    peg_add_comment(p, \"" << c_emit::escape_string(c->open)
             << "\", \"" << c_emit::escape_string(c->close) << "\", "
-            << (c->nested ? "true" : "false") << ");\n";
+            << (c->nested ? "true" : "false") << ", "
+            << (c->structured ? "true" : "false") << ");\n";
     }
     out << "}\n\n";
 }

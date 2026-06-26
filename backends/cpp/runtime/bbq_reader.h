@@ -15,6 +15,7 @@
 #include "CaptureDecode.h"  // bbq::decode_int (count decode-on-access)
 #include "ParseArena.h"     // bbq::ParseArena
 #include "bbq_machine.h"    // bbq::machine — the shared endian register + loop stack
+#include "bbq_node.h"       // bbq::bytes_view — the non-scalar field_ref span
 
 #include <cstddef>
 #include <cstdint>
@@ -231,6 +232,14 @@ inline int64_t bbq_view_i64(reader& r, const char* name) {
     int64_t bits = 0; bool sgn = false;
     if (c) decode_int(c, r.data, &bits, &sgn);
     return bits;
+}
+
+// A field reference to a NON-SCALAR (Bytes/String/External) capture as its
+// [start,end) span — the ViewProfile field_ref_bytes hook (dual of bbq_view_i64).
+inline bytes_view bbq_view_bytes(reader& r, const char* name) {
+    const FieldCapture* c = r.builder.find_field_str(name);
+    if (!c) return {};
+    return { r.data + c->start_offset, (size_t)(c->end_offset - c->start_offset) };
 }
 
 }  // namespace bbq

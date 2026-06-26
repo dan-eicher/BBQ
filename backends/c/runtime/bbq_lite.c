@@ -290,6 +290,17 @@ int64_t bbq_view_i64(bbq_view_ctx_t* c, const char* name) {
     return bits;
 }
 
+/* Recover a prior NON-SCALAR (Bytes/String/External) field in scope as its
+ * [start,end) span — the field_ref spelling for a where-clause over such a field
+ * (the dual of bbq_view_i64; a Bytes capture has no integer value, only a span). */
+bbq_bytes_t bbq_view_bytes(bbq_view_ctx_t* c, const char* name) {
+    const bbq_field_capture* cap = bbq_cap_find_field_str(&c->builder, name);
+    if (!cap) { bbq_bytes_t z = { 0, 0 }; return z; }
+    bbq_bytes_t b = { c->cur.data + cap->start_offset,
+                      (size_t)(cap->end_offset - cap->start_offset) };
+    return b;
+}
+
 /* ── view read points ── */
 
 static bbq_computed_value* alloc_cv(bbq_view_ctx_t* c) {

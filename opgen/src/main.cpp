@@ -49,8 +49,9 @@ static bool slurp(const char* path, std::string& out) {
 
 static void usage(const char* prog) {
     fprintf(stderr,
-        "Usage: %s -i <opcodes.def> -o <out_dir>\n"
-        "  Emits the interpreter, JIT stencils, opcode/type tables, and runtime headers.\n",
+        "Usage: %s -i <opcodes.def> -o <out_dir> -prefix <name>\n"
+        "  Emits the interpreter, JIT stencils, opcode/type tables, and runtime headers.\n"
+        "  -prefix names the emitted symbols/files (e.g. -prefix jav -> jav_jit_meta.h).\n",
         prog);
 }
 
@@ -67,12 +68,14 @@ static int write_file(const char* dir, const char* name,
 static int run(int argc, char** argv) {
     const char* in_path = nullptr;
     const char* out_dir = nullptr;
+    const char* prefix = nullptr;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-i") == 0 && i + 1 < argc) in_path = argv[++i];
         else if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) out_dir = argv[++i];
+        else if (strcmp(argv[i], "-prefix") == 0 && i + 1 < argc) prefix = argv[++i];
         else { usage(argv[0]); return 2; }
     }
-    if (!in_path || !out_dir) { usage(argv[0]); return 2; }
+    if (!in_path || !out_dir || !prefix) { usage(argv[0]); return 2; }
 
     std::string src;
     if (!slurp(in_path, src)) return 1;
@@ -87,7 +90,7 @@ static int run(int argc, char** argv) {
 
     Module* m = p.ast;
     Spec spec(m);
-    VmEmitter vm(m);
+    VmEmitter vm(m, prefix);
     TablesEmitter tables(spec);
 
     int rc = 0;
@@ -96,11 +99,11 @@ static int run(int argc, char** argv) {
     rc |= write_file(out_dir, "runtime_api.h",        [&](FILE* o){ vm.emit_runtime_api_h(o); });
     rc |= write_file(out_dir, "gen_interp.h",         [&](FILE* o){ vm.emit_interp_h(o); });
     rc |= write_file(out_dir, "gen_interp.c",         [&](FILE* o){ vm.emit_interp_c(o); });
-    rc |= write_file(out_dir, "wasm_stencils.c",      [&](FILE* o){ vm.emit_stencil_c(o); });
-    rc |= write_file(out_dir, "wasm_jit_meta.h",      [&](FILE* o){ vm.emit_jit_meta(o); });
-    rc |= write_file(out_dir, "wasm_valtype.h",       [&](FILE* o){ vm.emit_valtype_h(o); });
-    rc |= write_file(out_dir, "wasm_type_meta.h",     [&](FILE* o){ vm.emit_type_meta(o); });
-    rc |= write_file(out_dir, "wasm_jit_symbols.h",   [&](FILE* o){ vm.emit_jit_symbols(o); });
+    rc |= write_file(out_dir, (std::string(prefix) + "_stencils.c").c_str(),    [&](FILE* o){ vm.emit_stencil_c(o); });
+    rc |= write_file(out_dir, (std::string(prefix) + "_jit_meta.h").c_str(),    [&](FILE* o){ vm.emit_jit_meta(o); });
+    rc |= write_file(out_dir, (std::string(prefix) + "_valtype.h").c_str(),     [&](FILE* o){ vm.emit_valtype_h(o); });
+    rc |= write_file(out_dir, (std::string(prefix) + "_type_meta.h").c_str(),   [&](FILE* o){ vm.emit_type_meta(o); });
+    rc |= write_file(out_dir, (std::string(prefix) + "_jit_symbols.h").c_str(), [&](FILE* o){ vm.emit_jit_symbols(o); });
 
     return rc;
 }

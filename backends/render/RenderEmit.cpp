@@ -113,6 +113,9 @@ struct Emitter {
 
     // ── output spelling (render_expr dispatches the expr-tree leaves here) ──
     virtual std::string field_ref(const std::string& name) const { return "out->" + name; }
+    // A field_ref to a NON-SCALAR (Bytes/String) capture: the owning backend's
+    // out->name is already the right type; only the views need a span recovery.
+    virtual std::string field_ref_bytes(const std::string& name) const { return field_ref(name); }
     virtual std::string path_start(const std::string& name) const { return "out->" + name; }
     virtual std::string path_field(const std::string& base, const std::string& field) const {
         return base + "." + field;
@@ -435,7 +438,9 @@ std::string render_expr(const json& e, const Emitter& em) {
     if (k == "float")      return std::to_string(e["v"].get<double>());
     if (k == "str")        return "\"" + e["v"].get<std::string>() + "\"";
     if (k == "builtin")    return em.builtin(e["name"].get<std::string>());
-    if (k == "field_ref")  return em.field_ref(e["name"].get<std::string>());
+    if (k == "field_ref")  return e.value("bytes", false)
+                                  ? em.field_ref_bytes(e["name"].get<std::string>())
+                                  : em.field_ref(e["name"].get<std::string>());
     if (k == "cross_ref")  return em.cross_ref(e["parent"].get<std::string>(),
                                                e["depth"].get<int>(), e["path"].get<std::string>());
     if (k == "path_start") return em.path_start(e["name"].get<std::string>());
@@ -488,6 +493,32 @@ json lower_grammar(const CompilerCtx& ctx) {
     return functions;
 }
 
+// A field_ref to a Bytes/String capture must spell a span recovery, not an int
+// decode — but the capture type isn't on the ref node. Collect each rule's
+// read_bytes targets and tag matching field_ref nodes `{"bytes":true}`; the
+// dispatch in render_expr then routes them to field_ref_bytes (the CEK semantics:
+// a ref yields the field's value AT ITS CAPTURE TYPE).
+static void tag_bytes_refs(json& node, const std::set<std::string>& bf) {
+    if (node.is_object()) {
+        if (node.value("e", std::string()) == "field_ref" &&
+            bf.count(node.value("name", std::string())))
+            node["bytes"] = true;
+        for (auto it = node.begin(); it != node.end(); ++it) tag_bytes_refs(it.value(), bf);
+    } else if (node.is_array()) {
+        for (auto& el : node) tag_bytes_refs(el, bf);
+    }
+}
+static void annotate_bytes_field_refs(json& functions) {
+    for (auto& fn : functions) {
+        std::set<std::string> bf;
+        for (auto& op : fn["ops"])
+            if (op.value("op", std::string()) == "read_bytes" && op.contains("target"))
+                bf.insert(op["target"].get<std::string>());
+        if (bf.empty()) continue;
+        for (auto& op : fn["ops"]) tag_bytes_refs(op, bf);
+    }
+}
+
 std::string render_emit(const CompilerCtx& ctx, const Emitter& em, json functions) {
     // Merge the per-emitter function header (name/type/kpfx) onto the neutral lowering,
     // then drop the rule-name stash so it doesn't leak into the template data.
@@ -499,6 +530,7 @@ std::string render_emit(const CompilerCtx& ctx, const Emitter& em, json function
     // Fold-pass: the owning reader folds struct boundaries into the path and drops the
     // begin_struct/end_struct ops (remapping successors); the view leaves them as
     // runtime stencils (its post_lower is a no-op).
+    annotate_bytes_field_refs(functions);
     em.post_lower(functions);
     // Spell the neutral expr records: burg emitted backend-blind expr trees; the
     // Emitter spells the leaves (builtins/refs/path-nav) here.
@@ -559,12 +591,15 @@ struct OwningCReader : Emitter {
     }
     void post_lower(json& functions) const override { fold_owning_paths(functions); }
     std::string prologue() const override { return kMustTail; }
-    std::string epilogue(const CompilerCtx& ctx) const override {
-        std::string out;
+    // @source DEFINITIONS go at the TOP of the reader (before the rules call them, via
+    // {{ user_source }} in the template), so a file-local `static` helper needs no @header.
+    // @header stays a convenience for a single-file grammar's shared structs (types header).
+    void extra_data(json& data, const CompilerCtx& ctx) const override {
+        std::string src;
         if (ctx.ast)
             for (auto* cb : ctx.ast->codes)
-                if (cb->section == BBQ::CodeSection::SourceBlock) out += std::string(cb->code) + "\n";
-        return out;
+                if (cb->section == BBQ::CodeSection::SourceBlock) src += std::string(cb->code) + "\n";
+        data["user_source"] = src;
     }
 };
 
@@ -708,6 +743,9 @@ struct ZCowReader : Emitter {
     std::string field_ref(const std::string& name) const override {
         return "bbq_view_i64(r, \"" + name + "\")";
     }
+    std::string field_ref_bytes(const std::string& name) const override {
+        return "bbq_view_bytes(r, \"" + name + "\")";
+    }
     std::string path_start(const std::string& name) const override {
         return "r.builder.find_field_str(\"" + name + "\")";
     }
@@ -805,6 +843,9 @@ struct ViewCReader : Emitter {
     std::string field_ref(const std::string& name) const override {
         return "bbq_view_i64(ctx, \"" + name + "\")";
     }
+    std::string field_ref_bytes(const std::string& name) const override {
+        return "bbq_view_bytes(ctx, \"" + name + "\")";
+    }
     std::string path_start(const std::string& name) const override {
         return "bbq_cap_find_field_str(&ctx->builder, \"" + name + "\")";
     }
@@ -843,7 +884,7 @@ struct ViewCReader : Emitter {
         if (which == "buffer")     return "((bbq_bytes_t){ctx->cur.data + bbq_cap_current_scope_start(&ctx->builder), bbq_pos(&ctx->cur) - bbq_cap_current_scope_start(&ctx->builder)})";
         return "/*?builtin*/";
     }
-    void extra_data(json& data, const CompilerCtx&) const override {
+    void extra_data(json& data, const CompilerCtx& ctx) const override {
         json externs = json::array();
         std::set<std::string> seen;
         for (auto& fnj : data["functions"])
@@ -853,6 +894,17 @@ struct ViewCReader : Emitter {
                     if (seen.insert(f).second) externs.push_back(f);
                 }
         data["externs"] = externs;
+        // The c-lite reader has no types header, so it carries the grammar's @header (e.g. a
+        // shared #include) AND @source at the top — {{ user_source_header }} / {{ user_source }} —
+        // before the rules that use them.
+        std::string hdr, src;
+        if (ctx.ast)
+            for (auto* cb : ctx.ast->codes) {
+                if (cb->section == BBQ::CodeSection::HeaderBlock) hdr += std::string(cb->code) + "\n";
+                if (cb->section == BBQ::CodeSection::SourceBlock) src += std::string(cb->code) + "\n";
+            }
+        data["user_source_header"] = hdr;
+        data["user_source"] = src;
     }
     std::string prologue() const override { return kMustTail; }
 };

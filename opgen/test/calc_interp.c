@@ -16,8 +16,8 @@
 /* The threaded-dispatch driver: each handler does its work and musttail-jumps
  * back here for the next opcode; we stop when the cursor runs off the program. */
 static u2 g_len;
-void wasm_trap(vm_t* vm) { (void)vm; }   /* the calc opcodes never trap */
-void wasm_next(vm_t* vm) {
+void calc_trap(vm_t* vm) { (void)vm; }   /* the calc opcodes never trap */
+void calc_next(vm_t* vm) {
     frame_t* f = &vm->frame;
     if (f->pc >= g_len) return;
     const opcode_handler_t* table = gen_interp_dispatch_table();
@@ -41,7 +41,7 @@ static s4 run(const prog_t* p) {
     memset(&g_vm, 0, sizeof g_vm);
     g_vm.frame.code = p->b; g_vm.frame.pc = 0; g_vm.frame.sp = 0;
     g_len = p->n;
-    wasm_next(&g_vm);
+    calc_next(&g_vm);
     return g_vm.frame.stack[0].i;
 }
 static u1 final_sp(void) { return g_vm.frame.sp; }

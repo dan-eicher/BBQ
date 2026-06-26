@@ -202,12 +202,12 @@ FamilyDef <. std::vector<opgen::Opcode*>& ops .>
              std::vector<opgen::StackParam*> nin;
              for (size_t i = 0; i < tin.size(); i++) {
                  opgen::ValueType ty = in_var[i] ? mvts[m] : tin[i]->ty;
-                 nin.push_back(new opgen::StackParam(ty, tin[i]->name, tin[i]->sem_expr));
+                 nin.push_back(new opgen::StackParam(ty, tin[i]->name, tin[i]->sem_expr, tin[i]->count));
              }
              std::vector<opgen::StackParam*> nout;
              for (size_t i = 0; i < tout.size(); i++) {
                  opgen::ValueType ty = out_var[i] ? mvts[m] : tout[i]->ty;
-                 nout.push_back(new opgen::StackParam(ty, tout[i]->name, tout[i]->sem_expr));
+                 nout.push_back(new opgen::StackParam(ty, tout[i]->name, tout[i]->sem_expr, tout[i]->count));
              }
              ops.push_back(new opgen::Opcode(
                  mnames[m], (int32_t)mhexes[m], (int32_t)msubs[m],
@@ -227,7 +227,7 @@ FamilyStackParam <. std::vector<opgen::StackParam*>& list, std::vector<int>& var
       ident<ns>
       [ "=" string_lit<es>   (. sem_expr = opgen_dup(es); .) ]
       (. var_flags.push_back(isvar);
-         list.push_back(new opgen::StackParam(ty, opgen_dup(ns), opgen_opt(sem_expr))); .)
+         list.push_back(new opgen::StackParam(ty, opgen_dup(ns), opgen_opt(sem_expr), opgen_opt((opgen::SemExpr*)nullptr))); .)
 .
 
 // One family member: <ValueType> <mnemonic> <opcode> [<subop>]. The optional second
@@ -254,10 +254,11 @@ OperandParam <. std::vector<opgen::OperandParam*>& list .>
 
 StackParam <. std::vector<opgen::StackParam*>& list .>
     (. opgen::ValueType ty; peg::Span ns; peg::Span es;
-       const char* sem_expr = nullptr; .)
-    = ValueType<ty> ident<ns>
+       const char* sem_expr = nullptr; opgen::SemExpr* count = nullptr; .)
+    = [ "[" SemExpr<count> "]" ]   // VARIADIC: `[count-expr] ty name` (§3b) — pops `count-expr` operands
+      ValueType<ty> ident<ns>
       [ "=" string_lit<es>  (. sem_expr = opgen_dup(es); .) ]
-      (. list.push_back(new opgen::StackParam(ty, opgen_dup(ns), opgen_opt(sem_expr))); .)
+      (. list.push_back(new opgen::StackParam(ty, opgen_dup(ns), opgen_opt(sem_expr), opgen_opt(count))); .)
 .
 
 // ═══════════════════════════════════════════════════════════════
@@ -269,6 +270,7 @@ StackParam <. std::vector<opgen::StackParam*>& list .>
 ValueType <. opgen::ValueType& out .>
     = "dword" !ident_continue (. out = opgen::ValueType::TyDword; .)
     | "word"  !ident_continue (. out = opgen::ValueType::TyWord;  .)
+    | "addr"  !ident_continue (. out = opgen::ValueType::TyAddr;  .)
     | "ref"   !ident_continue (. out = opgen::ValueType::TyRef;   .)
     | "i64"   !ident_continue (. out = opgen::ValueType::TyI64;   .)
     | "i32"   !ident_continue (. out = opgen::ValueType::TyI32;   .)
@@ -295,6 +297,10 @@ ValueType <. opgen::ValueType& out .>
     | "sleb64"    !ident_continue (. out = opgen::ValueType::TySleb64; .)
     | "sleb32"    !ident_continue (. out = opgen::ValueType::TySleb32; .)
     | "memarg"    !ident_continue (. out = opgen::ValueType::TyMemarg; .)
+    | "blocktype" !ident_continue (. out = opgen::ValueType::TyBlockType; .)
+    | "brtable"   !ident_continue (. out = opgen::ValueType::TyBrTable;   .)
+    | "trytable"  !ident_continue (. out = opgen::ValueType::TyTryTable;  .)
+    | "selectvec" !ident_continue (. out = opgen::ValueType::TySelectVec; .)
     | "any"   !ident_continue (. out = opgen::ValueType::TyAny;   .)
 .
 
@@ -579,11 +585,14 @@ MethodParam <. std::vector<opgen::MethodParam*>& list .>
 // status <c-type> <ok> <err> <halt> — the control-flow status vocabulary,
 // so no target identifiers are baked into the generator.
 StatusDecl <. std::optional<opgen::StatusDecl*>& out .>
-    (. peg::Span ty; peg::Span ok; peg::Span er; peg::Span ha; .)
+    (. peg::Span ty; peg::Span ok; peg::Span er; peg::Span ha; peg::Span ex;
+       std::vector<const char*> extra; .)
     = "status" !ident_continue
       ident<ty> ident<ok> ident<er> ident<ha>
-      (. out = new opgen::StatusDecl(opgen_dup(ty), opgen_dup(ok),
-                                     opgen_dup(er), opgen_dup(ha)); .)
+      [ "[" ident<ex> (. extra.push_back(opgen_dup(ex)); .)
+        { "," ident<ex> (. extra.push_back(opgen_dup(ex)); .) } "]" ]
+      (. out = new opgen::StatusDecl(opgen_dup(ty), opgen_dup(ok), opgen_dup(er),
+                                     opgen_dup(ha), std::move(extra)); .)
 .
 
 // backend "<header>" — the substrate header (frame_t/vm_t/heap_t) the consumer
@@ -607,15 +616,16 @@ TypeDecl <. std::vector<opgen::TypeDecl*>& list .>
 .
 
 MethodDecl <. std::vector<opgen::MethodDecl*>& list .>
-    (. bool native = false; const char* rty = nullptr; peg::Span ns;
+    (. bool native = false; bool inl = false; const char* rty = nullptr; peg::Span ns;
        std::vector<opgen::MethodParam*> params;
        std::vector<opgen::SemStmt*> body; .)
-    = [ "native" !ident_continue (. native = true; .) ]
+    = [ "inline" !ident_continue (. inl = true; .) ]
+      [ "native" !ident_continue (. native = true; .) ]
       MethodType<rty> ident<ns>
       "(" [ MethodParam<params> { "," MethodParam<params> } ] ")"
       ( ";"
       | "{" { SemBlockStmt<body> } "}" )
-      (. list.push_back(new opgen::MethodDecl(native, rty, opgen_dup(ns),
+      (. list.push_back(new opgen::MethodDecl(native, inl, rty, opgen_dup(ns),
              std::move(params), std::move(body))); .)
 .
 
@@ -632,5 +642,6 @@ JavaPrimType <. const char*& out .>
     | "double"  !ident_continue (. out = "double";  .)
     | "unsigned" !ident_continue (. out = "unsigned"; .)
     | "signed"   !ident_continue (. out = "signed";   .)
+    | "any"      !ident_continue (. out = "any";      .)
 .
 END Opgen.

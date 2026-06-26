@@ -28,7 +28,7 @@ void Parser::setup_skip() {
     set_whitespace([](char c) -> bool {
         return ((((c == 13) || (c == 10)) || (c == 9)) || (c == 32));
     });
-    set_comments({{"//", "\n", false}, {"/*", "*/", false}});
+    set_comments({{"//", "\n", false, false}, {"/*", "*/", false, false}});
 }
 
 

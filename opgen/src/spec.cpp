@@ -19,6 +19,7 @@ int Spec::type_bytes(ValueType ty) {
         case ValueType::TyI64:
         case ValueType::TyF64:   return 8;
         case ValueType::TyAny:   return 8;   // runtime-typed; max width for sizing
+        case ValueType::TyAddr:  return 8;   // addrtype i32/i64 — size as the max width
         case ValueType::TyV128:
         case ValueType::TyI8x16: case ValueType::TyI16x8: case ValueType::TyI32x4:
         case ValueType::TyI64x2: case ValueType::TyF32x4: case ValueType::TyF64x2:
@@ -57,6 +58,7 @@ int Spec::stack_slots(ValueType ty) const {
         case ValueType::TyI64:
         case ValueType::TyF64:   return 2;
         case ValueType::TyAny:   return 1;   // runtime-typed; 1/2 from the stack tag
+        case ValueType::TyAddr:  return 1;   // addrtype: always ONE slot (i32 or i64) in the single-slot model
         case ValueType::TyV128:
         case ValueType::TyI8x16: case ValueType::TyI16x8: case ValueType::TyI32x4:
         case ValueType::TyI64x2: case ValueType::TyF32x4: case ValueType::TyF64x2:
@@ -122,8 +124,15 @@ int Spec::compute_length(const Opcode* op) const {
     return total;
 }
 
+// §3b: an op with a variadic stack param (`count * ty name`) pops a runtime-determined number of operands.
+static bool has_variadic_stack(const Opcode* op) {
+    for (auto* s : op->stack_in)  if (s->count.has_value()) return true;
+    for (auto* s : op->stack_out) if (s->count.has_value()) return true;
+    return false;
+}
+
 int Spec::compute_sp_delta(const Opcode* op) const {
-    if (any_flag_starts_with(op, "special_")) return OPCD_VARIABLE;
+    if (any_flag_starts_with(op, "special_") || has_variadic_stack(op)) return OPCD_VARIABLE;
     int in = 0, out = 0;
     for (auto* s : op->stack_in)  in  += stack_slots(s->ty);
     for (auto* s : op->stack_out) out += stack_slots(s->ty);
@@ -131,7 +140,7 @@ int Spec::compute_sp_delta(const Opcode* op) const {
 }
 
 int Spec::compute_sp_pops(const Opcode* op) const {
-    if (any_flag_starts_with(op, "special_")) return OPCD_VARIABLE;
+    if (any_flag_starts_with(op, "special_") || has_variadic_stack(op)) return OPCD_VARIABLE;
     int in = 0;
     for (auto* s : op->stack_in) in += stack_slots(s->ty);
     return in;

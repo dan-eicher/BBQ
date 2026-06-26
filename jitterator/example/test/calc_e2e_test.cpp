@@ -17,18 +17,18 @@
 #define TAIL __attribute__((musttail))
 
 static const opcode_handler_t* g_table;
-extern "C" void wasm_next(vm_t* vm) {
+extern "C" void calc_next(vm_t* vm) {
     u1 op; if (!bbq_read_u8(&vm->frame.code, &op)) return;
     TAIL return g_table[op](vm);
 }
-extern "C" void wasm_trap(vm_t* vm) { vm->trapped = 1; }
+extern "C" void calc_trap(vm_t* vm) { vm->trapped = 1; }
 
 static s4 run_bytecode(const std::vector<uint8_t>& code) {
     static vm_t vm;
     g_table = gen_interp_dispatch_table();
     bbq_ctx_init(&vm.frame.code, code.data(), code.size());
     vm.frame.sp = 0; vm.depth = 0; vm.trapped = 0; vm.result.i = 0; vm.result_type = T_INT;
-    wasm_next(&vm);
+    calc_next(&vm);
     return vm.result.i;
 }
 

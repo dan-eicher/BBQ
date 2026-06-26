@@ -155,6 +155,9 @@ double  bbq_node_float(const bbq_field_capture* cap, const uint8_t* buf);
 /* Decode a prior field in scope as int by name (the field_ref spelling: array count
  * `[n]`, where-clause, switch back-reference). */
 int64_t bbq_view_i64(bbq_view_ctx_t* c, const char* name);
+/* Recover a prior non-scalar (Bytes/String/External) field in scope as its span —
+ * the field_ref spelling for a where-clause over such a field. */
+bbq_bytes_t bbq_view_bytes(bbq_view_ctx_t* c, const char* name);
 
 /* ── view-layer read points (the stencil sink: advance cursor + record span) ── */
 /* Record a computed value at the cursor (compute(...)/bitfield entry). The _val macro

@@ -1,7 +1,7 @@
 /*
  * calc_vm_test.c — runs calc bytecode through BOTH tiers of the opgen-generated
  * VM and asserts they agree. opgen turned calc.def into gen_interp.c (the
- * threaded interpreter) AND wasm_stencils.c (the copy-and-patch JIT stencils +
+ * threaded interpreter) AND calc_stencils.c (the copy-and-patch JIT stencils +
  * the generated machinery stencils). This drives:
  *   tier 0 — interp_run    (javelina's interp.c, smaller)
  *   tier 1 — jit_run        (javelina's jit_driver.c, stripped to the calc)
@@ -10,9 +10,9 @@
 #include "gen_interp.h"            /* dispatch-table accessor + runtime_api.h (vm_t, slot_t) */
 #include "opcodes.h"               /* OP_* */
 #include "bbq_runtime.h"           /* bbq_ctx_t + bbq_read_* */
-#include "wasm_stencil_table.h"    /* jitterator: stencil_table[], STENCIL_*, StencilDef, PatchEntry */
-#include "wasm_jit_meta.h"         /* opgen: wasm_jit_meta[256], jit_operand_kind_t */
-#include "wasm_jit_symbols.h"      /* opgen: _HOLE_<native> -> address */
+#include "calc_stencil_table.h"    /* jitterator: stencil_table[], STENCIL_*, StencilDef, PatchEntry */
+#include "calc_jit_meta.h"         /* opgen: calc_jit_meta[256], jit_operand_kind_t */
+#include "calc_jit_symbols.h"      /* opgen: _HOLE_<native> -> address */
 #include "jit_codebuf.h"           /* jitterator's executable code buffer */
 #include "calc_natives.h"          /* calc_br / calc_call / calc_ret (shared, both tiers) */
 #include <stdio.h>
@@ -24,18 +24,18 @@
 
 /* ── Tier 0: the threaded interpreter. ── */
 static const opcode_handler_t* g_table;
-void wasm_next(vm_t* vm) {
+void calc_next(vm_t* vm) {
     u1 op;
     if (!bbq_read_u8(&vm->frame.code, &op)) return;
     TAIL return g_table[op](vm);
 }
-void wasm_trap(vm_t* vm) { vm->trapped = 1; }
+void calc_trap(vm_t* vm) { vm->trapped = 1; }
 
 static s4 interp_run(vm_t* vm, const u1* code, size_t len) {
     g_table = gen_interp_dispatch_table();
     bbq_ctx_init(&vm->frame.code, code, len);
     vm->frame.sp = 0; vm->depth = 0; vm->trapped = 0; vm->result.i = 0; vm->result_type = T_INT;
-    wasm_next(vm);
+    calc_next(vm);
     return vm->result.i;
 }
 
@@ -79,7 +79,7 @@ static int find_hole(const StencilDef* d, const char* n) {
     return -1;
 }
 static void* jit_sym(const char* n) {
-    for (int i = 0; i < wasm_jit_symbols_count; i++) if (!strcmp(wasm_jit_symbols[i].name, n)) return wasm_jit_symbols[i].addr;
+    for (int i = 0; i < calc_jit_symbols_count; i++) if (!strcmp(calc_jit_symbols[i].name, n)) return calc_jit_symbols[i].addr;
     return NULL;
 }
 static void fill_native_holes(const StencilDef* d, uint64_t* v) {
@@ -128,7 +128,7 @@ static jit_func_t* jit_compile(bbq_ctx_t code) {
             sids[n] = STENCIL_GEN_ST_HALT; n++;
             break;
         }
-        wasm_jit_meta_t m = wasm_jit_meta[op];
+        calc_jit_meta_t m = calc_jit_meta[op];
         const StencilDef* def = &stencil_table[m.stencil];
         uint64_t vals[16] = {0};
         fill_native_holes(def, vals);
@@ -200,6 +200,18 @@ static void check(const char* msg, const u1* code, size_t len, s4 want) {
     } else printf("ok:   %-30s interp==jit==%d\n", msg, i);
 }
 
+/* The trap path (the CALC_TRAP status-extra native): assert BOTH tiers flag
+ * vm->trapped and stop before the trailing ret, so no result is delivered. */
+static void check_trap(const char* msg, const u1* code, size_t len) {
+    static vm_t vi, vj;
+    interp_run(&vi, code, len);
+    jit_run(&vj, code, len);
+    if (!vi.trapped || !vj.trapped) {
+        printf("FAIL: %-30s interp_trapped=%d jit_trapped=%d want both 1\n",
+               msg, vi.trapped, vj.trapped); fails++;
+    } else printf("ok:   %-30s interp==jit trapped\n", msg);
+}
+
 int main(void) {
     { static const u1 c[] = {0x01,0x03, 0x01,0x04, 0x02, 0x01,0x05, 0x04, 0x10};
       check("(3+4)*5", c, sizeof c, 35); }
@@ -215,6 +227,20 @@ int main(void) {
       check("br_if not taken", c, sizeof c, 7); }
     { static const u1 c[] = {0x01,0x02, 0x01,0x03, 0x08, 0x10};
       check("2 < 3", c, sizeof c, 1); }
+
+    /* Inline native (calc_abs): a DIRECT, folded call in both tiers — no _HOLE_
+     * patch, no jit-symbol. const -8 (sleb 0x78); abs; ret. */
+    { static const u1 c[] = {0x01,0x78, 0x14, 0x10};
+      check("abs(-8)", c, sizeof c, 8); }
+    { static const u1 c[] = {0x01,0x08, 0x14, 0x10};
+      check("abs(8)", c, sizeof c, 8); }
+
+    /* Status-extra native (calc_abort → CALC_TRAP). trap fires only when c != 0;
+     * not-taken falls through to `const 42; ret`. const c; trap; const 42; ret. */
+    { static const u1 c[] = {0x01,0x00, 0x15, 0x01,0x2A, 0x10};
+      check("trap not taken -> 42", c, sizeof c, 42); }
+    { static const u1 c[] = {0x01,0x05, 0x15, 0x01,0x2A, 0x10};
+      check_trap("trap taken", c, sizeof c); }
 
     /* Function calls — the call/ret natives are control transfers; both
      * tiers run the SAME calc_call/calc_ret, and OP_CALL's operands (sleb

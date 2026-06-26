@@ -56,6 +56,7 @@ typedef struct {
     const char* open;
     const char* close;
     bool nested;
+    bool structured;   /* skip a balanced ()-nested, string-aware token group (annotations); inner-comment awareness is a frame override */
 } peg_comment_spec;
 
 /* ── Parse error ─────────────────────────────────────────── */

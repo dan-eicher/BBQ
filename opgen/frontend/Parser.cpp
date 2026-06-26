@@ -32,7 +32,7 @@ void Parser::setup_skip() {
     set_whitespace([](char c) -> bool {
         return ((((c == 13) || (c == 10)) || (c == 9)) || (c == 32));
     });
-    set_comments({{"#", "\n", false}});
+    set_comments({{"#", "\n", false, false}});
 }
 
 
@@ -514,12 +514,12 @@ bool Parser::parse_FamilyDef(std::vector<opgen::Opcode*>& ops) {
              std::vector<opgen::StackParam*> nin;
              for (size_t i = 0; i < tin.size(); i++) {
                  opgen::ValueType ty = in_var[i] ? mvts[m] : tin[i]->ty;
-                 nin.push_back(new opgen::StackParam(ty, tin[i]->name, tin[i]->sem_expr));
+                 nin.push_back(new opgen::StackParam(ty, tin[i]->name, tin[i]->sem_expr, tin[i]->count));
              }
              std::vector<opgen::StackParam*> nout;
              for (size_t i = 0; i < tout.size(); i++) {
                  opgen::ValueType ty = out_var[i] ? mvts[m] : tout[i]->ty;
-                 nout.push_back(new opgen::StackParam(ty, tout[i]->name, tout[i]->sem_expr));
+                 nout.push_back(new opgen::StackParam(ty, tout[i]->name, tout[i]->sem_expr, tout[i]->count));
              }
              ops.push_back(new opgen::Opcode(
                  mnames[m], (int32_t)mhexes[m], (int32_t)msubs[m],
@@ -570,7 +570,7 @@ bool Parser::parse_FamilyStackParam(std::vector<opgen::StackParam*>& list, std::
         }()) restore(_m2);
     }
     var_flags.push_back(isvar);
-         list.push_back(new opgen::StackParam(ty, opgen_dup(ns), opgen_opt(sem_expr)));
+         list.push_back(new opgen::StackParam(ty, opgen_dup(ns), opgen_opt(sem_expr), opgen_opt((opgen::SemExpr*)nullptr)));
     return true;
 }
 
@@ -628,13 +628,25 @@ bool Parser::parse_OperandParam(std::vector<opgen::OperandParam*>& list) {
 
 bool Parser::parse_StackParam(std::vector<opgen::StackParam*>& list) {
     opgen::ValueType ty; peg::Span ns; peg::Span es;
-       const char* sem_expr = nullptr;
+       const char* sem_expr = nullptr; opgen::SemExpr* count = nullptr;
+    {
+        auto _m0 = save();
+        if (![&]() -> bool {
+            skip();
+            if (!match("[")) return false;
+            skip();
+            if (!parse_SemExpr(count)) return false;
+            skip();
+            if (!match("]")) return false;
+            return true;
+        }()) restore(_m0);
+    }
     skip();
     if (!parse_ValueType(ty)) return false;
     skip();
     if (!ident(ns)) return false;
     {
-        auto _m0 = save();
+        auto _m1 = save();
         if (![&]() -> bool {
             skip();
             if (!match("=")) return false;
@@ -642,9 +654,9 @@ bool Parser::parse_StackParam(std::vector<opgen::StackParam*>& list) {
             if (!string_lit(es)) return false;
             sem_expr = opgen_dup(es);
             return true;
-        }()) restore(_m0);
+        }()) restore(_m1);
     }
-    list.push_back(new opgen::StackParam(ty, opgen_dup(ns), opgen_opt(sem_expr)));
+    list.push_back(new opgen::StackParam(ty, opgen_dup(ns), opgen_opt(sem_expr), opgen_opt(count)));
     return true;
 }
 
@@ -687,7 +699,7 @@ bool Parser::parse_ValueType(opgen::ValueType& out) {
         restore(_m0);
         if ([&]() -> bool {
             skip();
-            if (!match("ref")) return false;
+            if (!match("addr")) return false;
             {
                 auto _m3 = save();
                 bool _ok3 = [&]() -> bool {
@@ -698,13 +710,13 @@ bool Parser::parse_ValueType(opgen::ValueType& out) {
                 restore(_m3);
                 if (_ok3) return false;
             }
-            out = opgen::ValueType::TyRef;
+            out = opgen::ValueType::TyAddr;
             return true;
         }()) {} else {
         restore(_m0);
         if ([&]() -> bool {
             skip();
-            if (!match("i64")) return false;
+            if (!match("ref")) return false;
             {
                 auto _m4 = save();
                 bool _ok4 = [&]() -> bool {
@@ -715,13 +727,13 @@ bool Parser::parse_ValueType(opgen::ValueType& out) {
                 restore(_m4);
                 if (_ok4) return false;
             }
-            out = opgen::ValueType::TyI64;
+            out = opgen::ValueType::TyRef;
             return true;
         }()) {} else {
         restore(_m0);
         if ([&]() -> bool {
             skip();
-            if (!match("i32")) return false;
+            if (!match("i64")) return false;
             {
                 auto _m5 = save();
                 bool _ok5 = [&]() -> bool {
@@ -732,13 +744,13 @@ bool Parser::parse_ValueType(opgen::ValueType& out) {
                 restore(_m5);
                 if (_ok5) return false;
             }
-            out = opgen::ValueType::TyI32;
+            out = opgen::ValueType::TyI64;
             return true;
         }()) {} else {
         restore(_m0);
         if ([&]() -> bool {
             skip();
-            if (!match("i16")) return false;
+            if (!match("i32")) return false;
             {
                 auto _m6 = save();
                 bool _ok6 = [&]() -> bool {
@@ -749,13 +761,13 @@ bool Parser::parse_ValueType(opgen::ValueType& out) {
                 restore(_m6);
                 if (_ok6) return false;
             }
-            out = opgen::ValueType::TyI16;
+            out = opgen::ValueType::TyI32;
             return true;
         }()) {} else {
         restore(_m0);
         if ([&]() -> bool {
             skip();
-            if (!match("i8")) return false;
+            if (!match("i16")) return false;
             {
                 auto _m7 = save();
                 bool _ok7 = [&]() -> bool {
@@ -766,13 +778,13 @@ bool Parser::parse_ValueType(opgen::ValueType& out) {
                 restore(_m7);
                 if (_ok7) return false;
             }
-            out = opgen::ValueType::TyI8;
+            out = opgen::ValueType::TyI16;
             return true;
         }()) {} else {
         restore(_m0);
         if ([&]() -> bool {
             skip();
-            if (!match("u16")) return false;
+            if (!match("i8")) return false;
             {
                 auto _m8 = save();
                 bool _ok8 = [&]() -> bool {
@@ -783,13 +795,13 @@ bool Parser::parse_ValueType(opgen::ValueType& out) {
                 restore(_m8);
                 if (_ok8) return false;
             }
-            out = opgen::ValueType::TyU16;
+            out = opgen::ValueType::TyI8;
             return true;
         }()) {} else {
         restore(_m0);
         if ([&]() -> bool {
             skip();
-            if (!match("u8")) return false;
+            if (!match("u16")) return false;
             {
                 auto _m9 = save();
                 bool _ok9 = [&]() -> bool {
@@ -800,13 +812,13 @@ bool Parser::parse_ValueType(opgen::ValueType& out) {
                 restore(_m9);
                 if (_ok9) return false;
             }
-            out = opgen::ValueType::TyU8;
+            out = opgen::ValueType::TyU16;
             return true;
         }()) {} else {
         restore(_m0);
         if ([&]() -> bool {
             skip();
-            if (!match("f64")) return false;
+            if (!match("u8")) return false;
             {
                 auto _m10 = save();
                 bool _ok10 = [&]() -> bool {
@@ -817,13 +829,13 @@ bool Parser::parse_ValueType(opgen::ValueType& out) {
                 restore(_m10);
                 if (_ok10) return false;
             }
-            out = opgen::ValueType::TyF64;
+            out = opgen::ValueType::TyU8;
             return true;
         }()) {} else {
         restore(_m0);
         if ([&]() -> bool {
             skip();
-            if (!match("f32")) return false;
+            if (!match("f64")) return false;
             {
                 auto _m11 = save();
                 bool _ok11 = [&]() -> bool {
@@ -834,13 +846,13 @@ bool Parser::parse_ValueType(opgen::ValueType& out) {
                 restore(_m11);
                 if (_ok11) return false;
             }
-            out = opgen::ValueType::TyF32;
+            out = opgen::ValueType::TyF64;
             return true;
         }()) {} else {
         restore(_m0);
         if ([&]() -> bool {
             skip();
-            if (!match("i8x16")) return false;
+            if (!match("f32")) return false;
             {
                 auto _m12 = save();
                 bool _ok12 = [&]() -> bool {
@@ -851,13 +863,13 @@ bool Parser::parse_ValueType(opgen::ValueType& out) {
                 restore(_m12);
                 if (_ok12) return false;
             }
-            out = opgen::ValueType::TyI8x16;
+            out = opgen::ValueType::TyF32;
             return true;
         }()) {} else {
         restore(_m0);
         if ([&]() -> bool {
             skip();
-            if (!match("i16x8")) return false;
+            if (!match("i8x16")) return false;
             {
                 auto _m13 = save();
                 bool _ok13 = [&]() -> bool {
@@ -868,13 +880,13 @@ bool Parser::parse_ValueType(opgen::ValueType& out) {
                 restore(_m13);
                 if (_ok13) return false;
             }
-            out = opgen::ValueType::TyI16x8;
+            out = opgen::ValueType::TyI8x16;
             return true;
         }()) {} else {
         restore(_m0);
         if ([&]() -> bool {
             skip();
-            if (!match("i32x4")) return false;
+            if (!match("i16x8")) return false;
             {
                 auto _m14 = save();
                 bool _ok14 = [&]() -> bool {
@@ -885,13 +897,13 @@ bool Parser::parse_ValueType(opgen::ValueType& out) {
                 restore(_m14);
                 if (_ok14) return false;
             }
-            out = opgen::ValueType::TyI32x4;
+            out = opgen::ValueType::TyI16x8;
             return true;
         }()) {} else {
         restore(_m0);
         if ([&]() -> bool {
             skip();
-            if (!match("i64x2")) return false;
+            if (!match("i32x4")) return false;
             {
                 auto _m15 = save();
                 bool _ok15 = [&]() -> bool {
@@ -902,13 +914,13 @@ bool Parser::parse_ValueType(opgen::ValueType& out) {
                 restore(_m15);
                 if (_ok15) return false;
             }
-            out = opgen::ValueType::TyI64x2;
+            out = opgen::ValueType::TyI32x4;
             return true;
         }()) {} else {
         restore(_m0);
         if ([&]() -> bool {
             skip();
-            if (!match("f32x4")) return false;
+            if (!match("i64x2")) return false;
             {
                 auto _m16 = save();
                 bool _ok16 = [&]() -> bool {
@@ -919,13 +931,13 @@ bool Parser::parse_ValueType(opgen::ValueType& out) {
                 restore(_m16);
                 if (_ok16) return false;
             }
-            out = opgen::ValueType::TyF32x4;
+            out = opgen::ValueType::TyI64x2;
             return true;
         }()) {} else {
         restore(_m0);
         if ([&]() -> bool {
             skip();
-            if (!match("f64x2")) return false;
+            if (!match("f32x4")) return false;
             {
                 auto _m17 = save();
                 bool _ok17 = [&]() -> bool {
@@ -936,13 +948,13 @@ bool Parser::parse_ValueType(opgen::ValueType& out) {
                 restore(_m17);
                 if (_ok17) return false;
             }
-            out = opgen::ValueType::TyF64x2;
+            out = opgen::ValueType::TyF32x4;
             return true;
         }()) {} else {
         restore(_m0);
         if ([&]() -> bool {
             skip();
-            if (!match("v128")) return false;
+            if (!match("f64x2")) return false;
             {
                 auto _m18 = save();
                 bool _ok18 = [&]() -> bool {
@@ -953,13 +965,13 @@ bool Parser::parse_ValueType(opgen::ValueType& out) {
                 restore(_m18);
                 if (_ok18) return false;
             }
-            out = opgen::ValueType::TyV128;
+            out = opgen::ValueType::TyF64x2;
             return true;
         }()) {} else {
         restore(_m0);
         if ([&]() -> bool {
             skip();
-            if (!match("funcref")) return false;
+            if (!match("v128")) return false;
             {
                 auto _m19 = save();
                 bool _ok19 = [&]() -> bool {
@@ -970,13 +982,13 @@ bool Parser::parse_ValueType(opgen::ValueType& out) {
                 restore(_m19);
                 if (_ok19) return false;
             }
-            out = opgen::ValueType::TyFuncRef;
+            out = opgen::ValueType::TyV128;
             return true;
         }()) {} else {
         restore(_m0);
         if ([&]() -> bool {
             skip();
-            if (!match("externref")) return false;
+            if (!match("funcref")) return false;
             {
                 auto _m20 = save();
                 bool _ok20 = [&]() -> bool {
@@ -987,13 +999,13 @@ bool Parser::parse_ValueType(opgen::ValueType& out) {
                 restore(_m20);
                 if (_ok20) return false;
             }
-            out = opgen::ValueType::TyExternRef;
+            out = opgen::ValueType::TyFuncRef;
             return true;
         }()) {} else {
         restore(_m0);
         if ([&]() -> bool {
             skip();
-            if (!match("i31ref")) return false;
+            if (!match("externref")) return false;
             {
                 auto _m21 = save();
                 bool _ok21 = [&]() -> bool {
@@ -1004,13 +1016,13 @@ bool Parser::parse_ValueType(opgen::ValueType& out) {
                 restore(_m21);
                 if (_ok21) return false;
             }
-            out = opgen::ValueType::TyI31Ref;
+            out = opgen::ValueType::TyExternRef;
             return true;
         }()) {} else {
         restore(_m0);
         if ([&]() -> bool {
             skip();
-            if (!match("uleb128")) return false;
+            if (!match("i31ref")) return false;
             {
                 auto _m22 = save();
                 bool _ok22 = [&]() -> bool {
@@ -1021,13 +1033,13 @@ bool Parser::parse_ValueType(opgen::ValueType& out) {
                 restore(_m22);
                 if (_ok22) return false;
             }
-            out = opgen::ValueType::TyUleb32;
+            out = opgen::ValueType::TyI31Ref;
             return true;
         }()) {} else {
         restore(_m0);
         if ([&]() -> bool {
             skip();
-            if (!match("uleb64")) return false;
+            if (!match("uleb128")) return false;
             {
                 auto _m23 = save();
                 bool _ok23 = [&]() -> bool {
@@ -1038,13 +1050,13 @@ bool Parser::parse_ValueType(opgen::ValueType& out) {
                 restore(_m23);
                 if (_ok23) return false;
             }
-            out = opgen::ValueType::TyUleb64;
+            out = opgen::ValueType::TyUleb32;
             return true;
         }()) {} else {
         restore(_m0);
         if ([&]() -> bool {
             skip();
-            if (!match("uleb32")) return false;
+            if (!match("uleb64")) return false;
             {
                 auto _m24 = save();
                 bool _ok24 = [&]() -> bool {
@@ -1055,13 +1067,13 @@ bool Parser::parse_ValueType(opgen::ValueType& out) {
                 restore(_m24);
                 if (_ok24) return false;
             }
-            out = opgen::ValueType::TyUleb32;
+            out = opgen::ValueType::TyUleb64;
             return true;
         }()) {} else {
         restore(_m0);
         if ([&]() -> bool {
             skip();
-            if (!match("sleb128")) return false;
+            if (!match("uleb32")) return false;
             {
                 auto _m25 = save();
                 bool _ok25 = [&]() -> bool {
@@ -1072,13 +1084,13 @@ bool Parser::parse_ValueType(opgen::ValueType& out) {
                 restore(_m25);
                 if (_ok25) return false;
             }
-            out = opgen::ValueType::TySleb32;
+            out = opgen::ValueType::TyUleb32;
             return true;
         }()) {} else {
         restore(_m0);
         if ([&]() -> bool {
             skip();
-            if (!match("sleb64")) return false;
+            if (!match("sleb128")) return false;
             {
                 auto _m26 = save();
                 bool _ok26 = [&]() -> bool {
@@ -1089,13 +1101,13 @@ bool Parser::parse_ValueType(opgen::ValueType& out) {
                 restore(_m26);
                 if (_ok26) return false;
             }
-            out = opgen::ValueType::TySleb64;
+            out = opgen::ValueType::TySleb32;
             return true;
         }()) {} else {
         restore(_m0);
         if ([&]() -> bool {
             skip();
-            if (!match("sleb32")) return false;
+            if (!match("sleb64")) return false;
             {
                 auto _m27 = save();
                 bool _ok27 = [&]() -> bool {
@@ -1106,13 +1118,13 @@ bool Parser::parse_ValueType(opgen::ValueType& out) {
                 restore(_m27);
                 if (_ok27) return false;
             }
-            out = opgen::ValueType::TySleb32;
+            out = opgen::ValueType::TySleb64;
             return true;
         }()) {} else {
         restore(_m0);
         if ([&]() -> bool {
             skip();
-            if (!match("memarg")) return false;
+            if (!match("sleb32")) return false;
             {
                 auto _m28 = save();
                 bool _ok28 = [&]() -> bool {
@@ -1123,23 +1135,113 @@ bool Parser::parse_ValueType(opgen::ValueType& out) {
                 restore(_m28);
                 if (_ok28) return false;
             }
+            out = opgen::ValueType::TySleb32;
+            return true;
+        }()) {} else {
+        restore(_m0);
+        if ([&]() -> bool {
+            skip();
+            if (!match("memarg")) return false;
+            {
+                auto _m29 = save();
+                bool _ok29 = [&]() -> bool {
+                    if (at_end() || !is_ident_continue(peek())) return false;
+                    advance();
+                    return true;
+                }();
+                restore(_m29);
+                if (_ok29) return false;
+            }
             out = opgen::ValueType::TyMemarg;
+            return true;
+        }()) {} else {
+        restore(_m0);
+        if ([&]() -> bool {
+            skip();
+            if (!match("blocktype")) return false;
+            {
+                auto _m30 = save();
+                bool _ok30 = [&]() -> bool {
+                    if (at_end() || !is_ident_continue(peek())) return false;
+                    advance();
+                    return true;
+                }();
+                restore(_m30);
+                if (_ok30) return false;
+            }
+            out = opgen::ValueType::TyBlockType;
+            return true;
+        }()) {} else {
+        restore(_m0);
+        if ([&]() -> bool {
+            skip();
+            if (!match("brtable")) return false;
+            {
+                auto _m31 = save();
+                bool _ok31 = [&]() -> bool {
+                    if (at_end() || !is_ident_continue(peek())) return false;
+                    advance();
+                    return true;
+                }();
+                restore(_m31);
+                if (_ok31) return false;
+            }
+            out = opgen::ValueType::TyBrTable;
+            return true;
+        }()) {} else {
+        restore(_m0);
+        if ([&]() -> bool {
+            skip();
+            if (!match("trytable")) return false;
+            {
+                auto _m32 = save();
+                bool _ok32 = [&]() -> bool {
+                    if (at_end() || !is_ident_continue(peek())) return false;
+                    advance();
+                    return true;
+                }();
+                restore(_m32);
+                if (_ok32) return false;
+            }
+            out = opgen::ValueType::TyTryTable;
+            return true;
+        }()) {} else {
+        restore(_m0);
+        if ([&]() -> bool {
+            skip();
+            if (!match("selectvec")) return false;
+            {
+                auto _m33 = save();
+                bool _ok33 = [&]() -> bool {
+                    if (at_end() || !is_ident_continue(peek())) return false;
+                    advance();
+                    return true;
+                }();
+                restore(_m33);
+                if (_ok33) return false;
+            }
+            out = opgen::ValueType::TySelectVec;
             return true;
         }()) {} else {
         restore(_m0);
         skip();
         if (!match("any")) return false;
         {
-            auto _m29 = save();
-            bool _ok29 = [&]() -> bool {
+            auto _m34 = save();
+            bool _ok34 = [&]() -> bool {
                 if (at_end() || !is_ident_continue(peek())) return false;
                 advance();
                 return true;
             }();
-            restore(_m29);
-            if (_ok29) return false;
+            restore(_m34);
+            if (_ok34) return false;
         }
         out = opgen::ValueType::TyAny;
+        }
+        }
+        }
+        }
+        }
         }
         }
         }
@@ -2334,7 +2436,8 @@ bool Parser::parse_MethodParam(std::vector<opgen::MethodParam*>& list) {
 }
 
 bool Parser::parse_StatusDecl(std::optional<opgen::StatusDecl*>& out) {
-    peg::Span ty; peg::Span ok; peg::Span er; peg::Span ha;
+    peg::Span ty; peg::Span ok; peg::Span er; peg::Span ha; peg::Span ex;
+       std::vector<const char*> extra;
     skip();
     if (!match("status")) return false;
     {
@@ -2355,8 +2458,32 @@ bool Parser::parse_StatusDecl(std::optional<opgen::StatusDecl*>& out) {
     if (!ident(er)) return false;
     skip();
     if (!ident(ha)) return false;
-    out = new opgen::StatusDecl(opgen_dup(ty), opgen_dup(ok),
-                                     opgen_dup(er), opgen_dup(ha));
+    {
+        auto _m1 = save();
+        if (![&]() -> bool {
+            skip();
+            if (!match("[")) return false;
+            skip();
+            if (!ident(ex)) return false;
+            extra.push_back(opgen_dup(ex));
+            for (;;) {
+                auto _m2 = save();
+                if (![&]() -> bool {
+                    skip();
+                    if (!match(",")) return false;
+                    skip();
+                    if (!ident(ex)) return false;
+                    extra.push_back(opgen_dup(ex));
+                    return true;
+                }()) { restore(_m2); break; }
+            }
+            skip();
+            if (!match("]")) return false;
+            return true;
+        }()) restore(_m1);
+    }
+    out = new opgen::StatusDecl(opgen_dup(ty), opgen_dup(ok), opgen_dup(er),
+                                     opgen_dup(ha), std::move(extra));
     return true;
 }
 
@@ -2410,14 +2537,14 @@ bool Parser::parse_TypeDecl(std::vector<opgen::TypeDecl*>& list) {
 }
 
 bool Parser::parse_MethodDecl(std::vector<opgen::MethodDecl*>& list) {
-    bool native = false; const char* rty = nullptr; peg::Span ns;
+    bool native = false; bool inl = false; const char* rty = nullptr; peg::Span ns;
        std::vector<opgen::MethodParam*> params;
        std::vector<opgen::SemStmt*> body;
     {
         auto _m0 = save();
         if (![&]() -> bool {
             skip();
-            if (!match("native")) return false;
+            if (!match("inline")) return false;
             {
                 auto _m1 = save();
                 bool _ok1 = [&]() -> bool {
@@ -2428,9 +2555,28 @@ bool Parser::parse_MethodDecl(std::vector<opgen::MethodDecl*>& list) {
                 restore(_m1);
                 if (_ok1) return false;
             }
-            native = true;
+            inl = true;
             return true;
         }()) restore(_m0);
+    }
+    {
+        auto _m2 = save();
+        if (![&]() -> bool {
+            skip();
+            if (!match("native")) return false;
+            {
+                auto _m3 = save();
+                bool _ok3 = [&]() -> bool {
+                    if (at_end() || !is_ident_continue(peek())) return false;
+                    advance();
+                    return true;
+                }();
+                restore(_m3);
+                if (_ok3) return false;
+            }
+            native = true;
+            return true;
+        }()) restore(_m2);
     }
     skip();
     if (!parse_MethodType(rty)) return false;
@@ -2439,22 +2585,22 @@ bool Parser::parse_MethodDecl(std::vector<opgen::MethodDecl*>& list) {
     skip();
     if (!match("(")) return false;
     {
-        auto _m2 = save();
+        auto _m4 = save();
         if (![&]() -> bool {
             skip();
             if (!parse_MethodParam(params)) return false;
             for (;;) {
-                auto _m3 = save();
+                auto _m5 = save();
                 if (![&]() -> bool {
                     skip();
                     if (!match(",")) return false;
                     skip();
                     if (!parse_MethodParam(params)) return false;
                     return true;
-                }()) { restore(_m3); break; }
+                }()) { restore(_m5); break; }
             }
             return true;
-        }()) restore(_m2);
+        }()) restore(_m4);
     }
     skip();
     if (!match(")")) return false;
@@ -2466,17 +2612,17 @@ bool Parser::parse_MethodDecl(std::vector<opgen::MethodDecl*>& list) {
         skip();
         if (!match("{")) return false;
         for (;;) {
-            auto _m4 = save();
+            auto _m6 = save();
             if (![&]() -> bool {
                 skip();
                 if (!parse_SemBlockStmt(body)) return false;
                 return true;
-            }()) { restore(_m4); break; }
+            }()) { restore(_m6); break; }
         }
         skip();
         if (!match("}")) return false;
     }
-    list.push_back(new opgen::MethodDecl(native, rty, opgen_dup(ns),
+    list.push_back(new opgen::MethodDecl(native, inl, rty, opgen_dup(ns),
              std::move(params), std::move(body)));
     return true;
 }
@@ -2671,19 +2817,37 @@ bool Parser::parse_JavaPrimType(const char*& out) {
             return true;
         }()) {} else {
         restore(_m0);
+        if ([&]() -> bool {
+            skip();
+            if (!match("signed")) return false;
+            {
+                auto _m12 = save();
+                bool _ok12 = [&]() -> bool {
+                    if (at_end() || !is_ident_continue(peek())) return false;
+                    advance();
+                    return true;
+                }();
+                restore(_m12);
+                if (_ok12) return false;
+            }
+            out = "signed";
+            return true;
+        }()) {} else {
+        restore(_m0);
         skip();
-        if (!match("signed")) return false;
+        if (!match("any")) return false;
         {
-            auto _m12 = save();
-            bool _ok12 = [&]() -> bool {
+            auto _m13 = save();
+            bool _ok13 = [&]() -> bool {
                 if (at_end() || !is_ident_continue(peek())) return false;
                 advance();
                 return true;
             }();
-            restore(_m12);
-            if (_ok12) return false;
+            restore(_m13);
+            if (_ok13) return false;
         }
-        out = "signed";
+        out = "any";
+        }
         }
         }
         }

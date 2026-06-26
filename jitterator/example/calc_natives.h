@@ -48,9 +48,19 @@ calc_status_t calc_call(vm_t* vm, heap_t* h, s4 entry, s4 nargs) {
     f->sp -= (u4)nargs;                      /* consume args; result returns here */
     vm->callstack[vm->depth++] = *f;         /* the reified continuation */
     f->sp = 0;                               /* fresh callee operand stack */
-    for (s4 i = 0; i < nargs; i++) { f->locals[i] = argv[i]; f->local_types[i] = argt[i]; }
+    for (s4 i = 0; i < nargs; i++) { f->local_slots[i] = argv[i]; f->local_slot_types[i] = argt[i]; }
     bbq_seek(&f->code, (size_t)entry);
     return CALC_OK;
+}
+
+/* Abort the program: flag the trap and seek to the end so the threaded loop
+ * stops (the same halt mechanism as calc_ret's top level). Returns the CALC_TRAP
+ * extra status — the calc_status_t value opgen widened the enum to include. */
+calc_status_t calc_abort(vm_t* vm, heap_t* h, s4 code) {
+    (void)h; (void)code;
+    vm->trapped = 1;
+    bbq_seek(&vm->frame.code, bbq_total_size(&vm->frame.code));
+    return CALC_TRAP;
 }
 
 /* Return v to the caller (restore frame, push result), or deliver the

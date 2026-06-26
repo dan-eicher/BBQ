@@ -35,6 +35,7 @@ jrow SemLowerer::jtype(ValueType t) const {
     case ValueType::TyF32:   return jrow{"f4",    "f4",    1, 'f'};  // JVM float
     case ValueType::TyF64:   return jrow{"f8",    "f8",    2, 'f'};  // JVM double
     case ValueType::TyAny:   return jrow{"any_t", "any_t", 1, 'i'};  // runtime-typed
+    case ValueType::TyAddr:  return jrow{"u8",    "u8",    1, 'l'};  // WASM addrtype: 1 slot; GPOP_ADDR (custom) picks .i/.l by the stack tag
     case ValueType::TyV128:  return jrow{"v128_t", "v128_t", 1, 'v'};  // WASM SIMD
     case ValueType::TyI8x16: case ValueType::TyI16x8: case ValueType::TyI32x4:
     case ValueType::TyI64x2: case ValueType::TyF32x4: case ValueType::TyF64x2:
@@ -47,6 +48,11 @@ jrow SemLowerer::jtype(ValueType t) const {
     case ValueType::TySleb32:    return jrow{"s4", "u4", 1, 's'};
     case ValueType::TySleb64:    return jrow{"s8", "u8", 1, 's'};
     case ValueType::TyMemarg:    return jrow{"u8", "u8", 1, 's'};
+    case ValueType::TyBlockType: return jrow{"s4", "u4", 1, 's'};   // s33 carrier; the trailing heaptype (0x63/0x64) is skipped by the reader, not bound
+    // Variable-length tail immediates (br_table / try_table / select type vector):
+    // not value-stack slots — the op's native decodes them, so no slot carrier applies.
+    case ValueType::TyBrTable: case ValueType::TyTryTable: case ValueType::TySelectVec:
+        break;
     }
     return jrow{"s4", "u4", 2, 's'};
 }
@@ -62,6 +68,7 @@ const char* SemLowerer::java_c(const char* jt) {
     if (!strcmp(jt, "float"))   return "f4";
     if (!strcmp(jt, "double"))  return "f8";
     if (!strcmp(jt, "boolean")) return "s1";
+    if (!strcmp(jt, "any"))     return "any_t";
     return "s4";
 }
 
@@ -101,6 +108,7 @@ const char* SemLowerer::fetch_fn(ValueType t) {
     case ValueType::TyUleb64: return "bbq_read_uleb128_u64";
     case ValueType::TySleb32: return "bbq_read_sleb128_i32";
     case ValueType::TySleb64: return "bbq_read_sleb128_i64";
+    case ValueType::TyBlockType: return "bbq_read_sleb128_i32";   // base s33 read; trailing heaptype skipped separately (vmemit)
     case ValueType::TyF32:    return "bbq_read_f32le";
     case ValueType::TyF64:    return "bbq_read_f64le";
     default:                  return nullptr;
@@ -134,6 +142,7 @@ const char* SemLowerer::slot_class(ValueType t) {
     if (t == ValueType::TyI32 || t == ValueType::TyDword) return "INT";
     if (t == ValueType::TyWord) return "WORD";
     if (t == ValueType::TyAny) return "ANY";
+    if (t == ValueType::TyAddr) return "ADDR";
     return "I16";
 }
 
@@ -154,7 +163,7 @@ void SemLowerer::int_slot_view(char* fld, const char** islot, const char** uw, i
             int bits = scalar_bits(r.scalar);
             if (bits > best) {
                 best = bits; *fld = r.field; *islot = r.scalar; *w = bits;
-                *uw = (bits <= 16) ? "u2" : "u4";
+                *uw = (bits <= 16) ? "u2" : (bits <= 32) ? "u4" : "u8";
             }
         }
     }
@@ -175,49 +184,56 @@ const char* SemLowerer::slot_index_tag_array(const SemExpr* e) const {
     if (idx->base->tag != SemExprTag::SIdent) return nullptr;
     const char* b = static_cast<const SIdent*>(idx->base)->name;
     if (!strcmp(b, "locals"))  return "f->local_types";
-    if (!strcmp(b, "globals")) return "vm->global_types";
+    if (!strcmp(b, "globals")) return "vm->frame.ctx->global_types";   // §8: globals via the active instance context
     return nullptr;
 }
 
+// globalinst access goes through the GLOBAL_GET/SET/TAG_SET vocabulary macros — opgen emits a
+// generated default (vm->globals[i][0]; held BY REFERENCE so an entry aliases its defining instance's
+// slot, sharing a mutable imported global), which a backend may override (#ifndef) to point the access
+// at a different shape (e.g. an instance-context global table) WITHOUT changing this lowering.
 void SemLowerer::lower_global_read(const Opcode* op, const SemExpr* idx, ValueType rt) {
-    fputs("(vm->globals[", out_); lower_expr(idx, op, rt); fputs("])", out_);
+    fputs("GLOBAL_GET(", out_); lower_expr(idx, op, rt); fputs(")", out_);
 }
 
 void SemLowerer::lower_global_store(const Opcode* op, const SemExpr* idx, const SemExpr* val) {
-    fputs("    vm->globals[", out_); lower_expr(idx, op, ValueType::TyI32); fputs("] = ", out_);
-    lower_expr(val, op, ValueType::TyWord); fputs(";\n", out_);
+    fputs("    GLOBAL_SET(", out_); lower_expr(idx, op, ValueType::TyI32); fputs(", ", out_);
+    lower_expr(val, op, ValueType::TyWord); fputs(");\n", out_);
     if (val->tag == SemExprTag::SIdent) {
-        fputs("    vm->global_types[", out_); lower_expr(idx, op, ValueType::TyI32);
-        fprintf(out_, "] = %s_wt;\n", static_cast<const SIdent*>(val)->name);
+        fputs("    GLOBAL_TAG_SET(", out_); lower_expr(idx, op, ValueType::TyI32);
+        fprintf(out_, ", %s_wt);\n", static_cast<const SIdent*>(val)->name);
     }
 }
 
+// localinst access goes through LOCAL_SLOT (the generated default `f->locals[i]`, backend-overridable)
+// — the value-model field selector (.i/.l/.r) stays here (it IS the value model, parameterized by the
+// backend's type rows). LOCAL_TAG_SET records the runtime type tag for whole-slot moves + GC roots.
 void SemLowerer::lower_local_read(const Opcode* op, const SemExpr* idx, ValueType rt) {
     if (local_vt(op) == ValueType::TyWord) {
-        fputs("(f->locals[", out_); lower_expr(idx, op, rt); fputs("])", out_);
+        fputs("(LOCAL_SLOT(", out_); lower_expr(idx, op, rt); fputs("))", out_);
         return;
     }
     jrow r = jtype(local_vt(op));
     if (r.field == 'r') {
-        fputs("(f->locals[", out_); lower_expr(idx, op, rt); fputs("].r)", out_);
+        fputs("(LOCAL_SLOT(", out_); lower_expr(idx, op, rt); fputs(").r)", out_);
     } else if (r.slots == 1) {
-        fputs("(f->locals[", out_); lower_expr(idx, op, rt); fprintf(out_, "].%c)", r.field);
+        fputs("(LOCAL_SLOT(", out_); lower_expr(idx, op, rt); fprintf(out_, ").%c)", r.field);
     } else {
         char ic; const char* islot; const char* uw; int w;
         int_slot_view(&ic, &islot, &uw, &w); (void)islot;
         if (r.scalar[0] == 'f') {
-            fprintf(out_, "(__extension__ ({ union { %s w; %s u; } _x; _x.u = ((%s)(%s)f->locals[",
+            fprintf(out_, "(__extension__ ({ union { %s w; %s u; } _x; _x.u = ((%s)(%s)LOCAL_SLOT(",
                     r.scalar, r.uscalar, r.uscalar, uw);
             lower_expr(idx, op, rt);
-            fprintf(out_, "].%c) | (((%s)(%s)f->locals[(", ic, r.uscalar, uw);
+            fprintf(out_, ").%c) | (((%s)(%s)LOCAL_SLOT((", ic, r.uscalar, uw);
             lower_expr(idx, op, rt);
-            fprintf(out_, ")+1].%c) << %d); _x.w; }))", ic, w);
+            fprintf(out_, ")+1).%c) << %d); _x.w; }))", ic, w);
         } else {
-            fprintf(out_, "(((%s)(%s)f->locals[", r.scalar, uw);
+            fprintf(out_, "(((%s)(%s)LOCAL_SLOT(", r.scalar, uw);
             lower_expr(idx, op, rt);
-            fprintf(out_, "].%c) | (((%s)f->locals[(", ic, r.scalar);
+            fprintf(out_, ").%c) | (((%s)LOCAL_SLOT((", ic, r.scalar);
             lower_expr(idx, op, rt);
-            fprintf(out_, ")+1].%c) << %d))", ic, w);
+            fprintf(out_, ")+1).%c) << %d))", ic, w);
         }
     }
 }
@@ -247,7 +263,7 @@ void SemLowerer::emit_arg(const SemExpr* a, const Opcode* op, ValueType at) {
 
 bool SemLowerer::is_intrinsic(const char* n) {
     static const char* names[] = { "sqrt","fabs","ceil","floor","ftrunc","nearest",
-        "fmin","fmax","copysign","clz","ctz","popcnt","rotl","rotr","reinterpret", nullptr };
+        "fmin","fmax","copysign","clz","ctz","popcnt","rotl","rotr","reinterpret","push","pop", nullptr };
     for (int i = 0; names[i]; i++) if (!strcmp(n, names[i])) return true;
     return false;
 }
@@ -262,6 +278,18 @@ void SemLowerer::lower_intrinsic(const SemExpr* e, const Opcode* op, ValueType r
     int wide = scalar_bits(c_scalar(at)) >= 64;
     int W = scalar_bits(c_scalar(at)), Msk = W - 1;
     const char* u = c_unsigned(at); const char* sc = c_scalar(at);
+
+    // push(v): a control-conditional value push (the signature can't express a push on only one path,
+    // e.g. br_on_null re-pushing the non-null ref). v is an any_t; GPUSH_ANY rides its runtime tag.
+    if (!strcmp(n,"push")) {
+        fputs("GPUSH_ANY(", out_); lower_expr(a0, op, ValueType::TyAny); fputc(')', out_); return;
+    }
+    // pop(): pop one slot as an any_t (value + runtime tag) — the mirror of push(), for the variadic
+    // constructors (struct.new/array.new_fixed) which pop their fields in the body AFTER allocating, so
+    // the fields stay GC-rooted on the stack across the alloc. Decrement sp, then read the slot + tag.
+    if (!strcmp(n,"pop")) {
+        fputs("(JV_SP--, (any_t){ .bits = JV_STK[JV_SP].l, .kind = JV_STKT[JV_SP] })", out_); return;
+    }
 
     const char* fn = nullptr;
     if      (!strcmp(n,"sqrt"))    fn = wide ? "sqrt"  : "sqrtf";
@@ -341,17 +369,21 @@ void SemLowerer::emit_native_fnptr_cast(const MethodDecl* md) {
 void SemLowerer::lower_call(const SemExpr* e, const Opcode* op, ValueType rt) {
     auto* call = static_cast<const SCall*>(e);
     if (is_intrinsic(call->name)) { lower_intrinsic(e, op, rt); return; }
+    // Domain natives (GC element/field reads, table size, ref tests, …) are NOT special-cased here:
+    // they are ordinary `inline native` declarations in the spec, lowered through the generic native
+    // path below to a direct `name(NATIVE_ARGS, …)` call that folds a backend `static inline`/macro.
     const MethodDecl* md = find_method(call->name);
     if (!md) {
         fprintf(stderr, "opgen: call to undeclared built-in '%s' in %s\n",
                 call->name, op->mnemonic);
         return;
     }
-    if (mode_ == Mode::Stencil) {
+    native_called_ = true;   // a native may set vm->trapped → the stencil must check + bail (see emit_one_opcode)
+    if (mode_ == Mode::Stencil && !md->inl) {   // inline natives emit a DIRECT call (folds a static-inline backend fn); regular natives ride a _HOLE_ patch point
         fputs("((", out_); emit_native_fnptr_cast(md);
-        fprintf(out_, "(uintptr_t)_HOLE_%s)(vm, vm->heap", call->name);
+        fprintf(out_, "(uintptr_t)_HOLE_%s)(NATIVE_ARGS", call->name);
     } else {
-        fprintf(out_, "(%s(vm, vm->heap", call->name);
+        fprintf(out_, "(%s(NATIVE_ARGS", call->name);
     }
     for (auto* a : call->args) { fputs(", ", out_); lower_expr(a, op, rt); }
     fputs("))", out_);
@@ -417,10 +449,20 @@ void SemLowerer::lower_expr(const SemExpr* e, const Opcode* op, ValueType rt) {
     case SemExprTag::SIndex: {
         auto* ix = static_cast<const SIndex*>(e);
         const SemExpr* base = ix->base;
+        const char* bnm = base->tag == SemExprTag::SIdent ? static_cast<const SIdent*>(base)->name : nullptr;
+        const StackParam* vp = nullptr;   // §3b variadic stack param? (name[i] reads the in-place operand slice)
+        if (bnm) for (auto* si : op->stack_in) if (!strcmp(si->name, bnm) && si->count.has_value()) { vp = si; break; }
         int _lc = 0; const char* _lf = nullptr;
-        if (base->tag == SemExprTag::SIdent)
-            lane_elem(type_of_name(op, static_cast<const SIdent*>(base)->name), &_lc, &_lf);
-        if (_lc) {
+        if (base->tag == SemExprTag::SIdent && !vp)
+            lane_elem(type_of_name(op, bnm), &_lc, &_lf);
+        if (vp) {   // read the i-th variadic operand in place as an any_t (value + runtime tag)
+            fprintf(out_, "((any_t){ .bits = _vb_%s[", bnm);
+            lower_expr(ix->index, op, ValueType::TyI32);
+            fprintf(out_, "].l, .kind = _vt_%s[", bnm);
+            lower_expr(ix->index, op, ValueType::TyI32);
+            fputs("] })", out_);
+        }
+        else if (_lc) {
             fprintf(out_, "%s.%s[", static_cast<const SIdent*>(base)->name, _lf);
             lower_expr(ix->index, op, ValueType::TyI32); fputc(']', out_);
         }
@@ -439,7 +481,8 @@ void SemLowerer::lower_expr(const SemExpr* e, const Opcode* op, ValueType rt) {
     case SemExprTag::SIdent: {
         auto* id = static_cast<const SIdent*>(e);
         int lc; const char* lf;
-        if (!strcmp(id->name, "sp"))      fputs("f->sp", out_);
+        if (!strcmp(id->name, "sp"))      fputs("JV_SP", out_);
+        else if (!strcmp(id->name, "stp")) fputs("f->stp", out_);   // side-table pointer: control ops advance it on fall-through
         else if (!strcmp(id->name, "pc")) fputs("f->pc", out_);
         else if (lane_ && !strcmp(id->name, "lane")) fputs("_k", out_);
         else if (lane_ && (lane_elem(type_of_name(op, id->name), &lc, &lf), lc))
@@ -464,21 +507,21 @@ void SemLowerer::lower_expr(const SemExpr* e, const Opcode* op, ValueType rt) {
 void SemLowerer::lower_local_store(const Opcode* op, const SemExpr* idx, const SemExpr* val) {
     ValueType lt = local_vt(op);
     if (lt == ValueType::TyWord) {
-        fputs("    f->locals[", out_); lower_expr(idx, op, lt); fputs("] = ", out_);
+        fputs("    LOCAL_SLOT(", out_); lower_expr(idx, op, lt); fputs(") = ", out_);
         lower_expr(val, op, lt); fputs(";\n", out_);
         if (val->tag == SemExprTag::SIdent) {
-            fputs("    f->local_types[", out_); lower_expr(idx, op, lt);
-            fprintf(out_, "] = %s_wt;\n", static_cast<const SIdent*>(val)->name);
+            fputs("    LOCAL_TAG_SET(", out_); lower_expr(idx, op, lt);
+            fprintf(out_, ", %s_wt);\n", static_cast<const SIdent*>(val)->name);
         }
         return;
     }
     jrow r = jtype(lt);
     if (r.field == 'r') {
-        fputs("    f->locals[", out_); lower_expr(idx, op, lt); fputs("].r = (ref_t)(", out_);
+        fputs("    LOCAL_SLOT(", out_); lower_expr(idx, op, lt); fputs(").r = (ref_t)(", out_);
         lower_expr(val, op, lt); fputs(");\n", out_);
     } else if (r.slots == 1) {
-        fputs("    f->locals[", out_); lower_expr(idx, op, lt);
-        fprintf(out_, "].%c = (%s)(", r.field, r.scalar);
+        fputs("    LOCAL_SLOT(", out_); lower_expr(idx, op, lt);
+        fprintf(out_, ").%c = (%s)(", r.field, r.scalar);
         lower_expr(val, op, lt); fputs(");\n", out_);
     } else {
         char ic; const char* islot; const char* uw; int w;
@@ -486,45 +529,55 @@ void SemLowerer::lower_local_store(const Opcode* op, const SemExpr* idx, const S
         if (r.scalar[0] == 'f') {
             fprintf(out_, "    { union { %s w; %s u; } _x; _x.w = (", r.scalar, r.uscalar);
             lower_expr(val, op, lt); fputs(");\n", out_);
-            fputs("      f->locals[", out_); lower_expr(idx, op, lt);
-            fprintf(out_, "].%c = (%s)(_x.u);\n", ic, islot);
-            fputs("      f->locals[(", out_); lower_expr(idx, op, lt);
-            fprintf(out_, ")+1].%c = (%s)(_x.u >> %d); }\n", ic, islot, w);
+            fputs("      LOCAL_SLOT(", out_); lower_expr(idx, op, lt);
+            fprintf(out_, ").%c = (%s)(_x.u);\n", ic, islot);
+            fputs("      LOCAL_SLOT((", out_); lower_expr(idx, op, lt);
+            fprintf(out_, ")+1).%c = (%s)(_x.u >> %d); }\n", ic, islot, w);
         } else {
             fprintf(out_, "    { %s _v = (", r.scalar);
             lower_expr(val, op, lt); fputs(");\n", out_);
-            fputs("      f->locals[", out_); lower_expr(idx, op, lt);
-            fprintf(out_, "].%c = (%s)(_v);\n", ic, islot);
-            fputs("      f->locals[(", out_); lower_expr(idx, op, lt);
-            fprintf(out_, ")+1].%c = (%s)(_v >> %d); }\n", ic, islot, w);
+            fputs("      LOCAL_SLOT(", out_); lower_expr(idx, op, lt);
+            fprintf(out_, ").%c = (%s)(_v);\n", ic, islot);
+            fputs("      LOCAL_SLOT((", out_); lower_expr(idx, op, lt);
+            fprintf(out_, ")+1).%c = (%s)(_v >> %d); }\n", ic, islot, w);
         }
     }
 }
 
 void SemLowerer::lower_void_call(const SemExpr* e, const Opcode* op) {
     auto* call = static_cast<const SCall*>(e);
+    if (is_intrinsic(call->name)) {   // a statement-level intrinsic (e.g. push(v)) — emit it as a statement
+        fputs("    ", out_); lower_intrinsic(e, op, ValueType::TyI32); fputs(";\n", out_);
+        return;
+    }
+    // Statement-level domain natives (GC element/field writes, addr-result push, the control
+    // transfers transfer()/func_return()) are ordinary spec declarations: a void `inline native`
+    // for the stores/pushes, an `inline native status` for the control transfers (the status return
+    // routes them through the generic control path below — bake _HOLE_ip, call, resync). No special
+    // case here; the backend supplies each via a `static inline`/macro of the same name.
     const MethodDecl* md = find_method(call->name);
     if (!md) {
         fprintf(stderr, "opgen: call to undeclared built-in '%s' in %s\n",
                 call->name, op->mnemonic);
         return;
     }
+    native_called_ = true;   // may set vm->trapped; non-status (non-resync) natives need the stencil trap-check
     int ctrl = !strcmp(md->ret_ty, "status");
     if (mode_ == Mode::Stencil && ctrl)
         fputs("    vm->frame.code.pos = (size_t)_HOLE_ip;\n", out_);
     fputs("    ", out_);
-    if (mode_ == Mode::Stencil) {
+    if (mode_ == Mode::Stencil && !md->inl) {   // inline natives emit a DIRECT call (folds a static-inline backend fn); regular natives ride a _HOLE_ patch point
         fputs("((", out_); emit_native_fnptr_cast(md);
-        fprintf(out_, "(uintptr_t)_HOLE_%s)(vm, vm->heap", call->name);
+        fprintf(out_, "(uintptr_t)_HOLE_%s)(NATIVE_ARGS", call->name);
     } else {
-        fprintf(out_, "%s(vm, vm->heap", call->name);
+        fprintf(out_, "%s(NATIVE_ARGS", call->name);
     }
     for (auto* a : call->args) { fputs(", ", out_); lower_expr(a, op, ValueType::TyI32); }
-    if (mode_ == Mode::Stencil) fputs("));\n", out_);
-    else                        fputs(");\n", out_);
+    if (mode_ == Mode::Stencil && !md->inl) fputs("));\n", out_);   // close the extra `(` of the _HOLE_ fn-ptr cast; a direct inline-native call has one less
+    else                                    fputs(");\n", out_);
     if (ctrl) {
         if (mode_ == Mode::Stencil) fputs("    TAIL return _HOLE_resync(vm);\n", out_);
-        else                        fputs("    TAIL return wasm_next(vm);\n", out_);
+        else                        fprintf(out_, "    TAIL return %s_next(vm);\n", prefix_.c_str());
     }
 }
 
@@ -559,14 +612,53 @@ bool SemLowerer::is_slot_index(const SemExpr* e) {
 }
 const char* SemLowerer::slot_val_arr(const SemExpr* e) {
     auto* ix = static_cast<const SIndex*>(e);
-    return !strcmp(static_cast<const SIdent*>(ix->base)->name, "stack") ? "f->stack" : "scratch";
+    return !strcmp(static_cast<const SIdent*>(ix->base)->name, "stack") ? "JV_STK" : "scratch";
 }
 const char* SemLowerer::slot_tag_arr(const SemExpr* e) {
     auto* ix = static_cast<const SIndex*>(e);
-    return !strcmp(static_cast<const SIdent*>(ix->base)->name, "stack") ? "f->stack_types" : "scratch_t";
+    return !strcmp(static_cast<const SIdent*>(ix->base)->name, "stack") ? "JV_STKT" : "scratch_t";
 }
 
 // ── Statement lowering ──────────────────────────────────────
+
+// A literal-init local is a constant (lowered to a read-only `_HOLE_` immediate, e.g. so a float
+// literal needn't ride .rodata) ONLY if it is never reassigned. A mutated local — a loop counter
+// `k = k - 1` — is a within-stencil temporary that must stay a plain C local (clang allocates it,
+// like struct.new's counter); holing it as a baked immediate is wrong, you cannot assign to it.
+static bool stmt_assigns(const SemStmt* s, const char* name) {
+    if (!s) return false;
+    switch (s->tag) {
+    case SemStmtTag::SAssign: {
+        auto* a = static_cast<const SAssign*>(s);
+        return a->target->tag == SemExprTag::SIdent &&
+               !strcmp(static_cast<const SIdent*>(a->target)->name, name);
+    }
+    case SemStmtTag::SIf: {
+        auto* i = static_cast<const SIf*>(s);
+        return stmt_assigns(i->then_, name) ||
+               (i->else_.has_value() && stmt_assigns(*i->else_, name));
+    }
+    case SemStmtTag::SWhile:
+        return stmt_assigns(static_cast<const SWhile*>(s)->body, name);
+    case SemStmtTag::SFor: {
+        auto* f = static_cast<const SFor*>(s);
+        return (f->init.has_value()   && stmt_assigns(*f->init,   name)) ||
+               (f->update.has_value() && stmt_assigns(*f->update, name)) ||
+               stmt_assigns(f->body, name);
+    }
+    case SemStmtTag::SBlock: {
+        for (auto* st : static_cast<const SBlock*>(s)->stmts)
+            if (stmt_assigns(st, name)) return true;
+        return false;
+    }
+    default: return false;
+    }
+}
+static bool body_assigns(const Opcode* op, const char* name) {
+    for (size_t i = 0; i < op->sem_body.size(); i++)
+        if (stmt_assigns(op->sem_body[i], name)) return true;
+    return false;
+}
 
 void SemLowerer::lower_stmt(const Opcode* op, const SemStmt* s) {
     switch (s->tag) {
@@ -575,7 +667,9 @@ void SemLowerer::lower_stmt(const Opcode* op, const SemStmt* s) {
         const SemExpr* t = asn->target;
         const SemExpr* v = asn->value;
         if (t->tag == SemExprTag::SIdent && !strcmp(static_cast<const SIdent*>(t)->name, "sp")) {
-            fputs("    f->sp = (u1)(", out_); lower_expr(v, op, ValueType::TyI32); fputs(");\n", out_);
+            fputs("    JV_SP = (u1)(", out_); lower_expr(v, op, ValueType::TyI32); fputs(");\n", out_);
+        } else if (t->tag == SemExprTag::SIdent && !strcmp(static_cast<const SIdent*>(t)->name, "stp")) {
+            fputs("    f->stp = (u4)(", out_); lower_expr(v, op, ValueType::TyI32); fputs(");\n", out_);
         } else if (is_slot_index(t)) {
             if (!is_slot_index(v)) {
                 fprintf(stderr, "opgen: slot store needs a slot source in %s\n", op->mnemonic);
@@ -646,7 +740,7 @@ void SemLowerer::lower_stmt(const Opcode* op, const SemStmt* s) {
         const char* ct = java_c(decl->ty);
         const SemExpr* init = opt_ptr(decl->init);
         uint64_t bits;
-        if (mode_ == Mode::Stencil && init && const_eval(init, ct, &bits)) {
+        if (mode_ == Mode::Stencil && init && const_eval(init, ct, &bits) && !body_assigns(op, decl->name)) {
             if (ct[0] == 'f') {
                 const char* ui = scalar_bits(ct) >= 64 ? "u8" : "u4";
                 fprintf(out_, "    %s %s = (__extension__({ union { %s i; %s f; } _u; "
@@ -657,8 +751,15 @@ void SemLowerer::lower_stmt(const Opcode* op, const SemStmt* s) {
                         ct, decl->name, ct, decl->name);
             }
         } else if (init) {
+            // The initializer's expected type is the LOCAL's declared type, not a blanket i32 — so a
+            // width-sensitive op like reinterpret(f64) into a `long`/`double` local keeps all 64 bits.
+            ValueType ivt = ValueType::TyI32;
+            if      (!strcmp(decl->ty, "long")  || !strcmp(decl->ty, "ulong")) ivt = ValueType::TyI64;
+            else if (!strcmp(decl->ty, "double"))                              ivt = ValueType::TyF64;
+            else if (!strcmp(decl->ty, "float"))                               ivt = ValueType::TyF32;
+            else if (!strcmp(decl->ty, "any"))                                 ivt = ValueType::TyAny;
             fprintf(out_, "    %s %s = (%s)(", ct, decl->name, ct);
-            lower_expr(init, op, ValueType::TyI32);
+            lower_expr(init, op, ivt);
             fputs(");\n", out_);
         } else {
             fprintf(out_, "    %s %s;\n", ct, decl->name);
@@ -699,7 +800,7 @@ void SemLowerer::lower_stmt(const Opcode* op, const SemStmt* s) {
     }
     case SemStmtTag::STrap:
         if (mode_ == Mode::Stencil) fputs("    TAIL return _HOLE_trap(vm);\n", out_);
-        else                        fputs("    TAIL return wasm_trap(vm);\n", out_);
+        else                        fprintf(out_, "    TAIL return %s_trap(vm);\n", prefix_.c_str());
         break;
     }
 }
@@ -738,7 +839,8 @@ void SemLowerer::collect_natives_expr(const SemExpr* e, const char** names, int*
     switch (e->tag) {
     case SemExprTag::SCall: {
         auto* call = static_cast<const SCall*>(e);
-        if (find_method(call->name)) {
+        const MethodDecl* md = find_method(call->name);
+        if (md && !md->inl) {   // inline natives are direct calls — no _HOLE_ patch point, so no hole to collect/declare
             int dup = 0;
             for (int i = 0; i < *n; i++) if (!strcmp(names[i], call->name)) { dup = 1; break; }
             if (!dup) names[(*n)++] = call->name;
@@ -897,7 +999,7 @@ const SemExpr* SemLowerer::body_divide(const Opcode* op) {
 void SemLowerer::guard_trap(const char* throw_name) {
     (void)throw_name;
     if (mode_ == Mode::Stencil) fputs(" TAIL return _HOLE_trap(vm);\n", out_);
-    else fputs(" TAIL return wasm_trap(vm);\n", out_);
+    else fprintf(out_, " TAIL return %s_trap(vm);\n", prefix_.c_str());
 }
 
 int SemLowerer::has_error(const Opcode* op, const char* name) {
@@ -957,6 +1059,7 @@ int SemLowerer::op_const_holes(const Opcode* op, const char* names[8], uint64_t 
         if (!decl->init.has_value()) continue;
         uint64_t bits;
         if (!const_eval(*decl->init, java_c(decl->ty), &bits)) continue;
+        if (body_assigns(op, decl->name)) continue;   // a reassigned local is a temp, not a constant hole
         snprintf(buf[n], sizeof buf[n], "_HOLE_%s", decl->name);
         names[n] = buf[n]; vals[n] = bits; n++;
     }

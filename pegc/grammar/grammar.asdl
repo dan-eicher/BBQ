@@ -34,7 +34,7 @@ module PegGrammar {
     token_def = TokenDef(identifier name, peg_expr body)
 
     // Comment definitions (COMMENTS section)
-    comment_def = CommentDef(string open, string close, bool nested)
+    comment_def = CommentDef(string open, string close, bool nested, bool structured)
 
     // Productions (PRODUCTIONS section)
     production = Production(identifier name, param* params, string? locals_code,

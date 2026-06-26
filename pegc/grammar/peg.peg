@@ -177,7 +177,7 @@ TokenDecl <. std::vector<TokenDef*> &defs .>
 
 CommentDecl <. std::vector<CommentDef*> &defs .>
     (. peg::Span open_span; peg::Span close_span; peg::Span tname_span;
-       bool nested = false; std::string open; std::string close_str; std::string tname; .)
+       bool nested = false; bool structured = false; std::string open; std::string close_str; std::string tname; .)
     = "COMMENTS"
       "FROM"
       string_lit<open_span> (. open = peg::unescape_string_lit(open_span);
@@ -187,7 +187,8 @@ CommentDecl <. std::vector<CommentDef*> &defs .>
       | ident<tname_span>      (. close_str = tname_span.to_string(); .)
       )
       [ "NESTED"          (. nested = true; .) ]
-    (. auto* c = new CommentDef(std::move(open), std::move(close_str), nested);
+      [ "STRUCTURED"      (. structured = true; .) ]   /* skip a balanced ()-nested, string-aware token group (e.g. (@…) annotations); the language-specific inner-comment awareness is a frame override */
+    (. auto* c = new CommentDef(std::move(open), std::move(close_str), nested, structured);
        c->loc = loc;
        defs.push_back(c); .)
 .

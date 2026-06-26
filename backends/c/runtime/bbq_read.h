@@ -557,6 +557,16 @@ static inline bool bbq_read_sleb128_i32(bbq_ctx_t* ctx, int32_t* out) {
 static inline bool bbq_read_sleb128_i64(bbq_ctx_t* ctx, int64_t* out) {
     return bbq_read_sleb128(ctx, out, 64);
 }
+/* WASM §5.3.3/§5.3.4 heaptype / §5.3.3 blocktype: a signed LEB128 whose value is at most 33
+ * bits — an abstract code (negative) or a typeidx (non-negative). Reads EXACTLY s33 (≤5 bytes,
+ * range-validated): returns false on an overlong encoding or an out-of-s33-range value (the
+ * caller MUST check and reject — do not (void) it). The value is carried as int32: a realizable
+ * typeidx is far below 2^31 and abstract codes are small negatives, so the cast is lossless in
+ * practice; a (malicious) typeidx >= 2^31 is rejected by the s33 range check above. */
+static inline bool bbq_read_sleb128_s33(bbq_ctx_t* ctx, int32_t* out) {
+    int64_t v; if (!bbq_read_sleb128(ctx, &v, 33)) return false;
+    *out = (int32_t)v; return true;
+}
 
 static inline bool bbq_read_f32be(bbq_ctx_t* ctx, float* out) {
     uint32_t v; if (!bbq_read_u32be(ctx, &v)) return false;

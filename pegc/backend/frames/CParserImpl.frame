@@ -139,27 +139,62 @@ PEG_INTERNAL void peg_set_whitespace(peg_state* p, bool (*fn)(char)) {
 }
 
 PEG_INTERNAL void peg_add_comment(peg_state* p, const char* open,
-                            const char* close, bool nested) {
+                            const char* close, bool nested, bool structured) {
     if (p->comment_count < PEG_MAX_COMMENTS) {
         p->comments[p->comment_count].open = open;
         p->comments[p->comment_count].close = close;
         p->comments[p->comment_count].nested = nested;
+        p->comments[p->comment_count].structured = structured;
         p->comment_count++;
     }
 }
 
+/* A STRUCTURED skip element (e.g. `(@id … )` annotations): from `open`, walk to the matching
+ * close counting GENERIC ()-nesting, treating "…" string literals (with \-escapes) as opaque so
+ * their parens don't perturb the balance. The `close` delimiter is unused (paren depth ends it).
+ * Language-specific awareness (inner line/block comments, identifier validation) is NOT generic —
+ * a grammar that needs it overrides this in its OWN frame copy (see -frames). Always succeeds. */
+PEG_INTERNAL bool peg_skip_structured(peg_state* p, const peg_comment_spec* spec) {
+    int open_len = (int)strlen(spec->open);
+    if (p->pos + open_len > p->end) return false;
+    if (memcmp(p->pos, spec->open, (size_t)open_len) != 0) return false;
+    for (int i = 0; i < open_len; i++) peg_advance(p);
+    int depth = 1;
+    while (p->pos < p->end && depth > 0) {
+        char c = *p->pos;
+        if (c == '"') {                                  /* string literal: skip with \-escapes */
+            peg_advance(p);
+            while (p->pos < p->end && *p->pos != '"') {
+                if (*p->pos == '\\' && p->pos + 1 < p->end) peg_advance(p);
+                peg_advance(p);
+            }
+            if (p->pos < p->end) peg_advance(p);
+        } else if (c == '(') { depth++; peg_advance(p); }
+        else if (c == ')') { depth--; peg_advance(p); }
+        else peg_advance(p);
+    }
+    return true;
+}
+
 PEG_INTERNAL bool peg_skip_comment(peg_state* p, const peg_comment_spec* spec) {
+    if (spec->structured) return peg_skip_structured(p, spec);
     int open_len = (int)strlen(spec->open);
     if (p->pos + open_len > p->end) return false;
     if (memcmp(p->pos, spec->open, (size_t)open_len) != 0) return false;
     for (int i = 0; i < open_len; i++) peg_advance(p);
     int close_len = (int)strlen(spec->close);
+    /* A single-LF close is the line-comment idiom; a line ends at LF or CR (or CRLF),
+     * so such a comment terminates on a bare CR too — standard line-comment behavior. */
+    int line_close = (close_len == 1 && spec->close[0] == '\n');
     int depth = 1;
     while (p->pos < p->end && depth > 0) {
         if (spec->nested && p->pos + open_len <= p->end &&
             memcmp(p->pos, spec->open, (size_t)open_len) == 0) {
             for (int i = 0; i < open_len; i++) peg_advance(p);
             depth++;
+        } else if (line_close && (*p->pos == '\n' || *p->pos == '\r')) {
+            peg_advance(p);
+            depth--;
         } else if (p->pos + close_len <= p->end &&
                    memcmp(p->pos, spec->close, (size_t)close_len) == 0) {
             for (int i = 0; i < close_len; i++) peg_advance(p);

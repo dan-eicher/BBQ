@@ -5,6 +5,10 @@
    the chain; cross-rule calls drop it (the callee captures its own). One {% if %}
    arm per stencil op; control flow is the successor each stencil names, so there
    is no goto/label/join logic here. #}
+
+{# @source helper definitions (e.g. where-clause predicates), before the rules that call them. #}
+{{ user_source }}
+
 {% for fn in functions %}
 {% for o in fn.ops %}
 static bool {{ fn.kpfx }}_k{{ o.id }}(bbq_ctx_t* ctx, {{ fn.type }}* out, size_t _struct_start);

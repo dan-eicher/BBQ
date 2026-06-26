@@ -4,6 +4,7 @@
 #include "opgen_ast.h"
 #include <cstdio>
 #include <cstdint>
+#include <string>
 
 namespace opgen {
 
@@ -21,13 +22,17 @@ class SemLowerer {
 public:
     enum class Mode { Interp, Stencil };
 
-    SemLowerer(const Module* mod, FILE* out, Mode mode)
-        : mod_(mod), out_(out), mode_(mode) {}
+    SemLowerer(const Module* mod, FILE* out, Mode mode, std::string prefix)
+        : mod_(mod), out_(out), mode_(mode), prefix_(std::move(prefix)) {}
 
     Mode mode() const { return mode_; }
     void set_lane(int on) { lane_ = on; }
     int  lane() const { return lane_; }
     FILE* out() const { return out_; }
+    // A body that calls a native may set vm->trapped; the stencil emitter uses this to bail (the
+    // JIT has no implicit code.pos check, unlike the interp's next-dispatch). Reset per opcode.
+    void clear_native_called() { native_called_ = false; }
+    bool native_called() const { return native_called_; }
 
     // ── The lowering ───────────────────────────────────────
     void lower_expr(const SemExpr* e, const Opcode* op, ValueType rt);
@@ -81,6 +86,8 @@ private:
     FILE*         out_;
     Mode          mode_;
     int           lane_ = 0;
+    bool          native_called_ = false;
+    std::string   prefix_;
 
     // expression sub-lowerings
     void lower_global_read(const Opcode* op, const SemExpr* idx, ValueType rt);

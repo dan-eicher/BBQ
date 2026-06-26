@@ -51,7 +51,12 @@ enum class ValueType {
     TySleb32,
     TySleb64,
     TyMemarg,
-    TyAny
+    TyBlockType,
+    TyBrTable,
+    TyTryTable,
+    TySelectVec,
+    TyAny,
+    TyAddr
 };
 
 enum class LocalValueKind {
@@ -200,12 +205,13 @@ inline T* as(Node* n) {
 // ── Sum types (tag-dispatched hierarchies) ──────────────────
 
 struct StackParam : public ASTNode {
-    StackParam(ValueType ty, const char* name, std::optional<const char*> sem_expr)
-        : ty(ty), name(name), sem_expr(std::move(sem_expr)){}
+    StackParam(ValueType ty, const char* name, std::optional<const char*> sem_expr, std::optional<SemExpr*> count)
+        : ty(ty), name(name), sem_expr(std::move(sem_expr)), count(std::move(count)){}
 
     ValueType ty;
     const char* name;
     std::optional<const char*> sem_expr;
+    std::optional<SemExpr*> count;
 };
 
 struct OperandParam : public ASTNode {
@@ -445,10 +451,11 @@ struct MethodParam : public ASTNode {
 };
 
 struct MethodDecl : public ASTNode {
-    MethodDecl(bool native, const char* ret_ty, const char* name, std::vector<MethodParam*> params, std::vector<SemStmt*> body)
-        : native(native), ret_ty(ret_ty), name(name), params(std::move(params)), body(std::move(body)){}
+    MethodDecl(bool native, bool inl, const char* ret_ty, const char* name, std::vector<MethodParam*> params, std::vector<SemStmt*> body)
+        : native(native), inl(inl), ret_ty(ret_ty), name(name), params(std::move(params)), body(std::move(body)){}
 
     bool native;
+    bool inl;
     const char* ret_ty;
     const char* name;
     std::vector<MethodParam*> params;
@@ -456,13 +463,14 @@ struct MethodDecl : public ASTNode {
 };
 
 struct StatusDecl : public ASTNode {
-    StatusDecl(const char* type, const char* ok, const char* err, const char* halt)
-        : type(type), ok(ok), err(err), halt(halt){}
+    StatusDecl(const char* type, const char* ok, const char* err, const char* halt, std::vector<const char*> extra)
+        : type(type), ok(ok), err(err), halt(halt), extra(std::move(extra)){}
 
     const char* type;
     const char* ok;
     const char* err;
     const char* halt;
+    std::vector<const char*> extra;
 };
 
 struct TypeDecl : public ASTNode {

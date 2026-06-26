@@ -172,13 +172,13 @@ set(CALC_VM_DIR ${CMAKE_CURRENT_BINARY_DIR}/calc_vm)
 set(CALC_VM_GEN
     ${CALC_VM_DIR}/gen_interp.c   ${CALC_VM_DIR}/gen_interp.h
     ${CALC_VM_DIR}/runtime_api.h  ${CALC_VM_DIR}/opcodes.h
-    ${CALC_VM_DIR}/opcode_tables.c ${CALC_VM_DIR}/wasm_stencils.c
-    ${CALC_VM_DIR}/wasm_jit_meta.h ${CALC_VM_DIR}/wasm_jit_symbols.h
-    ${CALC_VM_DIR}/wasm_valtype.h  ${CALC_VM_DIR}/wasm_type_meta.h)
+    ${CALC_VM_DIR}/opcode_tables.c ${CALC_VM_DIR}/calc_stencils.c
+    ${CALC_VM_DIR}/calc_jit_meta.h ${CALC_VM_DIR}/calc_jit_symbols.h
+    ${CALC_VM_DIR}/calc_valtype.h  ${CALC_VM_DIR}/calc_type_meta.h)
 add_custom_command(
     OUTPUT ${CALC_VM_GEN}
     COMMAND ${CMAKE_COMMAND} -E make_directory ${CALC_VM_DIR}
-    COMMAND opgen -i ${CMAKE_CURRENT_SOURCE_DIR}/example/grammar/calc.def -o ${CALC_VM_DIR}
+    COMMAND opgen -i ${CMAKE_CURRENT_SOURCE_DIR}/example/grammar/calc.def -prefix calc -o ${CALC_VM_DIR}
     DEPENDS opgen
             ${CMAKE_CURRENT_SOURCE_DIR}/example/grammar/calc.def
             ${CMAKE_CURRENT_SOURCE_DIR}/example/calc_backend.h
@@ -212,22 +212,22 @@ add_custom_command(
 )
 
 # Tier 1 — the copy-and-patch stencils → jitterator → stencil table.
-set(CALC_VM_STENCILS_O ${CALC_VM_DIR}/wasm_stencils.o)
+set(CALC_VM_STENCILS_O ${CALC_VM_DIR}/calc_stencils.o)
 add_custom_command(
     OUTPUT ${CALC_VM_STENCILS_O}
     COMMAND ${CLANG_C_COMPILER} -std=c11 -O2 -fno-stack-protector
             -fno-asynchronous-unwind-tables ${CALC_VM_INCS}
-            -c ${CALC_VM_DIR}/wasm_stencils.c -o ${CALC_VM_STENCILS_O}
+            -c ${CALC_VM_DIR}/calc_stencils.c -o ${CALC_VM_STENCILS_O}
     DEPENDS ${CALC_VM_GEN}
-    COMMENT "clang: calc VM stencils (wasm_stencils.c)"
+    COMMENT "clang: calc VM stencils (calc_stencils.c)"
     VERBATIM
 )
-set(CALC_VM_STENCIL_TABLE ${CALC_VM_DIR}/wasm_stencil_table.h)
+set(CALC_VM_STENCIL_TABLE ${CALC_VM_DIR}/calc_stencil_table.h)
 add_custom_command(
     OUTPUT ${CALC_VM_STENCIL_TABLE}
     COMMAND jitterator ${CALC_VM_STENCILS_O} -o ${CALC_VM_STENCIL_TABLE}
     DEPENDS jitterator ${CALC_VM_STENCILS_O}
-    COMMENT "jitterator: calc VM stencils -> wasm_stencil_table.h"
+    COMMENT "jitterator: calc VM stencils -> calc_stencil_table.h"
     VERBATIM
 )
 

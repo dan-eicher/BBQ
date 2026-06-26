@@ -324,15 +324,17 @@ struct CommentDef : public ASTNode {
     CommentDef(
         std::string open,
         std::string close,
-        bool nested
+        bool nested,
+        bool structured
     )
-        : open(open), close(close), nested(nested){}
+        : open(open), close(close), nested(nested), structured(structured){}
 
     void accept(ASTVisitor& visitor) override { visitor.visit(this); }
 
     std::string open;
     std::string close;
     bool nested;
+    bool structured;
 };
 
 struct Production : public ASTNode {

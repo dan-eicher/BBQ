@@ -245,7 +245,8 @@ void ParserEmitter::emit_skip_setup(Grammar* grammar, std::ostream& out) {
             auto* c = grammar->comments[i];
             out << "{\"" << cpp_emit::escape_string(c->open) << "\", \""
                 << cpp_emit::escape_string(c->close) << "\", "
-                << (c->nested ? "true" : "false") << "}";
+                << (c->nested ? "true" : "false") << ", "
+                << (c->structured ? "true" : "false") << "}";
         }
         out << "});\n";
     }

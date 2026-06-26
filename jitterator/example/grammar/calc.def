@@ -2,7 +2,7 @@
 #
 # opgen generates the calc's TWO execution tiers from this one source: the
 # threaded interpreter handlers (gen_interp.c) AND the copy-and-patch JIT
-# stencils (wasm_stencils.c) + the side-table the jit_driver reads. calc.burg
+# stencils (calc_stencils.c) + the side-table the jit_driver reads. calc.burg
 # lowers the IR continuation graph to this bytecode (emit_op), exactly as
 # yoctojc's codegen.burg lowers to JCVM bytecode.
 #
@@ -17,7 +17,10 @@
 # opgen #includes this into runtime_api.h at the value-model's substrate point.
 backend "calc_backend.h"
 
-status calc_status_t CALC_OK CALC_ERR CALC_HALT
+# The status vocabulary. CALC_TRAP is an EXTRA status (beyond ok/err/halt) — the
+# `status … [extra,…]` form: opgen widens the generated enum (CALC_TRAP = 3) so a
+# native can return a target-specific outcome without the generator baking it in.
+status calc_status_t CALC_OK CALC_ERR CALC_HALT [CALC_TRAP]
 
 type i32 int32_t uint32_t 1 i
 
@@ -26,6 +29,13 @@ type i32 int32_t uint32_t 1 i
 native status calc_br(int off);   # reposition the code cursor (absolute byte offset)
 native status calc_ret(int v);    # return v to the caller (or halt at the top level)
 native status calc_call(int entry, int nargs);   # save frame, pass args, enter the callee
+native status calc_abort(int code);   # set vm->trapped + halt; returns the CALC_TRAP extra status
+
+# An INLINE native: opgen emits a DIRECT call (not a _HOLE_ patch point) in BOTH
+# tiers, so the backend's `static inline` definition folds into the handler AND the
+# JIT stencil — no extern prototype, no jit-symbol entry. (javelina uses this for
+# linear-memory access; the calc proves the mechanism with a pure-arithmetic op.)
+inline native int calc_abs(int x);   # |x|, folded inline
 
 # ── Values ──────────────────────────────────────────────────
 const 0x01 [ sleb128 v ] ( -- i32 r )
@@ -66,3 +76,8 @@ call  0x13 [ sleb128 entry, u8 nargs ] ( -- )   # save frame, pass nargs from th
     (. calc_call(entry, nargs); .)
 
 pop 0x11 (i32 v -- )
+
+# ── Exercising the generic opgen additions ──────────────────
+abs  0x14 (i32 a -- i32 r)   (. r = calc_abs(a); .)      # inline native (direct call, both tiers)
+trap 0x15 (i32 c -- )                                    # status-extra native: abort when c != 0
+    (. if (c != 0) calc_abort(c); .)

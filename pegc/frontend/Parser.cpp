@@ -35,7 +35,7 @@ void Parser::setup_skip() {
     set_whitespace([](char c) -> bool {
         return ((((c == 13) || (c == 10)) || (c == 9)) || (c == 32));
     });
-    set_comments({{"//", "\n", false}, {"/*", "*/", false}});
+    set_comments({{"//", "\n", false, false}, {"/*", "*/", false, false}});
 }
 
 
@@ -387,7 +387,7 @@ bool Parser::parse_TokenDecl(std::vector<TokenDef*>& defs) {
 
 bool Parser::parse_CommentDecl(std::vector<CommentDef*>& defs) {
     peg::Span open_span; peg::Span close_span; peg::Span tname_span;
-       bool nested = false; std::string open; std::string close_str; std::string tname;
+       bool nested = false; bool structured = false; std::string open; std::string close_str; std::string tname;
     skip();
     if (!match("COMMENTS")) return false;
     skip();
@@ -421,7 +421,16 @@ bool Parser::parse_CommentDecl(std::vector<CommentDef*>& defs) {
             return true;
         }()) restore(_m1);
     }
-    auto* c = new CommentDef(std::move(open), std::move(close_str), nested);
+    {
+        auto _m2 = save();
+        if (![&]() -> bool {
+            skip();
+            if (!match("STRUCTURED")) return false;
+            structured = true;
+            return true;
+        }()) restore(_m2);
+    }
+    auto* c = new CommentDef(std::move(open), std::move(close_str), nested, structured);
        c->loc = loc;
        defs.push_back(c);
     return true;
@@ -634,21 +643,25 @@ bool Parser::parse_PegAtom(PegExpr*& result) {
             {
                 auto _m2 = save();
                 if (![&]() -> bool {
-                    skip();
-                    if (peek_at("<.")) {
-                        skip();
-                        if (!match("<.")) return false;
-                        if (!scan_to("." ">", args)) return false;
+                    {
+                        auto _m3 = save();
+                        if ([&]() -> bool {
+                            skip();
+                            if (!match("<.")) return false;
+                            if (!scan_to("." ">", args)) return false;
            size_t b = args.find_first_not_of(" \t\r\n");
            size_t e = args.find_last_not_of(" \t\r\n");
            args = (b == std::string::npos) ? "" : args.substr(b, e - b + 1);
-                    } else {
+                            return true;
+                        }()) {} else {
+                        restore(_m3);
                         skip();
                         if (!match("<")) return false;
                         if (!scan_to(">", args)) return false;
            size_t b = args.find_first_not_of(" \t\r\n");
            size_t e = args.find_last_not_of(" \t\r\n");
            args = (b == std::string::npos) ? "" : args.substr(b, e - b + 1);
+                        }
                     }
                     return true;
                 }()) restore(_m2);
@@ -690,13 +703,13 @@ bool Parser::parse_PegAtom(PegExpr*& result) {
         skip();
         if (!match("}")) return false;
         {
-            auto _m3 = save();
+            auto _m4 = save();
             if (![&]() -> bool {
                 skip();
                 if (!match("+")) return false;
                 is_plus = true;
                 return true;
-            }()) restore(_m3);
+            }()) restore(_m4);
         }
         if (is_plus) {
              result = new Plus(inner);

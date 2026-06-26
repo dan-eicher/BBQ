@@ -88,7 +88,7 @@ if(OPGEN_CLANG)
         OUTPUT ${CALC_OUT}/gen_interp.c ${CALC_OUT}/gen_interp.h
                ${CALC_OUT}/opcodes.h ${CALC_OUT}/runtime_api.h
         COMMAND ${CMAKE_COMMAND} -E make_directory ${CALC_OUT}
-        COMMAND $<TARGET_FILE:opgen> -i ${CALC_DEF} -o ${CALC_OUT}
+        COMMAND $<TARGET_FILE:opgen> -i ${CALC_DEF} -prefix calc -o ${CALC_OUT}
         DEPENDS opgen ${CALC_DEF}
         COMMENT "opgen: generating the calc VM for the interp e2e"
         VERBATIM)

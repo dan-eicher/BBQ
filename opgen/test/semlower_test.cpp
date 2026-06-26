@@ -23,7 +23,7 @@ std::string lower_body(const opgen::Module* m, const opgen::Opcode* op,
                        opgen::SemLowerer::Mode mode) {
     char* buf = nullptr; size_t len = 0;
     FILE* f = open_memstream(&buf, &len);
-    opgen::SemLowerer low(m, f, mode);
+    opgen::SemLowerer low(m, f, mode, "wasm");
     for (auto* s : op->sem_body) low.lower_stmt(op, s);
     fclose(f);
     std::string out(buf, len);
@@ -80,14 +80,15 @@ TEST(OpgenLower, JavaPrimCast) {
 
 TEST(OpgenLower, NativeCallInterpVsStencil) {
     auto* m = parse(kSpec); ASSERT_NE(m, nullptr);
-    // INTERP: direct call.
+    // INTERP: direct call. The leading runtime context is the NATIVE_ARGS seam
+    // (default `vm, vm->heap`; a backend redefines it to change the calling convention).
     EXPECT_EQ(lower_body(m, op_named(m, "callop"), Mode::Interp),
-              "    r = (int32_t)((helper(vm, vm->heap, a)));\n");
+              "    r = (int32_t)((helper(NATIVE_ARGS, a)));\n");
     // STENCIL: indirect call through the _HOLE_ fn-pointer, with the synthesized
     // (ret(*)(vm_t*, heap_t*, params)) cast.
     EXPECT_EQ(lower_body(m, op_named(m, "callop"), Mode::Stencil),
               "    r = (int32_t)((((s4(*)(vm_t*, heap_t*, s4))(uintptr_t)_HOLE_helper)"
-              "(vm, vm->heap, a)));\n");
+              "(NATIVE_ARGS, a)));\n");
 }
 
 TEST(OpgenLower, IfElse) {

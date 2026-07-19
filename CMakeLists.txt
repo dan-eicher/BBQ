@@ -9,6 +9,7 @@ add_library(bbq_crt STATIC
     crt/bbq_arena.c
     crt/bbq_buf.c
     crt/bbq_htree.c
+    crt/bbq_hmap.c
 )
 set_target_properties(bbq_crt PROPERTIES
     C_STANDARD 11
@@ -176,6 +177,17 @@ add_executable(lib_tests lib/tests/test_worklist.cpp)
 target_include_directories(lib_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/lib)
 target_link_libraries(lib_tests PRIVATE GTest::GTest GTest::Main)
 add_test(NAME lib_tests COMMAND lib_tests)
+
+# --- bbq_hmap allocation-failure tests ---
+# Separate binary: `--wrap=calloc` is link-wide, and forcing every other test in the
+# suite through an interposed allocator to cover one module would be a bad trade. The
+# timeout is load-bearing — the bug these tests pin down is an unbounded probe loop,
+# which presents as a hang rather than a failed assertion.
+add_executable(crt_hmap_oom_tests test/crt_hmap_oom_test.cpp)
+target_link_libraries(crt_hmap_oom_tests PRIVATE bbq_crt GTest::GTest GTest::Main)
+target_link_options(crt_hmap_oom_tests PRIVATE -Wl,--wrap=calloc)
+add_test(NAME crt_hmap_oom_tests COMMAND crt_hmap_oom_tests)
+set_tests_properties(crt_hmap_oom_tests PROPERTIES TIMEOUT 30)
 
 # --- Python extension module (optional) ---
 find_package(Python3 COMPONENTS Development)

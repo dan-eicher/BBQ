@@ -710,7 +710,7 @@ void BurgBackend::emit_rewrite_body(std::ostream& out, int indent) {
         pad(out, indent + 1); out << "else\n";
         pad(out, indent + 2);
         out << "burg_set_error(\"burg: start nonterminal has no rule at root\", "
-            << start_idx << ctx_arg() << ");\n";
+               "(int)BURG_NODE_OP(root)" << ctx_arg() << ");\n";
     }
     pad(out, indent + 1); out << "return;\n";
     pad(out, indent); out << "}\n\n";
@@ -735,6 +735,10 @@ void BurgBackend::emit_rewrite_body(std::ostream& out, int indent) {
         pad(out, indent + 1); out << state_type() << "* s = burg_cache_lookup(BURG_NODE_ID(n)" << ctx_arg() << ");\n";
         pad(out, indent + 1); out << "if (s && s->rule[" << start_idx << "])\n";
         pad(out, indent + 2); out << "burg_reduce(n, s, " << start_idx << ctx_arg() << ");\n";
+        pad(out, indent + 1); out << "else\n";
+        pad(out, indent + 2);
+        out << "burg_set_error(\"burg: start nonterminal does not cover graph node\", "
+               "(int)BURG_NODE_OP(n)" << ctx_arg() << ");\n";
         pad(out, indent); out << "}\n";
     }
 }

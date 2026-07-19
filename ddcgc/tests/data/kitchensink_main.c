@@ -176,9 +176,53 @@ static void dump_trace(kitchensink_ctx_t* ctx) {
     }
 }
 
+/* asdl's generated C constructors must zero the shared `loc` field.
+ *
+ * bbq_arena_alloc bump-allocates and bbq_arena_reset rewinds WITHOUT zeroing the pages
+ * it hands back, so a node built after a reset lands on a previous node's bytes. A fresh
+ * arena returns zeroed pages from malloc, which means a check that only ever allocates
+ * once passes whether or not the constructor zeroes anything — dirtying the memory and
+ * resetting is the entire point of doing it this way.
+ *
+ * This lives in the kitchensink driver because it is the one target that compiles and
+ * runs asdl's -lang c output; the assertion is about that template, not about ddcgc. */
+static int check_ctor_zeroes_loc(void) {
+    bbq_arena a;
+    bbq_arena_init(&a, 0);
+
+    ast_expr_t* first = ast_lit(&a, 1);
+    first->loc.file = "poison.k";
+    first->loc.line = 4242;
+    first->loc.col  = 77;
+
+    bbq_arena_reset(&a);
+    ast_expr_t* recycled = ast_lit(&a, 2);
+
+    int rc = 0;
+    /* Self-check: if the arena ever stops handing this address back, the test is no
+     * longer exercising dirty memory and must say so rather than pass vacuously. */
+    if (recycled != first) {
+        fprintf(stderr, "FAIL: arena reset did not recycle the node address; "
+                        "the loc check is not exercising dirty memory\n");
+        rc = 1;
+    }
+    if (recycled->loc.file != NULL || recycled->loc.line != 0 || recycled->loc.col != 0) {
+        fprintf(stderr, "FAIL: constructor left a stale loc (file=%s line=%d col=%d)\n",
+                recycled->loc.file ? recycled->loc.file : "(null)",
+                recycled->loc.line, recycled->loc.col);
+        rc = 1;
+    }
+
+    bbq_arena_free(&a);
+    return rc;
+}
+
 int main(void) {
     bbq_arena arena;
     bbq_arena_init(&arena, 0);
+
+    if (check_ctor_zeroes_loc() != 0)
+        return 1;
 
     // Same tree shape as big_main.cpp — every rule's catalogued
     // sub-tree gets a turn.

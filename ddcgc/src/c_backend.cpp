@@ -596,7 +596,6 @@ void CBackend::emit_helpers_block() {
     if (list_elems_.empty() && tuple_shapes_.empty()) return;
 
     out() << "/* ─── ddcgc-emitted list/tuple helpers ─── */\n";
-    out() << "#include <stdlib.h>\n";
     out() << "#include <string.h>\n\n";
 
     // Per-element-type list: dynamic vector + alloc-and-copy from a
@@ -605,19 +604,27 @@ void CBackend::emit_helpers_block() {
         std::string t = list_type_name(elem);
         std::string suffix = sanitize_for_suffix(elem);
         std::string fn_prefix = compiler_prefix() + "_list_" + suffix;
+        // Transient compile-time lists are arena-backed: `.data` is bump-allocated
+        // from the ddcg ctx arena (carried in `.arena`, set at make/from_arr), so a
+        // list dies wholesale when the compile arena is freed — no per-list free, no
+        // leak. Growth re-bumps and copies (the prior block is reclaimed at arena
+        // teardown). make/from_arr are the only creation sites, so `.arena` is always set.
         out() << "typedef struct {\n"
               << "    " << elem << "* data;\n"
               << "    int count;\n"
               << "    int capacity;\n"
+              << "    bbq_arena* arena;\n"
               << "} " << t << ";\n\n";
-        out() << "static inline " << t << " " << fn_prefix << "_make(void) {\n"
-              << "    " << t << " r = {0}; return r;\n"
+        out() << "static inline " << t << " " << fn_prefix << "_make(bbq_arena* arena) {\n"
+              << "    " << t << " r = {0}; r.arena = arena; return r;\n"
               << "}\n\n";
         out() << "static inline " << t << " " << fn_prefix
               << "_push(" << t << " a, " << elem << " v) {\n"
               << "    if (a.count >= a.capacity) {\n"
               << "        int nc = a.capacity ? a.capacity * 2 : 4;\n"
-              << "        a.data = (" << elem << "*)realloc(a.data, sizeof(*a.data) * (size_t)nc);\n"
+              << "        " << elem << "* nd = (" << elem << "*)bbq_arena_alloc(a.arena, sizeof(*a.data) * (size_t)nc);\n"
+              << "        if (a.count) memcpy(nd, a.data, sizeof(*a.data) * (size_t)a.count);\n"
+              << "        a.data = nd;\n"
               << "        a.capacity = nc;\n"
               << "    }\n"
               << "    a.data[a.count++] = v;\n"
@@ -630,10 +637,10 @@ void CBackend::emit_helpers_block() {
               << "    return a;\n"
               << "}\n\n";
         out() << "static inline " << t << " " << fn_prefix
-              << "_from_arr(" << elem << "* arr, int n) {\n"
-              << "    " << t << " r = {0};\n"
+              << "_from_arr(bbq_arena* arena, " << elem << "* arr, int n) {\n"
+              << "    " << t << " r = {0}; r.arena = arena;\n"
               << "    if (n <= 0) return r;\n"
-              << "    r.data = (" << elem << "*)malloc(sizeof(*r.data) * (size_t)n);\n"
+              << "    r.data = (" << elem << "*)bbq_arena_alloc(arena, sizeof(*r.data) * (size_t)n);\n"
               << "    memcpy(r.data, arr, sizeof(*r.data) * (size_t)n);\n"
               << "    r.count = n;\n"
               << "    r.capacity = n;\n"
@@ -740,7 +747,7 @@ void CBackend::emit_list_lit(DdcgAst::ListLit* l) {
     std::string fn_pfx = compiler_prefix() + "_list_" +
                          sanitize_for_suffix(elem);
     out() << "({ " << list_type_name(elem) << " _l = "
-          << fn_pfx << "_make();";
+          << fn_pfx << "_make(ctx->arena);";
     for (auto* x : l->elems) {
         out() << " _l = " << fn_pfx << "_push(_l, ";
         emit_expr(x);
@@ -1092,7 +1099,7 @@ bool CBackend::emit_seq_field_acc(DdcgAst::FieldAccExpr* fa) {
     std::string elem_c = c_for_field_elem(schema, *matched);
     std::string fn = compiler_prefix() + "_list_" +
                       sanitize_for_suffix(elem_c) + "_from_arr";
-    out() << fn << "(";
+    out() << fn << "(ctx->arena, ";
     emit_expr(fa->base);
     out() << "->" << fa->field << ", ";
     emit_expr(fa->base);
@@ -1347,7 +1354,7 @@ int CBackend::emit_match(const Schema& schema,
                         std::string fn = compiler_prefix() + "_list_" +
                                           sanitize_for_suffix(elem_c) + "_from_arr";
                         indent() << ty << " " << bp->name << " = " << fn
-                                 << "(" << field_expr << ", "
+                                 << "(ctx->arena, " << field_expr << ", "
                                  << field_expr << "_count);\n";
                     } else {
                         indent() << ty << " " << bp->name << " = "
@@ -1380,7 +1387,7 @@ int CBackend::emit_match(const Schema& schema,
                 std::string fn = compiler_prefix() + "_list_" +
                                   sanitize_for_suffix(elem_c) + "_from_arr";
                 indent() << c_for_field(schema, *matched) << " "
-                         << rf->name << " = " << fn << "("
+                         << rf->name << " = " << fn << "(ctx->arena, "
                          << field_expr << ", " << field_expr
                          << "_count);\n";
             } else {

@@ -135,6 +135,7 @@ struct {{c_name(name, def.name)}} {
 {% if length(type.fields) > 0 %}
 static inline {{c_name(name, def.name)}}* {{snakecase(name)}}_{{snakecase(type.name)}}(bbq_arena* _a{% for field in type.fields %}{% if field.flag == "sequence" %}, {{get_type(field.type)}}* {{safe_name(field.name)}}, int {{safe_name(field.name)}}_count{% else %}, {{get_type(field.type)}} {{safe_name(field.name)}}{% endif %}{% endfor %}) {
     {{c_name(name, def.name)}}* _n = ({{c_name(name, def.name)}}*)bbq_arena_alloc(_a, sizeof({{c_name(name, def.name)}}));
+    _n->loc = ({{name}}_srcloc){0};   /* zero the common source location — arena_alloc doesn't; the parser stamps set nodes */
 {% for field in type.fields %}
 {% if field.flag == "sequence" %}
     _n->{{safe_name(field.name)}} = {{safe_name(field.name)}};
@@ -152,6 +153,7 @@ static inline {{c_name(name, def.name)}}* {{snakecase(name)}}_{{snakecase(type.n
 {% if length(type.fields) > 0 %}
 static inline {{c_name(name, def.name)}}* {{snakecase(name)}}_{{snakecase(type.name)}}(bbq_arena* _a{% for field in type.fields %}{% if field.flag == "sequence" %}, {{get_type(field.type)}}* {{safe_name(field.name)}}, int {{safe_name(field.name)}}_count{% else %}, {{get_type(field.type)}} {{safe_name(field.name)}}{% endif %}{% endfor %}) {
     {{c_name(name, def.name)}}* _n = ({{c_name(name, def.name)}}*)bbq_arena_alloc(_a, sizeof({{c_name(name, def.name)}}));
+    _n->loc = ({{name}}_srcloc){0};   /* zero the common source location — arena_alloc doesn't; the parser stamps set nodes */
     _n->tag = {{upper(name)}}_{{upper(type.name)}};
 {% for field in type.fields %}
 {% if field.flag == "sequence" %}
@@ -170,6 +172,7 @@ static inline {{c_name(name, def.name)}}* {{snakecase(name)}}_{{snakecase(type.n
 {% else %}
 static inline {{c_name(name, def.name)}}* {{snakecase(name)}}_{{snakecase(type.name)}}(bbq_arena* _a) {
     {{c_name(name, def.name)}}* _n = ({{c_name(name, def.name)}}*)bbq_arena_alloc(_a, sizeof({{c_name(name, def.name)}}));
+    _n->loc = ({{name}}_srcloc){0};   /* zero the common source location — arena_alloc doesn't; the parser stamps set nodes */
     _n->tag = {{upper(name)}}_{{upper(type.name)}};
 {% if existsIn(def, "attributes") %}{% for field in def.attributes %}
     _n->{{safe_name(field.name)}} = {% if field.flag == "optional" %}NULL{% else %}0{% endif %};
@@ -187,6 +190,7 @@ static inline {{c_name(name, def.name)}}* {{snakecase(name)}}_{{snakecase(type.n
 {% if length(def.fields) > 0 %}
 static inline {{c_name(name, def.name)}}* {{snakecase(name)}}_{{snakecase(def.name)}}(bbq_arena* _a{% for field in def.fields %}{% if field.flag == "sequence" %}, {{get_type(field.type)}}* {{safe_name(field.name)}}, int {{safe_name(field.name)}}_count{% else %}, {{get_type(field.type)}} {{safe_name(field.name)}}{% endif %}{% endfor %}) {
     {{c_name(name, def.name)}}* _n = ({{c_name(name, def.name)}}*)bbq_arena_alloc(_a, sizeof({{c_name(name, def.name)}}));
+    _n->loc = ({{name}}_srcloc){0};   /* zero the common source location — arena_alloc doesn't; the parser stamps set nodes */
 {% for field in def.fields %}
 {% if field.flag == "sequence" %}
     _n->{{safe_name(field.name)}} = {{safe_name(field.name)}};

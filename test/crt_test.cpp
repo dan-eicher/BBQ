@@ -1,4 +1,4 @@
-// Tests for the BBQ C Runtime Library (bbq_arena, bbq_vec, bbq_buf, bbq_htree)
+// Tests for the BBQ C Runtime Library (bbq_arena, bbq_vec, bbq_buf, bbq_htree, bbq_hmap)
 
 #include <gtest/gtest.h>
 
@@ -7,6 +7,7 @@ extern "C" {
 #include "bbq_vec.h"
 #include "bbq_buf.h"
 #include "bbq_htree.h"
+#include "bbq_hmap.h"
 }
 
 // ── Arena tests ────────────────────────────────────────────
@@ -350,4 +351,94 @@ TEST(BbqHtree, VisitedSetPattern) {
         EXPECT_FALSE(bbq_htree_contains(t, i));
 
     bbq_htree_destroy(t);
+}
+
+// ── bbq_hmap ───────────────────────────────────────────────
+//
+// The flat, open-addressed map for DENSE 64-bit / POINTER keys. bbq_htree is a nibble
+// TRIE: right for sparse integer keys nobody controls (a packed (class, field) cell key),
+// but a lookup is up to 8 DEPENDENT pointer loads, which is the wrong shape for "what
+// index did I give this node?" — a question asked millions of times per compile against
+// keys we minted ourselves. This is one array probe instead.
+
+TEST(BbqHmap, GetOnEmptyIsNull) {
+    bbq_hmap m;
+    ASSERT_TRUE(bbq_hmap_init(&m, 0));
+    EXPECT_EQ(bbq_hmap_get(&m, 0x1234), nullptr);
+    bbq_hmap_free(&m);
+}
+
+TEST(BbqHmap, PutThenGet) {
+    bbq_hmap m;
+    ASSERT_TRUE(bbq_hmap_init(&m, 0));
+    ASSERT_TRUE(bbq_hmap_put(&m, 0x1000, (void*)(uintptr_t)1));
+    ASSERT_TRUE(bbq_hmap_put(&m, 0x2000, (void*)(uintptr_t)2));
+    EXPECT_EQ(bbq_hmap_get(&m, 0x1000), (void*)(uintptr_t)1);
+    EXPECT_EQ(bbq_hmap_get(&m, 0x2000), (void*)(uintptr_t)2);
+    EXPECT_EQ(bbq_hmap_get(&m, 0x3000), nullptr);
+    bbq_hmap_free(&m);
+}
+
+// A re-put REPLACES; it must not insert a second entry for the same key.
+TEST(BbqHmap, PutReplaces) {
+    bbq_hmap m;
+    ASSERT_TRUE(bbq_hmap_init(&m, 0));
+    ASSERT_TRUE(bbq_hmap_put(&m, 42, (void*)(uintptr_t)1));
+    ASSERT_TRUE(bbq_hmap_put(&m, 42, (void*)(uintptr_t)9));
+    EXPECT_EQ(bbq_hmap_get(&m, 42), (void*)(uintptr_t)9);
+    EXPECT_EQ(bbq_hmap_len(&m), 1u);
+    bbq_hmap_free(&m);
+}
+
+// Growth: every key inserted must still be findable after the table rehashes. This is the
+// one that catches a broken probe/rehash — the failure mode is a key that silently
+// vanishes, which in the optimizer would be a node with no vnode.
+TEST(BbqHmap, GrowsAndKeepsEveryKey) {
+    bbq_hmap m;
+    ASSERT_TRUE(bbq_hmap_init(&m, 4));            // deliberately tiny: forces several rehashes
+    const uint64_t N = 5000;
+    for (uint64_t i = 1; i <= N; i++)
+        ASSERT_TRUE(bbq_hmap_put(&m, i * 8, (void*)(uintptr_t)i));   // 8-aligned, like real pointers
+    EXPECT_EQ(bbq_hmap_len(&m), N);
+    for (uint64_t i = 1; i <= N; i++)
+        EXPECT_EQ(bbq_hmap_get(&m, i * 8), (void*)(uintptr_t)i) << "lost key " << i;
+    for (uint64_t i = 1; i <= N; i++)
+        EXPECT_EQ(bbq_hmap_get(&m, i * 8 + 4), nullptr);   // absent keys stay absent
+    bbq_hmap_free(&m);
+}
+
+// A NULL value is a legitimate value, and must be distinguishable from "absent".
+TEST(BbqHmap, NullValueIsNotAbsent) {
+    bbq_hmap m;
+    ASSERT_TRUE(bbq_hmap_init(&m, 0));
+    ASSERT_TRUE(bbq_hmap_put(&m, 7, nullptr));
+    EXPECT_TRUE(bbq_hmap_contains(&m, 7));
+    EXPECT_EQ(bbq_hmap_get(&m, 7), nullptr);
+    EXPECT_FALSE(bbq_hmap_contains(&m, 8));
+    bbq_hmap_free(&m);
+}
+
+// Key 0 must be storable: the empty slot cannot be signalled by a zero KEY, or a real
+// key of 0 reads as absent. (Pointers are never 0 in the optimizer's use, but a map that
+// quietly loses one key value is a trap for the next caller.)
+TEST(BbqHmap, ZeroKeyIsAValidKey) {
+    bbq_hmap m;
+    ASSERT_TRUE(bbq_hmap_init(&m, 0));
+    ASSERT_TRUE(bbq_hmap_put(&m, 0, (void*)(uintptr_t)77));
+    EXPECT_TRUE(bbq_hmap_contains(&m, 0));
+    EXPECT_EQ(bbq_hmap_get(&m, 0), (void*)(uintptr_t)77);
+    bbq_hmap_free(&m);
+}
+
+// Clustered keys — real pointers from an arena are 8-aligned and near each other, so the
+// low bits are a terrible hash. The map must not degenerate into a linear scan.
+TEST(BbqHmap, ClusteredAlignedKeys) {
+    bbq_hmap m;
+    ASSERT_TRUE(bbq_hmap_init(&m, 0));
+    uint64_t base = 0x7f0000001000ull;
+    for (uint64_t i = 0; i < 2000; i++)
+        ASSERT_TRUE(bbq_hmap_put(&m, base + i * 64, (void*)(uintptr_t)(i + 1)));
+    for (uint64_t i = 0; i < 2000; i++)
+        EXPECT_EQ(bbq_hmap_get(&m, base + i * 64), (void*)(uintptr_t)(i + 1));
+    bbq_hmap_free(&m);
 }

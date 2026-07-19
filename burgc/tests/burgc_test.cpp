@@ -909,6 +909,11 @@ TEST(BurgCBackend, ErrorReportingPollsContext) {
     EXPECT_EQ(code.find("assert(false"), std::string::npos);
 }
 
+// Uncovered-root reporting is asserted end-to-end instead of by grepping the emitted
+// text: burgc_coverage_c_e2e and burgc_coverage_cpp_e2e compile the generated matcher
+// and run it. A string count cannot tell a matcher that reports the right thing from one
+// that reports a stale message from the previous rewrite, which is what the C backend did.
+
 TEST(BurgCppBackend, RewriteResetsArenaFirst) {
     BurgGenerator gen;
     auto* spec = gen.parse(source_path("tests/data/simple.burg"));

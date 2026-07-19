@@ -2,6 +2,7 @@
 build/
 build-*/
 pegc/build/
+Testing/
 
 # IDE / editor
 .cache/

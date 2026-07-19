@@ -323,6 +323,10 @@ void CBurgBackend::emit_rpo_dfs(std::ostream& out, int indent) {
 void CBurgBackend::emit_rewrite_body(std::ostream& out, int indent) {
     int64_t start_idx = a_->nonterm_index.at(a_->start_nonterm);
 
+    // burg_set_error latches the FIRST error and ignores later ones, so a rewrite that
+    // does not clear on entry would report a previous call's failure forever. The C++
+    // backend gets this for free by throwing; C polls, so C must clear.
+    pad(out, indent); out << "burg_clear_error(ctx);\n";
     pad(out, indent); out << "arena_reset(ctx);\n\n";
 
     pad(out, indent); out << "if (BURG_NODE_SUCC_COUNT(root) == 0) {\n";
@@ -330,6 +334,10 @@ void CBurgBackend::emit_rewrite_body(std::ostream& out, int indent) {
     if (a_->has_actions) {
         pad(out, indent + 1); out << "if (state->rule[" << start_idx << "])\n";
         pad(out, indent + 2); out << ns_prefix_ << "burg_reduce(root, state, " << start_idx << ", ctx);\n";
+        pad(out, indent + 1); out << "else\n";
+        pad(out, indent + 2);
+        out << "burg_set_error(\"burg: start nonterminal has no rule at root\", "
+               "(int)BURG_NODE_OP(root), ctx);\n";
     }
     pad(out, indent + 1); out << "return;\n";
     pad(out, indent); out << "}\n\n";
@@ -353,6 +361,13 @@ void CBurgBackend::emit_rewrite_body(std::ostream& out, int indent) {
         pad(out, indent + 2); out << "burg_state_t* s = burg_cache_lookup((uint32_t)(uintptr_t)BURG_NODE_ID(rpo[_i]), ctx);\n";
         pad(out, indent + 2); out << "if (s && s->rule[" << start_idx << "])\n";
         pad(out, indent + 3); out << ns_prefix_ << "burg_reduce(rpo[_i], s, " << start_idx << ", ctx);\n";
+        pad(out, indent + 2); out << "else\n";
+        // No break: burg_reduce already opens with an error check, so once this fires
+        // every later node is a no-op call, and burg_set_error keeps the first message.
+        // The loop running to the end is what makes reduction stop, not a jump out of it.
+        pad(out, indent + 3);
+        out << "burg_set_error(\"burg: start nonterminal does not cover graph node\", "
+               "(int)BURG_NODE_OP(rpo[_i]), ctx);\n";
         pad(out, indent + 1); out << "}\n";
         pad(out, indent); out << "}\n";
     }

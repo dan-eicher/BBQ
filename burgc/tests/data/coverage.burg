@@ -1,0 +1,25 @@
+// coverage.burg — fixture for the rewrite-error e2e tests.
+//
+// The grammar exists to produce ONE thing the happy-path fixtures cannot: a root the
+// start nonterminal does not derive. `junk` is reachable from the Orphan terminal but
+// nothing chains junk to stmt, so an Orphan-rooted tree labels cleanly and then has no
+// rule for the start nonterminal — the exact silent-skip case burg_rewrite used to
+// return from without a word.
+//
+// Everything else is the smallest grammar that still exercises both rewrite paths: a
+// tree (no successor edges, the fast path) and a spine (successor edges, the RPO path).
+
+(. #include "coverage_node.h" .)
+
+TERM Const  = COV_CONST
+TERM Add    = COV_ADD
+TERM Orphan = COV_ORPHAN
+
+START stmt
+
+RULES
+
+reg  : Const         = 1 (. cov_record(1); .);
+reg  : Add(reg, reg) = 1 (. cov_record(2); .);
+stmt : reg           = 0 (. cov_record(10); .);
+junk : Orphan        = 1 (. cov_record(99); .);

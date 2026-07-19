@@ -302,10 +302,19 @@ bool Parser::parse_MulExpr(calc::Expr* * result) {
         auto _m0 = save();
         if (![&]() -> bool {
             skip();
-            if (!match("*")) return false;
-            skip();
-            if (!parse_UnaryExpr(&right)) return false;
-            *result = new calc::BinOp(calc::Op::Mul, *result, right);
+            if (peek_at("*")) {
+                skip();
+                if (!match("*")) return false;
+                skip();
+                if (!parse_UnaryExpr(&right)) return false;
+                *result = new calc::BinOp(calc::Op::Mul, *result, right);
+            } else {
+                skip();
+                if (!match("/")) return false;
+                skip();
+                if (!parse_UnaryExpr(&right)) return false;
+                *result = new calc::BinOp(calc::Op::Div, *result, right);
+            }
             return true;
         }()) { restore(_m0); break; }
     }

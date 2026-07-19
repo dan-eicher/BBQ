@@ -27,6 +27,7 @@ struct LoadLocal;
 struct Add;
 struct Sub;
 struct Mul;
+struct Div;
 struct Neg;
 struct CmpEq;
 struct CmpNeq;
@@ -118,6 +119,7 @@ struct ASTVisitor {
     virtual void visit(Add* node) {}
     virtual void visit(Sub* node) {}
     virtual void visit(Mul* node) {}
+    virtual void visit(Div* node) {}
     virtual void visit(Neg* node) {}
     virtual void visit(CmpEq* node) {}
     virtual void visit(CmpNeq* node) {}
@@ -172,6 +174,7 @@ enum class NodeTag : int {
     Add,
     Sub,
     Mul,
+    Div,
     Neg,
     CmpEq,
     CmpNeq,
@@ -260,6 +263,22 @@ struct Mul : public Node {
     static constexpr int kind_value = static_cast<int>(NodeTag::Mul);
 
     Mul(
+        Node* left,
+        Node* right
+    )
+        : Node(kind), left(left), right(right) {}
+
+    void accept(ASTVisitor& visitor) override { visitor.visit(this); }
+
+    Node* left;
+    Node* right;
+};
+
+struct Div : public Node {
+    static constexpr NodeTag kind = NodeTag::Div;
+    static constexpr int kind_value = static_cast<int>(NodeTag::Div);
+
+    Div(
         Node* left,
         Node* right
     )

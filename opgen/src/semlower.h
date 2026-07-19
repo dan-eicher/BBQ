@@ -71,14 +71,9 @@ public:
     int  body_tail_returns(const Opcode* op) const;
     static int  op_has_flag(const Opcode* op, const char* f);
     static int  stencil_excluded(const Opcode* op);
-    static const SemExpr* find_divisor(const SemExpr* e);
-    static const SemExpr* body_divisor(const Opcode* op);
-    static const SemExpr* find_divide(const SemExpr* e);
-    static const SemExpr* body_divide(const Opcode* op);
-    static int  has_error(const Opcode* op, const char* name);
     static const SemExpr* body_call(const Opcode* op);
     static int  expr_has_unary_minus(const SemExpr* e);
-    void guard_trap(const char* throw_name);
+    void guard_trap(const char* error_name);
     void emit_native_fnptr_cast(const MethodDecl* md);
 
 private:

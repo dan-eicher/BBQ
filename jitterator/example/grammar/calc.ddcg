@@ -313,6 +313,16 @@ rule bin_op_mul : ast.BinOp(op: Mul, left: l, right: r) {
     gen(l, rho, local(tl), jump(after_r), after_r);
 }
 
+rule bin_op_div : ast.BinOp(op: Div, left: l, right: r) {
+    let tl = alloc_local();
+    let tr = alloc_local();
+    let ll = make_load_local(tl);
+    let lr = make_load_local(tr);
+    let after = cg_deliver(build ir.Div(ll, lr), delta, gamma, Lnext);
+    let after_r = gen(r, rho, local(tr), jump(after), after);
+    gen(l, rho, local(tl), jump(after_r), after_r);
+}
+
 rule neg_op : ast.NegOp(operand: e) {
     let te = alloc_local();
     let le = make_load_local(te);

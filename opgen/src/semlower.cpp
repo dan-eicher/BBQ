@@ -263,7 +263,8 @@ void SemLowerer::emit_arg(const SemExpr* a, const Opcode* op, ValueType at) {
 
 bool SemLowerer::is_intrinsic(const char* n) {
     static const char* names[] = { "sqrt","fabs","ceil","floor","ftrunc","nearest",
-        "fmin","fmax","copysign","clz","ctz","popcnt","rotl","rotr","reinterpret","push","pop", nullptr };
+        "fmin","fmax","copysign","clz","ctz","popcnt","rotl","rotr","reinterpret","push","pop",
+        "int_min", nullptr };
     for (int i = 0; names[i]; i++) if (!strcmp(n, names[i])) return true;
     return false;
 }
@@ -279,6 +280,15 @@ void SemLowerer::lower_intrinsic(const SemExpr* e, const Opcode* op, ValueType r
     int W = scalar_bits(c_scalar(at)), Msk = W - 1;
     const char* u = c_unsigned(at); const char* sc = c_scalar(at);
 
+    // int_min(): the most negative value of the surrounding expression's integer type. Nullary and
+    // width-polymorphic — it takes its width from `rt`, so ONE declared guard covers a `( T a, T b -- T )`
+    // family across i32 and i64. The overflow guards that need it (INT_MIN / -1) cannot be written any
+    // other way without hardcoding a width and losing the family.
+    if (!strcmp(n,"int_min")) {
+        int rW = scalar_bits(c_scalar(rt));
+        fprintf(out_, "(%s)((%s)1 << %d)", c_scalar(rt), c_unsigned(rt), rW - 1);
+        return;
+    }
     // push(v): a control-conditional value push (the signature can't express a push on only one path,
     // e.g. br_on_null re-pushing the non-null ref). v is an any_t; GPUSH_ANY rides its runtime tag.
     if (!strcmp(n,"push")) {
@@ -768,7 +778,10 @@ void SemLowerer::lower_stmt(const Opcode* op, const SemStmt* s) {
     }
     case SemStmtTag::SIf: {
         auto* sif = static_cast<const SIf*>(s);
-        fputs("    if (", out_); lower_expr(sif->cond, op, ValueType::TyI32); fputs(") {\n", out_);
+        // `(_Bool)` for the same reason the guard emitter uses it: lower_expr already
+        // parenthesises a binary operator, so a bare `if (` + expr + `)` yields
+        // `if ((c == 0))`, which clang flags as an extraneous-parenthesised equality.
+        fputs("    if ((_Bool)", out_); lower_expr(sif->cond, op, ValueType::TyI32); fputs(") {\n", out_);
         lower_stmt(op, sif->then_);
         if (sif->else_.has_value()) { fputs("    } else {\n", out_); lower_stmt(op, *sif->else_); }
         fputs("    }\n", out_);
@@ -920,92 +933,15 @@ int SemLowerer::stencil_excluded(const Opcode* op) {
     return op_has_flag(op, "no_jit");
 }
 
-// ── Guard synthesis helpers ─────────────────────────────────
-
-const SemExpr* SemLowerer::find_divisor(const SemExpr* e) {
-    if (!e) return nullptr;
-    switch (e->tag) {
-    case SemExprTag::SBinOp: {
-        auto* b = static_cast<const SBinOp*>(e);
-        if (!strcmp(b->op, "/") || !strcmp(b->op, "%")) return b->right;
-        const SemExpr* r = find_divisor(b->left);
-        return r ? r : find_divisor(b->right);
-    }
-    case SemExprTag::SUnary:   return find_divisor(static_cast<const SUnary*>(e)->operand);
-    case SemExprTag::STernary: {
-        auto* tn = static_cast<const STernary*>(e);
-        const SemExpr* r = find_divisor(tn->cond);
-        if (r) return r;
-        r = find_divisor(tn->then_);
-        return r ? r : find_divisor(tn->else_);
-    }
-    case SemExprTag::SCast:    return find_divisor(static_cast<const SCast*>(e)->operand);
-    case SemExprTag::SIndex: {
-        auto* ix = static_cast<const SIndex*>(e);
-        const SemExpr* r = find_divisor(ix->base);
-        return r ? r : find_divisor(ix->index);
-    }
-    case SemExprTag::SCall: {
-        for (auto* a : static_cast<const SCall*>(e)->args) {
-            const SemExpr* r = find_divisor(a);
-            if (r) return r;
-        }
-        return nullptr;
-    }
-    default: return nullptr;
-    }
-}
-
-const SemExpr* SemLowerer::body_divisor(const Opcode* op) {
-    for (auto* s : op->sem_body) {
-        const SemExpr* d = nullptr;
-        if (s->tag == SemStmtTag::SAssign)        d = find_divisor(static_cast<const SAssign*>(s)->value);
-        else if (s->tag == SemStmtTag::SExprStmt) d = find_divisor(static_cast<const SExprStmt*>(s)->value);
-        if (d) return d;
-    }
-    return nullptr;
-}
-
-const SemExpr* SemLowerer::find_divide(const SemExpr* e) {
-    if (!e) return nullptr;
-    switch (e->tag) {
-    case SemExprTag::SBinOp: {
-        auto* b = static_cast<const SBinOp*>(e);
-        if (!strcmp(b->op, "/")) return e;
-        const SemExpr* r = find_divide(b->left);
-        return r ? r : find_divide(b->right);
-    }
-    case SemExprTag::SUnary:   return find_divide(static_cast<const SUnary*>(e)->operand);
-    case SemExprTag::SCast:    return find_divide(static_cast<const SCast*>(e)->operand);
-    case SemExprTag::STernary: {
-        auto* tn = static_cast<const STernary*>(e);
-        const SemExpr* r = find_divide(tn->then_);
-        return r ? r : find_divide(tn->else_);
-    }
-    default: return nullptr;
-    }
-}
-
-const SemExpr* SemLowerer::body_divide(const Opcode* op) {
-    for (auto* s : op->sem_body) {
-        const SemExpr* d = nullptr;
-        if (s->tag == SemStmtTag::SAssign)        d = find_divide(static_cast<const SAssign*>(s)->value);
-        else if (s->tag == SemStmtTag::SExprStmt) d = find_divide(static_cast<const SExprStmt*>(s)->value);
-        if (d) return d;
-    }
-    return nullptr;
-}
-
-void SemLowerer::guard_trap(const char* throw_name) {
-    (void)throw_name;
-    if (mode_ == Mode::Stencil) fputs(" TAIL return _HOLE_trap(vm);\n", out_);
-    else fprintf(out_, " TAIL return %s_trap(vm);\n", prefix_.c_str());
-}
-
-int SemLowerer::has_error(const Opcode* op, const char* name) {
-    for (auto* e : op->errors)
-        if (e->error_name && strstr(e->error_name, name)) return 1;
-    return 0;
+// A fired guard reports WHICH error fired, then tails to the trap continuation.
+// The declared name reaches the backend as an OPGEN_ERR_* code through the
+// OPGEN_GUARD_TRAP seam; the generated default discards it, so a backend with a
+// single undifferentiated trap needs no change, and one that distinguishes trap
+// causes (wasm's "integer divide by zero" vs "integer overflow") overrides it.
+void SemLowerer::guard_trap(const char* error_name) {
+    fprintf(out_, " { OPGEN_GUARD_TRAP(vm, OPGEN_ERR_%s);", error_name);
+    if (mode_ == Mode::Stencil) fputs(" TAIL return _HOLE_trap(vm); }\n", out_);
+    else fprintf(out_, " TAIL return %s_trap(vm); }\n", prefix_.c_str());
 }
 
 const SemExpr* SemLowerer::body_call(const Opcode* op) {

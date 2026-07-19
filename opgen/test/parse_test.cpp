@@ -33,7 +33,7 @@ int helper(int a) {
 }
 
 iconst 0x10 [ i32 imm ] (i32 a -- i32 r)
-    error: "a > 100" -> overflow
+    error: (. a > 100 .) -> overflow
     flag: pure
     (.
         int t = a + 1;
@@ -79,8 +79,15 @@ TEST(OpgenParse, OpcodeFieldsAndOperands) {
     ASSERT_EQ(op->stack_out.size(), 1u);
     EXPECT_STREQ(op->stack_out[0]->name, "r");
     ASSERT_EQ(op->errors.size(), 1u);
+    // The condition is a parsed expression in the action language, not a string:
+    // `a > 100` is an SBinOp over the stack input, which is what gets emitted.
     ASSERT_TRUE(op->errors[0]->condition.has_value());
-    EXPECT_STREQ(*op->errors[0]->condition, "\"a > 100\"");  // raw, quotes kept
+    const auto* cond = *op->errors[0]->condition;
+    ASSERT_EQ(cond->tag, opgen::SemExprTag::SBinOp);
+    const auto* bin = static_cast<const opgen::SBinOp*>(cond);
+    EXPECT_STREQ(bin->op, ">");
+    ASSERT_EQ(bin->left->tag, opgen::SemExprTag::SIdent);
+    EXPECT_STREQ(static_cast<const opgen::SIdent*>(bin->left)->name, "a");
     EXPECT_STREQ(op->errors[0]->error_name, "overflow");
     ASSERT_EQ(op->flags.size(), 1u);
     EXPECT_STREQ(op->flags[0], "pure");

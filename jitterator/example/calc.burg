@@ -21,6 +21,7 @@ TERM LoadLocal  = calc_ir::LoadLocal::kind_value
 TERM Add        = calc_ir::Add::kind_value
 TERM Sub        = calc_ir::Sub::kind_value
 TERM Mul        = calc_ir::Mul::kind_value
+TERM Div        = calc_ir::Div::kind_value
 TERM Neg        = calc_ir::Neg::kind_value
 TERM CmpEq      = calc_ir::CmpEq::kind_value
 TERM CmpNeq     = calc_ir::CmpNeq::kind_value
@@ -63,6 +64,7 @@ reg: LoadLocal = 1 (. E.op(OP_LOAD);  E.u8((uint8_t)static_cast<calc_ir::LoadLoc
 reg: Add(reg, reg) = 1 (. E.op(OP_ADD); .);
 reg: Sub(reg, reg) = 1 (. E.op(OP_SUB); .);
 reg: Mul(reg, reg) = 1 (. E.op(OP_MUL); .);
+reg: Div(reg, reg) = 1 (. E.op(OP_DIV); .);
 reg: Neg(reg)      = 1 (. E.op(OP_NEG); .);
 
 reg: CmpEq(reg, reg)  = 1 (. E.op(OP_EQ); .);

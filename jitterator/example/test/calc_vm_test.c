@@ -228,6 +228,26 @@ int main(void) {
     { static const u1 c[] = {0x01,0x02, 0x01,0x03, 0x08, 0x10};
       check("2 < 3", c, sizeof c, 1); }
 
+    /* Declared `error:` guards on `div` (0x16). Both guard conditions are emitted
+     * verbatim from calc.def into BOTH tiers, so these assert the interpreter and
+     * the JIT stencil agree on exactly when a guard fires — the parity that a
+     * body-shape-inferred guard could never promise.
+     *
+     * The not-taken cases matter as much as the taken ones: a guard that fired
+     * unconditionally would still "trap correctly" on the div-by-zero input. */
+    { static const u1 c[] = {0x01,0x14, 0x01,0x04, 0x16, 0x10};
+      check("20 / 4", c, sizeof c, 5); }
+    { static const u1 c[] = {0x01,0x7F, 0x01,0x02, 0x16, 0x10};
+      check("-1 / 2 (neither guard fires)", c, sizeof c, 0); }
+    { static const u1 c[] = {0x01,0x2A, 0x01,0x00, 0x16, 0x10};
+      check_trap("div by zero", c, sizeof c); }
+    /* INT_MIN / -1: the int_min() guard. sleb128 for -2147483648 is 5 bytes. */
+    { static const u1 c[] = {0x01,0x80,0x80,0x80,0x80,0x78, 0x01,0x7F, 0x16, 0x10};
+      check_trap("INT_MIN / -1 overflow", c, sizeof c); }
+    /* INT_MIN / 2 — same numerator, guard must NOT fire. */
+    { static const u1 c[] = {0x01,0x80,0x80,0x80,0x80,0x78, 0x01,0x02, 0x16, 0x10};
+      check("INT_MIN / 2 (overflow guard not taken)", c, sizeof c, -1073741824); }
+
     /* Inline native (calc_abs): a DIRECT, folded call in both tiers — no _HOLE_
      * patch, no jit-symbol. const -8 (sleb 0x78); abs; ret. */
     { static const u1 c[] = {0x01,0x78, 0x14, 0x10};

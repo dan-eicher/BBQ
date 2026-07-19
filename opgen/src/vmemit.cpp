@@ -45,31 +45,44 @@ const SemExpr* VmEmitter::out_count(const StackParam* sp) {   // §3b variadic: 
     return sp->count.has_value() ? *sp->count : nullptr;
 }
 
-// ── Guard synthesis ─────────────────────────────────────────
+// The type an `error:` condition is lowered at.
+//
+// lower_expr threads ONE result type down both sides of an operator — opgen has
+// no per-node type inference, for guards or for bodies. So a condition is
+// lowered at the type of the first stack input or operand it names, in
+// declaration order, defaulting to i32 when it names none (a condition over
+// only literals). This is what lets ONE declared condition cover a polymorphic
+// `( T a, T b -- T )` family: the family expands to concrete opcodes first, so
+// `b == 0` resolves to i32 or i64 per expansion.
+ValueType VmEmitter::cond_type(const Opcode* op, const SemExpr* cond) {
+    for (auto* s : op->stack_in)
+        if (expr_refs_name(cond, s->name)) return s->ty;
+    for (auto* od : op->operands)
+        if (expr_refs_name(cond, od->name)) return od->ty;
+    return ValueType::TyI32;
+}
+
+// ── Guard emission ──────────────────────────────────────────
+//
+// One `error:` declaration, one emitted guard, in declaration order. The
+// condition is the predicate the spec author wrote — opgen does not infer a
+// guard from the body's shape, so a guard is expressible for any condition the
+// action language can state, not just the two shapes a matcher knew how to spot.
 
 void VmEmitter::emit_guards(SemLowerer& low, const Opcode* op) {
     FILE* o = low.out();
-    if (SemLowerer::has_error(op, "DivByZero")) {
-        const SemExpr* d = SemLowerer::body_divisor(op);
-        if (d) {
-            fputs("    if ((", o);
-            low.lower_expr(d, op, ValueType::TyI32);
-            fputs(") == 0)", o);
-            low.guard_trap("throw_div_by_zero");
-        }
-    }
-    if (SemLowerer::has_error(op, "Overflow")) {
-        const SemExpr* div = SemLowerer::body_divide(op);
-        if (div) {
-            const SemExpr* num = static_cast<const SBinOp*>(div)->left;
-            ValueType nt = (num->tag == SemExprTag::SIdent)
-                ? low.type_of_name(op, static_cast<const SIdent*>(num)->name) : ValueType::TyI32;
-            int W = SemLowerer::scalar_bits(low.c_scalar(nt));
-            fputs("    if ((", o); low.lower_expr(static_cast<const SBinOp*>(div)->right, op, nt);
-            fputs(") == -1 && (", o); low.lower_expr(num, op, nt);
-            fprintf(o, ") == (%s)((%s)1 << %d))", low.c_scalar(nt), low.c_unsigned(nt), W - 1);
-            low.guard_trap("throw_div_by_zero");
-        }
+    for (auto* e : op->errors) {
+        if (!e->condition.has_value()) continue;   // a bare `error: Name` declares no guard
+        const SemExpr* cond = *e->condition;
+        // The `(_Bool)` is load-bearing, not decoration: lower_expr already wraps a
+        // binary operator in its own parens, so a bare `if (` + expr + `)` emits
+        // `if ((b == 0))` — which clang flags as an extraneous-parenthesised equality
+        // ("use '=' to turn this into an assignment"). The cast separates the two paren
+        // levels and states the intent: a guard condition is a predicate.
+        fputs("    if ((_Bool)", o);
+        low.lower_expr(cond, op, cond_type(op, cond));
+        fputc(')', o);
+        low.guard_trap(e->error_name);
     }
 }
 
@@ -153,7 +166,11 @@ int VmEmitter::stack_in_live(const Opcode* op, int k) {
         if (se && se[0] == '"' && l >= 2 && strlen(name) == l - 2 &&
             !strncmp(se + 1, name, l - 2)) return 1;
     }
-    if (k == 0 && SemLowerer::has_error(op, "ClassCast")) return 1;
+    // A guard reads its operands too. Without this an input named only by an
+    // `error:` condition would be dropped with a bare `JV_SP -=` instead of
+    // popped into a variable, and the emitted guard would not compile.
+    for (auto* e : op->errors)
+        if (e->condition.has_value() && expr_refs_name(*e->condition, name)) return 1;
     return 0;
 }
 
@@ -208,7 +225,12 @@ void VmEmitter::emit_slot_macros(SemLowerer& low) {
 // per-stencil source byte offset: the GENERATED DEFAULT discards it (no trap-frame recording, and
 // so _HOLE_pc never appears → no JIT hole). A backend that records a trap site #defines this to bake
 // the baked offset into its frame (e.g. f->instr_pc = (u4)(pc)).
-"#ifndef STENCIL_TRAP_PC\n#define STENCIL_TRAP_PC(pc)\n#endif\n", o);
+"#ifndef STENCIL_TRAP_PC\n#define STENCIL_TRAP_PC(pc)\n#endif\n"
+// which declared `error:` fired, as an OPGEN_ERR_* code, immediately before the tail to the trap
+// continuation. The GENERATED DEFAULT discards it — a backend with one undifferentiated trap needs
+// nothing. A backend that reports distinct trap causes (wasm separates "integer divide by zero" from
+// "integer overflow") #defines this to record the code before the trap unwinds.
+"#ifndef OPGEN_GUARD_TRAP\n#define OPGEN_GUARD_TRAP(vm, err) ((void)(err))\n#endif\n", o);
     const char* seen[32]; int ns = 0;
     for (auto* td : mod_->types) {
         const char* c = SemLowerer::slot_class(td->ty);
@@ -1058,12 +1080,35 @@ void VmEmitter::emit_runtime_api_h(FILE* o) {
         fputs(");\n", o);
     }
 
+    // Guard error codes: one per distinct name declared by an `error:` annotation,
+    // in first-declaration order. A fired guard passes its code to OPGEN_GUARD_TRAP
+    // before tailing to the trap continuation, so a backend can tell the causes apart.
     fputs(
-"\n/* Synthesized-guard throws: opgen emits calls to these from the contract\n"
-" * facts; a backend creates + raises the exception. */\n", o);
-    static const char* throws[] = { "throw_div_by_zero" };
-    for (size_t i = 0; i < sizeof(throws) / sizeof(throws[0]); i++)
-        fprintf(o, "%s %s(vm_t*, heap_t*);\n", low.status_type(), throws[i]);
+"\n/* ── Guard error codes (from the `error:` declarations in the spec) ──\n"
+" * A fired guard reports one of these through OPGEN_GUARD_TRAP before it\n"
+" * traps. The default discards it; override the macro to record it. */\n", o);
+    {
+        // Unbounded on purpose: a fixed cap would drop a declared name, and the
+        // guard that names it would then emit an undefined OPGEN_ERR_*.
+        std::vector<const char*> seen_e;
+        fputs("typedef enum {", o);
+        for (auto* op : mod_->opcodes) {
+            for (auto* e : op->errors) {
+                if (!e->error_name) continue;
+                bool dup = false;
+                for (const char* s : seen_e) if (!strcmp(s, e->error_name)) { dup = true; break; }
+                if (dup) continue;
+                fprintf(o, "%s\n    OPGEN_ERR_%s = %d",
+                        seen_e.empty() ? "" : ",", e->error_name, (int)seen_e.size());
+                seen_e.push_back(e->error_name);
+            }
+        }
+        // A spec with no `error:` declarations still needs the type to exist: the
+        // OPGEN_GUARD_TRAP default mentions it only inside guards, but the enum is
+        // part of the emitted API surface either way.
+        if (seen_e.empty()) fputs("\n    OPGEN_ERR_NONE = 0", o);
+        fputs("\n} opgen_err_t;\n", o);
+    }
 
     fputs("\n#endif /* OPGEN_RUNTIME_API_H */\n", o);
 }

@@ -22,7 +22,8 @@ namespace calc {
 enum class Op {
     Add,
     Sub,
-    Mul
+    Mul,
+    Div
 };
 
 // ── Forward declarations ────────────────────────────────────

@@ -47,6 +47,16 @@ sub 0x03 (i32 a, i32 b -- i32 r)   (. r = a - b; .)
 mul 0x04 (i32 a, i32 b -- i32 r)   (. r = a * b; .)
 neg 0x05 (i32 a -- i32 r)          (. r = -a; .)
 
+# The declared-guard opcode. Both conditions are emitted verbatim from what is
+# written here — opgen does not infer a guard from the body's shape — and both
+# tiers get them, so the interpreter and the JIT stencil trap identically.
+# int_min() is nullary and takes its width from the surrounding expression, so
+# the overflow guard would read the same on an i64 division.
+div 0x16 (i32 a, i32 b -- i32 r)
+    error: (. b == 0 .) -> DivByZero
+    error: (. b == -1 && a == int_min() .) -> Overflow
+    (. r = a / b; .)
+
 # ── Comparisons (yield 0 / 1) ───────────────────────────────
 eq 0x06 (i32 a, i32 b -- i32 r)    (. r = a == b; .)
 ne 0x07 (i32 a, i32 b -- i32 r)    (. r = a != b; .)

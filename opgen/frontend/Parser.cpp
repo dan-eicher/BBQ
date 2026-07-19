@@ -1385,9 +1385,9 @@ bool Parser::parse_LocalValueKind(opgen::LocalValueKind& out) {
 }
 
 bool Parser::parse_Annotation(std::vector<opgen::ErrorCase*>& errs, std::vector<const char*>& flags, std::optional<opgen::LocalValueDecl*>& local_value) {
-    peg::Span s1; peg::Span fname;
+    peg::Span fname;
        opgen::LocalValueKind lvk;
-       const char* cond = nullptr;
+       opgen::SemExpr* cond = nullptr;
     skip();
     if (peek_at("error:")) {
         skip();
@@ -1396,10 +1396,9 @@ bool Parser::parse_Annotation(std::vector<opgen::ErrorCase*>& errs, std::vector<
             auto _m0 = save();
             if (![&]() -> bool {
                 skip();
-                if (!string_lit(s1)) return false;
+                if (!parse_SemCond(cond)) return false;
                 skip();
                 if (!match("->")) return false;
-                cond = opgen_dup(s1);
                 return true;
             }()) restore(_m0);
         }
@@ -1445,6 +1444,29 @@ bool Parser::parse_SemBody(std::vector<opgen::SemStmt*>& body) {
             return true;
         }()) {} else {
         restore(_m1);
+        return false;
+        }
+    }
+    return true;
+}
+
+bool Parser::parse_SemCond(opgen::SemExpr*& out) {
+    skip();
+    if (!match("(")) return false;
+    skip();
+    if (!match(".")) return false;
+    skip();
+    if (!parse_SemExpr(out)) return false;
+    {
+        auto _m0 = save();
+        if ([&]() -> bool {
+            skip();
+            if (!match(".")) return false;
+            skip();
+            if (!match(")")) return false;
+            return true;
+        }()) {} else {
+        restore(_m0);
         return false;
         }
     }

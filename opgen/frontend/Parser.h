@@ -97,6 +97,7 @@ private:
     bool parse_LocalValueKind(opgen::LocalValueKind& out);
     bool parse_Annotation(std::vector<opgen::ErrorCase*>& errs, std::vector<const char*>& flags, std::optional<opgen::LocalValueDecl*>& local_value);
     bool parse_SemBody(std::vector<opgen::SemStmt*>& body);
+    bool parse_SemCond(opgen::SemExpr*& out);
     bool parse_SemBlockStmt(std::vector<opgen::SemStmt*>& list);
     bool parse_SemLocalDecl(std::vector<opgen::SemStmt*>& list);
     bool parse_SemDeclarator(std::vector<opgen::SemStmt*>& list, const char* ty);

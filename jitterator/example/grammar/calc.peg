@@ -110,6 +110,7 @@ MulExpr <. calc::Expr* *result .>
     (. calc::Expr* right; .)
     = UnaryExpr<result>
       { "*" UnaryExpr<&right>  (. *result = new calc::BinOp(calc::Op::Mul, *result, right); .)
+      | "/" UnaryExpr<&right>  (. *result = new calc::BinOp(calc::Op::Div, *result, right); .)
       }
 .
 

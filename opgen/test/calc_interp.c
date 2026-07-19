@@ -16,7 +16,9 @@
 /* The threaded-dispatch driver: each handler does its work and musttail-jumps
  * back here for the next opcode; we stop when the cursor runs off the program. */
 static u2 g_len;
-void calc_trap(vm_t* vm) { (void)vm; }   /* the calc opcodes never trap */
+/* The trap continuation: `idiv` declares an `error:` guard, so this IS reachable.
+ * Park the cursor at the end so the driver loop stops and no result is delivered. */
+void calc_trap(vm_t* vm) { vm->frame.pc = g_len; }
 void calc_next(vm_t* vm) {
     frame_t* f = &vm->frame;
     if (f->pc >= g_len) return;

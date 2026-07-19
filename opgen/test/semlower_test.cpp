@@ -91,10 +91,13 @@ TEST(OpgenLower, NativeCallInterpVsStencil) {
               "(NATIVE_ARGS, a)));\n");
 }
 
+// The `(_Bool)` is required, not cosmetic: lower_expr parenthesises a binary
+// operator, so `if (` + expr + `)` would emit `if ((a > b))` — and for an
+// equality that is clang's extraneous-parenthesised-comparison warning.
 TEST(OpgenLower, IfElse) {
     auto* m = parse(kSpec); ASSERT_NE(m, nullptr);
     EXPECT_EQ(lower_body(m, op_named(m, "ifop"), Mode::Interp),
-              "    if ((a > b)) {\n"
+              "    if ((_Bool)(a > b)) {\n"
               "    r = (int32_t)(a);\n"
               "    } else {\n"
               "    r = (int32_t)(b);\n"

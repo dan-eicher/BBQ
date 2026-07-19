@@ -320,10 +320,10 @@ LocalValueKind <. opgen::LocalValueKind& out .>
 Annotation <. std::vector<opgen::ErrorCase*>& errs,
               std::vector<const char*>& flags,
               std::optional<opgen::LocalValueDecl*>& local_value .>
-    (. peg::Span s1; peg::Span fname;
+    (. peg::Span fname;
        opgen::LocalValueKind lvk;
-       const char* cond = nullptr; .)
-    = "error:" [ string_lit<s1> "->" (. cond = opgen_dup(s1); .) ]
+       opgen::SemExpr* cond = nullptr; .)
+    = "error:" [ SemCond<cond> "->" ]
         ident<fname>
         (. errs.push_back(new opgen::ErrorCase(opgen_opt(cond), opgen_dup(fname))); .)
 
@@ -363,6 +363,16 @@ Annotation <. std::vector<opgen::ErrorCase*>& errs,
 
 SemBody <. std::vector<opgen::SemStmt*>& body .>
     = "(" "." { SemBlockStmt<body> }
+      ( "." ")" | (. return false; .) )
+.
+
+// A single expression in the same "(. ... .)" delimiters a body uses — the
+// guard predicate of an `error:` annotation. Distinct from SemBody because a
+// condition is one expression, not a statement list; same hard-fail on an
+// unterminated block, so a malformed guard is a parse error, never a silent
+// backtrack that drops the guard.
+SemCond <. opgen::SemExpr*& out .>
+    = "(" "." SemExpr<out>
       ( "." ")" | (. return false; .) )
 .
 

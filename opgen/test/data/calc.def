@@ -45,5 +45,5 @@ iload 0x0C [ i8 idx ] ( -- i32 r )
     (. r = locals[idx]; .)
 
 idiv 0x0D (i32 a, i32 b -- i32 r)
-    error: "divisor must be non-zero" -> DivByZero
+    error: (. b == 0 .) -> DivByZero
     (. r = a / b; .)

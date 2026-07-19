@@ -224,10 +224,12 @@ struct OperandParam : public ASTNode {
 };
 
 struct ErrorCase : public ASTNode {
-    ErrorCase(std::optional<const char*> condition, const char* error_name)
+    ErrorCase(std::optional<SemExpr*> condition, const char* error_name)
         : condition(std::move(condition)), error_name(error_name){}
 
-    std::optional<const char*> condition;
+    // The guard predicate, in the same closed action language as an opcode
+    // body — this IS what gets emitted, not a description of it.
+    std::optional<SemExpr*> condition;
     const char* error_name;
 };
 

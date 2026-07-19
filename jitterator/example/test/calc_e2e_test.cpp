@@ -49,6 +49,14 @@ int main(void) {
         {"5",                                       5},
         {"1+2",                                     3},
         {"2+3*4",                                  14},
+        // Division: same precedence tier as `*`, left-associative, and it binds
+        // tighter than `+`. The `div` opcode is the one carrying declared
+        // `error:` guards, so these also prove a guarded opcode still computes.
+        {"12/4",                                    3},
+        {"100/5/2",                                10},
+        {"2+12/4",                                  5},
+        {"20/3",                                    6},   // truncating, like C
+        {"-12/4",                                  -3},
         {"1==1",                                    1},
         {"2<3",                                     1},
         {"3<2",                                     0},

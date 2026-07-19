@@ -6,7 +6,7 @@
 //   sub-tree fields (real IR pointers, not integer side-channels).
 //     LoadConst(value)
 //     LoadLocal(src)                     // leaf — frame[fp+src]
-//     Add/Sub/Mul(left, right)
+//     Add/Sub/Mul/Div(left, right)       // Div traps on a zero divisor
 //     Neg(operand)
 //     CmpEq/Neq/Lt/Le/Gt/Ge(left, right)
 //     Call(target, args, frame_size)     // value = function's return value
@@ -34,6 +34,7 @@ module calc_ir {
          | Add(node left, node right)
          | Sub(node left, node right)
          | Mul(node left, node right)
+         | Div(node left, node right)
          | Neg(node operand)
          | CmpEq(node left, node right)
          | CmpNeq(node left, node right)

@@ -12,7 +12,7 @@ module calc {
 
     function = Function(identifier name, identifier* params, expr body)
 
-    op = Add | Sub | Mul
+    op = Add | Sub | Mul | Div
 
     // Each comparison kind is its own continuation in the CEK model;
     // the AST mirrors that — no enum-tagged Cmp constructor.

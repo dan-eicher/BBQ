@@ -51,6 +51,8 @@ private:
     static int  expr_refs_name(const SemExpr* e, const char* name);
     static int  stmt_refs_name(const SemStmt* s, const char* name);
     static int  stack_in_live(const Opcode* op, int k);
+    // The type an `error:` condition is lowered at. See the definition.
+    static ValueType cond_type(const Opcode* op, const SemExpr* cond);
     static const char* out_sem_expr(const StackParam* sp);   // optional<const char*> → ptr
     static const SemExpr* out_count(const StackParam* sp);   // §3b variadic pop-count expr → ptr (or null)
 };

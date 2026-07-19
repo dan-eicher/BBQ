@@ -117,9 +117,27 @@ mnemonic 0xNN [subop] [ <operands> ] ( <stack_in> -- <stack_out> )
   runtime `FETCH` with no hole.
 - **stack effect** `( a, b -- r )` names the inputs popped and outputs
   pushed; the body reads the inputs and assigns the outputs by name.
-- **annotations**: `error: "cond" -> handler` (a guarded fault),
+- **annotations**: `error: (. cond .) -> Name` (a guarded fault),
   `flag: name` (an opcode flag bit), `local_value: int` (declares the
   body touches the `locals[]` array with the given element kind).
+
+  A guard's condition is an expression in the same action language as a
+  body, and it is emitted *verbatim* — opgen never infers a guard from
+  the body's shape, so any condition the language can state is a
+  guard. Guards emit in declaration order, ahead of the body, into
+  **both** tiers, so the interpreter and the JIT stencil trap
+  identically. An input named only by a condition is still popped into
+  a variable. A condition is lowered at the type of the first stack
+  input or operand it names (i32 if it names none), which is what lets
+  one guard on a `family` cover every member width.
+
+  `Name` becomes `OPGEN_ERR_<Name>` in the generated `opgen_err_t`
+  enum. A fired guard passes its code to `OPGEN_GUARD_TRAP(vm, err)`
+  and then tails to the trap continuation; the generated default
+  discards the code, so a backend with a single undifferentiated trap
+  needs nothing, and one that reports distinct causes overrides the
+  macro. `error: Name` with no condition declares a name without a
+  guard.
 
 A **`family ( T a -- T r ) { i32 iadd 0x60  i64 ladd 0x61  … }`** block
 expands at parse time into one ordinary opcode per member, sharing a
@@ -136,6 +154,14 @@ through built-in calls (`get_field(o,ref)`, `array_load(a,i)`, …), never
 dotted access. Loops-as-control-flow inside the dispatch loop, `new`,
 `this`, `++`/`--`, and compound assignment are deliberately excluded.
 A body that does not parse is a hard error — there is no raw-C escape.
+
+Intrinsics available as calls: `sqrt`, `fabs`, `ceil`, `floor`,
+`ftrunc`, `nearest`, `fmin`, `fmax`, `copysign`, `clz`, `ctz`,
+`popcnt`, `rotl`, `rotr`, `reinterpret`, `push`, `pop`, and
+`int_min()`. `int_min()` is nullary and takes its width from the
+surrounding expression's type, so an overflow guard written once —
+`error: (. b == -1 && a == int_min() .) -> Overflow` — holds for
+every member of a `family`.
 
 ### Verbatim trailer
 

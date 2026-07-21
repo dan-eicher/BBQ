@@ -42,6 +42,38 @@ TEST(BbqArena, ResetReusesPages) {
     bbq_arena_free(&a);
 }
 
+// An allocation LARGER than page_size, made after a reset, must not be served
+// out of a recycled normal-size page. The arena records no per-page capacity,
+// so the reuse path had nothing to check the request against: it set pos = 0 on
+// a 4096-byte page and returned it for an 8192-byte request, and the caller's
+// write ran off the end of the heap block.
+//
+// Asserted by address rather than by writing, so this fails deterministically
+// on a plain build instead of only under a sanitizer.
+TEST(BbqArena, ResetThenOversizedAllocDoesNotReuseANormalPage) {
+    bbq_arena a;
+    bbq_arena_init(&a, 4096);
+
+    for (int i = 0; i < 5; i++)               // fills page 0, opens page 1
+        ASSERT_NE(bbq_arena_alloc(&a, 1024), nullptr);
+    ASSERT_GE(a.page_count, 2);
+    char* page0 = a.pages[0];
+    char* page1 = a.pages[1];
+
+    bbq_arena_reset(&a);
+    ASSERT_NE(bbq_arena_alloc(&a, 64), nullptr);          // back on page 0
+
+    char* big = (char*)bbq_arena_alloc(&a, 8192);         // twice page_size
+    ASSERT_NE(big, nullptr);
+    EXPECT_FALSE(big >= page0 && big < page0 + 4096)
+        << "8192-byte block was served from the recycled 4096-byte page 0";
+    EXPECT_FALSE(big >= page1 && big < page1 + 4096)
+        << "8192-byte block was served from the recycled 4096-byte page 1";
+
+    memset(big, 0xAB, 8192);                  // the write the bug corrupted
+    bbq_arena_free(&a);
+}
+
 TEST(BbqArena, LargeAllocation) {
     bbq_arena a;
     bbq_arena_init(&a, 64);

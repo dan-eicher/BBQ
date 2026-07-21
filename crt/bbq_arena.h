@@ -19,6 +19,10 @@ extern "C" {
 
 typedef struct bbq_arena {
     char** pages;
+    /* Capacity of each page. A page is page_size bytes unless a single
+     * allocation needed more, so after a reset the reuse path can tell whether
+     * a recycled page is actually big enough for the request in hand. */
+    size_t* page_sizes;
     int    page_count;
     int    page_cap;
     int    cur_page;

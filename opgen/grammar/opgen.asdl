@@ -32,7 +32,7 @@ module opgen {
                | TyBlockType              // WASM blocktype (s33): 0x40/valtype/typeidx; the (ref null? ht) forms 0x63/0x64 carry a TRAILING heaptype (carrier s32)
                | TyBrTable | TyTryTable | TySelectVec  // WASM operand vectors: br_table label list, try_table catch list, select result-type vector
                | TyAny                    // runtime-typed value; slot width (1/2) from the stack tag
-               | TyAddr                   // WASM memory64/table64: an addrtype-width integer (i32 or i64), the pop width chosen from the stack tag (i32 zero-extended); pop-only
+               | TyAddr                   // WASM memory64/table64: an addrtype-width integer (i32 or i64). The width is the addrtype DECLARED by the module entry the operand addresses, named by the signature's `addr(<is64-expr>)` source (see stack_param.at_src) — never the operand's runtime tag. i32 zero-extends; pop-only
 
     // sem_expr captures the rare "= expr" form on stack outputs that
     // the harness emitter uses for dup/dup2/etc. — e.g.
@@ -43,12 +43,24 @@ module opgen {
     // stack (GC roots) for the body to read in-place as `name[i]`; opgen drops them (sp -= count) AFTER
     // the body, then pushes the results. This is the §3(b) "variadic by immediate" form (struct.new/
     // array.new_fixed/call): the signature stops lying and opgen owns the marshaling.
-    stack_param   = StackParam(value_type ty, ident name, ident ?sem_expr, sem_expr ?count)
+    // `at_src` (optional): the param's type is an ADDRESS TYPE resolved from a module entry, written
+    // `addr(x) name` where x is the index immediate. WASM §2.3.11 makes addrtype ::= i32 | i64, and
+    // §2.3.15/§2.3.16 make it part of each memory's / table's DECLARED type (memtype ::= addrtype
+    // limits page; tabletype ::= addrtype limits reftype). So every typing rule reads the width from
+    // the module — `C.mems[x] = at lim page  =>  C |- nt.load x memarg : at -> nt` (§3.4.5),
+    // `C.tables[x] = at lim rt  =>  C |- table.get x : at -> rt` (§3.4.4) — and §4.6.8 executes it as
+    // "ASSERT: Due to validation ... Pop the value (at.const i)": asserted from the declared type,
+    // never tested at runtime. Naming the source here is what lets the generated pop read the SAME
+    // fact the validator read, instead of re-deriving the width from the operand's value tag.
+    stack_param   = StackParam(value_type ty, ident name, ident ?sem_expr, sem_expr ?count,
+                               sem_expr ?at_src)
     operand_param = OperandParam(value_type ty, ident name, bool cp_ref)
 
     // Error annotation: optional condition + an error-name tag.
-    // An unconditional error has condition == NULL.
-    error_case = ErrorCase(rawcode ?condition, ident error_name)
+    // An unconditional error has condition == NULL. The condition is a parsed
+    // expression in the same closed action language as an opcode body — it IS
+    // what gets emitted as the guard, not a description of it.
+    error_case = ErrorCase(sem_expr ?condition, ident error_name)
 
     // Type of a local-variable-referencing opcode's referenced slot:
     // sload/sstore touch a short, iload/istore an int (2 slots), aload
@@ -144,11 +156,18 @@ module opgen {
     // header (frame_t/vm_t/heap_t) a consumer supplies. opgen #includes
     // it at the value-model's substrate point in runtime_api.h; absent,
     // the self-test default frame is emitted instead.
+    // `sidetable`: the bare `sidetable` directive — this op set has
+    // STRUCTURED control, so opgen owns the Titzer side-table entry
+    // format and the §4.4.8 walk over it, and emits both. Declared
+    // rather than inferred: an op set can name its transfer built-in
+    // anything, and a spec with no side table must not be handed a
+    // walk that reads frame fields its substrate does not have.
     module = Module(opcode *opcodes,
                     method_decl *methods,
                     status_decl ?status,
                     type_decl *types,
                     rawcode *headers,
                     rawcode ?body_c,
-                    rawcode ?backend)
+                    rawcode ?backend,
+                    bool sidetable)
 }

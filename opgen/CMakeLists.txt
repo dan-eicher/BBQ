@@ -68,6 +68,7 @@ add_executable(opgen_tests
     test/parse_test.cpp
     test/spec_test.cpp
     test/semlower_test.cpp
+    test/vmemit_test.cpp
     test/bbq_emit_test.cpp)
 target_include_directories(opgen_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/runtime)
 target_link_libraries(opgen_tests PRIVATE opgen_core GTest::GTest GTest::Main)

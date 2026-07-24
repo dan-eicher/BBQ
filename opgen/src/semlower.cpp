@@ -1,6 +1,7 @@
 // The opcode-body lowering (sem_expr/sem_stmt → C), ported from the C
 // emit_interp_c.cpp. The algorithm is unchanged — every emitted byte matches
 // the reference VM; the g_mod/g_mode/g_lane globals are now members.
+#include <cstdlib>
 #include "semlower.h"
 #include <cstring>
 #include <cctype>
@@ -35,7 +36,7 @@ jrow SemLowerer::jtype(ValueType t) const {
     case ValueType::TyF32:   return jrow{"f4",    "f4",    1, 'f'};  // JVM float
     case ValueType::TyF64:   return jrow{"f8",    "f8",    2, 'f'};  // JVM double
     case ValueType::TyAny:   return jrow{"any_t", "any_t", 1, 'i'};  // runtime-typed
-    case ValueType::TyAddr:  return jrow{"u8",    "u8",    1, 'l'};  // WASM addrtype: 1 slot; GPOP_ADDR (custom) picks .i/.l by the stack tag
+    case ValueType::TyAddr:  return jrow{"u8",    "u8",    1, 'l'};  // WASM addrtype: 1 slot; GPOP_ADDR (custom) picks .i/.l from the DECLARED addrtype the signature's addr(...) source names
     case ValueType::TyV128:  return jrow{"v128_t", "v128_t", 1, 'v'};  // WASM SIMD
     case ValueType::TyI8x16: case ValueType::TyI16x8: case ValueType::TyI32x4:
     case ValueType::TyI64x2: case ValueType::TyF32x4: case ValueType::TyF64x2:
@@ -169,6 +170,29 @@ void SemLowerer::int_slot_view(char* fld, const char** islot, const char** uw, i
     }
 }
 
+// Does this expression already denote a whole SLOT (value + tag), as opposed to a
+// scalar? Only slot-valued sources can be assigned to a `word` target wholesale.
+int SemLowerer::expr_is_slot_valued(const Opcode* op, const SemExpr* e) const {
+    if (!e) return 0;
+    switch (e->tag) {
+    case SemExprTag::SIdent: {
+        ValueType t = type_of_name(op, static_cast<const SIdent*>(e)->name);
+        return t == ValueType::TyWord || t == ValueType::TyAny;
+    }
+    case SemExprTag::STernary: {
+        auto* tn = static_cast<const STernary*>(e);
+        return expr_is_slot_valued(op, tn->then_) && expr_is_slot_valued(op, tn->else_);
+    }
+    case SemExprTag::SIndex:            /* locals[i] / globals[i] read a slot */
+        return 1;
+    case SemExprTag::SCall: {           /* a native returning `any`/`word` */
+        const MethodDecl* md = find_method(static_cast<const SCall*>(e)->name);
+        return md && md->ret_ty && (!strcmp(md->ret_ty, "any") || !strcmp(md->ret_ty, "word"));
+    }
+    default: return 0;
+    }
+}
+
 ValueType SemLowerer::type_of_name(const Opcode* op, const char* name) const {
     for (auto* s : op->stack_out) if (!strcmp(s->name, name)) return s->ty;
     for (auto* s : op->stack_in)  if (!strcmp(s->name, name)) return s->ty;
@@ -298,7 +322,13 @@ void SemLowerer::lower_intrinsic(const SemExpr* e, const Opcode* op, ValueType r
     // constructors (struct.new/array.new_fixed) which pop their fields in the body AFTER allocating, so
     // the fields stay GC-rooted on the stack across the alloc. Decrement sp, then read the slot + tag.
     if (!strcmp(n,"pop")) {
-        fputs("(JV_SP--, (any_t){ .bits = JV_STK[JV_SP].l, .kind = JV_STKT[JV_SP] })", out_); return;
+        // Both 64-bit halves when the model carries v128 — an any_t built from .l
+        // alone drops lanes 2/3 of a T_V128 slot (the GC-object truncation bug).
+        // The slot member letter comes from the spec's type table, never hardcoded.
+        char vf = v128_field();
+        if (vf) fprintf(out_, "(JV_SP--, (any_t){ .bits = JV_STK[JV_SP].%c.i64[0], .hi = JV_STK[JV_SP].%c.i64[1], .kind = JV_STKT[JV_SP] })", vf, vf);
+        else    fputs("(JV_SP--, (any_t){ .bits = JV_STK[JV_SP].l, .kind = JV_STKT[JV_SP] })", out_);
+        return;
     }
 
     const char* fn = nullptr;
@@ -361,6 +391,11 @@ const char* SemLowerer::api_c_type_for(const char* t, const char* status_ty) {
     if (!strcmp(t, "short"))   return "s2";
     if (!strcmp(t, "char"))    return "u2";
     if (!strcmp(t, "long"))    return "s8";
+    // The unsigned widths the action language already accepts (java_c maps them). Left
+    // out here, a native declared `ulong` got an s4 prototype — a SILENT narrowing of
+    // its signature, which is what a native taking an addrtype value needs to state.
+    if (!strcmp(t, "uint"))    return "u4";
+    if (!strcmp(t, "ulong"))   return "u8";
     if (!strcmp(t, "float"))   return "f4";
     if (!strcmp(t, "double"))  return "f8";
     if (!strcmp(t, "any"))     return "any_t";
@@ -386,7 +421,7 @@ void SemLowerer::lower_call(const SemExpr* e, const Opcode* op, ValueType rt) {
     if (!md) {
         fprintf(stderr, "opgen: call to undeclared built-in '%s' in %s\n",
                 call->name, op->mnemonic);
-        return;
+        exit(1);   /* dropping the call would emit a body that silently does nothing */
     }
     native_called_ = true;   // a native may set vm->trapped → the stencil must check + bail (see emit_one_opcode)
     if (mode_ == Mode::Stencil && !md->inl) {   // inline natives emit a DIRECT call (folds a static-inline backend fn); regular natives ride a _HOLE_ patch point
@@ -402,6 +437,20 @@ void SemLowerer::lower_call(const SemExpr* e, const Opcode* op, ValueType rt) {
 // ── Expression lowering ─────────────────────────────────────
 
 void SemLowerer::lower_expr(const SemExpr* e, const Opcode* op, ValueType rt) {
+    // A float constant in a stencil reads its named hole instead of being spelled as
+    // a C literal, which clang would materialize from the .rodata constant pool — a
+    // relocation copy-and-patch cannot carry. Same union pun a literal-init local
+    // uses; intercepted BEFORE the switch so `-2147483648.0` is one constant rather
+    // than a negation routed through _HOLE_fsignmask.
+    uint64_t kbits;
+    if (mode_ == Mode::Stencil && in_guard_ && float_const_bits(e, rt, &kbits)) {
+        char nm[64]; float_hole_name(kbits, nm, sizeof nm);
+        const char* sc = c_scalar(rt);
+        const char* ui = scalar_bits(sc) >= 64 ? "u8" : "u4";
+        fprintf(out_, "(__extension__({ union { %s i; %s f; } _u; _u.i = (%s)%s; _u.f; }))",
+                ui, sc, ui, nm);
+        return;
+    }
     switch (e->tag) {
     case SemExprTag::SBinOp: {
         auto* b = static_cast<const SBinOp*>(e);
@@ -465,12 +514,26 @@ void SemLowerer::lower_expr(const SemExpr* e, const Opcode* op, ValueType rt) {
         int _lc = 0; const char* _lf = nullptr;
         if (base->tag == SemExprTag::SIdent && !vp)
             lane_elem(type_of_name(op, bnm), &_lc, &_lf);
-        if (vp) {   // read the i-th variadic operand in place as an any_t (value + runtime tag)
-            fprintf(out_, "((any_t){ .bits = _vb_%s[", bnm);
-            lower_expr(ix->index, op, ValueType::TyI32);
-            fprintf(out_, "].l, .kind = _vt_%s[", bnm);
-            lower_expr(ix->index, op, ValueType::TyI32);
-            fputs("] })", out_);
+        if (vp) {   // read the i-th variadic operand in place as an any_t (value + runtime tag);
+                    // both halves when the model carries v128 (struct.new of a v128 field / a
+                    // v128 tag param must not truncate to the low 64 bits); the slot member
+                    // letter comes from the spec's type table
+            char vf = v128_field();
+            if (vf) {
+                fprintf(out_, "((any_t){ .bits = _vb_%s[", bnm);
+                lower_expr(ix->index, op, ValueType::TyI32);
+                fprintf(out_, "].%c.i64[0], .hi = _vb_%s[", vf, bnm);
+                lower_expr(ix->index, op, ValueType::TyI32);
+                fprintf(out_, "].%c.i64[1], .kind = _vt_%s[", vf, bnm);
+                lower_expr(ix->index, op, ValueType::TyI32);
+                fputs("] })", out_);
+            } else {
+                fprintf(out_, "((any_t){ .bits = _vb_%s[", bnm);
+                lower_expr(ix->index, op, ValueType::TyI32);
+                fprintf(out_, "].l, .kind = _vt_%s[", bnm);
+                lower_expr(ix->index, op, ValueType::TyI32);
+                fputs("] })", out_);
+            }
         }
         else if (_lc) {
             fprintf(out_, "%s.%s[", static_cast<const SIdent*>(base)->name, _lf);
@@ -482,8 +545,10 @@ void SemLowerer::lower_expr(const SemExpr* e, const Opcode* op, ValueType rt) {
             lower_global_read(op, ix->index, rt);
         else if (base->tag == SemExprTag::SIdent && !strcmp(static_cast<const SIdent*>(base)->name, "code")) {
             fputs("f->code[", out_); lower_expr(ix->index, op, ValueType::TyI32); fputc(']', out_);
-        } else
+        } else {
             fprintf(stderr, "opgen: only locals[]/code[] indexing is supported in %s\n", op->mnemonic);
+            exit(1);
+        }
         break;
     }
     case SemExprTag::SCall:
@@ -492,7 +557,7 @@ void SemLowerer::lower_expr(const SemExpr* e, const Opcode* op, ValueType rt) {
         auto* id = static_cast<const SIdent*>(e);
         int lc; const char* lf;
         if (!strcmp(id->name, "sp"))      fputs("JV_SP", out_);
-        else if (!strcmp(id->name, "stp")) fputs("f->stp", out_);   // side-table pointer: control ops advance it on fall-through
+        else if (!strcmp(id->name, "stp")) fputs("OPGEN_ST_PTR(f)", out_);   // side-table pointer (backend-relocatable seam): control ops advance it on fall-through
         else if (!strcmp(id->name, "pc")) fputs("f->pc", out_);
         else if (lane_ && !strcmp(id->name, "lane")) fputs("_k", out_);
         else if (lane_ && (lane_elem(type_of_name(op, id->name), &lc, &lf), lc))
@@ -569,7 +634,7 @@ void SemLowerer::lower_void_call(const SemExpr* e, const Opcode* op) {
     if (!md) {
         fprintf(stderr, "opgen: call to undeclared built-in '%s' in %s\n",
                 call->name, op->mnemonic);
-        return;
+        exit(1);   /* dropping the call would emit a body that silently does nothing */
     }
     native_called_ = true;   // may set vm->trapped; non-status (non-resync) natives need the stencil trap-check
     int ctrl = !strcmp(md->ret_ty, "status");
@@ -679,10 +744,11 @@ void SemLowerer::lower_stmt(const Opcode* op, const SemStmt* s) {
         if (t->tag == SemExprTag::SIdent && !strcmp(static_cast<const SIdent*>(t)->name, "sp")) {
             fputs("    JV_SP = (u1)(", out_); lower_expr(v, op, ValueType::TyI32); fputs(");\n", out_);
         } else if (t->tag == SemExprTag::SIdent && !strcmp(static_cast<const SIdent*>(t)->name, "stp")) {
-            fputs("    f->stp = (u4)(", out_); lower_expr(v, op, ValueType::TyI32); fputs(");\n", out_);
+            fputs("    OPGEN_ST_PTR(f) = (u4)(", out_); lower_expr(v, op, ValueType::TyI32); fputs(");\n", out_);
         } else if (is_slot_index(t)) {
             if (!is_slot_index(v)) {
                 fprintf(stderr, "opgen: slot store needs a slot source in %s\n", op->mnemonic);
+                exit(1);
                 break;
             }
             auto* tx = static_cast<const SIndex*>(t);
@@ -701,7 +767,17 @@ void SemLowerer::lower_stmt(const Opcode* op, const SemStmt* s) {
                 fputs(");\n", out_);
                 break;
             }
-            if (rt == ValueType::TyAny || rt == ValueType::TyWord || rt == ValueType::TyV128 || is_lane_type(rt))
+            // A `word` result is a whole slot. Assigning ANOTHER slot to it (select's
+            // `result = c ? v1 : v2`) is a slot move; assigning a SCALAR has to go
+            // through the value model's field selector, or C rejects it — that is the
+            // "opgen owns the value model but does not expose it" gap. The tag is the
+            // body's to set via `<name>_wt`, which is what makes a runtime-width
+            // result (memory.size's addrtype) expressible as an honest signature.
+            if (rt == ValueType::TyWord && !expr_is_slot_valued(op, v)) {
+                fprintf(out_, "    %s.%c = (%s)(", tname, jtype(ValueType::TyI64).field,
+                        c_scalar(ValueType::TyI64));
+            }
+            else if (rt == ValueType::TyAny || rt == ValueType::TyWord || rt == ValueType::TyV128 || is_lane_type(rt))
                 fprintf(out_, "    %s = (", tname);
             else
                 fprintf(out_, "    %s = (%s)(", tname, c_scalar(rt));
@@ -734,15 +810,18 @@ void SemLowerer::lower_stmt(const Opcode* op, const SemStmt* s) {
             lower_expr(v, op, wet); fputs(");\n", out_);
         } else {
             fprintf(stderr, "opgen: unsupported assignment target in %s\n", op->mnemonic);
+            exit(1);
         }
         break;
     }
     case SemStmtTag::SExprStmt: {
         auto* es = static_cast<const SExprStmt*>(s);
-        if (es->value->tag == SemExprTag::SCall)
+        if (es->value->tag == SemExprTag::SCall) {
             lower_void_call(es->value, op);
-        else
+        } else {
             fprintf(stderr, "opgen: expression statement must be a built-in call in %s\n", op->mnemonic);
+            exit(1);
+        }
         break;
     }
     case SemStmtTag::SLocalDecl: {
@@ -985,10 +1064,168 @@ int SemLowerer::expr_has_unary_minus(const SemExpr* e) {
     }
 }
 
-int SemLowerer::op_const_holes(const Opcode* op, const char* names[8], uint64_t vals[8]) const {
-    static char buf[8][64];
+int SemLowerer::expr_refs_name(const SemExpr* e, const char* name) {
+    if (!e) return 0;
+    switch (e->tag) {
+    case SemExprTag::SBinOp: {
+        auto* b = static_cast<const SBinOp*>(e);
+        return expr_refs_name(b->left, name) || expr_refs_name(b->right, name);
+    }
+    case SemExprTag::SUnary:   return expr_refs_name(static_cast<const SUnary*>(e)->operand, name);
+    case SemExprTag::STernary: {
+        auto* t = static_cast<const STernary*>(e);
+        return expr_refs_name(t->cond, name) || expr_refs_name(t->then_, name) ||
+               expr_refs_name(t->else_, name);
+    }
+    case SemExprTag::SCast:    return expr_refs_name(static_cast<const SCast*>(e)->operand, name);
+    case SemExprTag::SIndex: {
+        auto* ix = static_cast<const SIndex*>(e);
+        return expr_refs_name(ix->base, name) || expr_refs_name(ix->index, name);
+    }
+    case SemExprTag::SCall: {
+        for (auto* a : static_cast<const SCall*>(e)->args)
+            if (expr_refs_name(a, name)) return 1;
+        return 0;
+    }
+    case SemExprTag::SIdent:   return !strcmp(static_cast<const SIdent*>(e)->name, name);
+    case SemExprTag::SInt:     return 0;
+    case SemExprTag::SFloat:   return 0;
+    }
+    return 0;
+}
+
+// lower_expr threads ONE result type down both sides of an operator — opgen has
+// no per-node type inference, for guards or for bodies. So a condition is
+// lowered at the type of the first stack input or operand it names, in
+// declaration order, defaulting to i32 when it names none (a condition over
+// only literals). This is what lets ONE declared condition cover a polymorphic
+// `( T a, T b -- T )` family: the family expands to concrete opcodes first, so
+// `b == 0` resolves to i32 or i64 per expansion.
+ValueType SemLowerer::cond_type(const Opcode* op, const SemExpr* cond) {
+    for (auto* s : op->stack_in)
+        if (expr_refs_name(cond, s->name)) return s->ty;
+    for (auto* od : op->operands)
+        if (expr_refs_name(cond, od->name)) return od->ty;
+    return ValueType::TyI32;
+}
+
+// ── Float constants inside a guard ──────────────────────────
+//
+// A float literal lowers to a plain C literal, which clang materializes from the
+// .rodata constant pool — a relocation a copy-and-patch stencil cannot carry. In a
+// BODY that never bites, because a literal-init local becomes a named `_HOLE_`
+// (op_const_holes below). A CONDITION has no local to hang a name on, so the
+// literal needs a synthesized one.
+//
+// The name is derived from the VALUE (`_HOLE_k<bit pattern>`) rather than from a
+// walk index, so the hole table and the emitter cannot disagree about which
+// literal is which — no ordering contract between them, and two occurrences of the
+// same constant share one hole.
+//
+// `-2147483648.0` is matched as ONE constant, not as a negation of one: folding the
+// sign in keeps it off the `_HOLE_fsignmask` path, whose hole is only declared for
+// unary minus appearing in a body.
+int SemLowerer::float_const_bits(const SemExpr* e, ValueType rt, uint64_t* bits) const {
+    if (!e) return 0;
+    const char* sc = c_scalar(rt);
+    if (sc[0] != 'f') return 0;                       // only float constants need a hole
+    if (e->tag == SemExprTag::SUnary) {
+        auto* u = static_cast<const SUnary*>(e);
+        if (strcmp(u->op, "-") || !u->operand || u->operand->tag != SemExprTag::SFloat) return 0;
+    } else if (e->tag != SemExprTag::SFloat) {
+        return 0;
+    }
+    return const_eval(e, sc, bits);   // c_scalar ("f4"/"f8") is the form const_eval reads
+}
+
+// Does this guard still negate a float at RUNTIME? A negated float LITERAL folds
+// into one constant hole (float_const_bits) and never reaches the sign-mask path, so
+// asking `expr_has_unary_minus` alone would declare a mask nothing references.
+int SemLowerer::expr_has_live_float_negate(const SemExpr* e, ValueType rt) const {
+    if (!e) return 0;
+    uint64_t bits;
+    if (float_const_bits(e, rt, &bits)) return 0;      // folded; not a runtime negate
+    switch (e->tag) {
+    case SemExprTag::SUnary: {
+        auto* u = static_cast<const SUnary*>(e);
+        if (!strcmp(u->op, "-")) return 1;
+        return expr_has_live_float_negate(u->operand, rt);
+    }
+    case SemExprTag::SBinOp: {
+        auto* b = static_cast<const SBinOp*>(e);
+        return expr_has_live_float_negate(b->left, rt) || expr_has_live_float_negate(b->right, rt);
+    }
+    case SemExprTag::STernary: {
+        auto* t = static_cast<const STernary*>(e);
+        return expr_has_live_float_negate(t->cond, rt) || expr_has_live_float_negate(t->then_, rt) ||
+               expr_has_live_float_negate(t->else_, rt);
+    }
+    case SemExprTag::SCast:
+        return expr_has_live_float_negate(static_cast<const SCast*>(e)->operand, rt);
+    case SemExprTag::SIndex: {
+        auto* ix = static_cast<const SIndex*>(e);
+        return expr_has_live_float_negate(ix->base, rt) || expr_has_live_float_negate(ix->index, rt);
+    }
+    case SemExprTag::SCall:
+        for (auto* a : static_cast<const SCall*>(e)->args)
+            if (expr_has_live_float_negate(a, rt)) return 1;
+        return 0;
+    default: return 0;
+    }
+}
+
+void SemLowerer::float_hole_name(uint64_t bits, char* out, size_t cap) {
+    snprintf(out, cap, "_HOLE_k%016llx", (unsigned long long)bits);
+}
+
+// Walk a guard for float constants, in pre-order, calling `hit` on each.
+void SemLowerer::walk_float_consts(const SemExpr* e, ValueType rt,
+                                   void* ctx, void (*hit)(void*, uint64_t)) const {
+    if (!e) return;
+    uint64_t bits;
+    if (float_const_bits(e, rt, &bits)) { hit(ctx, bits); return; }   // one constant: do not recurse
+    switch (e->tag) {
+    case SemExprTag::SBinOp: {
+        auto* b = static_cast<const SBinOp*>(e);
+        walk_float_consts(b->left, rt, ctx, hit); walk_float_consts(b->right, rt, ctx, hit); return;
+    }
+    case SemExprTag::SUnary:
+        walk_float_consts(static_cast<const SUnary*>(e)->operand, rt, ctx, hit); return;
+    case SemExprTag::STernary: {
+        auto* t = static_cast<const STernary*>(e);
+        walk_float_consts(t->cond, rt, ctx, hit); walk_float_consts(t->then_, rt, ctx, hit);
+        walk_float_consts(t->else_, rt, ctx, hit); return;
+    }
+    case SemExprTag::SCast:
+        walk_float_consts(static_cast<const SCast*>(e)->operand, rt, ctx, hit); return;
+    case SemExprTag::SIndex: {
+        auto* ix = static_cast<const SIndex*>(e);
+        walk_float_consts(ix->base, rt, ctx, hit); walk_float_consts(ix->index, rt, ctx, hit); return;
+    }
+    case SemExprTag::SCall:
+        for (auto* a : static_cast<const SCall*>(e)->args) walk_float_consts(a, rt, ctx, hit);
+        return;
+    default: return;
+    }
+}
+
+/* The hole table is fixed at OP_CONST_HOLES entries because that is the caller's array
+ * size. Overflowing it is FATAL, never a silent truncation: the stencil still references
+ * the dropped hole by name, and the JIT driver, finding nothing to patch, bakes 0 — a
+ * wrong stencil rather than a missing one, and wrong in JIT code only. */
+static void hole_room_or_die(const Opcode* op, int n, const char* nm) {
+    if (n < SemLowerer::OP_CONST_HOLES) return;
+    fprintf(stderr, "opgen: %s: more than %d constant holes (adding '%s') — the stencil "
+                    "hole table is full and a dropped hole would be baked as 0\n",
+            op->mnemonic, SemLowerer::OP_CONST_HOLES, nm);
+    exit(1);
+}
+
+int SemLowerer::op_const_holes(const Opcode* op, const char* names[OP_CONST_HOLES],
+                               uint64_t vals[OP_CONST_HOLES]) const {
+    static char buf[OP_CONST_HOLES][64];
     int n = 0;
-    for (size_t i = 0; i < op->sem_body.size() && n < 8; i++) {
+    for (size_t i = 0; i < op->sem_body.size(); i++) {
         const SemStmt* s = op->sem_body[i];
         if (s->tag != SemStmtTag::SLocalDecl) continue;
         auto* decl = static_cast<const SLocalDecl*>(s);
@@ -996,22 +1233,64 @@ int SemLowerer::op_const_holes(const Opcode* op, const char* names[8], uint64_t 
         uint64_t bits;
         if (!const_eval(*decl->init, java_c(decl->ty), &bits)) continue;
         if (body_assigns(op, decl->name)) continue;   // a reassigned local is a temp, not a constant hole
+        hole_room_or_die(op, n, decl->name);
         snprintf(buf[n], sizeof buf[n], "_HOLE_%s", decl->name);
         names[n] = buf[n]; vals[n] = bits; n++;
     }
+    /* Float constants named by a guard. Keyed by value, so a repeated constant
+     * costs one hole and the emitter finds it under the same name. */
+    static char fbuf[OP_CONST_HOLES][64];
+    struct Ctx { const Opcode* op; const char** names; uint64_t* vals; int* n; }
+        cx = { op, names, vals, &n };
+    for (auto* e : op->errors) {
+        if (!e->condition.has_value()) continue;
+        walk_float_consts(*e->condition, cond_type(op, *e->condition), &cx,
+                          [](void* v, uint64_t bits) {
+            auto* c = (Ctx*)v;
+            char nm[64]; float_hole_name(bits, nm, sizeof nm);
+            for (int i = 0; i < *c->n; i++) if (!strcmp(c->names[i], nm)) return;
+            hole_room_or_die(c->op, *c->n, nm);
+            snprintf(fbuf[*c->n], sizeof fbuf[0], "%s", nm);
+            c->names[*c->n] = fbuf[*c->n]; c->vals[*c->n] = bits; (*c->n)++;
+        });
+    }
+
+    /* The float sign mask, when a GUARD negates a float. The body scan below cannot
+     * cover this: it keys on the RESULT type, and a float compare has an i32 result
+     * (i32.trunc_f32_s), so the width has to come from the condition. Without this the
+     * stencil references _HOLE_fsignmask32 and nothing declares it — jitterator waves
+     * it through on the name prefix and the driver bakes 0, silently dropping the sign
+     * flip in JIT code only. */
+    for (auto* e : op->errors) {
+        if (!e->condition.has_value()) continue;
+        ValueType ct = cond_type(op, *e->condition);
+        if (c_scalar(ct)[0] != 'f' || !expr_has_live_float_negate(*e->condition, ct)) continue;
+        int W = scalar_bits(c_scalar(ct));
+        const char* nm = W >= 64 ? "_HOLE_fsignmask64" : "_HOLE_fsignmask32";
+        int dup = 0;
+        for (int i = 0; i < n; i++) if (!strcmp(names[i], nm)) dup = 1;
+        if (dup) continue;
+        hole_room_or_die(op, n, nm);
+        names[n] = nm; vals[n] = (uint64_t)1 << (W - 1); n++;
+    }
+
     if (!op->stack_out.empty()) {
         int lc; const char* lf;
         ValueType le = lane_elem(op->stack_out[0]->ty, &lc, &lf);
         ValueType et = lc ? le : op->stack_out[0]->ty;
         if (c_scalar(et)[0] == 'f') {
-            for (size_t i = 0; i < op->sem_body.size() && n < 8; i++) {
+            for (size_t i = 0; i < op->sem_body.size(); i++) {
                 const SemStmt* s = op->sem_body[i];
                 const SemExpr* v = s->tag == SemStmtTag::SAssign   ? static_cast<const SAssign*>(s)->value
                                  : s->tag == SemStmtTag::SExprStmt ? static_cast<const SExprStmt*>(s)->value : nullptr;
                 if (v && expr_has_unary_minus(v)) {
                     int W = scalar_bits(c_scalar(et));
-                    names[n] = W >= 64 ? "_HOLE_fsignmask64" : "_HOLE_fsignmask32";
-                    vals[n] = (uint64_t)1 << (W - 1); n++;
+                    const char* nm = W >= 64 ? "_HOLE_fsignmask64" : "_HOLE_fsignmask32";
+                    int dup = 0;
+                    for (int i2 = 0; i2 < n; i2++) if (!strcmp(names[i2], nm)) dup = 1;
+                    if (dup) break;
+                    hole_room_or_die(op, n, nm);
+                    names[n] = nm; vals[n] = (uint64_t)1 << (W - 1); n++;
                     break;
                 }
             }

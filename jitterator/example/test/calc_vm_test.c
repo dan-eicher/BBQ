@@ -31,10 +31,23 @@ void calc_next(vm_t* vm) {
 }
 void calc_trap(vm_t* vm) { vm->trapped = 1; }
 
+/* The side table a br_table program branches through. opgen emitted the entry TYPE and
+ * the walk over it; a real consumer's validator fills the entries. The tests below build
+ * them by hand, which is the same role played by hand-written bytecode elsewhere here. */
+static const opgen_st_entry_t* g_sidetable = NULL;
+
+static void reset_vm(vm_t* vm, const u1* code, size_t len) {
+    bbq_ctx_init(&vm->frame.code, code, len);
+    vm->frame.sp = 0; vm->depth = 0; vm->trapped = 0;
+    vm->result.i = 0; vm->result_type = T_INT;
+    vm->frame.sidetable = g_sidetable; vm->frame.stp = 0;
+    memset(vm->mem, 0, sizeof vm->mem);
+    vm->cell.l = 0; vm->cell_type = T_VOID; vm->acc = 0;
+}
+
 static s4 interp_run(vm_t* vm, const u1* code, size_t len) {
     g_table = gen_interp_dispatch_table();
-    bbq_ctx_init(&vm->frame.code, code, len);
-    vm->frame.sp = 0; vm->depth = 0; vm->trapped = 0; vm->result.i = 0; vm->result_type = T_INT;
+    reset_vm(vm, code, len);
     calc_next(vm);
     return vm->result.i;
 }
@@ -92,8 +105,22 @@ static uint64_t decode_operand(bbq_ctx_t* c, jit_operand_kind_t k) {
     case JOP_ULEB32: { uint32_t v = 0; bbq_read_uleb128_u32(c, &v); return v; }
     case JOP_ULEB64: { uint64_t v = 0; bbq_read_uleb128_u64(c, &v); return v; }
     case JOP_U8:     { uint8_t v = 0; bbq_read_u8(c, &v); return v; }
+    /* The stencil's hole is the double's BIT PATTERN, so read the bits, not the value. */
+    case JOP_F64:    { double v = 0; uint64_t b; bbq_read_f64le(c, &v); memcpy(&b, &v, 8); return b; }
+    /* br_table's vec(labelidx) LENGTH. Reading it is what lets the tail walk below
+     * skip the right number of labels, and the stencil bakes it as a hole because the
+     * body clamps the key against it. */
+    case JOP_BRTABLE_COUNT: { uint32_t v = 0; bbq_read_uleb128_u32(c, &v); return v; }
     default: return 0;
     }
+}
+
+/* A variable-length trailing immediate: the op's meta says what kind, the walk skips it
+ * so the NEXT stencil is placed at the right source offset. br_table's count has already
+ * been consumed as a fixed operand, so only the count+1 labels remain. */
+static void skip_tail(bbq_ctx_t* c, jit_tail_kind_t k, uint64_t brtable_count) {
+    if (k != JTAIL_BRTABLE) return;
+    for (uint64_t i = 0; i <= brtable_count; i++) { uint32_t l = 0; bbq_read_uleb128_u32(c, &l); }
 }
 
 typedef void* jit_addr_t;
@@ -131,13 +158,16 @@ static jit_func_t* jit_compile(bbq_ctx_t code) {
         calc_jit_meta_t m = calc_jit_meta[op];
         const StencilDef* def = &stencil_table[m.stencil];
         uint64_t vals[16] = {0};
+        uint64_t brtable_count = 0;
         fill_native_holes(def, vals);
         for (int k = 0; k < m.operand_count; k++) {
             uint64_t imm = (m.operands[k].kind == JOP_CONST) ? m.operands[k].value
                                                             : decode_operand(&cur, m.operands[k].kind);
+            if (m.operands[k].kind == JOP_BRTABLE_COUNT) brtable_count = imm;
             int h = find_hole(def, m.operands[k].hole);
             if (h >= 0) vals[h] = imm;
         }
+        skip_tail(&cur, (jit_tail_kind_t)m.tail, brtable_count);
         int hip = find_hole(def, "_HOLE_ip");
         if (hip >= 0) vals[hip] = cur.pos;
         boffs[n] = bpos;
@@ -181,13 +211,36 @@ static void jit_enter(const jit_func_t* fn, vm_t* vm) {
 static void jit_free(jit_func_t* fn) { jcb_free(&fn->buf); free(fn->offmap); free(fn); }
 
 static s4 jit_run(vm_t* vm, const u1* code, size_t len) {
-    bbq_ctx_init(&vm->frame.code, code, len);
-    vm->frame.sp = 0; vm->depth = 0; vm->trapped = 0; vm->result.i = 0; vm->result_type = T_INT;
+    reset_vm(vm, code, len);
     jit_func_t* fn = jit_compile(vm->frame.code);
     jit_enter(fn, vm);
     jit_free(fn);
     return vm->result.i;
 }
+
+/* ── A tiny program builder. ──
+ *
+ * The original cases hand-encode their bytes, which stays readable for one-byte
+ * operands. The ops below carry sleb128 and IEEE doubles, where a byte literal says
+ * nothing about what it encodes — so those cases build their programs instead. */
+typedef struct { u1 b[256]; size_t n; } prog_t;
+
+static void p_op(prog_t* p, u1 op)     { p->b[p->n++] = op; }
+static void p_u8(prog_t* p, u1 v)      { p->b[p->n++] = v; }
+static void p_f64(prog_t* p, double v) { memcpy(&p->b[p->n], &v, 8); p->n += 8; }
+static void p_sleb(prog_t* p, int64_t v) {
+    for (;;) {
+        u1 byte = (u1)(v & 0x7f);
+        v >>= 7;
+        int done = (v == 0 && !(byte & 0x40)) || (v == -1 && (byte & 0x40));
+        p->b[p->n++] = done ? byte : (u1)(byte | 0x80);
+        if (done) return;
+    }
+}
+/* `const N` / `lconst N` — the two sleb-carrying constant pushes. */
+static void p_iconst(prog_t* p, int32_t v) { p_op(p, 0x01); p_sleb(p, v); }
+static void p_lconst(prog_t* p, int64_t v) { p_op(p, 0x17); p_sleb(p, v); }
+static void p_dconst(prog_t* p, double v)  { p_op(p, 0x18); p_f64(p, v); }
 
 /* ── The test: each program runs on BOTH tiers; they must agree. ── */
 static int fails = 0;
@@ -273,6 +326,201 @@ int main(void) {
     { /* fn fac($n) (if ($n < 2) 1 else $n * fac($n - 1)); fac(5) */
       static const u1 c[] = {0x01,0x05,0x0D,0x00,0x0C,0x00,0x13,0x8E,0x80,0x80,0x80,0x00,0x01,0x10,0x0C,0x00,0x0D,0x06,0x01,0x02,0x0D,0x07,0x0C,0x06,0x0C,0x07,0x08,0x0E,0xC5,0x80,0x80,0x80,0x00,0x0C,0x00,0x0D,0x01,0x0C,0x00,0x0D,0x04,0x01,0x01,0x0D,0x05,0x0C,0x04,0x0C,0x05,0x03,0x0D,0x03,0x0C,0x03,0x13,0x8E,0x80,0x80,0x80,0x00,0x01,0x0D,0x02,0x0C,0x01,0x0C,0x02,0x04,0x10,0x01,0x01,0x10};
       check("recursion fac(5)", c, sizeof c, 120); }
+
+    /* ═══ Float constants INSIDE a guard ═══════════════════════════════════════
+     *
+     * A float literal in a condition lowers to a C literal, which clang materializes
+     * out of .rodata — a relocation a copy-and-patch stencil cannot carry. opgen gives
+     * each one a `_HOLE_k<bits>` named by its VALUE instead. Get it wrong and the JIT
+     * bakes 0: the guard stops firing IN JIT CODE ONLY, which is precisely why every
+     * case here runs on both tiers. */
+    { prog_t p = {{0}, 0};
+      p_dconst(&p, 2147483647.0); p_op(&p, 0x1A); p_op(&p, 0x10);   /* trunc; ret */
+      check("trunc 2147483647.0 (in range)", p.b, p.n, 2147483647); }
+    { prog_t p = {{0}, 0};
+      p_dconst(&p, -2147483648.0); p_op(&p, 0x1A); p_op(&p, 0x10);
+      check("trunc -2147483648.0 (lower bound)", p.b, p.n, -2147483648); }
+    { prog_t p = {{0}, 0};                                          /* just over 2^31 */
+      p_dconst(&p, 2147483648.0); p_op(&p, 0x1A); p_op(&p, 0x10);
+      check_trap("trunc 2147483648.0 overflows", p.b, p.n); }
+    { prog_t p = {{0}, 0};
+      p_dconst(&p, -2147483649.0); p_op(&p, 0x1A); p_op(&p, 0x10);
+      check_trap("trunc -2147483649.0 overflows", p.b, p.n); }
+
+    /* A guard that NEGATES a float at run time rather than folding a literal: the sign
+     * flip rides _HOLE_fsignmask64, whose width comes from the CONDITION (the body scan
+     * keys on the result type and would miss it). Undeclared, jitterator waves the hole
+     * through on its name prefix and the driver bakes 0 — a negation by zero. */
+    { prog_t p = {{0}, 0};
+      p_dconst(&p, -2000000.0); p_dconst(&p, 2.0);                  /* -a = 2000000 > 1e6 */
+      p_op(&p, 0x1B); p_op(&p, 0x1A); p_op(&p, 0x10);
+      check_trap("ddiv guard negates at run time", p.b, p.n); }
+    { prog_t p = {{0}, 0};
+      p_dconst(&p, -8.0); p_dconst(&p, 2.0);                        /* -a = 8, guard quiet */
+      p_op(&p, 0x1B); p_op(&p, 0x1A); p_op(&p, 0x10);
+      check("ddiv -8.0 / 2.0 (guard not taken)", p.b, p.n, -4); }
+    { prog_t p = {{0}, 0};
+      p_dconst(&p, 1.0); p_dconst(&p, 0.0);
+      p_op(&p, 0x1B); p_op(&p, 0x1A); p_op(&p, 0x10);
+      check_trap("ddiv by zero", p.b, p.n); }
+
+    /* A native reachable ONLY from a guard still rides a _HOLE_ patch point, so its
+     * extern must still be declared — otherwise the stencil TU does not compile, and
+     * this case never gets as far as running. */
+    { prog_t p = {{0}, 0};
+      p_dconst(&p, 13.0); p_op(&p, 0x1C); p_op(&p, 0x1A); p_op(&p, 0x10);
+      check_trap("guard-only native fires", p.b, p.n); }
+    { prog_t p = {{0}, 0};
+      p_dconst(&p, 12.0); p_op(&p, 0x1C); p_op(&p, 0x1A); p_op(&p, 0x10);
+      check("guard-only native quiet", p.b, p.n, 12); }
+
+    /* ═══ v128 across the runtime-typed carrier ════════════════════════════════
+     *
+     * box/unbox move a whole slot through any_t. Shaped for a 64-bit payload, the
+     * carrier drops lanes 2/3 — so lane 1 comes back as 0 and the low lane still
+     * looks right, which is what made this survive so long. */
+    { prog_t p = {{0}, 0};
+      p_lconst(&p, 0x1111); p_lconst(&p, 0x2222);
+      p_op(&p, 0x1D);                       /* vmake: build the v128 from both halves */
+      p_op(&p, 0x1E); p_op(&p, 0x1F);       /* box; unbox */
+      p_op(&p, 0x20); p_u8(&p, 1);          /* vlane 1 — the half that used to vanish */
+      p_op(&p, 0x29); p_op(&p, 0x10);       /* l2i; ret */
+      check("v128 high lane survives any_t", p.b, p.n, 0x2222); }
+    { prog_t p = {{0}, 0};
+      p_lconst(&p, 0x1111); p_lconst(&p, 0x2222);
+      p_op(&p, 0x1D); p_op(&p, 0x1E); p_op(&p, 0x1F);
+      p_op(&p, 0x20); p_u8(&p, 0);
+      p_op(&p, 0x29); p_op(&p, 0x10);
+      check("v128 low lane survives any_t", p.b, p.n, 0x1111); }
+    /* The tag has to survive too, or the carrier is only half honest. */
+    { prog_t p = {{0}, 0};
+      p_lconst(&p, 1); p_lconst(&p, 2);
+      p_op(&p, 0x1D); p_op(&p, 0x1E); p_op(&p, 0x1F);
+      p_op(&p, 0x2A); p_op(&p, 0x10);       /* tagof; ret */
+      check("any_t carries the v128 tag", p.b, p.n, T_V128); }
+
+    /* ═══ `word`: one declared type, two lowerings ═════════════════════════════
+     *
+     * select's arms are slots, so its assignment is a slot move. msize's value is a
+     * SCALAR whose width is decided at run time, so it goes through the value model's
+     * field selector and the body sets the tag itself — which is what makes a
+     * runtime-width result an honest signature rather than a lie. */
+    { static const u1 c[] = {0x01,0x0B, 0x01,0x16, 0x01,0x01, 0x21, 0x10};
+      check("select picks v1 when c != 0", c, sizeof c, 11); }
+    { static const u1 c[] = {0x01,0x0B, 0x01,0x16, 0x01,0x00, 0x21, 0x10};
+      check("select picks v2 when c == 0", c, sizeof c, 22); }
+    { static const u1 c[] = {0x22,0x00, 0x10};                       /* msize 0; ret */
+      check("msize value (i32 addrtype memory)", c, sizeof c, CALC_MEM_BYTES); }
+    /* The TAG is the half a plain value check would miss: memory 1's addrtype is
+     * 64-bit, so the same op must push its result tagged as a long. */
+    { static const u1 c[] = {0x22,0x00, 0x1E, 0x1F, 0x2A, 0x10};     /* msize 0; box; unbox; tagof */
+      check("msize tag follows the i32 addrtype", c, sizeof c, T_INT); }
+    { static const u1 c[] = {0x22,0x01, 0x1E, 0x1F, 0x2A, 0x10};
+      check("msize tag follows the i64 addrtype", c, sizeof c, T_LONG); }
+
+    /* ═══ addrtype: the width is DECLARED, not sniffed ═════════════════════════ */
+
+    /* Memory 0 has a 32-bit addrtype and an ordinary i32 address — the easy direction. */
+    { static const u1 c[] = {0x01,0x04, 0x01,0x2A, 0x24,0x00,      /* const 4; const 42; store32 0 */
+                             0x01,0x04, 0x23,0x00, 0x10};          /* const 4; load32 0; ret */
+      check("store/load through a 32-bit addrtype", c, sizeof c, 42); }
+
+    /* THE case. The address is 64-bit and out of bounds, but it carries an i32 tag —
+     * the shape a value reconstructed out of an aggregate has, where the tag describes
+     * the container rather than the value's declared width. Reading the width from the
+     * DECLARED addrtype sees 0x1_0000_0002 and traps. Reading it from the tag truncates
+     * to 2, lands in bounds, and silently returns a different location's contents. */
+    { prog_t p = {{0}, 0};
+      p_lconst(&p, 0x100000002LL);
+      p_op(&p, 0x25); p_u8(&p, T_INT);      /* pushtag T_INT — the tag now lies */
+      p_op(&p, 0x23); p_u8(&p, 1);          /* load32 memory 1 (64-bit addrtype) */
+      p_op(&p, 0x10);
+      check_trap("64-bit address under an i32 tag still traps", p.b, p.n); }
+    /* ...and the guard is not simply always firing. */
+    { prog_t p = {{0}, 0};
+      p_lconst(&p, 8);
+      p_op(&p, 0x25); p_u8(&p, T_INT);
+      p_op(&p, 0x23); p_u8(&p, 1);
+      p_op(&p, 0x10);
+      check("in-bounds 64-bit address does not trap", p.b, p.n, 0); }
+
+    /* ═══ §3(b) variadic ═══════════════════════════════════════════════════════
+     *
+     * sum_n takes the DEFAULT drop-after-body path: its operands stay on the stack
+     * across the body and are read in place as `args[i]` — a runtime-typed read
+     * through the same carrier as box/unbox. opgen drops sp afterwards. (The `call`
+     * cases below take the other path; see pops_first.) */
+    { static const u1 c[] = {0x01,0x01, 0x01,0x02, 0x01,0x03, 0x26,0x03, 0x10};
+      check("sum_n over 3 in-place operands", c, sizeof c, 6); }
+    /* Count 0: consumes nothing, still pushes its one result. `add` then sees the 9
+     * that was already there — so a variadic pop of 0 must not disturb the stack. */
+    { static const u1 c[] = {0x01,0x09, 0x26,0x00, 0x02, 0x10};
+      check("sum_n over 0 operands consumes nothing", c, sizeof c, 9); }
+
+    /* A variadic RESULT names a count, not a value: the values are already at the frame
+     * top and exposing them is a single sp raise. Popping twice and returning the third
+     * is what proves sp actually rose by 3. */
+    { static const u1 c[] = {0x27,0x03, 0x11, 0x11, 0x10};   /* expose 3; pop; pop; ret */
+      check("variadic result raises sp by its count", c, sizeof c, 100); }
+
+    /* ═══ br_table + the side table ════════════════════════════════════════════
+     *
+     * The label TARGETS live in the side table, so the vector in the bytecode is pure
+     * decode: opgen reads its length as `labels_count`, skips the labels, and the body
+     * clamps the key against the count. delta_ip is relative to the byte just past the
+     * whole instruction, which both tiers agree on — the JIT's compile-walk skips the
+     * label vector before baking _HOLE_ip. */
+    {
+        /*  0: const KEY        2: br_table cnt=2 [0,1,2]
+         *  7: const 10; ret   10: const 20; ret   13: const 30; ret  */
+        static const opgen_st_entry_t tbl[] = {
+            { 0, 0, 0, 0 },   /* case 0    -> 7  */
+            { 3, 0, 0, 0 },   /* case 1    -> 10 */
+            { 6, 0, 0, 0 },   /* default   -> 13 */
+        };
+        g_sidetable = tbl;
+        u1 c[] = {0x01,0x00, 0x28,0x02,0x00,0x01,0x02,
+                  0x01,0x0A,0x10, 0x01,0x14,0x10, 0x01,0x1E,0x10};
+        c[1] = 0; check("br_table key 0", c, sizeof c, 10);
+        c[1] = 1; check("br_table key 1", c, sizeof c, 20);
+        c[1] = 7; check("br_table key clamps to default", c, sizeof c, 30);
+        g_sidetable = NULL;
+    }
+
+    /* The entry's vals/pop half: a taken branch keeps the top `vals` operands and drops
+     * `pop` beneath them. Here 33 is kept and 22 dropped, so the trailing `add` sees
+     * 11 + 33; without the drop it would see 22 + 33. */
+    {
+        static const opgen_st_entry_t tbl[] = { { 0, 0, 1, 1 } };
+        g_sidetable = tbl;
+        /*  0: const 11  2: const 22  4: const 33  6: const 0(key)
+         *  8: br_table cnt=0 [0]     11: add      12: ret */
+        static const u1 c[] = {0x01,0x0B, 0x01,0x16, 0x01,0x21, 0x01,0x00,
+                               0x28,0x00,0x00, 0x02, 0x10};
+        check("br_table entry keeps vals, drops pop", c, sizeof c, 44);
+        g_sidetable = NULL;
+    }
+
+    /* ═══ Running off the end of a function ════════════════════════════════════
+     *
+     * No trailing `ret`. The halt stencil stashes nothing — the results ARE the top of
+     * the frame stack, where a caller reads them. It used to write vm->result, which
+     * named a field of ONE consumer's vm_t: a baked-in target identifier in a generator
+     * that promises to have none. */
+    {
+        static const u1 c[] = {0x01,0x03, 0x01,0x04, 0x02};   /* const 3; const 4; add */
+        static vm_t vi, vj;
+        interp_run(&vi, c, sizeof c);
+        jit_run(&vj, c, sizeof c);
+        int ok = vi.frame.sp == 1 && vj.frame.sp == 1 &&
+                 vi.frame.stack[0].i == 7 && vj.frame.stack[0].i == 7;
+        if (!ok) {
+            printf("FAIL: %-30s interp sp=%u top=%d  jit sp=%u top=%d  want sp=1 top=7\n",
+                   "run off the end", vi.frame.sp, vi.frame.stack[0].i,
+                   vj.frame.sp, vj.frame.stack[0].i);
+            fails++;
+        } else printf("ok:   %-30s interp==jit results on the frame stack\n", "run off the end");
+    }
 
     if (!fails) { printf("\ncalc VM (interp == JIT): all checks passed\n"); return 0; }
     printf("\ncalc VM: %d FAILED\n", fails);

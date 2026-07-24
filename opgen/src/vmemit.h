@@ -15,6 +15,9 @@ namespace opgen {
 // Drives a SemLowerer (per-output mode) for the handler/stencil bodies.
 class VmEmitter {
 public:
+    // Does a body mention this name? Public because the emission helpers ask it.
+    static int  stmt_refs_name(const SemStmt* s, const char* name);
+
     VmEmitter(const Module* mod, std::string prefix)
         : mod_(mod), prefix_(std::move(prefix)) {
         for (char c : prefix_) uprefix_ += (char)toupper((unsigned char)c);
@@ -48,11 +51,7 @@ private:
     static const char* jop_kind(ValueType t);
     static const char* wvt_name(ValueType t);
     static const char* ht_name(ValueType t);
-    static int  expr_refs_name(const SemExpr* e, const char* name);
-    static int  stmt_refs_name(const SemStmt* s, const char* name);
     static int  stack_in_live(const Opcode* op, int k);
-    // The type an `error:` condition is lowered at. See the definition.
-    static ValueType cond_type(const Opcode* op, const SemExpr* cond);
     static const char* out_sem_expr(const StackParam* sp);   // optional<const char*> → ptr
     static const SemExpr* out_count(const StackParam* sp);   // §3b variadic pop-count expr → ptr (or null)
 };

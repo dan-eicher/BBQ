@@ -103,6 +103,7 @@ Opgen
        std::vector<opgen::TypeDecl*> types;
        std::optional<const char*> body_c;
        std::optional<const char*> backend;
+       bool sidetable = false;
        std::string hdr; .)
     = { "(."
         (. if (!scan_to("." ")", hdr)) return false;
@@ -110,6 +111,7 @@ Opgen
       }
       { StatusDecl<status>
       | BackendDecl<backend>
+      | SidetableDecl<sidetable>
       | TypeDecl<types>
       | MethodDecl<methods>
       | FamilyDef<ops>
@@ -126,7 +128,7 @@ Opgen
       ]
       (. skip(); if (!at_end()) return false; .)
     (. ast = new opgen::Module(std::move(ops), std::move(methods), status,
-           std::move(types), std::move(headers), body_c, backend); .)
+           std::move(types), std::move(headers), body_c, backend, sidetable); .)
 .
 
 // ═══════════════════════════════════════════════════════════════
@@ -202,12 +204,12 @@ FamilyDef <. std::vector<opgen::Opcode*>& ops .>
              std::vector<opgen::StackParam*> nin;
              for (size_t i = 0; i < tin.size(); i++) {
                  opgen::ValueType ty = in_var[i] ? mvts[m] : tin[i]->ty;
-                 nin.push_back(new opgen::StackParam(ty, tin[i]->name, tin[i]->sem_expr, tin[i]->count));
+                 nin.push_back(new opgen::StackParam(ty, tin[i]->name, tin[i]->sem_expr, tin[i]->count, tin[i]->at_src));
              }
              std::vector<opgen::StackParam*> nout;
              for (size_t i = 0; i < tout.size(); i++) {
                  opgen::ValueType ty = out_var[i] ? mvts[m] : tout[i]->ty;
-                 nout.push_back(new opgen::StackParam(ty, tout[i]->name, tout[i]->sem_expr, tout[i]->count));
+                 nout.push_back(new opgen::StackParam(ty, tout[i]->name, tout[i]->sem_expr, tout[i]->count, tout[i]->at_src));
              }
              ops.push_back(new opgen::Opcode(
                  mnames[m], (int32_t)mhexes[m], (int32_t)msubs[m],
@@ -227,7 +229,9 @@ FamilyStackParam <. std::vector<opgen::StackParam*>& list, std::vector<int>& var
       ident<ns>
       [ "=" string_lit<es>   (. sem_expr = opgen_dup(es); .) ]
       (. var_flags.push_back(isvar);
-         list.push_back(new opgen::StackParam(ty, opgen_dup(ns), opgen_opt(sem_expr), opgen_opt((opgen::SemExpr*)nullptr))); .)
+         list.push_back(new opgen::StackParam(ty, opgen_dup(ns), opgen_opt(sem_expr),
+                                              opgen_opt((opgen::SemExpr*)nullptr),
+                                              opgen_opt((opgen::SemExpr*)nullptr))); .)
 .
 
 // One family member: <ValueType> <mnemonic> <opcode> [<subop>]. The optional second
@@ -254,11 +258,16 @@ OperandParam <. std::vector<opgen::OperandParam*>& list .>
 
 StackParam <. std::vector<opgen::StackParam*>& list .>
     (. opgen::ValueType ty; peg::Span ns; peg::Span es;
-       const char* sem_expr = nullptr; opgen::SemExpr* count = nullptr; .)
+       const char* sem_expr = nullptr; opgen::SemExpr* count = nullptr; opgen::SemExpr* at_src = nullptr; .)
     = [ "[" SemExpr<count> "]" ]   // VARIADIC: `[count-expr] ty name` (§3b) — pops `count-expr` operands
-      ValueType<ty> ident<ns>
+      ValueType<ty>
+      [ "(" SemExpr<at_src> ")" ]  // ADDRTYPE SOURCE: `addr(x) name` — the width is the addrtype
+                                   // declared by module entry x (WASM §2.3.11/§2.3.15/§2.3.16), the
+                                   // same fact validation reads; NOT the operand's runtime tag.
+      ident<ns>
       [ "=" string_lit<es>  (. sem_expr = opgen_dup(es); .) ]
-      (. list.push_back(new opgen::StackParam(ty, opgen_dup(ns), opgen_opt(sem_expr), opgen_opt(count))); .)
+      (. list.push_back(new opgen::StackParam(ty, opgen_dup(ns), opgen_opt(sem_expr),
+                                              opgen_opt(count), opgen_opt(at_src))); .)
 .
 
 // ═══════════════════════════════════════════════════════════════
@@ -613,6 +622,17 @@ BackendDecl <. std::optional<const char*>& out .>
     (. peg::Span hdr; .)
     = "backend" !ident_continue string_lit<hdr>
       (. out = opgen_dup(hdr); .)
+.
+
+// sidetable — this op set has STRUCTURED control, so opgen owns the Titzer
+// side-table entry format (opgen_st_entry_t) and the §4.4.8 walk over it
+// (opgen_do_transfer), and emits both into runtime_api.h. Declared rather than
+// inferred from a built-in's name: opgen bakes in no target identifiers, and a
+// spec with no side table must not be handed a walk that reads frame fields its
+// substrate does not have.
+SidetableDecl <. bool& out .>
+    = "sidetable" !ident_continue
+      (. out = true; .)
 .
 
 // type <value-type> <c-scalar> <c-unsigned> <slots> <field> — a slot/type-table

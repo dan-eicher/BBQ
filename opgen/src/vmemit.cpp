@@ -32,9 +32,22 @@ static const char* tail_kind_name(const Opcode* op) {
         }
     return "JTAIL_NONE";
 }
+/* Does the body name a tail operand's `<name>_count`? Only then is it decoded and
+ * (in the stencil) given a hole — an unused count would be a wasted patch point. */
+static int op_body_refs_count(const Opcode* op, const char* name) {
+    char buf[64];
+    snprintf(buf, sizeof buf, "%s_count", name);
+    for (auto* s : op->sem_body) if (VmEmitter::stmt_refs_name(s, buf)) return 1;
+    return 0;
+}
+
 static int n_fixed_operands(const Opcode* op) {
     int n = 0;
-    for (auto* od : op->operands) if (!is_tail_operand(od->ty)) n++;
+    for (auto* od : op->operands) {
+        if (!is_tail_operand(od->ty)) { n++; continue; }
+        // br_table's count is tail-shaped but IS a fixed JIT operand (see the meta emitter)
+        if (od->ty == ValueType::TyBrTable && op_body_refs_count(op, od->name)) n++;
+    }
     return n;
 }
 
@@ -43,23 +56,6 @@ const char* VmEmitter::out_sem_expr(const StackParam* sp) {
 }
 const SemExpr* VmEmitter::out_count(const StackParam* sp) {   // §3b variadic: the pop-count expr, or null
     return sp->count.has_value() ? *sp->count : nullptr;
-}
-
-// The type an `error:` condition is lowered at.
-//
-// lower_expr threads ONE result type down both sides of an operator — opgen has
-// no per-node type inference, for guards or for bodies. So a condition is
-// lowered at the type of the first stack input or operand it names, in
-// declaration order, defaulting to i32 when it names none (a condition over
-// only literals). This is what lets ONE declared condition cover a polymorphic
-// `( T a, T b -- T )` family: the family expands to concrete opcodes first, so
-// `b == 0` resolves to i32 or i64 per expansion.
-ValueType VmEmitter::cond_type(const Opcode* op, const SemExpr* cond) {
-    for (auto* s : op->stack_in)
-        if (expr_refs_name(cond, s->name)) return s->ty;
-    for (auto* od : op->operands)
-        if (expr_refs_name(cond, od->name)) return od->ty;
-    return ValueType::TyI32;
 }
 
 // ── Guard emission ──────────────────────────────────────────
@@ -80,7 +76,9 @@ void VmEmitter::emit_guards(SemLowerer& low, const Opcode* op) {
         // ("use '=' to turn this into an assignment"). The cast separates the two paren
         // levels and states the intent: a guard condition is a predicate.
         fputs("    if ((_Bool)", o);
-        low.lower_expr(cond, op, cond_type(op, cond));
+        low.set_in_guard(true);
+        low.lower_expr(cond, op, SemLowerer::cond_type(op, cond));
+        low.set_in_guard(false);
         fputc(')', o);
         low.guard_trap(e->error_name);
     }
@@ -88,61 +86,31 @@ void VmEmitter::emit_guards(SemLowerer& low, const Opcode* op) {
 
 // ── Name-occurrence + liveness ──────────────────────────────
 
-int VmEmitter::expr_refs_name(const SemExpr* e, const char* name) {
-    if (!e) return 0;
-    switch (e->tag) {
-    case SemExprTag::SBinOp: {
-        auto* b = static_cast<const SBinOp*>(e);
-        return expr_refs_name(b->left, name) || expr_refs_name(b->right, name);
-    }
-    case SemExprTag::SUnary:   return expr_refs_name(static_cast<const SUnary*>(e)->operand, name);
-    case SemExprTag::STernary: {
-        auto* t = static_cast<const STernary*>(e);
-        return expr_refs_name(t->cond, name) || expr_refs_name(t->then_, name) ||
-               expr_refs_name(t->else_, name);
-    }
-    case SemExprTag::SCast:    return expr_refs_name(static_cast<const SCast*>(e)->operand, name);
-    case SemExprTag::SIndex: {
-        auto* ix = static_cast<const SIndex*>(e);
-        return expr_refs_name(ix->base, name) || expr_refs_name(ix->index, name);
-    }
-    case SemExprTag::SCall: {
-        for (auto* a : static_cast<const SCall*>(e)->args)
-            if (expr_refs_name(a, name)) return 1;
-        return 0;
-    }
-    case SemExprTag::SIdent:   return !strcmp(static_cast<const SIdent*>(e)->name, name);
-    case SemExprTag::SInt:     return 0;
-    case SemExprTag::SFloat:   return 0;
-    }
-    return 0;
-}
-
 int VmEmitter::stmt_refs_name(const SemStmt* s, const char* name) {
     if (!s) return 0;
     switch (s->tag) {
     case SemStmtTag::SAssign: {
         auto* a = static_cast<const SAssign*>(s);
-        return expr_refs_name(a->target, name) || expr_refs_name(a->value, name);
+        return SemLowerer::expr_refs_name(a->target, name) || SemLowerer::expr_refs_name(a->value, name);
     }
-    case SemStmtTag::SExprStmt: return expr_refs_name(static_cast<const SExprStmt*>(s)->value, name);
+    case SemStmtTag::SExprStmt: return SemLowerer::expr_refs_name(static_cast<const SExprStmt*>(s)->value, name);
     case SemStmtTag::SLocalDecl: {
         auto* d = static_cast<const SLocalDecl*>(s);
-        return d->init.has_value() ? expr_refs_name(*d->init, name) : 0;
+        return d->init.has_value() ? SemLowerer::expr_refs_name(*d->init, name) : 0;
     }
     case SemStmtTag::SIf: {
         auto* sif = static_cast<const SIf*>(s);
-        return expr_refs_name(sif->cond, name) || stmt_refs_name(sif->then_, name) ||
+        return SemLowerer::expr_refs_name(sif->cond, name) || stmt_refs_name(sif->then_, name) ||
                (sif->else_.has_value() && stmt_refs_name(*sif->else_, name));
     }
     case SemStmtTag::SWhile: {
         auto* w = static_cast<const SWhile*>(s);
-        return expr_refs_name(w->cond, name) || stmt_refs_name(w->body, name);
+        return SemLowerer::expr_refs_name(w->cond, name) || stmt_refs_name(w->body, name);
     }
     case SemStmtTag::SFor: {
         auto* f = static_cast<const SFor*>(s);
         return (f->init.has_value() && stmt_refs_name(*f->init, name)) ||
-               (f->cond.has_value() && expr_refs_name(*f->cond, name)) ||
+               (f->cond.has_value() && SemLowerer::expr_refs_name(*f->cond, name)) ||
                (f->update.has_value() && stmt_refs_name(*f->update, name)) ||
                stmt_refs_name(f->body, name);
     }
@@ -170,7 +138,7 @@ int VmEmitter::stack_in_live(const Opcode* op, int k) {
     // `error:` condition would be dropped with a bare `JV_SP -=` instead of
     // popped into a variable, and the emitted guard would not compile.
     for (auto* e : op->errors)
-        if (e->condition.has_value() && expr_refs_name(*e->condition, name)) return 1;
+        if (e->condition.has_value() && SemLowerer::expr_refs_name(*e->condition, name)) return 1;
     return 0;
 }
 
@@ -278,13 +246,24 @@ void VmEmitter::emit_slot_macros(SemLowerer& low) {
 " do { JV_SP--; name = JV_STK[JV_SP]; name##_wt = JV_STKT[JV_SP]; } while (0)\n"
 "#define GPUSH_WORD(name) do { JV_STK[JV_SP] = (name);"
 " JV_STKT[JV_SP] = name##_wt; JV_SP++; } while (0)\n", o);
-    // GPOP_ANY/GPUSH_ANY: the runtime-typed carrier (any_t = {bits, kind}) — a value whose type tag is
-    // known only at run time (table/struct/array.get's element type, ref.test's operand). The native packs
-    // (value, tag) into one any_t it can return; the push macro unpacks it, so the opcode body stays
+    // GPOP_ANY/GPUSH_ANY: the runtime-typed carrier (any_t = {bits, hi, kind}) — a value whose type tag
+    // is known only at run time (table/struct/array.get's element type, ref.test's operand). The native
+    // packs (value, tag) into one any_t it can return; the push macro unpacks it, so the opcode body stays
     // value-only (it never constructs a slot). Shape follows the slot model: a uniform single-slot backend
     // (i64 in one slot) rides the full 8-byte value in .l; the JVM two-slot model splits long/double.
+    // A spec that declares v128 gets BOTH halves copied unconditionally (bits + hi = the slot's two
+    // 64-bit lanes) so a T_V128 value never truncates crossing the carrier — the 8-byte-only variant of
+    // these macros silently dropped lanes 2/3 of every v128 struct/array field (found by the javelina
+    // compiler-driven parity battery; the official suite has no GC×SIMD coverage).
+    char any_vf = low.v128_field();   /* the spec's own slot-member letter for v128, or 0 */
     if (low.jtype(ValueType::TyI64).slots == 1) {
-        fputs(
+        if (any_vf)
+            fprintf(o,
+"#define GPOP_ANY(name) any_t name; do { JV_SP--; name.bits = JV_STK[JV_SP].%c.i64[0]; name.hi = JV_STK[JV_SP].%c.i64[1]; name.kind = JV_STKT[JV_SP]; } while (0)\n"
+"#define GPUSH_ANY(_av) do { any_t _a = (_av); JV_STK[JV_SP].%c.i64[0] = _a.bits; JV_STK[JV_SP].%c.i64[1] = _a.hi; JV_STKT[JV_SP] = _a.kind; JV_SP++; } while (0)\n",
+                any_vf, any_vf, any_vf, any_vf);
+        else
+            fputs(
 "#define GPOP_ANY(name) any_t name; do { JV_SP--; name.bits = JV_STK[JV_SP].l; name.kind = JV_STKT[JV_SP]; } while (0)\n"
 "#define GPUSH_ANY(v) do { any_t _a = (v); JV_STK[JV_SP].l = _a.bits; JV_STKT[JV_SP] = _a.kind; JV_SP++; } while (0)\n", o);
     } else {
@@ -292,15 +271,26 @@ void VmEmitter::emit_slot_macros(SemLowerer& low) {
 "#define GPOP_ANY(name) any_t name; do { if (JV_STKT[JV_SP-1] == T_VOID) { JV_SP -= 2; name.bits = ((s8)(u4)JV_STK[JV_SP].i) | (((s8)JV_STK[JV_SP+1].i) << 32); name.kind = JV_STKT[JV_SP]; } else { JV_SP -= 1; name.bits = (s8)(u4)JV_STK[JV_SP].i; name.kind = JV_STKT[JV_SP]; } } while (0)\n"
 "#define GPUSH_ANY(v) do { any_t _a = (v); if (_a.kind == T_LONG || _a.kind == T_DOUBLE) { JV_STK[JV_SP].i = (s4)_a.bits; JV_STKT[JV_SP] = _a.kind; JV_STK[JV_SP+1].i = (s4)(_a.bits >> 32); JV_STKT[JV_SP+1] = T_VOID; JV_SP += 2; } else { JV_STK[JV_SP].i = (s4)_a.bits; JV_STKT[JV_SP] = _a.kind; JV_SP += 1; } } while (0)\n", o);
     }
-    // GPOP_ADDR (WASM memory64/table64): pop one addrtype-width integer as u8 — full width when the
-    // top slot is tagged i64, else a zero-extended i32. Pop-only (no GPUSH_ADDR; size/grow push via a
-    // stack-driven native). Fields/tag derived from the declared i32/i64 rows (single-slot int model).
+    // GPOP_ADDR (WASM memory64/table64): pop one addrtype-width integer as u8. `is64` is the DECLARED
+    // addrtype of the module entry the operand addresses, supplied by the signature's `addr(expr)`
+    // source — NOT the operand's runtime value tag.
+    //
+    // WASM §2.3.11 makes addrtype ::= i32 | i64, and §2.3.15/§2.3.16 make it part of each memory's /
+    // table's declared type. Every typing rule therefore reads it from the module
+    // (`C.mems[x] = at lim page => C |- nt.load x memarg : at -> nt`, §3.4.5), and §4.6.8 executes it
+    // as "ASSERT: Due to validation ... Pop the value (at.const i)". Asserted, never tested.
+    //
+    // Testing the tag instead was a divergence in MECHANISM: a tested fact can disagree with the
+    // declared type, an asserted one cannot. It did disagree — an i64 address read out of a GC
+    // aggregate carries that aggregate's reconstructed tag, so the width collapsed to 32 bits and an
+    // out-of-bounds memory64 access silently read a different in-bounds location instead of trapping.
+    // Pop-only (no GPUSH_ADDR; size/grow push via a stack-driven native).
     {
         jrow i32r = low.jtype(ValueType::TyI32), i64r = low.jtype(ValueType::TyI64);
         fprintf(o,
-"#define GPOP_ADDR(name) u8 name; do { if (JV_STKT[JV_SP-1] == %s) name = (u8)JV_STK[--JV_SP].%c;"
+"#define GPOP_ADDR(name, is64) u8 name; do { if (is64) name = (u8)JV_STK[--JV_SP].%c;"
 " else name = (u8)(u4)JV_STK[--JV_SP].%c; } while (0)\n",
-                tag_for(i64r), i64r.field, i32r.field);
+                i64r.field, i32r.field);
     }
     // globalinst access vocabulary — the GENERATED DEFAULT (a backend may #define these first to point
     // the access at a different shape; the #ifndef then skips the default). GET reads, SET writes the
@@ -368,6 +358,22 @@ void VmEmitter::emit_one_opcode(SemLowerer& low, const Opcode* op) {
             // body), so emit nothing. select_t FALLS THROUGH with no native reading its
             // vec(valtype), so the INTERP must skip it to advance the cursor (the JIT walk skips
             // it via meta.tail). A valtype is one byte, or 0x63/0x64 + a heaptype for a concrete ref.
+            // br_table: the label TARGETS live in the side-table, so the vector itself
+            // is pure decode — opgen's job. Expose its count as `<name>_count` so the
+            // body can clamp the key, and skip the labels. The JIT already reads this
+            // count during its compile-walk, so the stencil takes it as a baked hole.
+            if (od->ty == ValueType::TyBrTable && op_body_refs_count(op, od->name)) {
+                if (stencil) {
+                    fprintf(o, "    u4 %s_count = (u4)_HOLE_%s_count;\n", od->name, od->name);
+                } else {
+                    fprintf(o, "    u4 %s_count = 0; (void)bbq_read_uleb128_u32(&f->code, &%s_count);\n",
+                            od->name, od->name);
+                    fprintf(o, "    { for (u4 _bt_i = 0; _bt_i <= %s_count; _bt_i++)"
+                               " { u4 _bt_l = 0; (void)bbq_read_uleb128_u32(&f->code, &_bt_l); } }\n",
+                            od->name);
+                }
+                continue;
+            }
             if (!stencil && od->ty == ValueType::TySelectVec) {
                 fputs("    { u4 _sv_n = 0; (void)bbq_read_uleb128_u32(&f->code, &_sv_n);\n"
                       "      for (u4 _sv_i = 0; _sv_i < _sv_n; _sv_i++) { u1 _sv_vt = 0; (void)bbq_read_u8(&f->code, &_sv_vt);\n"
@@ -435,8 +441,33 @@ void VmEmitter::emit_one_opcode(SemLowerer& low, const Opcode* op) {
             fprintf(o, "    slot_t* _vb_%s = &JV_STK[JV_SP - _vc_%s]; u1* _vt_%s = &JV_STKT[JV_SP - _vc_%s];"
                        " (void)_vb_%s; (void)_vt_%s;\n",
                     si->name, si->name, si->name, si->name, si->name, si->name);
+            // `flag: pops_first` — drop sp BEFORE the body instead of after. Needed by the
+            // call family: the callee frame is carved at sp, so the operands must already
+            // be popped when the body hands off. ONLY sound when nothing between here and
+            // the hand-off allocates: sp bounds the GC root scan, so an allocation in that
+            // window could collect these very operands. The default (drop after) is what
+            // keeps struct.new/array.new_fixed safe, whose bodies DO allocate.
+            if (SemLowerer::op_has_flag(op, "pops_first"))
+                fprintf(o, "    JV_SP -= _vc_%s;\n", si->name);
         } else if (stack_in_live(op, k)) {
-            fprintf(o, "    GPOP_%s(%s);\n", SemLowerer::slot_class(si->ty), si->name);
+            if (si->ty == ValueType::TyAddr) {
+                /* §2.3.11: the width is the DECLARED addrtype of the module entry this operand
+                 * addresses, named by the signature's `addr(expr)` source and read here exactly as
+                 * validation reads it (§3.4.4/§3.4.5). A signature that omits the source cannot be
+                 * lowered — there is no correct default, and silently falling back to the operand's
+                 * runtime tag is the divergence this form exists to remove. */
+                if (!si->at_src) {
+                    fprintf(stderr, "opgen: %s: `addr` operand '%s' has no addrtype source — write "
+                                    "`addr(<is64-expr>) %s` (WASM §2.3.11: addrtype is declared "
+                                    "by the memtype/tabletype, not carried by the value)\n",
+                            op->mnemonic, si->name, si->name);
+                    exit(1);
+                }
+                fprintf(o, "    GPOP_ADDR(%s, ", si->name);
+                low.lower_expr(*si->at_src, op, ValueType::TyI32);
+                fprintf(o, ");\n");
+            } else
+                fprintf(o, "    GPOP_%s(%s);\n", SemLowerer::slot_class(si->ty), si->name);
         } else {
             fprintf(o, "    JV_SP -= %d;\n", low.jtype(si->ty).slots);
         }
@@ -445,7 +476,9 @@ void VmEmitter::emit_one_opcode(SemLowerer& low, const Opcode* op) {
     emit_guards(low, op);
 
     for (auto* so : op->stack_out)
-        if (!out_sem_expr(so)) {
+        // A VARIADIC result names a count, not a value: the slots are already on the
+        // stack and exposing them is an sp raise, so there is nothing to declare.
+        if (!out_sem_expr(so) && !out_count(so)) {
             if (so->ty == ValueType::TyWord)
                 fprintf(o, "    slot_t %s; u1 %s_wt;\n", so->name, so->name);
             else
@@ -480,11 +513,23 @@ void VmEmitter::emit_one_opcode(SemLowerer& low, const Opcode* op) {
         for (auto* s : op->sem_body) low.lower_stmt(op, s);
     }
 
-    // §3b variadic: now consume the operands the body read in-place (sp was held up so they stayed rooted).
-    for (auto* si : op->stack_in)
-        if (out_count(si)) fprintf(o, "    JV_SP -= _vc_%s;\n", si->name);
+    // §3b variadic: now consume the operands the body read in-place (sp was held up so they
+    // stayed rooted). `pops_first` ops already dropped theirs above.
+    if (!SemLowerer::op_has_flag(op, "pops_first"))
+        for (auto* si : op->stack_in)
+            if (out_count(si)) fprintf(o, "    JV_SP -= _vc_%s;\n", si->name);
 
     for (auto* so : op->stack_out) {
+        // §3b VARIADIC RESULT: an immediate-/type-driven result count. The values are
+        // already at the frame base (a nested callee left them there), so exposing them
+        // IS the marshaling — raise sp, push nothing. Only sound when the body is NOT
+        // terminal; a `status` native tail-returns and would strand this as dead code.
+        if (const SemExpr* rc = out_count(so)) {
+            fprintf(o, "    { s4 _vr_%s = (s4)(", so->name);
+            low.lower_expr(rc, op, ValueType::TyI32);
+            fprintf(o, "); JV_SP += _vr_%s; }\n", so->name);
+            continue;
+        }
         const char* se = out_sem_expr(so);
         fprintf(o, "    GPUSH_%s(", SemLowerer::slot_class(so->ty));
         if (se && se[0] == '"') {
@@ -577,7 +622,7 @@ void VmEmitter::emit_stencil_c(FILE* o) {
         char cseen[256][64]; int cnn = 0;
         for (auto* cop : mod_->opcodes) {
             if (!is_emittable(cop) || SemLowerer::stencil_excluded(cop)) continue;
-            const char* hn[8]; uint64_t hv[8];
+            const char* hn[SemLowerer::OP_CONST_HOLES]; uint64_t hv[SemLowerer::OP_CONST_HOLES];
             int nh = low.op_const_holes(cop, hn, hv);
             for (int k = 0; k < nh; k++) {
                 int dup = 0;
@@ -593,7 +638,16 @@ void VmEmitter::emit_stencil_c(FILE* o) {
     for (auto* op : mod_->opcodes) {
         if (!is_emittable(op) || SemLowerer::stencil_excluded(op)) continue;
         for (auto* od : op->operands) {
+            // br_table's baked label count is a hole under a DERIVED name; declare it
+            // or the stencil references an extern nothing emits. Each derived name
+            // needs its own storage — `seen` keeps the pointer.
+            static char cbuf[8][64]; static int ncbuf = 0;
             const char* nm = od->name;
+            if (od->ty == ValueType::TyBrTable && op_body_refs_count(op, od->name) &&
+                ncbuf < (int)(sizeof cbuf / sizeof cbuf[0])) {
+                snprintf(cbuf[ncbuf], sizeof cbuf[0], "%s_count", od->name);
+                nm = cbuf[ncbuf++];
+            }
             int dup = 0; for (int s = 0; s < ns; s++) if (!strcmp(seen[s], nm)) dup = 1;
             if (dup) continue;
             seen[ns++] = nm;
@@ -606,6 +660,24 @@ void VmEmitter::emit_stencil_c(FILE* o) {
         if (!is_emittable(op) || SemLowerer::stencil_excluded(op)) continue;
         for (auto* s : op->sem_body)
             low.collect_natives_stmt(s, nat, &nn);
+        // A guard is emitted into the stencil too, so a native named ONLY by an
+        // `error:` condition still rides a _HOLE_ patch point and still needs its
+        // extern declared. Scanning the body alone left that hole undeclared and the
+        // stencil failed to compile against it.
+        for (auto* e : op->errors)
+            if (e->condition.has_value())
+                low.collect_natives_expr(*e->condition, nat, &nn);
+        // §3b variadic: the pop-count expression is lowered into the stencil ahead of the
+        // body, so a native named ONLY by a count (the call family's jav_type_nparams —
+        // struct.new's jav_struct_nfields merely happened to appear in its body too) rides
+        // a _HOLE_ patch point on the same terms.
+        for (auto* si : op->stack_in)  if (const SemExpr* vc = out_count(si)) low.collect_natives_expr(vc, nat, &nn);
+        for (auto* so : op->stack_out) if (const SemExpr* vc = out_count(so)) low.collect_natives_expr(vc, nat, &nn);
+        // ...and the addrtype source, lowered into the same preamble. THE RULE: every
+        // expression the stencil lowers gets scanned, not just the body. An op set whose
+        // addrtype source happens to be an `inline native` never notices this one, because
+        // an inline native is a direct call with no hole to declare.
+        for (auto* si : op->stack_in)  if (si->at_src) low.collect_natives_expr(*si->at_src, nat, &nn);
     }
     for (int i = 0; i < nn; i++)
         fprintf(o, "extern uint64_t _HOLE_%s;\n", nat[i]);
@@ -629,10 +701,9 @@ void VmEmitter::emit_stencil_c(FILE* o) {
 "\n/* ── Machinery stencils (generated): the machine boundary + control\n"
 " * continuations, identical for every opgen VM (the JIT requires a bbq_ctx\n"
 " * code cursor in the backend frame). ── */\n"
-"void STENCIL gen_st_halt(vm_t* vm) {\n"
-"    frame_t* f = &vm->frame;\n"
-"    if (JV_SP > 0) { vm->result = JV_STK[JV_SP - 1]; vm->result_type = JV_STKT[JV_SP - 1]; }\n"
-"}\n"
+"/* Run off the function end. The results ARE the top of the frame stack, where the\n"
+" * caller reads them — there is nothing to stash into a side channel. */\n"
+"void STENCIL gen_st_halt(vm_t* vm) { (void)vm; }\n"
 "typedef void STENCIL (*opgen_kont_t)(vm_t*);\n"
 "extern uint64_t _HOLE_offmap;\n"
 "extern uint64_t _HOLE_codelen;\n"
@@ -694,7 +765,9 @@ void VmEmitter::emit_jit_meta(FILE* o) {
           "#ifndef WASM_JIT_META_H\n#define WASM_JIT_META_H\n"
           "#include \"opcodes.h\"\n#include \"wasm_stencil_table.h\"\n\n"
           "typedef enum { JOP_NONE, JOP_ULEB32, JOP_ULEB64, JOP_SLEB32, JOP_SLEB64,\n"
-          "               JOP_F32, JOP_F64, JOP_U8, JOP_MEMARG, JOP_BLOCKTYPE, JOP_CONST } jit_operand_kind_t;\n"
+          "               JOP_F32, JOP_F64, JOP_U8, JOP_MEMARG, JOP_BLOCKTYPE, JOP_CONST,\n"
+          "               JOP_BRTABLE_COUNT } jit_operand_kind_t;   /* the vec(labelidx) length; the\n"
+          "                                     tail walk then skips count+1 labels, not the count */\n"
           "/* A variable-length trailing immediate the op's native reads at runtime; the JIT\n"
           " * compile-walk skips it (by kind) after capturing _HOLE_ip, to place the next stencil. */\n"
           "typedef enum { JTAIL_NONE, JTAIL_BRTABLE, JTAIL_TRYTABLE, JTAIL_SELECTVEC } jit_tail_kind_t;\n"
@@ -704,12 +777,18 @@ void VmEmitter::emit_jit_meta(FILE* o) {
 
     for (auto* op : mod_->opcodes) {
         if (!is_emittable(op)) continue;
-        const char* cn[8]; uint64_t cv[8];
+        const char* cn[SemLowerer::OP_CONST_HOLES]; uint64_t cv[SemLowerer::OP_CONST_HOLES];
         int nc = low.op_const_holes(op, cn, cv);
         if (n_fixed_operands(op) == 0 && nc == 0) continue;   // tail-only ops have no fixed operand array
         fprintf(o, "static const jit_operand_t jitops_%s[] = {", op->mnemonic);
         for (auto* od : op->operands) {
-            if (is_tail_operand(od->ty)) continue;            // the tail isn't a fixed JIT operand
+            if (is_tail_operand(od->ty)) {
+                // br_table's COUNT is a fixed operand (the JIT walk reads it anyway);
+                // only the label vector itself remains tail-skipped.
+                if (od->ty == ValueType::TyBrTable && op_body_refs_count(op, od->name))
+                    fprintf(o, " {\"_HOLE_%s_count\", JOP_BRTABLE_COUNT, 0},", od->name);
+                continue;
+            }
             fprintf(o, " {\"_HOLE_%s\", %s, 0},", od->name, jop_kind(od->ty));
         }
         for (int k = 0; k < nc; k++)
@@ -718,7 +797,7 @@ void VmEmitter::emit_jit_meta(FILE* o) {
     }
 
     auto emit_meta_row = [&](const Opcode* op) {
-        const char* cn[8]; uint64_t cv[8];
+        const char* cn[SemLowerer::OP_CONST_HOLES]; uint64_t cv[SemLowerer::OP_CONST_HOLES];
         int pop = (int)op->stack_in.size(), push = (int)op->stack_out.size();
         int nops = n_fixed_operands(op) + low.op_const_holes(op, cn, cv);
         const char* tail = tail_kind_name(op);
@@ -966,7 +1045,27 @@ void VmEmitter::emit_value_model(SemLowerer& low, FILE* o) {
     }
     fputs(" } slot_t;\n", o);
 
-    fputs("typedef struct { s8 bits; u1 kind; } any_t;\n", o);
+    fputs("typedef struct { s8 bits; s8 hi; u1 kind; } any_t;   /* hi = the SECOND 64-bit half of a\n"
+          "    T_V128 value (dead/zero for every other kind — compound literals zero it). Without it a\n"
+          "    v128 crossing the runtime-typed carrier lost lanes 2/3. */\n", o);
+
+    /* Structured control (§1: opgen owns the Titzer side-table format). The entry is
+     * part of the abstract machine, not the substrate — the same tier as slot_t — so
+     * it is emitted HERE, above the backend header, and the backend's validator fills
+     * the same struct the generated walk reads. One definition, one owner.
+     * Turned on by the spec's `sidetable` directive: opgen bakes in no target
+     * identifiers, so it cannot key this off a built-in's NAME. */
+    if (mod_->sidetable) {
+    fputs("\n/* One side-table entry: a taken branch keeps the top `vals` operands,\n"
+          " * drops `pop` beneath them, then advances the code cursor and the\n"
+          " * side-table pointer by their deltas. */\n"
+          "typedef struct {\n"
+          "    s4 delta_ip;\n"
+          "    s4 delta_stp;\n"
+          "    u2 vals;\n"
+          "    u2 pop;\n"
+          "} opgen_st_entry_t;\n", o);
+    }
 
     fputs("enum { T_VOID = 0", o);
     const char* seen_t[16]; int nt = 0;
@@ -1064,7 +1163,40 @@ void VmEmitter::emit_runtime_api_h(FILE* o) {
     // supplying its own tag. The natives stop hand-rolling f->stack[f->sp] = …; f->stack_types[…] = ….
     fputs(
 "#define JV_NPUSH(f, slotval, tag) do { (f)->stack[(f)->sp] = (slotval); (f)->stack_types[(f)->sp] = (tag); (f)->sp++; } while (0)\n"
-"#define JV_NPOP(f, sv, tv) slot_t sv; u1 tv; do { (f)->sp--; sv = (f)->stack[(f)->sp]; tv = (f)->stack_types[(f)->sp]; } while (0)\n", o);
+"#define JV_NPOP(f, sv, tv) slot_t sv; u1 tv; do { (f)->sp--; sv = (f)->stack[(f)->sp]; tv = (f)->stack_types[(f)->sp]; } while (0)\n"
+/* The third primitive: relocate a slot WITHIN the stack, value and tag together. Not a
+ * push and not a pop, so neither macro above covers it; without it the one caller that
+ * needs it (the side-table walk) hand-rolls f->stack[...] = f->stack[...], which is the
+ * value-model duplication these macros exist to end. */
+"#define JV_NMOVE(f, dst, src) do { (f)->stack[dst] = (f)->stack[src];"
+" (f)->stack_types[dst] = (f)->stack_types[src]; } while (0)\n", o);
+
+    /* The three structured-control cursors, as overridable accessors — the same seam
+     * shape as LOCAL_SLOT/GLOBAL_GET. Defined unconditionally because an opcode BODY
+     * may name `stp` (it lowers to OPGEN_ST_PTR) whether or not opgen is also asked to
+     * emit the walk; a macro nothing expands costs nothing. */
+    fputs(
+"\n/* Structured control: the backend says where the cursors are. */\n"
+"#ifndef OPGEN_ST_TABLE\n#define OPGEN_ST_TABLE(f)  ((f)->sidetable)\n#endif\n"
+"#ifndef OPGEN_ST_PTR\n#define OPGEN_ST_PTR(f)    ((f)->stp)\n#endif\n"
+"#ifndef OPGEN_IP\n#define OPGEN_IP(f)        ((f)->code.pos)\n#endif\n", o);
+
+    /* The §4.4.8 walk. opgen owns the entry format (above), so it owns the walk that
+     * reads it. Gated on the spec's `sidetable` directive: a substrate with no side
+     * table must not be handed a walk that reads frame fields it does not have. */
+    if (mod_->sidetable) {
+    fputs(
+"static inline void opgen_do_transfer(frame_t* f) {\n"
+"    const opgen_st_entry_t* e = &OPGEN_ST_TABLE(f)[OPGEN_ST_PTR(f)];\n"
+"    if (e->pop) {\n"
+"        for (u2 i = 0; i < e->vals; i++)\n"
+"            JV_NMOVE(f, (f)->sp - e->vals - e->pop + i, (f)->sp - e->vals + i);\n"
+"        f->sp -= e->pop;\n"
+"    }\n"
+"    OPGEN_IP(f)      = (size_t)((long)OPGEN_IP(f) + e->delta_ip);\n"
+"    OPGEN_ST_PTR(f)  = (u4)((long)OPGEN_ST_PTR(f) + e->delta_stp);\n"
+"}\n", o);
+    }
     fputs(
 "\n/* ── Runtime-service operations (a backend defines all of these). Every op\n"
 " * takes the full runtime context (vm = execution state, h = object memory)\n"

@@ -2,12 +2,20 @@
  * coverage_main.c — e2e driver for burgc's C backend.
  *
  * The burgc unit tests assert on the GENERATED TEXT. That catches a missing emit; it
- * cannot catch a matcher that compiles, runs, and reports the wrong thing — which is
- * what the C backend did: it emitted a burg_clear_error() nobody called, so the first
- * uncovered root latched an error that every later rewrite kept reporting.
+ * cannot catch a matcher that compiles, runs, and reports the wrong thing. This driver
+ * compiles the generated matcher and runs it. Its twin, coverage_main.cpp, runs the
+ * same cases against the C++ backend.
  *
- * This driver compiles the generated matcher and runs it. Its twin, coverage_main.cpp,
- * runs the same cases against the C++ backend.
+ * THE CONTRACT UNDER TEST. burg_set_error latches the FIRST error and drops later ones,
+ * and burg_rewrite SHORT-CIRCUITS on a pending one rather than clearing it. That is what
+ * makes a lowered body — which is many burg_rewrite calls over one ctx — abort at its
+ * first uncovered statement and still report that failure at the end-of-body check.
+ * Clearing on entry instead let the next statement's rewrite swallow the failure, and a
+ * truncated body then shipped with its check green.
+ *
+ * The price is that independent cases are no longer independent: every test below opens
+ * with burg_clear_error(ctx), which is exactly the per-call isolation the contract says
+ * a caller has to ask for. burg_ctx_init starts clear, so the first one is free.
  */
 #include <stdio.h>
 #include <string.h>
@@ -52,6 +60,7 @@ static CovNode mk(int op, int id) {
  * chain rule stmt:reg reduces the reg derivation before firing its own action. */
 static void test_covered_tree(burg_ctx_t* ctx) {
     CovNode c = mk(COV_CONST, 1);
+    burg_clear_error(ctx);
     cov_trace_reset();
     burg_rewrite(&c, ctx);
 
@@ -70,6 +79,7 @@ static void test_covered_tile(burg_ctx_t* ctx) {
     a.kids[0] = &l;
     a.kids[1] = &r;
 
+    burg_clear_error(ctx);
     cov_trace_reset();
     burg_rewrite(&a, ctx);
 
@@ -86,6 +96,7 @@ static void test_covered_graph(burg_ctx_t* ctx) {
     n0.nsucc = 1;
     n0.succs[0] = &n1;
 
+    burg_clear_error(ctx);
     cov_trace_reset();
     burg_rewrite(&n0, ctx);
 
@@ -99,6 +110,7 @@ static void test_covered_graph(burg_ctx_t* ctx) {
  * the fix burg_rewrite simply returned, and the consumer read uninitialised output. */
 static void test_uncovered_tree_root(burg_ctx_t* ctx) {
     CovNode o = mk(COV_ORPHAN, 1);
+    burg_clear_error(ctx);
     cov_trace_reset();
     burg_rewrite(&o, ctx);
 
@@ -118,6 +130,7 @@ static void test_uncovered_graph_node(burg_ctx_t* ctx) {
     n0.nsucc = 1;
     n0.succs[0] = &bad;
 
+    burg_clear_error(ctx);
     cov_trace_reset();
     burg_rewrite(&n0, ctx);
 
@@ -129,10 +142,11 @@ static void test_uncovered_graph_node(burg_ctx_t* ctx) {
           "error arg must carry the offending opcode");
 }
 
-/* THE regression. burg_set_error latches the first error and drops the rest, so a
- * rewrite that does not clear on entry reports a PREVIOUS call's failure forever. Every
- * rewrite after the first failure looked broken, whatever it was handed. */
-static void test_error_does_not_leak_into_next_rewrite(burg_ctx_t* ctx) {
+/* Half the contract: a pending error makes every later rewrite a no-op, and the FIRST
+ * message is the one that survives. A rewrite handed a perfectly coverable tree must
+ * still emit nothing — that is what stops a truncated body from looking finished. */
+static void test_error_short_circuits_later_rewrites(burg_ctx_t* ctx) {
+    burg_clear_error(ctx);
     CovNode o = mk(COV_ORPHAN, 1);
     burg_rewrite(&o, ctx);
     CHECK(burg_has_error(ctx), "precondition: the uncovered rewrite must fail");
@@ -141,18 +155,63 @@ static void test_error_does_not_leak_into_next_rewrite(burg_ctx_t* ctx) {
     cov_trace_reset();
     burg_rewrite(&c, ctx);
 
-    CHECK(!burg_has_error(ctx),
-          "a successful rewrite must not report the previous rewrite's error");
+    CHECK(burg_has_error(ctx), "the latched error must survive a later rewrite");
+    CHECK(burg_get_error(ctx) != NULL &&
+              strstr(burg_get_error(ctx), "no rule at root") != NULL,
+          "the FIRST failure's message is the one kept");
+    check_trace(NULL, 0, "rewrite after failure emits nothing");
+}
+
+/* The other half: isolation is available, it just has to be asked for. This is what a
+ * caller does between two independent bodies — and what every test here opens with. */
+static void test_explicit_clear_restores(burg_ctx_t* ctx) {
+    burg_clear_error(ctx);
+    CovNode o = mk(COV_ORPHAN, 1);
+    burg_rewrite(&o, ctx);
+    CHECK(burg_has_error(ctx), "precondition: the uncovered rewrite must fail");
+
+    burg_clear_error(ctx);
+    CovNode c = mk(COV_CONST, 1);
+    cov_trace_reset();
+    burg_rewrite(&c, ctx);
+
+    CHECK(!burg_has_error(ctx), "an explicit clear must restore the context");
     const int want[] = {1, 10};
-    check_trace(want, 2, "rewrite after failure");
+    check_trace(want, 2, "rewrite after an explicit clear");
+}
+
+/* WHY the contract is this way. A lowered body is many burg_rewrite calls over one ctx
+ * with a single check at the end; here statement 2 has no cover. Clearing on entry made
+ * statement 3 wipe statement 2's failure, so the end-of-body check read green over a
+ * body missing a statement. Short-circuiting makes the failure reach the check, and
+ * makes statement 3 emit nothing rather than silently follow a hole. */
+static void test_body_of_rewrites_keeps_first_failure(burg_ctx_t* ctx) {
+    burg_clear_error(ctx);
+    CovNode s1 = mk(COV_CONST, 1);
+    CovNode s2 = mk(COV_ORPHAN, 2);
+    CovNode s3 = mk(COV_CONST, 3);
+
+    cov_trace_reset();
+    burg_rewrite(&s1, ctx);
+    burg_rewrite(&s2, ctx);
+    burg_rewrite(&s3, ctx);
+
+    CHECK(burg_has_error(ctx), "the body's end-of-body check must see the failure");
+    CHECK(burg_get_error_arg(ctx) == COV_ORPHAN,
+          "and must see the offending statement's opcode");
+    /* Only statement 1 emitted; statement 3 was short-circuited. */
+    const int want[] = {1, 10};
+    check_trace(want, 2, "body stops at the first uncovered statement");
 }
 
 /* A failed rewrite must not leave half-reduced output behind. burg_reduce opens with an
  * error check, so once the uncovered node latches the error every later node on the
  * spine is a no-op call — reduction stops without the loop jumping out of itself. That
- * makes the guard load-bearing rather than decorative, which is worth pinning: it is
- * also the reason a rewrite that fails to CLEAR the error emits nothing at all. */
+ * makes the guard load-bearing rather than decorative. It is the same mechanism the
+ * short-circuit uses one level up, applied WITHIN a single rewrite instead of across
+ * a body's worth of them. */
 static void test_graph_failure_stops_reducing(burg_ctx_t* ctx) {
+    burg_clear_error(ctx);
     CovNode tail = mk(COV_CONST, 3);
     CovNode bad = mk(COV_ORPHAN, 2);
     bad.nsucc = 1;
@@ -179,7 +238,9 @@ int main(void) {
     test_covered_graph(&ctx);
     test_uncovered_tree_root(&ctx);
     test_uncovered_graph_node(&ctx);
-    test_error_does_not_leak_into_next_rewrite(&ctx);
+    test_error_short_circuits_later_rewrites(&ctx);
+    test_explicit_clear_restores(&ctx);
+    test_body_of_rewrites_keeps_first_failure(&ctx);
     test_graph_failure_stops_reducing(&ctx);
 
     burg_ctx_free(&ctx);

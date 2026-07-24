@@ -205,13 +205,14 @@ inline T* as(Node* n) {
 // ── Sum types (tag-dispatched hierarchies) ──────────────────
 
 struct StackParam : public ASTNode {
-    StackParam(ValueType ty, const char* name, std::optional<const char*> sem_expr, std::optional<SemExpr*> count)
-        : ty(ty), name(name), sem_expr(std::move(sem_expr)), count(std::move(count)){}
+    StackParam(ValueType ty, const char* name, std::optional<const char*> sem_expr, std::optional<SemExpr*> count, std::optional<SemExpr*> at_src)
+        : ty(ty), name(name), sem_expr(std::move(sem_expr)), count(std::move(count)), at_src(std::move(at_src)){}
 
     ValueType ty;
     const char* name;
     std::optional<const char*> sem_expr;
     std::optional<SemExpr*> count;
+    std::optional<SemExpr*> at_src;
 };
 
 struct OperandParam : public ASTNode {
@@ -227,8 +228,6 @@ struct ErrorCase : public ASTNode {
     ErrorCase(std::optional<SemExpr*> condition, const char* error_name)
         : condition(std::move(condition)), error_name(error_name){}
 
-    // The guard predicate, in the same closed action language as an opcode
-    // body — this IS what gets emitted, not a description of it.
     std::optional<SemExpr*> condition;
     const char* error_name;
 };
@@ -503,8 +502,8 @@ struct Opcode : public ASTNode {
 };
 
 struct Module : public ASTNode {
-    Module(std::vector<Opcode*> opcodes, std::vector<MethodDecl*> methods, std::optional<StatusDecl*> status, std::vector<TypeDecl*> types, std::vector<const char*> headers, std::optional<const char*> body_c, std::optional<const char*> backend)
-        : opcodes(std::move(opcodes)), methods(std::move(methods)), status(std::move(status)), types(std::move(types)), headers(std::move(headers)), body_c(std::move(body_c)), backend(std::move(backend)){}
+    Module(std::vector<Opcode*> opcodes, std::vector<MethodDecl*> methods, std::optional<StatusDecl*> status, std::vector<TypeDecl*> types, std::vector<const char*> headers, std::optional<const char*> body_c, std::optional<const char*> backend, bool sidetable)
+        : opcodes(std::move(opcodes)), methods(std::move(methods)), status(std::move(status)), types(std::move(types)), headers(std::move(headers)), body_c(std::move(body_c)), backend(std::move(backend)), sidetable(sidetable){}
 
     std::vector<Opcode*> opcodes;
     std::vector<MethodDecl*> methods;
@@ -513,6 +512,7 @@ struct Module : public ASTNode {
     std::vector<const char*> headers;
     std::optional<const char*> body_c;
     std::optional<const char*> backend;
+    bool sidetable;
 };
 
 // ── Product types ───────────────────────────────────────────

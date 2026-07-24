@@ -902,11 +902,34 @@ TEST(BurgCBackend, ErrorReportingPollsContext) {
     EXPECT_NE(code.find("burg_error_msg"), std::string::npos);
     EXPECT_NE(code.find("bool burg_has_error("), std::string::npos);
     EXPECT_NE(code.find("burg_set_error("), std::string::npos);
-    // burg_rewrite clears errors first; reduce/rewrite poll between phases
+    // Clearing is the CALLER's tool for per-call isolation, so the API exposes it...
     EXPECT_NE(code.find("burg_clear_error("), std::string::npos);
+    // ...but rewrite/reduce poll rather than clear: a pending error short-circuits them.
     EXPECT_NE(code.find("if (burg_has_error("), std::string::npos);
     // No assert/abort calls
     EXPECT_EQ(code.find("assert(false"), std::string::npos);
+}
+
+// A body is lowered as many burg_rewrite calls over one ctx with a single check at the
+// end. burg_rewrite must therefore SHORT-CIRCUIT on a pending error, not clear it —
+// clearing let a later statement wipe an earlier statement's no-cover, and the truncated
+// body passed its check. Asserted on the text because it is an ordering property of the
+// emitted prologue; burgc_coverage_c_e2e asserts the behaviour it produces.
+TEST(BurgCBackend, RewriteShortCircuitsOnPendingError) {
+    auto backend = create_c_backend();
+    std::string code = gen_code(
+        "TERM X=1\n"
+        "RULES r: X = 1 (. emit_x(node); .);", *backend);
+    auto rewrite_pos = code.find("void burg_rewrite(");
+    ASSERT_NE(rewrite_pos, std::string::npos);
+    auto poll_pos  = code.find("if (burg_has_error(ctx)) return;", rewrite_pos);
+    auto arena_pos = code.find("arena_reset(ctx)", rewrite_pos);
+    ASSERT_NE(poll_pos, std::string::npos) << "burg_rewrite must open by polling";
+    ASSERT_NE(arena_pos, std::string::npos);
+    EXPECT_LT(poll_pos, arena_pos) << "the poll must precede the arena reset";
+    // And it must NOT clear on entry: the only burg_clear_error in the emitted matcher
+    // is the public API definition, which is defined before burg_rewrite.
+    EXPECT_EQ(code.find("burg_clear_error(ctx);", rewrite_pos), std::string::npos);
 }
 
 // Uncovered-root reporting is asserted end-to-end instead of by grepping the emitted

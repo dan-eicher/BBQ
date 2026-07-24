@@ -6,6 +6,11 @@
  * the assertions differ in mechanism and agree in outcome. Keeping both drivers on one
  * fixture is what makes "the two backends behave the same" a tested claim rather than
  * an assumed one.
+ *
+ * The outcome both must produce: a lowered body — many burg_rewrite calls with a single
+ * check at the end — stops at its first uncovered statement, emits nothing after it, and
+ * still reports THAT failure at the check. C++ gets this from unwinding; C had to be
+ * taught it (burg_rewrite short-circuits on a pending error rather than clearing it).
  */
 #include <cstdio>
 #include <cstring>
@@ -137,9 +142,10 @@ static void test_uncovered_graph_node() {
     CHECK(threw, "uncovered graph node must throw BurgError");
 }
 
-/* The C backend's sticky-error bug has no C++ analogue — a throw carries no state — but
- * the OUTCOME being asserted is identical, so the case is worth pinning on both: a
- * matcher reused after a failure must behave as if the failure never happened. */
+/* The C twin of test_explicit_clear_restores. A throw carries no state, so C++ gets for
+ * free what C asks for with burg_clear_error: past a caught failure, the next body starts
+ * clean. Pinned on both backends because it is the OUTCOME that has to match, not the
+ * mechanism. */
 static void test_matcher_reusable_after_failure() {
     BurgMatcher m;
     CovNode o = mk(COV_ORPHAN, 1);
@@ -159,6 +165,33 @@ static void test_matcher_reusable_after_failure() {
     }
     const int want[] = {1, 10};
     check_trace(want, 2, "rewrite after failure");
+}
+
+/* The twin of the C driver's test_body_of_rewrites_keeps_first_failure, and the reason
+ * the C backend short-circuits instead of clearing on entry. A lowered body is many
+ * burg_rewrite calls with ONE check at the end; statement 2 has no cover. C++ has never
+ * been able to get this wrong — the throw unwinds past statement 3 and lands in the
+ * end-of-body handler — which is precisely the behaviour C had to be fixed to match. */
+static void test_body_of_rewrites_keeps_first_failure() {
+    BurgMatcher m;
+    CovNode s1 = mk(COV_CONST, 1);
+    CovNode s2 = mk(COV_ORPHAN, 2);
+    CovNode s3 = mk(COV_CONST, 3);
+
+    cov_trace_reset();
+    bool threw = false;
+    try {
+        m.burg_rewrite(&s1);
+        m.burg_rewrite(&s2);
+        m.burg_rewrite(&s3);
+    } catch (const BurgError& e) {
+        threw = true;
+        CHECK(e.arg == COV_ORPHAN, "the end-of-body handler must see the offending opcode");
+    }
+    CHECK(threw, "the body's end-of-body handler must see the failure");
+    /* Only statement 1 emitted; statement 3 never ran. */
+    const int want[] = {1, 10};
+    check_trace(want, 2, "body stops at the first uncovered statement");
 }
 
 /* The throw unwinds out of the RPO loop, so nothing downstream of the uncovered node
@@ -193,6 +226,7 @@ int main() {
     test_uncovered_tree_root();
     test_uncovered_graph_node();
     test_matcher_reusable_after_failure();
+    test_body_of_rewrites_keeps_first_failure();
     test_graph_failure_stops_reducing();
 
     if (failures) {

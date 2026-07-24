@@ -124,6 +124,7 @@ private:
     bool parse_MethodParam(std::vector<opgen::MethodParam*>& list);
     bool parse_StatusDecl(std::optional<opgen::StatusDecl*>& out);
     bool parse_BackendDecl(std::optional<const char*>& out);
+    bool parse_SidetableDecl(bool& out);
     bool parse_TypeDecl(std::vector<opgen::TypeDecl*>& list);
     bool parse_MethodDecl(std::vector<opgen::MethodDecl*>& list);
     bool parse_JavaPrimType(const char*& out);

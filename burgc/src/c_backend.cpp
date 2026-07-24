@@ -323,10 +323,13 @@ void CBurgBackend::emit_rpo_dfs(std::ostream& out, int indent) {
 void CBurgBackend::emit_rewrite_body(std::ostream& out, int indent) {
     int64_t start_idx = a_->nonterm_index.at(a_->start_nonterm);
 
-    // burg_set_error latches the FIRST error and ignores later ones, so a rewrite that
-    // does not clear on entry would report a previous call's failure forever. The C++
-    // backend gets this for free by throwing; C polls, so C must clear.
-    pad(out, indent); out << "burg_clear_error(ctx);\n";
+    // burg_set_error latches the FIRST error and ignores later ones. Rewrite does
+    // NOT clear on entry — it SHORT-CIRCUITS: a body emitted as many rewrite calls
+    // over one ctx must keep the first failure visible at the end-of-body check.
+    // (Clear-on-entry let a mid-body no-cover be swallowed by the next statement's
+    // rewrite — the truncated body then SHIPPED with its check green.) A caller
+    // wanting per-call isolation clears explicitly (burg_ctx_init starts clear).
+    pad(out, indent); out << "if (burg_has_error(ctx)) return;\n";
     pad(out, indent); out << "arena_reset(ctx);\n\n";
 
     pad(out, indent); out << "if (BURG_NODE_SUCC_COUNT(root) == 0) {\n";

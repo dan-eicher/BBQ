@@ -191,6 +191,7 @@ bool Parser::parse_Opgen() {
        std::vector<opgen::TypeDecl*> types;
        std::optional<const char*> body_c;
        std::optional<const char*> backend;
+       bool sidetable = false;
        std::string hdr;
     for (;;) {
         auto _m0 = save();
@@ -221,6 +222,12 @@ bool Parser::parse_Opgen() {
                 restore(_m2);
                 if ([&]() -> bool {
                     skip();
+                    if (!parse_SidetableDecl(sidetable)) return false;
+                    return true;
+                }()) {} else {
+                restore(_m2);
+                if ([&]() -> bool {
+                    skip();
                     if (!parse_TypeDecl(types)) return false;
                     return true;
                 }()) {} else {
@@ -240,6 +247,7 @@ bool Parser::parse_Opgen() {
                 skip();
                 if (!parse_OpcodeDef(op)) return false;
                 ops.push_back(op);
+                }
                 }
                 }
                 }
@@ -265,7 +273,7 @@ bool Parser::parse_Opgen() {
     }
     skip(); if (!at_end()) return false;
     ast = new opgen::Module(std::move(ops), std::move(methods), status,
-           std::move(types), std::move(headers), body_c, backend);
+           std::move(types), std::move(headers), body_c, backend, sidetable);
     return true;
 }
 
@@ -514,12 +522,12 @@ bool Parser::parse_FamilyDef(std::vector<opgen::Opcode*>& ops) {
              std::vector<opgen::StackParam*> nin;
              for (size_t i = 0; i < tin.size(); i++) {
                  opgen::ValueType ty = in_var[i] ? mvts[m] : tin[i]->ty;
-                 nin.push_back(new opgen::StackParam(ty, tin[i]->name, tin[i]->sem_expr, tin[i]->count));
+                 nin.push_back(new opgen::StackParam(ty, tin[i]->name, tin[i]->sem_expr, tin[i]->count, tin[i]->at_src));
              }
              std::vector<opgen::StackParam*> nout;
              for (size_t i = 0; i < tout.size(); i++) {
                  opgen::ValueType ty = out_var[i] ? mvts[m] : tout[i]->ty;
-                 nout.push_back(new opgen::StackParam(ty, tout[i]->name, tout[i]->sem_expr, tout[i]->count));
+                 nout.push_back(new opgen::StackParam(ty, tout[i]->name, tout[i]->sem_expr, tout[i]->count, tout[i]->at_src));
              }
              ops.push_back(new opgen::Opcode(
                  mnames[m], (int32_t)mhexes[m], (int32_t)msubs[m],
@@ -570,7 +578,9 @@ bool Parser::parse_FamilyStackParam(std::vector<opgen::StackParam*>& list, std::
         }()) restore(_m2);
     }
     var_flags.push_back(isvar);
-         list.push_back(new opgen::StackParam(ty, opgen_dup(ns), opgen_opt(sem_expr), opgen_opt((opgen::SemExpr*)nullptr)));
+         list.push_back(new opgen::StackParam(ty, opgen_dup(ns), opgen_opt(sem_expr),
+                                              opgen_opt((opgen::SemExpr*)nullptr),
+                                              opgen_opt((opgen::SemExpr*)nullptr)));
     return true;
 }
 
@@ -628,7 +638,7 @@ bool Parser::parse_OperandParam(std::vector<opgen::OperandParam*>& list) {
 
 bool Parser::parse_StackParam(std::vector<opgen::StackParam*>& list) {
     opgen::ValueType ty; peg::Span ns; peg::Span es;
-       const char* sem_expr = nullptr; opgen::SemExpr* count = nullptr;
+       const char* sem_expr = nullptr; opgen::SemExpr* count = nullptr; opgen::SemExpr* at_src = nullptr;
     {
         auto _m0 = save();
         if (![&]() -> bool {
@@ -643,10 +653,22 @@ bool Parser::parse_StackParam(std::vector<opgen::StackParam*>& list) {
     }
     skip();
     if (!parse_ValueType(ty)) return false;
+    {
+        auto _m1 = save();
+        if (![&]() -> bool {
+            skip();
+            if (!match("(")) return false;
+            skip();
+            if (!parse_SemExpr(at_src)) return false;
+            skip();
+            if (!match(")")) return false;
+            return true;
+        }()) restore(_m1);
+    }
     skip();
     if (!ident(ns)) return false;
     {
-        auto _m1 = save();
+        auto _m2 = save();
         if (![&]() -> bool {
             skip();
             if (!match("=")) return false;
@@ -654,9 +676,10 @@ bool Parser::parse_StackParam(std::vector<opgen::StackParam*>& list) {
             if (!string_lit(es)) return false;
             sem_expr = opgen_dup(es);
             return true;
-        }()) restore(_m1);
+        }()) restore(_m2);
     }
-    list.push_back(new opgen::StackParam(ty, opgen_dup(ns), opgen_opt(sem_expr), opgen_opt(count)));
+    list.push_back(new opgen::StackParam(ty, opgen_dup(ns), opgen_opt(sem_expr),
+                                              opgen_opt(count), opgen_opt(at_src)));
     return true;
 }
 
@@ -2526,6 +2549,23 @@ bool Parser::parse_BackendDecl(std::optional<const char*>& out) {
     skip();
     if (!string_lit(hdr)) return false;
     out = opgen_dup(hdr);
+    return true;
+}
+
+bool Parser::parse_SidetableDecl(bool& out) {
+    skip();
+    if (!match("sidetable")) return false;
+    {
+        auto _m0 = save();
+        bool _ok0 = [&]() -> bool {
+            if (at_end() || !is_ident_continue(peek())) return false;
+            advance();
+            return true;
+        }();
+        restore(_m0);
+        if (_ok0) return false;
+    }
+    out = true;
     return true;
 }
 

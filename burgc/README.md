@@ -181,6 +181,59 @@ arity. burgc detects the mismatch and falls back to its heuristic
 demand filter for that terminal — the schema is consulted but
 doesn't constrain.
 
+## FAILURE REPORTING IN THE GENERATED MATCHER
+
+A rewrite fails when the start nonterminal has no rule at the root of
+a tree, or does not cover some node of a graph. Both backends report
+it; they differ in mechanism because C has no exceptions.
+
+### C++ -- `BurgError`
+
+`burg_set_error()` throws `BurgError` (a `std::runtime_error` carrying
+`.arg`, the offending opcode). `burg_has_error()` exists but always
+returns false: the throw is the only channel.
+
+### C -- a latched error on the context
+
+```c
+bool        burg_has_error(const burg_ctx_t*);
+const char* burg_get_error(const burg_ctx_t*);
+int         burg_get_error_arg(const burg_ctx_t*);   /* the offending opcode */
+void        burg_clear_error(burg_ctx_t*);
+```
+
+`burg_set_error()` latches the **first** error and drops later ones,
+and `burg_rewrite()` **short-circuits** on a pending one — it returns
+immediately, emitting nothing. It does *not* clear on entry.
+
+That is a deliberate contract, not an omission. A lowered body is many
+`burg_rewrite()` calls over one context with a single check at the end:
+
+```c
+burg_ctx_t ctx;
+burg_ctx_init(&ctx);                 /* starts clear */
+for (stmt_t* s = body; s; s = s->next)
+    burg_rewrite(s->node, &ctx);     /* a failure stops the rest */
+if (burg_has_error(&ctx))            /* ...and is still visible here */
+    fatal("%s (op %d)", burg_get_error(&ctx), burg_get_error_arg(&ctx));
+```
+
+Clearing on entry would let the *next* statement's rewrite wipe the
+previous statement's no-cover, so a body missing a statement passed its
+own check. Short-circuiting also stops the rewrites after the failure
+from emitting code that silently follows a hole. It matches what C++
+does by unwinding out of the whole body.
+
+A caller that wants per-call isolation asks for it:
+
+```c
+burg_clear_error(&ctx);              /* between independent bodies */
+```
+
+`burgc_coverage_c_e2e` and `burgc_coverage_cpp_e2e` compile the
+generated matchers and run the same cases against both, which is what
+makes "the two backends agree" a tested claim.
+
 ## EXAMPLES
 
 Basic codegen:
@@ -228,6 +281,10 @@ burgc/
     burgc_test.cpp            All burgc tests (gtest)
     data/
       simple.burg, chain.burg, actions.burg, costs.burg
+      coverage.burg           Fixture for the two e2e drivers
+      coverage_node.h, .c     Its node type
+      coverage_main.c         e2e driver: C backend (burg_ctx_t)
+      coverage_main.cpp       e2e driver: C++ backend (BurgError)
 ```
 
 ## SEE ALSO

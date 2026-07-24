@@ -22,7 +22,23 @@ backend "calc_backend.h"
 # native can return a target-specific outcome without the generator baking it in.
 status calc_status_t CALC_OK CALC_ERR CALC_HALT [CALC_TRAP]
 
-type i32 int32_t uint32_t 1 i
+# STRUCTURED CONTROL. opgen owns the Titzer side-table entry format and the walk over
+# it, and emits both (opgen_st_entry_t + opgen_do_transfer) into runtime_api.h. Declared,
+# not inferred from a built-in's name — opgen bakes in no target identifiers, and a
+# substrate with no side table must not be handed a walk that reads fields it lacks.
+sidetable
+
+# The value model. Scalars are opgen's OWN spellings (s4/u4/s8/u8/f4/f8 — the typedefs
+# the generated value model emits): scalar_bits() and the float paths key on those
+# names, so a row written `int64_t` would be silently sized as 32 bits.
+#
+# Single-slot throughout (the WASM model, not the JVM's two-slot long/double), so the
+# whole set is exercised: an i64 that fills a slot, a double, and a v128 whose slot is
+# WIDER than 64 bits — which is what makes the runtime-typed carrier honest.
+type i32  s4      u4      1 i
+type i64  s8      u8      1 l
+type f64  f8      f8      1 d
+type v128 v128_t  v128_t  1 v
 
 # Control built-ins (the calc backend implements them). A status return marks
 # them as control transfers: the handler runs the native, then tail-dispatches.
@@ -36,6 +52,36 @@ native status calc_abort(int code);   # set vm->trapped + halt; returns the CALC
 # JIT stencil — no extern prototype, no jit-symbol entry. (javelina uses this for
 # linear-memory access; the calc proves the mechanism with a pure-arithmetic op.)
 inline native int calc_abs(int x);   # |x|, folded inline
+
+# The structured-control transfer. A `status` return makes it a control transfer, which
+# is what the JIT needs: the stencil bakes _HOLE_ip, calls, and resyncs to the new pc —
+# a `void` transfer would reposition the cursor and then fall through to the NEXT
+# stencil, which is the wrong one. The backend implements it as opgen_do_transfer().
+native status transfer();
+
+# ── Natives for the generic capabilities the ops below exercise ──
+native int  calc_is_bad(double x);          # named ONLY by a guard (see dcheck)
+native void calc_vpush(long lo, long hi);   # push a v128 slot from its two 64-bit halves
+native void calc_box(any v);                # stash a runtime-typed value + its tag
+native any  calc_unbox();                   # ...and read it back out
+native long calc_vlane(any v, int i);       # lane i of a v128 carried as any_t
+native void calc_push_tagged(long v, int tag);   # push bits under a CHOSEN tag
+native int  calc_tag(any v);                # the runtime tag a value is carrying
+
+# Linear memory. Two memories with DIFFERENT declared addrtypes (memory 0 is 32-bit,
+# memory 1 is 64-bit) — the point of `addr(...)` is that the pop width comes from here,
+# from the module, and not from whatever tag the operand happens to carry.
+native int  calc_mem_is64(int m);
+native int  calc_mem_pages(int m);
+native int  calc_mem_in_bounds(int m, ulong a, int n);
+native int  calc_load32(int m, ulong a);
+native void calc_store32(int m, ulong a, int v);
+
+# §3(b) variadic support.
+native void calc_acc_reset();
+native void calc_accum(any v);      # fold one in-place operand into the accumulator
+native int  calc_acc();
+native void calc_produce(int n);    # write n values AT and above sp, without moving it
 
 # ── Values ──────────────────────────────────────────────────
 const 0x01 [ sleb128 v ] ( -- i32 r )
@@ -82,7 +128,13 @@ goto  0x0F [ sleb128 off ] ( -- )
     (. calc_br(off); .)
 ret   0x10 (i32 v -- )
     (. calc_ret(v); .)
-call  0x13 [ sleb128 entry, u8 nargs ] ( -- )   # save frame, pass nargs from the stack, enter the callee
+# §3(b) dynamic arity. The arg count is an immediate, so the signature can state it
+# instead of lying with `( -- )`, and opgen owns the marshaling. `pops_first` because
+# the callee frame is carved AT sp: the args must already be popped when the body hands
+# off. Sound only because nothing allocates in between — sp bounds any GC root scan, so
+# the DEFAULT (drop after the body) is what keeps a constructor's operands rooted.
+call  0x13 [ sleb128 entry, u8 nargs ] ( [nargs] i32 args -- )
+    flag: pops_first
     (. calc_call(entry, nargs); .)
 
 pop 0x11 (i32 v -- )
@@ -91,3 +143,110 @@ pop 0x11 (i32 v -- )
 abs  0x14 (i32 a -- i32 r)   (. r = calc_abs(a); .)      # inline native (direct call, both tiers)
 trap 0x15 (i32 c -- )                                    # status-extra native: abort when c != 0
     (. if (c != 0) calc_abort(c); .)
+
+# ── Wider values ────────────────────────────────────────────
+lconst 0x17 [ sleb64 v ] ( -- i64 r )   (. r = v; .)
+dconst 0x18 [ f64 v ]    ( -- f64 r )   (. r = v; .)
+dadd   0x19 (f64 a, f64 b -- f64 r)     (. r = a + b; .)
+
+# Narrowing/inspection ops, so a wider or runtime-typed result is observable from a
+# program that ends in `ret` (which delivers an i32). Not punning through the slot
+# union in the test: the value model is opgen's, and reading it is an opcode's job.
+l2i   0x29 (i64 a -- i32 r)   (. r = (int)a; .)
+tagof 0x2A (any v -- i32 r)   (. r = calc_tag(v); .)
+
+# ── Float constants INSIDE a guard ──────────────────────────
+#
+# A float literal lowers to a C literal, which clang materializes out of the .rodata
+# constant pool — a relocation a copy-and-patch stencil cannot carry. In a BODY that
+# never bites (a literal-init local already becomes a named hole); a CONDITION has no
+# local to hang a name on, so opgen synthesizes `_HOLE_k<bit pattern>` from the VALUE.
+# Get this wrong and the JIT bakes 0: the guard silently stops firing in JIT code only,
+# which is why both tiers run these cases.
+trunc 0x1A (f64 a -- i32 r)
+    error: (. a != a .) -> NaN
+    error: (. !(a >= -2147483648.0 && a < 2147483648.0) .) -> TruncOverflow
+    (. r = (int)a; .)
+
+# A guard that negates a float at RUN TIME, not a folded literal. The sign flip rides
+# _HOLE_fsignmask64 in the stencil, and the width has to come from the CONDITION — the
+# body scan keys on the result type, which here is a float, not the compare's i32.
+ddiv 0x1B (f64 a, f64 b -- f64 r)
+    error: (. b == 0.0 .) -> DivByZeroF
+    error: (. -a > 1000000.0 .) -> NegTooLarge
+    (. r = a / b; .)
+
+# A native reachable ONLY from a guard. Guards are emitted into the stencil too, so it
+# still rides a _HOLE_ patch point — and the extern must still be declared, or the
+# stencil translation unit does not compile.
+dcheck 0x1C (f64 a -- f64 r)
+    error: (. calc_is_bad(a) != 0 .) -> BadDouble
+    (. r = a; .)
+
+# ── The runtime-typed carrier (any_t) must not truncate a v128 ──
+#
+# any_t carries a value whose type is known only at run time. Shaped for a 64-bit
+# payload it silently drops lanes 2/3 of every v128 crossing it. `vmake` builds one,
+# `box`/`unbox` round-trip it through the carrier, `vlane` reads back the half that
+# would have been lost.
+vmake 0x1D (i64 lo, i64 hi -- )        (. calc_vpush(lo, hi); .)
+box   0x1E (any v -- )                 (. calc_box(v); .)
+unbox 0x1F ( -- any r )                (. r = calc_unbox(); .)
+vlane 0x20 [ u8 i ] (any v -- i64 r)   (. r = calc_vlane(v, i); .)
+
+# ── `word`: the result is a whole SLOT ──────────────────────
+#
+# select's arms are slots, so the assignment is a slot move. msize's value is a scalar
+# whose WIDTH is decided at run time (the addrtype of the addressed memory), so it goes
+# through the value model's field selector and the body sets the tag itself via _wt.
+# One declared type, two lowerings — which is what makes a runtime-width result an
+# honest signature instead of a lie.
+select 0x21 (word v1, word v2, i32 c -- word result)
+    (. result = c ? v1 : v2; result_wt = c ? v1_wt : v2_wt; .)
+msize  0x22 [ u8 m ] ( -- word result )
+    (. result = calc_mem_pages(m); result_wt = calc_mem_is64(m) ? T_LONG : T_INT; .)
+
+# ── addrtype: the width is DECLARED, never sniffed ──────────
+#
+# `addr(expr)` names where the width comes from — here the addressed memory's declared
+# addrtype, the same fact a validator would read. Deriving it from the operand's runtime
+# tag is a divergence in MECHANISM: a tested fact can disagree with the declared type,
+# an asserted one cannot. See `pushtag` for the case where it does disagree.
+load32  0x23 [ u8 m ] (addr(calc_mem_is64(m)) a -- i32 r)
+    error: (. !calc_mem_in_bounds(m, a, 4) .) -> OutOfBounds
+    (. r = calc_load32(m, a); .)
+store32 0x24 [ u8 m ] (addr(calc_mem_is64(m)) a, i32 v -- )
+    error: (. !calc_mem_in_bounds(m, a, 4) .) -> OutOfBounds
+    (. calc_store32(m, a, v); .)
+
+# Push a 64-bit value under a CHOSEN tag — the shape a value reconstructed out of an
+# aggregate has, where the tag describes the container and not the value's declared
+# width. A tag-driven addrtype pop truncates this to 32 bits and lands in bounds; a
+# declared-width pop sees the whole address and traps.
+pushtag 0x25 [ u8 t ] (i64 v -- )   (. calc_push_tagged(v, t); .)
+
+# ── §3(b) variadic operands, the DEFAULT drop-after-body ────
+#
+# The operands stay on the stack across the body (sp bounds any root scan, so a body
+# that allocates must not have dropped them yet) and are read in place as `args[i]` —
+# a runtime-typed read, the same carrier as box/unbox. opgen drops sp afterwards.
+sum_n 0x26 [ u8 n ] ( [n] i32 args -- i32 r )
+    (. calc_acc_reset();
+       for (int i = 0; i < n; i = i + 1) { calc_accum(args[i]); }
+       r = calc_acc(); .)
+
+# ── §3(b) variadic RESULTS ──────────────────────────────────
+#
+# The values are already at the frame top (a native left them there); exposing them IS
+# the marshaling. opgen raises sp and pushes nothing — a variadic result names a count,
+# not a value, so there is nothing to declare.
+expose 0x27 [ u8 n ] ( -- [n] i32 rets )   (. calc_produce(n); .)
+
+# ── br_table + the side table ───────────────────────────────
+#
+# The label TARGETS live in the side table, so the label vector in the bytecode is pure
+# decode — opgen's job. It exposes the vector's length as `labels_count` so the body can
+# clamp the key, and skips the labels themselves. §4.4.8: clamp an out-of-range key to
+# the default, index this br_table's consecutive entries, transfer.
+br_table 0x28 [ brtable labels ] (i32 key -- )
+    (. stp = stp + (((uint)key > labels_count) ? labels_count : (uint)key); transfer(); .)

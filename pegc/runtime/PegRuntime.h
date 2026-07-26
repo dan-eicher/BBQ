@@ -89,6 +89,14 @@ inline char unescape_char_lit(Span s) {
             case 'n': return '\n';
             case 'r': return '\r';
             case 't': return '\t';
+            // The rest of the standard control escapes. Their absence was not inert: the
+            // grammar's char_lit accepts '\\' ANY and the default arm below returns the
+            // LETTER, so a grammar writing IGNORE ... + '\f' silently got 'f' — the letter f
+            // became whitespace, and the form feed the author asked for was never skipped.
+            case 'f': return '\f';
+            case 'b': return '\b';
+            case 'v': return '\v';
+            case 'a': return '\a';
             case '\\': return '\\';
             case '\'': return '\'';
             case '"': return '"';

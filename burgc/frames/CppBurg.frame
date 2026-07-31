@@ -97,13 +97,16 @@ private:
 
 -->label_graph
 
+// Everything below is the consumer-facing surface, and it matches the C backend's
+// public functions one for one. The DP and the two labelers stay private above —
+// they are file-local `static` in the C backend for the same reason.
+public:
 -->rule_lookup
 
 -->nt_name
 
 -->reducer
 
-public:
 -->rewriter
 
 }; // class BurgMatcher

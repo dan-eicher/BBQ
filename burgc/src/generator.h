@@ -26,6 +26,10 @@ struct BurgAnalysis {
     std::vector<std::string> nonterms;
     std::unordered_map<std::string, int64_t> nonterm_index;
     std::string start_nonterm;
+    // Declared ENTRY nonterminals (see burg_ast::Spec::entries): additional
+    // goals a consumer reduces to by name. Validated in analyze(); consumed by
+    // the liveness analysis, which seeds demand for each exactly as for START.
+    std::vector<std::string> entries;
     int64_t max_rule = 0;
     bool has_actions = false;
     bool has_guards = false;
@@ -83,12 +87,22 @@ public:
     }
     virtual bool needs_impl_file() const { return false; }
 
+    // Opt-in: also export the labeled rule set (pattern, cost, guard) so a
+    // consumer can check the labeler's chosen cover against its own search over
+    // the same rules. Off by default — it is dead weight for a normal consumer,
+    // and it is the only thing in the output that no other code path reads.
+    void set_emit_rule_table(bool on) { emit_rule_table_ = on; }
+
 protected:
     const BurgAnalysis* a_ = nullptr;
+    bool emit_rule_table_ = false;
 
     // Backend customization — override to thread context parameter
     virtual std::string ctx_arg() const { return ""; }    // appended: ", ctx"
     virtual std::string ctx_solo() const { return ""; }   // standalone: "ctx"
+    // Prefix on user-facing symbol names (the C backend's COMPILER namespace).
+    virtual std::string sym_prefix() const { return ""; }
+    virtual std::string ctx_type_name() const { return "burg_ctx_t"; }
     virtual std::string state_type() const { return "BurgState"; }  // struct name
     // Whether the backend stores errors and the consumer polls
     // burg_has_error() to detect them. The C++ backend overrides to
@@ -110,7 +124,17 @@ protected:
     void emit_label_tree_body(std::ostream& out, int indent);
     virtual void emit_label_body(std::ostream& out, int indent);
     void emit_rule_func_body(std::ostream& out, int indent);
+    void emit_cost_func_body(std::ostream& out, int indent);
+    void emit_label_root_body(std::ostream& out, int indent);
     void emit_nt_name_body(std::ostream& out, int indent);
+
+    // --emit-rule-table. The C backend splits these across its .h/.c (types and
+    // extern declarations in the header, data in the impl); the C++ backend emits
+    // both inside the class, where `storage` makes the arrays inline members.
+    void emit_rule_table_types(std::ostream& out, int indent);
+    void emit_rule_table_decls(std::ostream& out);
+    void emit_rule_table_data(std::ostream& out, int indent, const std::string& storage);
+    void emit_rule_guard_body(std::ostream& out, int indent);
     void emit_reduce_body(std::ostream& out, int indent);
     virtual void emit_rewrite_body(std::ostream& out, int indent);
 

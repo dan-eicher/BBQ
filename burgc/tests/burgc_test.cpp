@@ -41,6 +41,12 @@ static std::string gen_cpp(const char* input) {
     return gen_code(input, *backend);
 }
 
+// Helper: same, with --emit-rule-table turned on.
+static std::string gen_code_with_table(const char* input, BurgBackend& backend) {
+    backend.set_emit_rule_table(true);
+    return gen_code(input, backend);
+}
+
 // ── Parser tests ──────────────────────────────────────────
 
 TEST(BurgParser, ParsesSimpleSpec) {
@@ -376,6 +382,168 @@ TEST(BurgAnalysis, ReportsDeadRule) {
     EXPECT_TRUE(found_dead) << "expected dead-rule warning for aux";
 }
 
+// The automaton build must scale like Proebsting's algorithm ("BURS Automata
+// Generation", TOPLAS 17(3) §3.3), not like naive tuple enumeration. There,
+// transitions are computed over REPRESENTER states — per (operator, dimension)
+// equivalence classes keeping only what can matter at that child position
+// (Fig. 11 Project(); credited to Chase) — and only when a dimension gains a
+// NEW representer (Fig. 12), so each (operator, representer-tuple) is evaluated
+// once. The naive form enumerates raw-state tuples, |states|^arity per worklist
+// round, re-recording transitions every round: on this fixture (12 leaf
+// terminals feeding one arity-5 operator, all equivalent at every position)
+// that is 12^5 tuples per round — and on the real codegen_wasm grammar it ran
+// 25+ minutes into 6 GB of duplicate transition records without emitting one
+// warning. Here all 12 leaf states project to ONE representer per dimension,
+// so the whole automaton is a handful of evaluations.
+TEST(BurgAnalysis, AutomatonScalesByRepresenterStatesNotRawTuples) {
+    std::string input = "TERM Op5=100\n";
+    for (int i = 1; i <= 12; i++)
+        input += "TERM L" + std::to_string(i) + "=" + std::to_string(i) + "\n";
+    input += "START stmt\nRULES\n";
+    for (int i = 1; i <= 12; i++)
+        input += "v: L" + std::to_string(i) + " = 1;\n";
+    input += "stmt: Op5(v, v, v, v, v) = 1;\n";
+
+    Parser parser;
+    parser.init(input.c_str(), (int)input.size());
+    ASSERT_TRUE(parser.parse());
+    BurgGenerator gen;
+    ASSERT_TRUE(gen.analyze(parser.ast));
+
+    AnalysisConfig cfg;
+    cfg.emit_coverage_warnings = true;
+    cfg.skip_dead_rule_analysis = false;
+    AnalysisReport report = run_completeness_analysis(gen.analysis(), cfg);
+
+    EXPECT_LT(report.stats.tuples_evaluated, 1000u)
+        << "transition computations must be bounded by representer-tuple "
+           "combinations, not raw-state tuples (12^5 per round here)";
+    EXPECT_LT(report.stats.transitions, 1000u)
+        << "each (operator, tuple) transition must be recorded once, not once "
+           "per worklist round";
+    // And the answer itself: a complete grammar, so no uncovered shapes.
+    for (auto& w : report.warnings)
+        EXPECT_EQ(w.find("uncovered"), std::string::npos) << w;
+}
+
+// ── ENTRY: declaring the grammar's other entry points ─────────────────────────
+//
+// Goal-directed reduction is the formalism, not an extension: iburg exposes
+// `rule(state, goalnt)` (iburg.pdf p.8) and Proebsting reduces via
+// `RuleTable(state, goal)` (BURS Automata Generation p.464-465, Fig. 4). START is
+// merely the ROOT's goal. A consumer whose control nodes cannot live in the
+// grammar — javelina's structurer, because a `br` depth is a scope-stack property
+// no action can reach — is a hand-written extension of Reduce() that demands
+// other nonterminals at its pattern frontiers. The analysis has no way to see
+// those demands, so it reports the whole family dead. ENTRY declares them.
+
+TEST(BurgParser, ParsesEntryDecls) {
+    Parser parser;
+    const char* input =
+        "TERM X=1\n"
+        "START stmt\n"
+        "ENTRY cond\n"
+        "ENTRY ncond\n"
+        "RULES stmt: X = 1; cond: X = 1; ncond: X = 1;";
+    parser.init(input, (int)strlen(input));
+    ASSERT_TRUE(parser.parse());
+    ASSERT_NE(parser.ast, nullptr);
+    ASSERT_EQ(parser.ast->entries.size(), 2u);
+    EXPECT_EQ(parser.ast->entries[0], "cond");
+    EXPECT_EQ(parser.ast->entries[1], "ncond");
+    EXPECT_EQ(parser.ast->start, "stmt");
+}
+
+TEST(BurgParser, EntryDeclOptional) {
+    Parser parser;
+    const char* input = "TERM X=1\nSTART reg\nRULES reg: X = 1;";
+    parser.init(input, (int)strlen(input));
+    ASSERT_TRUE(parser.parse());
+    ASSERT_NE(parser.ast, nullptr);
+    EXPECT_TRUE(parser.ast->entries.empty());
+}
+
+// The point of the whole declaration: a family reachable ONLY by name from the
+// consumer is live, and the analysis can finally say so.
+TEST(BurgAnalysis, EntrySeedsDemandSoItsRulesAreNotDead) {
+    const char* with_entry =
+        "TERM X=1\nTERM Y=2\n"
+        "START stmt\n"
+        "ENTRY aux\n"
+        "RULES stmt: X = 1; aux: Y = 1;";
+    const char* without =
+        "TERM X=1\nTERM Y=2\n"
+        "START stmt\n"
+        "RULES stmt: X = 1; aux: Y = 1;";
+
+    auto aux_dead = [](const char* src) {
+        Parser parser;
+        parser.init(src, (int)strlen(src));
+        EXPECT_TRUE(parser.parse());
+        BurgGenerator gen;
+        AnalysisConfig cfg;
+        cfg.skip_dead_rule_analysis = false;
+        gen.set_completeness_config(cfg);
+        EXPECT_TRUE(gen.analyze(parser.ast));
+        for (auto& w : gen.warnings())
+            if (w.find("dead") != std::string::npos &&
+                w.find("aux") != std::string::npos) return true;
+        return false;
+    };
+
+    // Undeclared, the rule really is unreachable from START — the warning is
+    // correct, and this half is what makes the other half mean something.
+    EXPECT_TRUE(aux_dead(without)) << "without ENTRY, aux is genuinely unreachable";
+    EXPECT_FALSE(aux_dead(with_entry)) << "ENTRY aux must seed demand for aux";
+}
+
+// A declaration that names nothing is a typo, and a typo that silently does
+// nothing would hand back exactly the dead-rule warnings ENTRY exists to remove.
+TEST(BurgAnalysis, UnknownEntryIsAnError) {
+    Parser parser;
+    const char* input =
+        "TERM X=1\nSTART reg\nENTRY nosuch\nRULES reg: X = 1;";
+    parser.init(input, (int)strlen(input));
+    ASSERT_TRUE(parser.parse());
+    BurgGenerator gen;
+    EXPECT_FALSE(gen.analyze(parser.ast));
+    bool named = false;
+    for (auto& e : gen.errors())
+        if (e.find("nosuch") != std::string::npos) named = true;
+    EXPECT_TRUE(named) << "the error must name the undeclared entry";
+}
+
+// Declaring the start nonterminal adds no demand it does not already have.
+TEST(BurgAnalysis, EntryOnStartIsHarmless) {
+    Parser parser;
+    const char* input =
+        "TERM X=1\nSTART reg\nENTRY reg\nRULES reg: X = 1;";
+    parser.init(input, (int)strlen(input));
+    ASSERT_TRUE(parser.parse());
+    BurgGenerator gen;
+    AnalysisConfig cfg;
+    cfg.skip_dead_rule_analysis = false;
+    gen.set_completeness_config(cfg);
+    EXPECT_TRUE(gen.analyze(parser.ast));
+    for (auto& w : gen.warnings())
+        EXPECT_EQ(w.find("dead"), std::string::npos) << w;
+}
+
+// ENTRY is an ANALYSIS declaration: the goal-directed C API it describes
+// (burg_label_root + burg_reduce) already exists, so the matcher must not change.
+TEST(BurgCBackend, EntryDoesNotAlterGeneratedMatcher) {
+    const char* base =
+        "TERM X=1\nSTART stmt\n%%RULES stmt: X = 1 (. emit_x(node); .); cond: X = 1;";
+    std::string with_entry(base), without(base);
+    with_entry.replace(with_entry.find("%%"), 2, "ENTRY cond\n");
+    without.replace(without.find("%%"), 2, "");
+
+    auto backend_a = create_c_backend();
+    auto backend_b = create_c_backend();
+    EXPECT_EQ(gen_code(with_entry.c_str(), *backend_a),
+              gen_code(without.c_str(), *backend_b));
+}
+
 TEST(BurgAnalysis, NoFalsePositivesOnSimpleGrammar) {
     // simple.burg is well-formed and complete; the analysis should
     // produce zero warnings on it.
@@ -483,6 +651,180 @@ TEST(BurgCppBackend, EmitsRuleLookup) {
     EXPECT_NE(code.find("burg_rule"), std::string::npos);
     EXPECT_NE(code.find("burg_label"), std::string::npos);
     EXPECT_NE(code.find("burg_nt_name"), std::string::npos);
+}
+
+// ── The goal-directed entry (burg_label_root + burg_cost) ──────────────────────
+//
+// burg_rewrite hard-codes the start nonterminal and keeps its labeled state to itself,
+// so a consumer could neither read what the DP claims a cover costs nor tile a tree
+// toward a nonterminal its CONTEXT names. These two exports close that. The behaviour
+// is asserted end-to-end by burgc_coverage_{c,cpp}_e2e; these tests pin the emitted
+// SHAPE — in particular that label_root reuses the same prologue as burg_rewrite,
+// since a stale arena would hand back a state pointing at freed memory.
+
+TEST(BurgCBackend, EmitsLabelRootAndCost) {
+    auto backend = create_c_backend();
+    std::string code = gen_code(
+        "TERM X=1\n"
+        "RULES r: X = 1 (. emit_x(node); .);", *backend);
+    EXPECT_NE(code.find("int burg_cost(burg_state_t* state, int goalnt);"), std::string::npos)
+        << "burg_cost must be declared in the public API";
+    EXPECT_NE(code.find("burg_state_t* burg_label_root(BURG_NODE_TYPE root, burg_ctx_t* ctx);"),
+              std::string::npos)
+        << "burg_label_root must be declared in the public API";
+    // An absent cover must read back as the state's own sentinel, not 0 ("free").
+    EXPECT_NE(code.find("goalnt > BURG_MAX_NT) return BURG_MAX_COST;"), std::string::npos);
+    EXPECT_NE(code.find("return state->cost[goalnt];"), std::string::npos);
+    // Same prologue as burg_rewrite: poll the error sink, THEN reset the arena.
+    auto lr = code.find("burg_state_t* burg_label_root(BURG_NODE_TYPE root, burg_ctx_t* ctx) {");
+    ASSERT_NE(lr, std::string::npos);
+    auto poll  = code.find("if (burg_has_error(ctx)) return NULL;", lr);
+    auto reset = code.find("arena_reset(ctx);", lr);
+    auto label = code.find("return burg_label_tree(root, ctx);", lr);
+    ASSERT_NE(poll, std::string::npos) << "label_root must short-circuit on a pending error";
+    ASSERT_NE(reset, std::string::npos);
+    ASSERT_NE(label, std::string::npos);
+    EXPECT_LT(poll, reset);
+    EXPECT_LT(reset, label);
+}
+
+TEST(BurgCppBackend, EmitsLabelRootAndCost) {
+    std::string code = gen_cpp(
+        "TERM X=1\n"
+        "RULES r: X = 1 (. emit_x(node); .);");
+    EXPECT_NE(code.find("static int burg_cost(BurgState* state, int goalnt)"), std::string::npos);
+    EXPECT_NE(code.find("BurgState* burg_label_root(BURG_NODE_TYPE root)"), std::string::npos);
+    EXPECT_NE(code.find("goalnt > BURG_MAX_NT) return BURG_MAX_COST;"), std::string::npos);
+    // C++ reports by throwing, so there is no error poll to emit — but the arena reset
+    // is not optional: the returned state is allocated out of it.
+    auto lr = code.find("BurgState* burg_label_root(BURG_NODE_TYPE root)");
+    ASSERT_NE(lr, std::string::npos);
+    EXPECT_EQ(code.find("burg_has_error", lr), std::string::npos)
+        << "the C++ backend throws; a poll here would be dead code";
+    auto reset = code.find("arena_reset();", lr);
+    auto label = code.find("return burg_label_tree(root);", lr);
+    ASSERT_NE(reset, std::string::npos);
+    ASSERT_NE(label, std::string::npos);
+    EXPECT_LT(reset, label);
+}
+
+// Backend parity: the C backend exports burg_rule/burg_cost/burg_nt_name/burg_reduce
+// as public functions, so the C++ backend must expose the same names as public members.
+// They were emitted into the class's PRIVATE section, which made the goal-directed
+// entry usable from C and unusable from C++ — half an API is the bug this pins.
+TEST(BurgCppBackend, ConsumerFacingMembersArePublic) {
+    std::string code = gen_cpp(
+        "TERM X=1\n"
+        "RULES r: X = 1 (. emit_x(node); .);");
+    // The consumer-facing section is opened by the LAST access specifier in the class;
+    // everything the frame emits before it is private (arena, cache, DP, labelers).
+    auto section = code.rfind("public:");
+    auto last_private = code.rfind("private:");
+    ASSERT_NE(section, std::string::npos);
+    ASSERT_NE(last_private, std::string::npos);
+    ASSERT_GT(section, last_private) << "the consumer section must be the last one opened";
+    for (const char* sym : {"int burg_rule(", "int burg_cost(", "const char* burg_nt_name(",
+                            "void burg_reduce(", "BurgState* burg_label_root(",
+                            "void burg_rewrite("}) {
+        auto pos = code.find(sym);
+        ASSERT_NE(pos, std::string::npos) << sym << " must be emitted";
+        EXPECT_GT(pos, section) << sym << " must sit in the consumer-facing section";
+    }
+    // …and the labelers must NOT: they are `static` in the C backend for the same reason.
+    for (const char* sym : {"BurgState* burg_label_tree(", "BurgState* burg_label("}) {
+        auto pos = code.find(sym);
+        ASSERT_NE(pos, std::string::npos) << sym << " must be emitted";
+        EXPECT_LT(pos, section) << sym << " must stay private";
+    }
+}
+
+// ── --emit-rule-table ─────────────────────────────────────────────────────────
+//
+// Exporting the rules as data is what lets a consumer check the labeler's cover
+// against its own search — the DP cannot audit itself. The e2e drivers run that
+// search; these pin the emission: opt-in, both backends, and a pattern encoding
+// that distinguishes a chain rule from a terminal one (get that wrong and the
+// oracle agrees with the labeler about nothing).
+
+static const char* RULE_TABLE_GRAMMAR =
+    "TERM Const = 1\n"
+    "TERM Add   = 2\n"
+    "START stmt\n"
+    "RULES\n"
+    "reg : Const where (. is_small(node) .) = 1 (. emit_c(node); .);\n"
+    "reg : Add(reg, reg) = 2 (. emit_a(node); .);\n"
+    "stmt: reg = 0;\n";
+
+TEST(BurgCBackend, RuleTableIsOptIn) {
+    auto off = create_c_backend();
+    EXPECT_EQ(gen_code(RULE_TABLE_GRAMMAR, *off).find("burg_rule_table"), std::string::npos)
+        << "nothing inside the matcher reads the table; it must not be emitted by default";
+    auto on = create_c_backend();
+    std::string code = gen_code_with_table(RULE_TABLE_GRAMMAR, *on);
+    EXPECT_NE(code.find("extern const burg_rule_row_t burg_rule_table[];"), std::string::npos);
+    EXPECT_NE(code.find("extern const int burg_rule_table_len;"), std::string::npos);
+    EXPECT_NE(code.find("int burg_rule_guard(int rule, BURG_NODE_TYPE node, burg_ctx_t* ctx);"),
+              std::string::npos);
+    EXPECT_NE(code.find("const int burg_rule_table_len = 3;"), std::string::npos);
+}
+
+TEST(BurgCppBackend, RuleTableIsOptIn) {
+    EXPECT_EQ(gen_cpp(RULE_TABLE_GRAMMAR).find("burg_rule_table"), std::string::npos);
+    auto on = create_cpp_backend();
+    std::string code = gen_code_with_table(RULE_TABLE_GRAMMAR, *on);
+    // Inside the class, so the arrays are inline members rather than externs.
+    EXPECT_NE(code.find("inline static const struct burg_rule_row_t burg_rule_table[]"),
+              std::string::npos);
+    EXPECT_NE(code.find("inline static const int burg_rule_table_len = 3;"), std::string::npos);
+    EXPECT_NE(code.find("static int burg_rule_guard(int rule, BURG_NODE_TYPE node)"),
+              std::string::npos);
+}
+
+// The encoding has to distinguish the three shapes a pattern can take.
+TEST(BurgCBackend, RuleTableEncodesPatternsAndGuards) {
+    auto backend = create_c_backend();
+    std::string code = gen_code_with_table(RULE_TABLE_GRAMMAR, *backend);
+    // `reg: Const` — one terminal node, no children.
+    EXPECT_NE(code.find("burg_pat_1[] = {{1, (int)BURG_Const, 0}}"), std::string::npos);
+    // `reg: Add(reg, reg)` — a terminal with two NONTERMINAL leaves (is_term 0),
+    // which is where a consumer's search recurses. (The start nonterminal is
+    // rotated to index 1, so `reg` is 2 here.)
+    EXPECT_NE(code.find("burg_pat_2[] = {{1, (int)BURG_Add, 2}, {0, (int)2, 0}, {0, (int)2, 0}}"),
+              std::string::npos);
+    // `stmt: reg` — a chain rule: a lone nonterminal leaf, no terminal at all.
+    EXPECT_NE(code.find("burg_pat_3[] = {{0, (int)2, 0}}"), std::string::npos);
+    // Rule 1 is guarded, rules 2 and 3 are not, and the guard is evaluable by number.
+    EXPECT_NE(code.find(", burg_pat_1, 1},"), std::string::npos) << "rule 1 is flagged guarded";
+    EXPECT_NE(code.find(", burg_pat_2, 0},"), std::string::npos) << "rule 2 is flagged unguarded";
+    EXPECT_NE(code.find("case 1: return (is_small(node)) ? 1 : 0;"), std::string::npos);
+    EXPECT_NE(code.find("default: return 1;"), std::string::npos)
+        << "an unguarded rule must evaluate to 1 so callers need no special case";
+}
+
+// Variable-arity children must be COSTED, not just reduced. The reducer tiles
+// children beyond the declared pattern with START; iburg (p.4, p.7's state())
+// sums every child's cost through the nonterminal demanded of it, so the DP arm
+// must carry the same loop on the cost side — otherwise the labeler minimizes
+// over covers of a smaller tree than the reducer emits. Behaviour is pinned by
+// the coverage e2e drivers (Call fixture); this pins the emitted shape and that
+// the loop starts at the DECLARED child count, mirroring emit_child_reductions.
+TEST(BurgCBackend, DPCostsVariableArityChildren) {
+    auto backend = create_c_backend();
+    std::string code = gen_code(
+        "TERM Const = 1\n"
+        "TERM Add   = 2\n"
+        "TERM Call  = 3\n"
+        "START stmt\n"
+        "RULES\n"
+        "reg : Const = 1;\n"
+        "reg : Add(reg, reg) = 1;\n"
+        "reg : Call = 3;\n"
+        "stmt: reg = 0;\n", *backend);
+    // The leaf-terminal rule (declared 0 children): extras from 0, costed at START.
+    EXPECT_NE(code.find("for (int _ci = 0; _ci < p->child_count; _ci++)"), std::string::npos);
+    EXPECT_NE(code.find("c += p->children[_ci]->cost[1];"), std::string::npos);
+    // The binary rule: extras start past its two declared children.
+    EXPECT_NE(code.find("for (int _ci = 2; _ci < p->child_count; _ci++)"), std::string::npos);
 }
 
 // A leaf pattern (arity 0) and an operand pattern (arity N) for the SAME terminal
@@ -920,7 +1262,10 @@ TEST(BurgCBackend, RewriteShortCircuitsOnPendingError) {
     std::string code = gen_code(
         "TERM X=1\n"
         "RULES r: X = 1 (. emit_x(node); .);", *backend);
-    auto rewrite_pos = code.find("void burg_rewrite(");
+    // Anchor on the DEFINITION, not the header declaration — the ordering claim is about
+    // burg_rewrite's own prologue, and anything emitted between the two would otherwise
+    // supply the poll/reset pair this reads.
+    auto rewrite_pos = code.find("void burg_rewrite(BURG_NODE_TYPE root, burg_ctx_t* ctx) {");
     ASSERT_NE(rewrite_pos, std::string::npos);
     auto poll_pos  = code.find("if (burg_has_error(ctx)) return;", rewrite_pos);
     auto arena_pos = code.find("arena_reset(ctx)", rewrite_pos);

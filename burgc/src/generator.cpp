@@ -113,6 +113,16 @@ bool BurgGenerator::analyze(burg_ast::Spec* spec) {
         }
     }
 
+    // ENTRY nonterminals must exist. A typo that silently did nothing would hand
+    // back exactly the dead-rule warnings the declaration exists to remove, so
+    // this is an error with the same standing as an undeclared terminal.
+    a.entries = spec->entries;
+    for (auto& e : a.entries) {
+        if (!a.nonterm_index.count(e))
+            errors_.push_back("ENTRY '" + e +
+                              "' is not a nonterminal defined by any rule");
+    }
+
     if (a.nonterms.empty())
         errors_.push_back("no rules defined");
 
@@ -439,6 +449,24 @@ void BurgBackend::emit_label_dp_switch(std::ostream& out, int indent) {
     for (auto& cr : const_cast<std::vector<ChainRule>&>(a_->chain_rules))
         chains_to[cr.from_nt].push_back(&cr);
 
+    // Variable arity: children beyond a rule's declared pattern are reduced with
+    // the START nonterminal (emit_child_reductions' trailing loop), so they must
+    // be COSTED with it here — iburg p.4: "Each C sums the costs of the
+    // non-terminals on the right-hand side"; the root's cost[start] is the
+    // cover's cost only if every child is summed through some nonterminal. An
+    // uncoverable extra child reads BURG_MAX_COST, which pushes c past every
+    // stored cost so the rule correctly never fires. For fixed-arity nodes the
+    // loop body never executes. The lambda emits the cost-side mirror of the
+    // reducer's loop, from the same declared-children count.
+    int64_t start_idx = a_->nonterm_index.at(a_->start_nonterm);
+    auto emit_extra_cost = [&](std::ostream& o, burg_ast::Rule* rule, int ind) {
+        pad(o, ind);
+        o << "for (int _ci = " << rule->pattern->children.size()
+          << "; _ci < p->child_count; _ci++)\n";
+        pad(o, ind + 1);
+        o << "c += p->children[_ci]->cost[" << start_idx << "];\n";
+    };
+
     std::unordered_map<std::string, std::vector<burg_ast::Rule*>> rules_by_term;
     for (auto* rule : a_->spec->rules) {
         if (rule->pattern->is_leaf() && !is_terminal(rule->pattern->name))
@@ -458,6 +486,7 @@ void BurgBackend::emit_label_dp_switch(std::ostream& out, int indent) {
             if (guard.empty() && trimmed_guard.empty()) {
                 pad(out, indent + 1); out << "{\n";
                 pad(out, indent + 2); out << "int c = " << cost_expr << " + " << rule->cost << ";\n";
+                emit_extra_cost(out, rule, indent + 2);
                 pad(out, indent + 2); out << "if (c < p->cost[" << nt_idx << "]) {\n";
                 pad(out, indent + 3); out << "p->cost[" << nt_idx << "] = c;\n";
                 pad(out, indent + 3); out << "p->rule[" << nt_idx << "] = " << rule->rule_number << ";\n";
@@ -475,6 +504,7 @@ void BurgBackend::emit_label_dp_switch(std::ostream& out, int indent) {
                 }
                 pad(out, indent + 1); out << "if (" << full_guard << ") {\n";
                 pad(out, indent + 2); out << "int c = " << cost_expr << " + " << rule->cost << ";\n";
+                emit_extra_cost(out, rule, indent + 2);
                 pad(out, indent + 2); out << "if (c < p->cost[" << nt_idx << "]) {\n";
                 pad(out, indent + 3); out << "p->cost[" << nt_idx << "] = c;\n";
                 pad(out, indent + 3); out << "p->rule[" << nt_idx << "] = " << rule->rule_number << ";\n";
@@ -565,6 +595,28 @@ void BurgBackend::emit_rule_func_body(std::ostream& out, int indent) {
     pad(out, indent); out << "return state->rule[goalnt];\n";
 }
 
+// The DP's accumulated cost for a goal — the claim a consumer checks its rule costs
+// against. An absent cover reads back as BURG_MAX_COST, the same sentinel the state
+// itself carries, never a 0 that would read as "free".
+void BurgBackend::emit_cost_func_body(std::ostream& out, int indent) {
+    pad(out, indent); out << "if (!state || goalnt < 1 || goalnt > BURG_MAX_NT) return BURG_MAX_COST;\n";
+    pad(out, indent); out << "return state->cost[goalnt];\n";
+}
+
+// Label a TREE and hand back its state, so a consumer can read the cost/rule vectors
+// and drive burg_reduce toward a goal of its own choosing. burg_rewrite can only ever
+// ask for the start nonterminal; a consumer that knows a tree's CONTEXT needs to ask
+// for the nonterminal that context demands. Same prologue as burg_rewrite: short-
+// circuit on a pending error, then reset the arena — the returned state lives in it
+// and stays valid until the next labeling or rewrite call.
+void BurgBackend::emit_label_root_body(std::ostream& out, int indent) {
+    if (needs_error_polling()) {
+        pad(out, indent); out << "if (burg_has_error(" << ctx_solo() << ")) return NULL;\n";
+    }
+    pad(out, indent); out << "arena_reset(" << ctx_solo() << ");\n";
+    pad(out, indent); out << "return burg_label_tree(root" << ctx_arg() << ");\n";
+}
+
 void BurgBackend::emit_nt_name_body(std::ostream& out, int indent) {
     pad(out, indent); out << "static const char* names[] = {\n";
     pad(out, indent + 1); out << "\"<invalid>\",\n";
@@ -574,6 +626,121 @@ void BurgBackend::emit_nt_name_body(std::ostream& out, int indent) {
     pad(out, indent); out << "};\n";
     pad(out, indent); out << "if (nt >= 1 && nt <= BURG_MAX_NT) return names[nt];\n";
     pad(out, indent); out << "return names[0];\n";
+}
+
+// ── --emit-rule-table ─────────────────────────────────────
+//
+// The labeler is a cost-minimizing DP, and "minimizing" is a claim about a
+// SEARCH: over every derivation the rules admit, the one it picks is cheapest.
+// Nothing inside the matcher can check that — the DP is the thing being checked,
+// and a chain-closure bug shows up as a cover that is merely legal. So the rules
+// are exported as data: which nonterminal a rule produces, the tree shape it
+// matches, what it costs, and how to evaluate its guard. A consumer can then run
+// its own search over the same rules and compare, without calling the labeler.
+//
+// The pattern is a preorder walk. Each node is (is_term, sym, nkids): for a
+// terminal, sym is its BURG_<Name> opcode; for a nonterminal leaf, sym is its
+// index and nkids is 0 — that is the position where the consumer recurses.
+
+static void flatten_pattern(burg_ast::TreePattern* pat, const BurgAnalysis& a,
+                            bool (*is_term)(const BurgAnalysis&, const std::string&),
+                            std::vector<std::string>& out) {
+    bool term = is_term(a, pat->name);
+    std::string sym = term ? ("BURG_" + pat->name)
+                           : std::to_string(a.nonterm_index.at(pat->name));
+    out.push_back("{" + std::to_string(term ? 1 : 0) + ", (int)" + sym + ", " +
+                  std::to_string(term ? pat->children.size() : 0) + "}");
+    if (!term) return;                       // a nonterminal leaf has no children here
+    for (auto* c : pat->children)
+        flatten_pattern(c, a, is_term, out);
+}
+
+static bool pat_is_term(const BurgAnalysis& a, const std::string& n) {
+    return a.term_names.count(n) != 0;
+}
+
+void BurgBackend::emit_rule_table_types(std::ostream& out, int indent) {
+    pad(out, indent);
+    out << "/* ── Exported rule table (--emit-rule-table) ──\n";
+    pad(out, indent);
+    out << "   The rules as DATA, so a consumer can search them itself and compare the\n";
+    pad(out, indent);
+    out << "   result with what the labeler chose. A pattern is a preorder walk: a\n";
+    pad(out, indent);
+    out << "   terminal node carries its opcode and child count, a nonterminal leaf\n";
+    pad(out, indent);
+    out << "   carries its nonterminal index and zero children — recurse there. */\n";
+    pad(out, indent);
+    out << "struct burg_pat_node_t { int is_term; int sym; int nkids; };\n";
+    pad(out, indent); out << "struct burg_rule_row_t {\n";
+    pad(out, indent); out << "    int rule;          /* rule number, as burg_rule() reports it   */\n";
+    pad(out, indent); out << "    int nonterm;       /* the nonterminal it produces              */\n";
+    pad(out, indent); out << "    int cost;          /* what firing it adds                      */\n";
+    pad(out, indent); out << "    int npat;          /* preorder pattern length                  */\n";
+    pad(out, indent); out << "    const struct burg_pat_node_t* pat;\n";
+    pad(out, indent); out << "    int guarded;       /* 1 if a where-clause gates it             */\n";
+    pad(out, indent); out << "};\n";
+}
+
+void BurgBackend::emit_rule_table_decls(std::ostream& out) {
+    out << "\n";
+    emit_rule_table_types(out, 0);
+    out << "typedef struct burg_pat_node_t burg_pat_node_t;\n";
+    out << "typedef struct burg_rule_row_t burg_rule_row_t;\n";
+    out << "extern const burg_rule_row_t " << sym_prefix() << "burg_rule_table[];\n";
+    out << "extern const int " << sym_prefix() << "burg_rule_table_len;\n";
+    out << "/* Evaluate rule `rule`'s where-clause at `node`; an unguarded rule yields 1,\n";
+    out << "   so a caller never has to special-case one. */\n";
+    out << "int " << sym_prefix() << "burg_rule_guard(int rule, BURG_NODE_TYPE node"
+        << (needs_error_polling() ? (", " + ctx_type_name() + "* ctx") : "") << ");\n";
+}
+
+void BurgBackend::emit_rule_table_data(std::ostream& out, int indent,
+                                       const std::string& storage) {
+    // The per-rule pattern arrays are always file-local / class-local; only the
+    // table and its length carry the storage the backend asks for, because in C
+    // they are what the header declares `extern`.
+    const std::string pat_storage = storage.empty() ? "static " : storage;
+    for (auto* rule : a_->spec->rules) {
+        std::vector<std::string> nodes;
+        flatten_pattern(rule->pattern, *a_, pat_is_term, nodes);
+        pad(out, indent);
+        out << pat_storage << "const struct burg_pat_node_t burg_pat_" << rule->rule_number << "[] = {";
+        for (size_t i = 0; i < nodes.size(); i++)
+            out << (i ? ", " : "") << nodes[i];
+        out << "};\n";
+    }
+    out << "\n";
+    pad(out, indent);
+    out << storage << "const struct burg_rule_row_t " << sym_prefix() << "burg_rule_table[] = {\n";
+    for (auto* rule : a_->spec->rules) {
+        std::vector<std::string> nodes;
+        flatten_pattern(rule->pattern, *a_, pat_is_term, nodes);
+        pad(out, indent);
+        out << "    {" << rule->rule_number << ", "
+            << a_->nonterm_index.at(rule->nonterm) << ", "
+            << rule->cost << ", " << nodes.size()
+            << ", burg_pat_" << rule->rule_number << ", "
+            << (trim(rule->guard).empty() ? 0 : 1) << "},"
+            << "  /* " << rule->nonterm << ": " << pattern_string(rule->pattern) << " */\n";
+    }
+    pad(out, indent); out << "};\n";
+    pad(out, indent);
+    out << storage << "const int " << sym_prefix() << "burg_rule_table_len = "
+        << a_->spec->rules.size() << ";\n\n";
+}
+
+void BurgBackend::emit_rule_guard_body(std::ostream& out, int indent) {
+    pad(out, indent); out << "(void)node;\n";
+    if (needs_error_polling()) { pad(out, indent); out << "(void)ctx;\n"; }
+    pad(out, indent); out << "switch (rule) {\n";
+    for (auto* rule : a_->spec->rules) {
+        std::string g = trim(rule->guard);
+        if (g.empty()) continue;
+        pad(out, indent); out << "case " << rule->rule_number << ": return (" << g << ") ? 1 : 0;\n";
+    }
+    pad(out, indent); out << "default: return 1;   /* unguarded */\n";
+    pad(out, indent); out << "}\n";
 }
 
 // ── Reducer ───────────────────────────────────────────────

@@ -26,19 +26,21 @@ PRODUCTIONS
 Burg
     (. std::vector<burg_ast::TermDecl*> terms;
        std::string start_sym;
+       std::vector<std::string> entry_syms;
        std::string ns;
        std::string members_block;
        std::string private_block;
        std::vector<std::string> headers;
        std::vector<burg_ast::Rule*> rules;
        burg_ast::Rule* r; .)
-    = { Decl<terms, start_sym, ns, members_block, private_block, headers> }
+    = { Decl<terms, start_sym, entry_syms, ns, members_block, private_block, headers> }
       "RULES"
       { RuleDecl<&r>  (. rules.push_back(r); .) }
       (. skip(); if (!at_end()) return false; .)
     (. ast = new burg_ast::Spec();
        ast->terminals = std::move(terms);
        ast->start = std::move(start_sym);
+       ast->entries = std::move(entry_syms);
        ast->ns = std::move(ns);
        ast->members = std::move(members_block);
        ast->private_helpers = std::move(private_block);
@@ -47,9 +49,10 @@ Burg
        ast->loc = {1, 1}; .)
 .
 
-Decl <. std::vector<burg_ast::TermDecl*> &terms, std::string &start, std::string &ns, std::string &members, std::string &priv, std::vector<std::string> &headers .>
+Decl <. std::vector<burg_ast::TermDecl*> &terms, std::string &start, std::vector<std::string> &entries, std::string &ns, std::string &members, std::string &priv, std::vector<std::string> &headers .>
     = TermDecl_<terms>
     | StartDecl<start>
+    | EntryDecl<entries>
     | NamespaceDecl<ns>
     | MembersDecl<members>
     | PrivateDecl<priv>
@@ -108,6 +111,14 @@ StartDecl <. std::string &start .>
     (. peg::Span start_span; .)
     = "START"
       ident<start_span>  (. start = start_span.to_string(); .)
+.
+
+// ENTRY nonterm — a goal a consumer reduces to by NAME, besides the root's
+// START goal. Repeatable; order is preserved for diagnostics only.
+EntryDecl <. std::vector<std::string> &entries .>
+    (. peg::Span entry_span; .)
+    = "ENTRY"
+      ident<entry_span>  (. entries.push_back(entry_span.to_string()); .)
 .
 
 RuleDecl <. burg_ast::Rule* *result .>

@@ -14,6 +14,7 @@
 TERM Const  = COV_CONST
 TERM Add    = COV_ADD
 TERM Orphan = COV_ORPHAN
+TERM Call   = COV_CALL
 
 START stmt
 
@@ -23,3 +24,8 @@ reg  : Const         = 1 (. cov_record(1); .);
 reg  : Add(reg, reg) = 1 (. cov_record(2); .);
 stmt : reg           = 0 (. cov_record(10); .);
 junk : Orphan        = 1 (. cov_record(99); .);
+// Variable arity: the pattern declares no children, the node may carry them.
+// The matcher reduces the extras with START — and must cost them with START too
+// (iburg p.4/p.7: every child of a cover contributes its cost at the nonterminal
+// demanded of it, or cost[start] at the root is not the cover's cost).
+reg  : Call          = 3 (. cov_record(4); .);

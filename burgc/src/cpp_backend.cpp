@@ -72,6 +72,9 @@ public:
         fp.CopyFramePart("rule_lookup");
         out << "    static int burg_rule(" << state_type() << "* state, int goalnt) {\n";
         emit_rule_func_body(out, 2);
+        out << "    }\n\n";
+        out << "    static int burg_cost(" << state_type() << "* state, int goalnt) {\n";
+        emit_cost_func_body(out, 2);
         out << "    }\n";
 
         fp.CopyFramePart("nt_name");
@@ -87,9 +90,27 @@ public:
         }
 
         fp.CopyFramePart("rewriter");
+        out << "    // Goal-directed entry: label a tree, then read its rule/cost vectors and\n";
+        out << "    // drive the reducer toward a goal of your own choosing. The state lives in\n";
+        out << "    // the matcher arena — valid until the next labeling or rewrite call.\n";
+        out << "    " << state_type() << "* burg_label_root(BURG_NODE_TYPE root) {\n";
+        emit_label_root_body(out, 2);
+        out << "    }\n\n";
         out << "    void burg_rewrite(BURG_NODE_TYPE root) {\n";
         emit_rewrite_body(out, 2);
         out << "    }\n";
+
+        if (emit_rule_table_) {
+            out << "\n";
+            emit_rule_table_types(out, 1);
+            out << "\n";
+            emit_rule_table_data(out, 1, "inline static ");
+            out << "    /* Evaluate rule `rule`'s where-clause at `node`; an unguarded rule\n";
+            out << "       yields 1, so a caller never has to special-case one. */\n";
+            out << "    static int burg_rule_guard(int rule, BURG_NODE_TYPE node) {\n";
+            emit_rule_guard_body(out, 2);
+            out << "    }\n";
+        }
 
         fp.CopyFramePart("namespace_close");
         if (!a.spec->ns.empty())

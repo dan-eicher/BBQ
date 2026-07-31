@@ -229,6 +229,270 @@ static void test_graph_failure_stops_reducing(burg_ctx_t* ctx) {
     check_trace(want, 2, "graph failure stops at the first uncovered node");
 }
 
+/* ── The goal-directed entry: burg_label_root + burg_cost ──────────────────────
+ *
+ * burg_rewrite can only ever ask for the START nonterminal, and the labeled state it
+ * builds is private to it, so a consumer could neither (a) read what the DP claims a
+ * cover costs nor (b) tile a tree toward some nonterminal OTHER than START. Both are
+ * real needs: (a) is how a consumer checks its rule costs against the bytes its actions
+ * actually emit, and (b) is how a consumer that knows a tree's CONTEXT — a branch
+ * condition, say — asks the matcher for the cover that context wants. burg_label_root
+ * returns the labeled state; burg_rule/burg_cost read it; burg_reduce drives it. */
+
+/* Labeling is pure: it computes the DP's accumulated cost and emits nothing. */
+static void test_label_root_reports_dp_cost(burg_ctx_t* ctx) {
+    CovNode l = mk(COV_CONST, 1);
+    CovNode r = mk(COV_CONST, 2);
+    CovNode a = mk(COV_ADD, 3);
+    a.nkids = 2;
+    a.kids[0] = &l;
+    a.kids[1] = &r;
+
+    burg_clear_error(ctx);
+    cov_trace_reset();
+    burg_state_t* s = burg_label_root(&a, ctx);
+
+    CHECK(s != NULL, "label_root must return a state for a coverable tree");
+    CHECK(!burg_has_error(ctx), "labeling a covered tree must not report an error");
+    check_trace(NULL, 0, "labeling emits nothing — no action runs");
+    /* reg: Add(reg,reg) = 1 over two reg: Const = 1 ⇒ 3. stmt: reg = 0 adds nothing. */
+    CHECK(burg_cost(s, reg_NT) == 3, "Add(Const,Const) as reg costs 1+1+1");
+    CHECK(burg_cost(s, stmt_NT) == 3, "the stmt chain rule adds 0 to it");
+    CHECK(burg_rule(s, stmt_NT) != 0, "and stmt has a rule at this root");
+}
+
+/* An uncoverable goal reads back as BURG_MAX_COST — the same "no cover" the state
+ * itself encodes — never a 0 a caller could mistake for free. */
+static void test_cost_of_uncovered_goal(burg_ctx_t* ctx) {
+    CovNode o = mk(COV_ORPHAN, 1);
+
+    burg_clear_error(ctx);
+    burg_state_t* s = burg_label_root(&o, ctx);
+
+    CHECK(s != NULL, "an Orphan-rooted tree still labels");
+    CHECK(burg_cost(s, junk_NT) == 1, "junk: Orphan = 1");
+    CHECK(burg_rule(s, stmt_NT) == 0, "nothing chains junk to stmt");
+    CHECK(burg_cost(s, stmt_NT) == BURG_MAX_COST, "an uncovered goal costs BURG_MAX_COST");
+    CHECK(burg_cost(s, 0) == BURG_MAX_COST, "an out-of-range goal reads as uncovered");
+    CHECK(burg_cost(s, BURG_MAX_NT + 1) == BURG_MAX_COST, "…at both ends of the range");
+    CHECK(burg_cost(NULL, stmt_NT) == BURG_MAX_COST, "and so does a null state");
+}
+
+/* The point of exposing the state: reduce toward a goal that is NOT the start
+ * nonterminal. Only that derivation's actions run — the stmt chain rule's does not. */
+static void test_label_root_reduce_to_explicit_goal(burg_ctx_t* ctx) {
+    CovNode c = mk(COV_CONST, 1);
+
+    burg_clear_error(ctx);
+    cov_trace_reset();
+    burg_state_t* s = burg_label_root(&c, ctx);
+    CHECK(s != NULL && burg_rule(s, reg_NT) != 0, "precondition: reg covers a Const");
+    burg_reduce(&c, s, reg_NT, ctx);
+
+    CHECK(!burg_has_error(ctx), "reducing to an explicit goal must succeed");
+    const int want[] = {1};
+    check_trace(want, 1, "only the reg derivation fires — not stmt: reg");
+}
+
+/* label_root obeys the same short-circuit contract as burg_rewrite: over a latched
+ * error it is a no-op returning NULL, so a caller cannot label past a failure and
+ * then reduce a state that was never computed. */
+static void test_label_root_short_circuits_on_pending_error(burg_ctx_t* ctx) {
+    burg_clear_error(ctx);
+    CovNode o = mk(COV_ORPHAN, 1);
+    burg_rewrite(&o, ctx);
+    CHECK(burg_has_error(ctx), "precondition: the uncovered rewrite must fail");
+
+    CovNode c = mk(COV_CONST, 1);
+    cov_trace_reset();
+    CHECK(burg_label_root(&c, ctx) == NULL,
+          "label_root must short-circuit on a pending error");
+    check_trace(NULL, 0, "and emit nothing");
+}
+
+/* ── The exported rule table, used as it is meant to be used ───────────────────
+ *
+ * The labeler's claim is that its cover is the CHEAPEST the rules admit. Nothing
+ * inside the matcher can check that: the DP is the thing under test, and a bug in
+ * chain-rule closure produces a cover that is merely legal. So this searches the
+ * exported rules directly — no labeler call anywhere below — and the two numbers
+ * have to agree.
+ *
+ * The search is deliberately naive where the labeler is clever: plain recursive
+ * minimization with no memo table and no closure precomputation. Agreeing by
+ * accident would take both a bug in the DP and the same bug here. */
+
+/* A preorder pattern is matched in two passes, and the ORDER matters: SHAPE
+ * first, then the guard, then the children's own minima. A where-clause reads the
+ * node's payload union, so evaluating one before its pattern has matched would
+ * read the wrong variant's fields — the labeler never does that (each guard sits
+ * inside its terminal's switch arm) and neither may this. */
+static int oracle_best(CovNode* n, int nt, burg_ctx_t* ctx, int fuel);
+
+static int oracle_shape(CovNode* n, const burg_pat_node_t* p, int* i) {
+    const burg_pat_node_t* here = &p[(*i)++];
+    if (!here->is_term) return 1;        /* a nonterminal leaf accepts any node */
+    if (n->op != here->sym || n->nkids < here->nkids) return 0;
+    for (int k = 0; k < here->nkids; k++)
+        if (!oracle_shape(n->kids[k], p, i)) return 0;
+    return 1;
+}
+
+static int oracle_kids(CovNode* n, const burg_pat_node_t* p, int* i,
+                       burg_ctx_t* ctx, int fuel, int* acc) {
+    const burg_pat_node_t* here = &p[(*i)++];
+    if (!here->is_term) {
+        int c = oracle_best(n, here->sym, ctx, fuel - 1);
+        if (c < 0) return 0;
+        *acc += c;
+        return 1;
+    }
+    for (int k = 0; k < here->nkids; k++)
+        if (!oracle_kids(n->kids[k], p, i, ctx, fuel, acc)) return 0;
+    return 1;
+}
+
+static int oracle_best(CovNode* n, int nt, burg_ctx_t* ctx, int fuel) {
+    if (fuel <= 0) return -1;            /* bounds chain-rule cycles */
+    int lo = -1;
+    for (int r = 0; r < burg_rule_table_len; r++) {
+        const burg_rule_row_t* row = &burg_rule_table[r];
+        if (row->nonterm != nt) continue;
+        int i = 0;
+        if (!oracle_shape(n, row->pat, &i)) continue;
+        if (!burg_rule_guard(row->rule, n, ctx)) continue;
+        i = 0;
+        int acc = 0;
+        if (!oracle_kids(n, row->pat, &i, ctx, fuel, &acc)) continue;
+        /* Variable arity, mirroring the matcher exactly: children beyond the
+         * declared pattern are covered with START, so they cost cost[START].
+         * (iburg p.4 — a cover's cost sums EVERY child through some nonterminal;
+         * the extras' nonterminal is START because that is how they reduce.) */
+        if (row->pat[0].is_term) {
+            int bad = 0;
+            for (int k = row->pat[0].nkids; k < n->nkids; k++) {
+                int c = oracle_best(n->kids[k], stmt_NT, ctx, fuel - 1);
+                if (c < 0) { bad = 1; break; }
+                acc += c;
+            }
+            if (bad) continue;
+        }
+        int c = row->cost + acc;
+        if (lo < 0 || c < lo) lo = c;
+    }
+    return lo;
+}
+
+/* The table must describe the grammar it was generated from. Checked against
+ * coverage.burg's four rules by hand, so a pattern encoded wrongly (a chain rule
+ * emitted as a terminal, say) fails here rather than silently making the oracle
+ * agree with the labeler about nothing. */
+static void test_rule_table_describes_the_grammar(burg_ctx_t* ctx) {
+    (void)ctx;
+    CHECK(burg_rule_table_len == 5, "coverage.burg has five rules");
+    /* reg: Call = 3 — a leaf-terminal rule over a VARIADIC node: npat 1, zero
+     * declared children. The extras exist only on the subject node. */
+    CHECK(burg_rule_table[4].nonterm == reg_NT && burg_rule_table[4].cost == 3 &&
+              burg_rule_table[4].npat == 1 && burg_rule_table[4].pat[0].is_term &&
+              burg_rule_table[4].pat[0].sym == COV_CALL &&
+              burg_rule_table[4].pat[0].nkids == 0,
+          "row 4 is reg: Call = 3 with no declared children");
+    /* reg: Const = 1 — a bare terminal, no children. */
+    CHECK(burg_rule_table[0].nonterm == reg_NT && burg_rule_table[0].cost == 1 &&
+              burg_rule_table[0].npat == 1 && burg_rule_table[0].pat[0].is_term &&
+              burg_rule_table[0].pat[0].sym == COV_CONST &&
+              burg_rule_table[0].pat[0].nkids == 0,
+          "row 0 is reg: Const = 1");
+    /* reg: Add(reg, reg) = 1 — a terminal with two nonterminal leaves. */
+    CHECK(burg_rule_table[1].npat == 3 && burg_rule_table[1].pat[0].is_term &&
+              burg_rule_table[1].pat[0].sym == COV_ADD &&
+              burg_rule_table[1].pat[0].nkids == 2 &&
+              !burg_rule_table[1].pat[1].is_term && burg_rule_table[1].pat[1].sym == reg_NT &&
+              !burg_rule_table[1].pat[2].is_term && burg_rule_table[1].pat[2].sym == reg_NT,
+          "row 1 is reg: Add(reg, reg), children encoded as nonterminal leaves");
+    /* stmt: reg = 0 — a chain rule: one nonterminal leaf, no terminal at all. */
+    CHECK(burg_rule_table[2].nonterm == stmt_NT && burg_rule_table[2].cost == 0 &&
+              burg_rule_table[2].npat == 1 && !burg_rule_table[2].pat[0].is_term &&
+              burg_rule_table[2].pat[0].sym == reg_NT,
+          "row 2 is the chain rule stmt: reg = 0");
+    for (int r = 0; r < burg_rule_table_len; r++)
+        CHECK(burg_rule_table[r].guarded == 0, "coverage.burg has no where-clauses");
+}
+
+/* Variable arity, both halves of the contract. A Call node carries children its
+ * rule never declared; the matcher reduces them with START, so it must COST them
+ * with START — otherwise the root's cost[start] is not the cover's cost and the
+ * DP is minimizing over covers of a smaller tree than it emits (iburg p.4, p.7).
+ *
+ * Call(Const, Const): reg = 3 (Call) + 1 + 1 (each Const as stmt via the 0-cost
+ * chain) = 5; the stmt chain adds 0. Reduction emits both children first, each
+ * through its full stmt derivation, then the Call's own action, then the chain's:
+ * {1,10, 1,10, 4, 10}. */
+static void test_variadic_children_are_costed(burg_ctx_t* ctx) {
+    CovNode l = mk(COV_CONST, 1);
+    CovNode r = mk(COV_CONST, 2);
+    CovNode call = mk(COV_CALL, 3);
+    call.nkids = 2;
+    call.kids[0] = &l;
+    call.kids[1] = &r;
+
+    burg_clear_error(ctx);
+    cov_trace_reset();
+    burg_state_t* s = burg_label_root(&call, ctx);
+
+    CHECK(s != NULL, "a variadic node labels");
+    check_trace(NULL, 0, "labeling emits nothing");
+    CHECK(burg_cost(s, reg_NT) == 5,
+          "Call(Const,Const) as reg costs 3 + the children's START covers (1+1)");
+    CHECK(burg_cost(s, stmt_NT) == 5, "the stmt chain adds 0 to it");
+
+    cov_trace_reset();
+    burg_rewrite(&call, ctx);
+    CHECK(!burg_has_error(ctx), "the variadic rewrite succeeds");
+    const int want[] = {1, 10, 1, 10, 4, 10};
+    check_trace(want, 6, "children reduce (with START) before the Call's action");
+
+    /* A childless Call is just its own rule — the loop's base case. */
+    CovNode bare = mk(COV_CALL, 4);
+    burg_clear_error(ctx);
+    burg_state_t* s0 = burg_label_root(&bare, ctx);
+    CHECK(burg_cost(s0, reg_NT) == 3, "a nullary Call costs its rule alone");
+}
+
+/* The labeler's cover must cost what an independent search says is cheapest. */
+static void test_labeler_agrees_with_an_independent_search(burg_ctx_t* ctx) {
+    CovNode c  = mk(COV_CONST, 1);
+    CovNode l  = mk(COV_CONST, 2);
+    CovNode r  = mk(COV_CONST, 3);
+    CovNode a  = mk(COV_ADD, 4);   a.nkids = 2;  a.kids[0] = &l;  a.kids[1] = &r;
+    CovNode l2 = mk(COV_CONST, 5);
+    CovNode a2 = mk(COV_ADD, 6);   a2.nkids = 2; a2.kids[0] = &a; a2.kids[1] = &l2;
+    CovNode o  = mk(COV_ORPHAN, 7);
+
+    CovNode ca = mk(COV_CALL, 8);          /* variadic: the oracle must agree here too */
+    ca.nkids = 2; ca.kids[0] = &c; ca.kids[1] = &a;
+    struct { CovNode* n; const char* what; } cases[] = {
+        {&c,  "Const"}, {&a,  "Add(Const,Const)"}, {&a2, "Add(Add(..),Const)"},
+        {&ca, "Call(Const, Add(..))"},
+    };
+    for (int i = 0; i < 4; i++) {
+        burg_clear_error(ctx);
+        burg_state_t* s = burg_label_root(cases[i].n, ctx);
+        int labeled = burg_cost(s, stmt_NT);
+        int searched = oracle_best(cases[i].n, stmt_NT, ctx, 32);
+        if (labeled != searched) {
+            printf("FAIL [%s]: labeler says %d, independent search says %d\n",
+                   cases[i].what, labeled, searched);
+            failures++;
+        }
+    }
+    /* And they must agree that the uncoverable root has no derivation at all. */
+    burg_clear_error(ctx);
+    burg_state_t* s = burg_label_root(&o, ctx);
+    CHECK(burg_rule(s, stmt_NT) == 0 && oracle_best(&o, stmt_NT, ctx, 32) < 0,
+          "both agree an Orphan root has no stmt derivation");
+}
+
 int main(void) {
     burg_ctx_t ctx;
     burg_ctx_init(&ctx);
@@ -242,6 +506,13 @@ int main(void) {
     test_explicit_clear_restores(&ctx);
     test_body_of_rewrites_keeps_first_failure(&ctx);
     test_graph_failure_stops_reducing(&ctx);
+    test_label_root_reports_dp_cost(&ctx);
+    test_cost_of_uncovered_goal(&ctx);
+    test_label_root_reduce_to_explicit_goal(&ctx);
+    test_label_root_short_circuits_on_pending_error(&ctx);
+    test_rule_table_describes_the_grammar(&ctx);
+    test_variadic_children_are_costed(&ctx);
+    test_labeler_agrees_with_an_independent_search(&ctx);
 
     burg_ctx_free(&ctx);
 

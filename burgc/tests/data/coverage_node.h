@@ -19,7 +19,14 @@ extern "C" {
 enum {
     COV_CONST  = 1,
     COV_ADD    = 2,
-    COV_ORPHAN = 3
+    COV_ORPHAN = 3,
+    /* Variable arity: Call's rule declares NO children, yet a Call node may carry
+     * them. The matcher reduces such extras with the start nonterminal — and per
+     * iburg (p.4: "Each C sums the costs of the non-terminals on the right-hand
+     * side"; p.7's state() is that sentence as code) it must COST them the same
+     * way, or the root's cost[start] stops being the cover's cost and the DP's
+     * minimality claim is over covers of the wrong tree. */
+    COV_CALL   = 4
 };
 
 typedef struct CovNode {

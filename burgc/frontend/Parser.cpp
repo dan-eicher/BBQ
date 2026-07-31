@@ -101,6 +101,7 @@ bool Parser::qualified_ident(peg::Span& out) {
 bool Parser::parse_Burg() {
     std::vector<burg_ast::TermDecl*> terms;
        std::string start_sym;
+       std::vector<std::string> entry_syms;
        std::string ns;
        std::string members_block;
        std::string private_block;
@@ -111,7 +112,7 @@ bool Parser::parse_Burg() {
         auto _m0 = save();
         if (![&]() -> bool {
             skip();
-            if (!parse_Decl(terms, start_sym, ns, members_block, private_block, headers)) return false;
+            if (!parse_Decl(terms, start_sym, entry_syms, ns, members_block, private_block, headers)) return false;
             return true;
         }()) { restore(_m0); break; }
     }
@@ -130,6 +131,7 @@ bool Parser::parse_Burg() {
     ast = new burg_ast::Spec();
        ast->terminals = std::move(terms);
        ast->start = std::move(start_sym);
+       ast->entries = std::move(entry_syms);
        ast->ns = std::move(ns);
        ast->members = std::move(members_block);
        ast->private_helpers = std::move(private_block);
@@ -139,7 +141,7 @@ bool Parser::parse_Burg() {
     return true;
 }
 
-bool Parser::parse_Decl(std::vector<burg_ast::TermDecl*>& terms, std::string& start, std::string& ns, std::string& members, std::string& priv, std::vector<std::string>& headers) {
+bool Parser::parse_Decl(std::vector<burg_ast::TermDecl*>& terms, std::string& start, std::vector<std::string>& entries, std::string& ns, std::string& members, std::string& priv, std::vector<std::string>& headers) {
     {
         auto _m0 = save();
         if ([&]() -> bool {
@@ -151,6 +153,12 @@ bool Parser::parse_Decl(std::vector<burg_ast::TermDecl*>& terms, std::string& st
         if ([&]() -> bool {
             skip();
             if (!parse_StartDecl(start)) return false;
+            return true;
+        }()) {} else {
+        restore(_m0);
+        if ([&]() -> bool {
+            skip();
+            if (!parse_EntryDecl(entries)) return false;
             return true;
         }()) {} else {
         restore(_m0);
@@ -174,6 +182,7 @@ bool Parser::parse_Decl(std::vector<burg_ast::TermDecl*>& terms, std::string& st
         restore(_m0);
         skip();
         if (!parse_HeaderAction_(headers)) return false;
+        }
         }
         }
         }
@@ -274,6 +283,16 @@ bool Parser::parse_StartDecl(std::string& start) {
     skip();
     if (!ident(start_span)) return false;
     start = start_span.to_string();
+    return true;
+}
+
+bool Parser::parse_EntryDecl(std::vector<std::string>& entries) {
+    peg::Span entry_span;
+    skip();
+    if (!match("ENTRY")) return false;
+    skip();
+    if (!ident(entry_span)) return false;
+    entries.push_back(entry_span.to_string());
     return true;
 }
 

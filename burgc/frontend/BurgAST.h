@@ -50,6 +50,13 @@ struct Rule {
 struct Spec {
     std::vector<TermDecl*> terminals;
     std::string start;                  // %start nonterminal (optional)
+    // ENTRY nonterms: goals a consumer reduces to BY NAME, in addition to the
+    // root's `start` goal. Goal-directed reduction is the formalism (iburg p.8
+    // `rule(state, goalnt)`), so a consumer whose control nodes cannot live in
+    // the grammar reduces its frontier subtrees at other goals. Declaring them
+    // is what lets the liveness analysis see that demand; it has no effect on
+    // the generated matcher, whose goal-directed API already exists.
+    std::vector<std::string> entries;
     std::string ns;                     // NAMESPACE name (optional)
     std::string members;                // MEMBERS block (class member declarations)
     std::string private_helpers;        // PRIVATE block. C++: private section

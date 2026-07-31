@@ -16,15 +16,31 @@
 
 #pragma once
 
+#include <cstddef>
 #include <map>
 #include <string>
 #include <vector>
 
 struct BurgAnalysis;
 
+// Automaton-size accounting, populated when the tree automaton is built.
+// `tuples_evaluated` is the number of (operator, child-tuple) transition
+// computations performed — the quantity that made the naive enumeration
+// infeasible on large grammars (|states|^arity per worklist round), and the
+// number the representer-state algorithm (Proebsting, "BURS Automata
+// Generation", TOPLAS 17(3) §3.3, after Chase) keeps small. Exposed so a test
+// can pin the bound instead of trusting the comment.
+struct AnalysisStats {
+    std::size_t states = 0;
+    std::size_t representers = 0;      // summed over (operator, dimension)
+    std::size_t transitions = 0;
+    std::size_t tuples_evaluated = 0;
+};
+
 struct AnalysisReport {
     std::vector<std::string> errors;
     std::vector<std::string> warnings;
+    AnalysisStats stats;
 };
 
 // Per-constructor schema info derived from an ASDL JSON sidecar.

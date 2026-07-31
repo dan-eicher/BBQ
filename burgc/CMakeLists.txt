@@ -67,6 +67,7 @@ add_custom_command(
     COMMAND ${CMAKE_COMMAND} -E make_directory ${BURGC_TEST_OUT}
     COMMAND burgc -i ${BURGC_TEST_DATA}/coverage.burg
                   -lang c
+                  --emit-rule-table
                   -frames ${CMAKE_CURRENT_SOURCE_DIR}/frames
                   -o ${BURGC_TEST_OUT}/coverage_burg.h
     DEPENDS burgc ${BURGC_TEST_DATA}/coverage.burg
@@ -81,6 +82,7 @@ add_custom_command(
     COMMAND ${CMAKE_COMMAND} -E make_directory ${BURGC_TEST_OUT}
     COMMAND burgc -i ${BURGC_TEST_DATA}/coverage.burg
                   -lang c++
+                  --emit-rule-table
                   -frames ${CMAKE_CURRENT_SOURCE_DIR}/frames
                   -o ${BURGC_TEST_OUT}/coverage_matcher.h
     DEPENDS burgc ${BURGC_TEST_DATA}/coverage.burg

@@ -16,6 +16,9 @@ class CBurgBackend : public BurgBackend {
     std::string ns_prefix_;
     std::string ctx_type_;
 
+    std::string sym_prefix() const override { return ns_prefix_; }
+    std::string ctx_type_name() const override { return ctx_type_; }
+
     void setup(const BurgAnalysis& a) {
         a_ = &a;
         ns_prefix_ = a.spec->ns.empty() ? "" : a.spec->ns + "_";
@@ -68,7 +71,13 @@ class CBurgBackend : public BurgBackend {
         out << "void " << ns_prefix_ << "burg_ctx_free(" << ctx_type_ << "* ctx);\n";
         out << "void " << ns_prefix_ << "burg_rewrite(BURG_NODE_TYPE root, " << ctx_type_ << "* ctx);\n";
         out << "int "  << ns_prefix_ << "burg_rule(burg_state_t* state, int goalnt);\n";
+        out << "int "  << ns_prefix_ << "burg_cost(burg_state_t* state, int goalnt);\n";
         out << "const char* " << ns_prefix_ << "burg_nt_name(int nt);\n";
+        out << "/* Goal-directed entry: label a tree, then read burg_rule/burg_cost and\n";
+        out << "   drive burg_reduce toward a goal of your own choosing. The state lives in\n";
+        out << "   the context arena — valid until the next burg_label_root/burg_rewrite. */\n";
+        out << "burg_state_t* " << ns_prefix_ << "burg_label_root(BURG_NODE_TYPE root, " << ctx_type_ << "* ctx);\n";
+        if (emit_rule_table_) emit_rule_table_decls(out);
         out << "/* Error API — check after burg_rewrite() */\n";
         out << "bool burg_has_error(const " << ctx_type_ << "* ctx);\n";
         out << "const char* burg_get_error(const " << ctx_type_ << "* ctx);\n";
@@ -155,6 +164,16 @@ class CBurgBackend : public BurgBackend {
         emit_rule_func_body(out, 1);
         out << "}\n\n";
 
+        // Cost lookup (public)
+        out << "int " << ns_prefix_ << "burg_cost(burg_state_t* state, int goalnt) {\n";
+        emit_cost_func_body(out, 1);
+        out << "}\n\n";
+
+        // Label a tree and expose its state (public)
+        out << "burg_state_t* " << ns_prefix_ << "burg_label_root(BURG_NODE_TYPE root, " << ctx_type_ << "* ctx) {\n";
+        emit_label_root_body(out, 1);
+        out << "}\n\n";
+
         // NT name (public)
         out << "const char* " << ns_prefix_ << "burg_nt_name(int nt) {\n";
         emit_nt_name_body(out, 1);
@@ -171,6 +190,16 @@ class CBurgBackend : public BurgBackend {
         out << "void " << ns_prefix_ << "burg_rewrite(BURG_NODE_TYPE root, " << ctx_type_ << "* ctx) {\n";
         emit_rewrite_body(out, 1);
         out << "}\n";
+
+        // Exported rule table (opt-in)
+        if (emit_rule_table_) {
+            out << "\n";
+            emit_rule_table_data(out, 0, "");
+            out << "int " << ns_prefix_ << "burg_rule_guard(int rule, BURG_NODE_TYPE node, "
+                << ctx_type_ << "* ctx) {\n";
+            emit_rule_guard_body(out, 1);
+            out << "}\n";
+        }
     }
 
 public:

@@ -111,46 +111,101 @@ struct State {
     std::map<int, std::set<int>> contributors;
 };
 
-// All transitions discovered during the build; each maps a
-// (terminal, child-state-tuple) to the resulting state id.
+// ─────────────────────────────────────────────────────────────
+// Representer states (Proebsting, "BURS Automata Generation",
+// TOPLAS 17(3) 1995, §3.3 Fig. 11 Project(), after Chase 1987)
+// ─────────────────────────────────────────────────────────────
+//
+// Rule matching at child position i of an operator consults exactly
+// two things about the child state: whether it carries the nonterminal
+// bits some rule's nonterminal-leaf demands there, and whether its
+// terminal equals one some rule's terminal-leaf (or nested pattern
+// root) demands there. Everything else — the terminal when nothing
+// demands it, bits no rule wants at that position — cannot affect any
+// transition. So states are projected per (operator, dimension) into
+// equivalence classes keyed by only that information, and transitions
+// are computed over CLASS tuples, not raw-state tuples. On this
+// grammar's worst operator (arity 5, ~40 raw i32-producing states per
+// position) that is the difference between 40^5 tuples and 1.
+struct RepKey {
+    NontermBits bits;        // full bits ∩ the position's nonterminal demand
+    std::string terminal;    // the terminal, iff it is demanded at the position
+    bool operator==(const RepKey& o) const {
+        return bits == o.bits && terminal == o.terminal;
+    }
+};
+struct RepKeyHash {
+    std::size_t operator()(const RepKey& k) const {
+        std::size_t h = std::hash<std::string>{}(k.terminal);
+        h ^= std::hash<NontermBits>{}(k.bits) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        return h;
+    }
+};
+
+struct Rep {
+    RepKey key;
+    std::vector<int> members;        // state ids projecting to this class
+    // Some member's FULL bit set is nonzero — i.e. the class is inhabited by a
+    // state that is itself covered. Witnesses through all-uncovered classes are
+    // derivative noise (the child is already reported) and are filtered.
+    bool any_covered_member = false;
+};
+
+// One dimension (child position) of an operator. `match_*` is what the RULES
+// can consult at this position — the projection key is built from it, so it
+// must never be widened past the rules. `enum_*` is which STATES are worth
+// enumerating here at all — the heuristic demand, or the ASDL overlay when the
+// schema matches (a strictly wider net that surfaces shapes the heuristic
+// can't; see AsdlSchemaTightensDemandFilter). Conflating the two would key
+// classes on demands no rule reads and break matching.
+struct OpDim {
+    NontermBits match_nts = 0;
+    std::set<std::string> match_terms;
+    NontermBits enum_nts = 0;
+    std::set<std::string> enum_terms;
+    std::vector<Rep> reps;
+    std::unordered_map<RepKey, int, RepKeyHash> intern;
+};
+
+struct OpInfo {
+    std::string term;
+    int arity;
+    std::vector<OpDim> dims;
+};
+
+// A transition, recorded once per (operator, representer-tuple). `op` is -1
+// for the arity-0 leaf seeds (empty tuple).
 struct TransitionRecord {
     std::string terminal;
-    std::vector<int> child_states;
+    int op;
+    std::vector<int> child_reps;
     int dest;
 };
 
-// True if a rule's pattern matches when its root terminal is `term`
-// and child-position states are `tuple`. Conservative on nested
-// grandchildren — see comment block in the function body.
+// True if a rule's pattern matches when its root terminal is `term` and the
+// child positions hold states of the given representer classes. The checks
+// read exactly the information RepKey retains — which is the argument that the
+// projection is sound. Conservative on nested grandchildren, as before: a
+// compound child pattern checks only the nested root's terminal.
 bool rule_matches(const BurgAnalysis& a,
                    burg_ast::Rule* rule,
                    const std::string& term,
-                   const std::vector<int>& tuple,
-                   const std::vector<State>& states) {
+                   const std::vector<RepKey>& tuple) {
     auto* pat = rule->pattern;
     if (pat->name != term) return false;
     if (pat->children.size() != tuple.size()) return false;
 
     for (size_t i = 0; i < pat->children.size(); i++) {
         auto* cp = pat->children[i];
-        const State& cs = states[tuple[i]];
+        const RepKey& ck = tuple[i];
         if (cp->is_leaf() && a.term_names.count(cp->name)) {
-            // Leaf terminal: child state's terminal must equal it.
-            if (cs.key.terminal != cp->name) return false;
+            if (ck.terminal != cp->name) return false;
         } else if (cp->is_leaf()) {
-            // Leaf nonterm: child state must have this nt bit set.
             auto it = a.nonterm_index.find(cp->name);
             if (it == a.nonterm_index.end()) return false;
-            if (!(cs.key.bits & bit((int)it->second))) return false;
+            if (!(ck.bits & bit((int)it->second))) return false;
         } else {
-            // Compound pattern at child position: child state's
-            // terminal must equal the nested root. We don't
-            // recursively check grandchildren — the abstract state
-            // doesn't carry that info. This is conservative: rules
-            // requiring deeply-nested shapes show up as "potentially
-            // matches" in the analysis even when at runtime they
-            // wouldn't.  For warnings (not errors) this is fine.
-            if (cs.key.terminal != cp->name) return false;
+            if (ck.terminal != cp->name) return false;
         }
     }
     return true;
@@ -192,20 +247,19 @@ void chain_close(const BurgAnalysis& a,
     }
 }
 
-// Compute the transition for (term, child_tuple). Walks all rules
+// Compute the transition for (term, representer-tuple). Walks all rules
 // rooted at term, applies chain closure, returns the final
 // (bits, contributors).
 void compute_transition(const BurgAnalysis& a,
                          const std::string& term,
-                         const std::vector<int>& tuple,
-                         const std::vector<State>& states,
+                         const std::vector<RepKey>& tuple,
                          NontermBits& out_bits,
                          std::map<int, std::set<int>>& out_contribs) {
     out_bits = 0;
     out_contribs.clear();
     for (auto* rule : a.spec->rules) {
         if (rule->pattern->name != term) continue;
-        if (!rule_matches(a, rule, term, tuple, states)) continue;
+        if (!rule_matches(a, rule, term, tuple)) continue;
         auto it = a.nonterm_index.find(rule->nonterm);
         if (it == a.nonterm_index.end()) continue;
         int nt_idx = (int)it->second;
@@ -297,24 +351,28 @@ compute_position_demands(const BurgAnalysis& a, const AsdlSchema* schema) {
     return out;
 }
 
-bool state_satisfies(const State& s, const PositionDemand& d) {
-    if (s.key.bits & d.accepted_nts) return true;
-    if (d.accepted_terms.count(s.key.terminal)) return true;
-    return false;
-}
-
 // Build the tree automaton. Returns false if the grammar is too
 // large for the analysis (caller emits a diagnostic).
 struct Automaton {
     std::vector<State> states;
     std::unordered_map<StateKey, int, StateKeyHash> intern_map;
+    std::vector<OpInfo> ops;
     std::vector<TransitionRecord> transitions;
-    // transitions_to[state_id] = indices into `transitions` whose dest is state_id
-    std::vector<std::vector<int>> transitions_to;
-    // missing_witnesses: (term, tuple) shapes that landed in the empty state
+    // missing_witnesses: (term, rep-tuple) shapes that landed in the empty state
     std::vector<TransitionRecord> missing_witnesses;
+    std::size_t tuples_evaluated = 0;
 };
 
+// The worklist algorithm of Proebsting Fig. 5 / Fig. 12, cost-erased. Pop a
+// state; for each (operator, dimension) it is usable in, project it to its
+// representer class. Only when a dimension gains a NEW class are transitions
+// enumerated — combinations of that class with the other dimensions' existing
+// classes — so each (operator, representer-tuple) is computed and recorded
+// exactly once. A state joining an existing class does no enumeration at all:
+// the class's transitions already speak for it. (The old form popped a state,
+// re-enumerated every raw-state tuple of every operator, and re-recorded every
+// transition each round — |states|^arity work and memory per round, which on
+// codegen_wasm.burg meant gigabytes of duplicate records and no answer.)
 bool build_automaton(const BurgAnalysis& a, const AsdlSchema* schema,
                        Automaton& aut) {
     if ((int)a.nonterms.size() > MAX_NONTERMS) return false;
@@ -322,6 +380,45 @@ bool build_automaton(const BurgAnalysis& a, const AsdlSchema* schema,
     auto term_arities = collect_terminal_arities(a);
     auto pos_demands = compute_position_demands(a, schema);
     bbq::Worklist<int> wl;
+
+    // The operator table, with per-dimension demands. `match_*` comes from the
+    // rules alone (it keys the projection); `enum_*` is the possibly
+    // schema-widened demand from compute_position_demands (it gates which
+    // states are enumerable at the position).
+    for (auto& [term, arities] : term_arities) {
+        for (int arity : arities) {
+            if (arity == 0) continue;
+            OpInfo op;
+            op.term = term;
+            op.arity = arity;
+            op.dims.resize(arity);
+            for (auto* rule : a.spec->rules) {
+                if (rule->pattern->name != term) continue;
+                if ((int)rule->pattern->children.size() != arity) continue;
+                for (int i = 0; i < arity; i++) {
+                    auto* cp = rule->pattern->children[i];
+                    OpDim& d = op.dims[i];
+                    if (cp->is_leaf() && a.term_names.count(cp->name)) {
+                        d.match_terms.insert(cp->name);
+                    } else if (cp->is_leaf()) {
+                        auto it = a.nonterm_index.find(cp->name);
+                        if (it != a.nonterm_index.end())
+                            d.match_nts |= bit((int)it->second);
+                    } else {
+                        d.match_terms.insert(cp->name);
+                    }
+                }
+            }
+            for (int i = 0; i < arity; i++) {
+                auto dit = pos_demands.find({term, arity, i});
+                if (dit != pos_demands.end()) {
+                    op.dims[i].enum_nts = dit->second.accepted_nts;
+                    op.dims[i].enum_terms = dit->second.accepted_terms;
+                }
+            }
+            aut.ops.push_back(std::move(op));
+        }
+    }
 
     auto intern = [&](const StateKey& key,
                        std::map<int, std::set<int>> contribs) -> int {
@@ -335,107 +432,127 @@ bool build_automaton(const BurgAnalysis& a, const AsdlSchema* schema,
         }
         int id = (int)aut.states.size();
         aut.states.push_back({key, std::move(contribs)});
-        aut.transitions_to.emplace_back();
         aut.intern_map[key] = id;
         wl.push(id);
         return id;
     };
 
-    auto record_transition = [&](const std::string& term,
-                                   const std::vector<int>& tuple,
+    auto record_transition = [&](const std::string& term, int op_idx,
+                                   const std::vector<int>& reps,
                                    int dest) {
-        int trans_idx = (int)aut.transitions.size();
-        aut.transitions.push_back({term, tuple, dest});
-        aut.transitions_to[dest].push_back(trans_idx);
+        aut.transitions.push_back({term, op_idx, reps, dest});
         if (aut.states[dest].key.bits == 0) {
-            aut.missing_witnesses.push_back({term, tuple, dest});
+            aut.missing_witnesses.push_back({term, op_idx, reps, dest});
         }
     };
 
     // Seed with arity-0 transitions for every terminal that appears
-    // with arity 0 in some rule.
+    // with arity 0 in some rule (ComputeLeafStates, Fig. 9).
     for (auto& [term, arities] : term_arities) {
         if (arities.count(0)) {
             NontermBits bits;
             std::map<int, std::set<int>> contribs;
-            compute_transition(a, term, {}, aut.states, bits, contribs);
-            // Empty-tuple transition: state's terminal is `term`.
+            compute_transition(a, term, {}, bits, contribs);
             int s = intern({term, bits}, contribs);
-            record_transition(term, {}, s);
+            record_transition(term, -1, {}, s);
         }
     }
 
-    // Worklist: each new state may unlock new (term, tuple)
-    // transitions. We re-enumerate over discovered states each pop;
-    // the transition cache (intern_map) ensures we only do real work
-    // for newly-reachable tuples.
-    auto enumerate_tuples = [&](const std::string& term, int arity,
-                                  std::vector<int>& tuple,
-                                  size_t pos,
-                                  auto& self) -> void {
-        if ((int)tuple.size() == arity) {
-            NontermBits bits;
-            std::map<int, std::set<int>> contribs;
-            compute_transition(a, term, tuple, aut.states, bits, contribs);
-            int dest = intern({term, bits}, contribs);
-            record_transition(term, tuple, dest);
-            return;
-        }
-        // Per-position demand filter: only enumerate child states
-        // that some rule at this (term, arity, pos) could plausibly
-        // accept. Without ASDL we use this as a heuristic for
-        // "states the consumer's IR would meaningfully construct
-        // at this position" — drops obvious false-positive shapes
-        // like Add(<Halt>, ...) where Halt isn't expected at any
-        // Add-rule's position 0 or 1.
-        auto demand_it = pos_demands.find({term, arity, (int)pos});
-        for (int s = 0; s < (int)aut.states.size(); s++) {
-            if (demand_it != pos_demands.end() &&
-                !state_satisfies(aut.states[s], demand_it->second))
-                continue;
-            tuple.push_back(s);
-            self(term, arity, tuple, pos + 1, self);
-            tuple.pop_back();
-        }
+    // Enumerate all rep-tuples of `op` with dimension `fixed_dim` pinned to
+    // `fixed_rep` and every other dimension ranging over its existing classes.
+    // Called exactly once per new class, so a tuple is evaluated exactly once —
+    // at the creation of the last-created class among its components.
+    auto enumerate_with = [&](int op_idx, int fixed_dim, int fixed_rep) {
+        OpInfo& op = aut.ops[op_idx];
+        std::vector<int> chosen(op.arity);
+        std::vector<RepKey> keys(op.arity);
+        auto rec = [&](int d, auto& self) -> void {
+            if (d == op.arity) {
+                aut.tuples_evaluated++;
+                NontermBits bits;
+                std::map<int, std::set<int>> contribs;
+                compute_transition(a, op.term, keys, bits, contribs);
+                int dest = intern({op.term, bits}, contribs);
+                record_transition(op.term, op_idx, chosen, dest);
+                return;
+            }
+            if (d == fixed_dim) {
+                chosen[d] = fixed_rep;
+                keys[d] = op.dims[d].reps[fixed_rep].key;
+                self(d + 1, self);
+                return;
+            }
+            for (int r = 0; r < (int)op.dims[d].reps.size(); r++) {
+                chosen[d] = r;
+                keys[d] = op.dims[d].reps[r].key;
+                self(d + 1, self);
+            }
+        };
+        rec(0, rec);
     };
 
     while (!wl.empty()) {
-        wl.pop();  // we just need progress — full re-enumerate below
-        // For each (terminal, arity > 0), enumerate all tuples of
-        // discovered states. New states get added inside intern();
-        // the worklist drives further iteration until quiescent.
-        size_t states_before = aut.states.size();
-        for (auto& [term, arities] : term_arities) {
-            for (int arity : arities) {
-                if (arity == 0) continue;
-                std::vector<int> tuple;
-                enumerate_tuples(term, arity, tuple, 0, enumerate_tuples);
+        int s = wl.pop();
+        // Copy out of the states vector: intern() during enumeration may grow
+        // it and invalidate references.
+        const NontermBits s_bits = aut.states[s].key.bits;
+        const std::string s_term = aut.states[s].key.terminal;
+
+        for (int op_idx = 0; op_idx < (int)aut.ops.size(); op_idx++) {
+            OpInfo& op = aut.ops[op_idx];
+            for (int d = 0; d < op.arity; d++) {
+                OpDim& dim = op.dims[d];
+                // Enumerability: some rule (or the schema) plausibly accepts
+                // this state at this position.
+                if (!(s_bits & dim.enum_nts) && !dim.enum_terms.count(s_term))
+                    continue;
+                RepKey rk{s_bits & dim.match_nts,
+                          dim.match_terms.count(s_term) ? s_term : std::string()};
+                auto it = dim.intern.find(rk);
+                if (it != dim.intern.end()) {
+                    Rep& rep = dim.reps[it->second];
+                    rep.members.push_back(s);
+                    rep.any_covered_member |= (s_bits != 0);
+                    continue;   // existing class: its transitions already stand
+                }
+                int rep_id = (int)dim.reps.size();
+                dim.reps.push_back({rk, {s}, s_bits != 0});
+                dim.intern[rk] = rep_id;
+                enumerate_with(op_idx, d, rep_id);
             }
         }
-        if (aut.states.size() == states_before) break;  // quiescent
     }
 
     return true;
 }
 
-// Render a state for human-readable warnings: the root terminal plus
-// the set of nonterms it can produce, e.g. "<reg-producing Const>".
-std::string describe_state(const BurgAnalysis& a, const State& s) {
+// Render a representer class for human-readable warnings. A class stands for
+// every state projecting to it at this position, so it reads as a description
+// of what CAN sit there, with one member as a concrete example.
+std::string describe_rep(const BurgAnalysis& a, const Automaton& aut,
+                          const Rep& rep) {
     std::ostringstream os;
-    os << s.key.terminal;
-    if (s.key.bits) {
-        os << " producing {";
+    if (!rep.key.terminal.empty()) os << rep.key.terminal;
+    if (rep.key.bits) {
+        if (!rep.key.terminal.empty()) os << " ";
+        os << "producing {";
         bool first = true;
         for (size_t i = 0; i < a.nonterms.size(); i++) {
-            if (s.key.bits & bit((int)(i + 1))) {
+            if (rep.key.bits & bit((int)(i + 1))) {
                 if (!first) os << ",";
                 os << a.nonterms[i];
                 first = false;
             }
         }
         os << "}";
-    } else {
-        os << " producing nothing";
+    } else if (rep.key.terminal.empty()) {
+        os << "producing nothing usable here";
+    }
+    if (!rep.members.empty() && rep.key.terminal.empty()) {
+        os << " (e.g. " << aut.states[rep.members[0]].key.terminal;
+        if (rep.members.size() > 1)
+            os << ", " << (rep.members.size() - 1) << " more";
+        os << ")";
     }
     return os.str();
 }
@@ -445,24 +562,26 @@ void report_missing_witnesses(const BurgAnalysis& a,
                                 std::vector<std::string>& warnings) {
     if (aut.missing_witnesses.empty()) return;
 
-    // Filter: skip witnesses where any child is itself an empty-bits
-    // (uncovered) state. Those children are already reported as
-    // missing on their own, so the parent shape is just derivative
-    // noise — and without ASDL we can't tell whether the empty-bits
-    // child shape is even constructible by the consumer's IR.
+    // Filter: skip witnesses where some child class contains no covered state
+    // at all. Those children are already reported as missing on their own, so
+    // the parent shape is just derivative noise — and without ASDL we can't
+    // tell whether such a child shape is even constructible by the consumer's
+    // IR.
     std::map<std::string, std::set<std::string>> by_term;
     for (auto& w : aut.missing_witnesses) {
-        bool has_empty_child = false;
-        for (int cs : w.child_states) {
-            if (aut.states[cs].key.bits == 0) { has_empty_child = true; break; }
+        bool has_uncovered_child = false;
+        for (size_t i = 0; i < w.child_reps.size(); i++) {
+            const Rep& rep = aut.ops[w.op].dims[i].reps[w.child_reps[i]];
+            if (!rep.any_covered_member) { has_uncovered_child = true; break; }
         }
-        if (has_empty_child) continue;
+        if (has_uncovered_child) continue;
 
         std::ostringstream os;
         os << w.terminal << "(";
-        for (size_t i = 0; i < w.child_states.size(); i++) {
+        for (size_t i = 0; i < w.child_reps.size(); i++) {
             if (i > 0) os << ", ";
-            os << "<" << describe_state(a, aut.states[w.child_states[i]]) << ">";
+            os << "<" << describe_rep(a, aut, aut.ops[w.op].dims[i].reps[w.child_reps[i]])
+               << ">";
         }
         os << ")";
         by_term[w.terminal].insert(os.str());
@@ -510,22 +629,40 @@ std::vector<NontermBits> compute_demand(const BurgAnalysis& a,
     std::vector<NontermBits> demanded(aut.states.size(), 0);
     auto start_it = a.nonterm_index.find(a.start_nonterm);
     if (start_it == a.nonterm_index.end()) return demanded;
-    int start_idx = (int)start_it->second;
 
-    // Seed: every state where bit(start_nt) is set is a candidate
-    // root, demanding start_nt at that state.
+    // Seed: every state producing a GOAL is a candidate root for that goal.
+    // START is the root's goal; each declared ENTRY is a goal the consumer
+    // reduces to by name at a frontier its own code owns (iburg p.8's
+    // `rule(state, goalnt)` — goal-directed reduction is the formalism, so a
+    // hand-written extension of Reduce() demanding another nonterminal is
+    // ordinary use, not a special case). Undeclared, such a family is
+    // unreachable from START and correctly reported dead; declared, it is
+    // seeded here and its rules are live.
+    std::vector<int> goals{(int)start_it->second};
+    for (auto& e : a.entries) {
+        auto it = a.nonterm_index.find(e);
+        if (it == a.nonterm_index.end()) continue;   // analyze() already errored
+        int idx = (int)it->second;
+        if (idx != goals[0]) goals.push_back(idx);
+    }
+
     for (size_t i = 0; i < aut.states.size(); i++) {
-        if (aut.states[i].key.bits & bit(start_idx)) {
-            demanded[i] |= bit(start_idx);
-            chain_demand_close(a, demanded[i]);
+        for (int g : goals) {
+            if (aut.states[i].key.bits & bit(g)) demanded[i] |= bit(g);
         }
+        if (demanded[i]) chain_demand_close(a, demanded[i]);
     }
 
     // Index rules by number for O(1) lookup during propagation.
     std::unordered_map<int, burg_ast::Rule*> rule_by_num;
     for (auto* r : a.spec->rules) rule_by_num[(int)r->rule_number] = r;
 
-    // Backward propagation through transitions to fixpoint.
+    // Backward propagation through transitions to fixpoint. A transition's
+    // children are representer CLASSES; a demand on a child position is a
+    // demand on every state in that class — two states in one class are
+    // interchangeable for matching but carry different contributors (different
+    // terminals), so crediting only a representative member would report its
+    // classmates' rules as falsely dead.
     bool changed = true;
     while (changed) {
         changed = false;
@@ -545,20 +682,23 @@ std::vector<NontermBits> compute_demand(const BurgAnalysis& a,
                     // propagation needed here.
                     if (pat->is_leaf() && !a.term_names.count(pat->name))
                         continue;
-                    if (pat->children.size() != t.child_states.size()) continue;
+                    if (pat->children.size() != t.child_reps.size()) continue;
                     for (size_t i = 0; i < pat->children.size(); i++) {
                         auto* cp = pat->children[i];
                         if (cp->is_leaf() && !a.term_names.count(cp->name)) {
                             auto cit = a.nonterm_index.find(cp->name);
                             if (cit == a.nonterm_index.end()) continue;
                             NontermBits new_demand = bit((int)cit->second);
-                            int csid = t.child_states[i];
-                            NontermBits before = demanded[csid];
-                            NontermBits after = before | new_demand;
-                            chain_demand_close(a, after);
-                            if (after != before) {
-                                demanded[csid] = after;
-                                changed = true;
+                            const Rep& rep =
+                                aut.ops[t.op].dims[i].reps[t.child_reps[i]];
+                            for (int csid : rep.members) {
+                                NontermBits before = demanded[csid];
+                                NontermBits after = before | new_demand;
+                                chain_demand_close(a, after);
+                                if (after != before) {
+                                    demanded[csid] = after;
+                                    changed = true;
+                                }
                             }
                         }
                     }
@@ -680,6 +820,12 @@ AnalysisReport run_completeness_analysis(const BurgAnalysis& a,
             ") — completeness analysis skipped");
         return report;
     }
+    report.stats.states = aut.states.size();
+    report.stats.transitions = aut.transitions.size();
+    report.stats.tuples_evaluated = aut.tuples_evaluated;
+    for (auto& op : aut.ops)
+        for (auto& dim : op.dims)
+            report.stats.representers += dim.reps.size();
 
     // Missing-rule (shape-enumeration) warnings are gated: without an
     // ASDL schema (zany-painting-spark.md), enumeration produces

@@ -13,6 +13,12 @@ static void usage() {
         "  -o <file>          Output file (.h for C++, .h+.c for C)\n"
         "  -lang c++|c        Target language (default: c++)\n"
         "  -frames <dir>      Frame template directory\n"
+        "  --emit-rule-table  Also export the labeled rule set (nonterminal, pattern,\n"
+        "                     cost, guard) as data, plus burg_rule_guard() to evaluate\n"
+        "                     a rule's where-clause. Lets a consumer search the rules\n"
+        "                     itself and check the labeler's chosen cover against an\n"
+        "                     independent minimum. Off by default — nothing inside the\n"
+        "                     matcher reads it.\n"
         "  -asdl <file.json>  ASDL JSON sidecar from `asdl --json`. When supplied,\n"
         "                     completeness analysis uses precise per-position\n"
         "                     demand from the IR's constructor schema instead of\n"
@@ -36,6 +42,7 @@ int main(int argc, char** argv) {
     std::string asdl_file;
     bool strict = false;
     bool coverage = false;
+    bool rule_table = false;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-i") == 0 && i + 1 < argc) {
@@ -52,6 +59,8 @@ int main(int argc, char** argv) {
             strict = true;
         } else if (strcmp(argv[i], "--coverage") == 0) {
             coverage = true;
+        } else if (strcmp(argv[i], "--emit-rule-table") == 0) {
+            rule_table = true;
         } else if (strcmp(argv[i], "-h") == 0) {
             usage();
             return 0;
@@ -119,6 +128,7 @@ int main(int argc, char** argv) {
         fprintf(stderr, "error: unknown language '%s' (use 'c++' or 'c')\n", lang.c_str());
         return 1;
     }
+    backend->set_emit_rule_table(rule_table);
 
     if (backend->needs_impl_file()) {
         if (output_file.empty()) {

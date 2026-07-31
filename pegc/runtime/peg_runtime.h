@@ -55,6 +55,8 @@ typedef struct {
 typedef struct {
     const char* open;
     const char* close;
+    int  open_len;     /* strlen(open/close), measured ONCE at peg_add_comment —  */
+    int  close_len;    /* the skip loop tries every spec at every token boundary  */
     bool nested;
     bool structured;   /* skip a balanced ()-nested, string-aware token group (annotations); inner-comment awareness is a frame override */
 } peg_comment_spec;
@@ -81,8 +83,22 @@ typedef struct {
     int col;
 
     bool (*ws_fn)(char);
+    bool ws_tab[256];  /* ws_fn tabulated at peg_set_whitespace — the skip loop had
+                        * an indirect call per character; the predicate is pure, so
+                        * the table is exact */
     peg_comment_spec comments[PEG_MAX_COMMENTS];
     int comment_count;
+
+    /* The skip memo. PEG backtracking re-enters peg_skip at positions it has
+     * already skipped (measured ~20 re-classifications per source character on a
+     * real corpus); skipping is DETERMINISTIC in pos, so one (from → to) pair
+     * erases nearly all of it. line/col are cached WITH the target — they are a
+     * pure function of position, and jumping pos without them would desync
+     * diagnostics. */
+    const char* skip_from;
+    const char* skip_to;
+    int skip_to_line;
+    int skip_to_col;
 
     peg_error errors[PEG_MAX_ERRORS];
     int error_count;

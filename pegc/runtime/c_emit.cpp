@@ -130,7 +130,8 @@ void cg_choice(Ctx* ctx, Choice* ch, std::ostream& out, int indent) {
             bool is_last = (i == n - 1);
 
             if (!is_last) {
-                out << ind << "if (peg_peek_at(p, \"" << escape_string(lit->value) << "\")) {\n";
+                out << ind << "if (peg_peek_at_n(p, \"" << escape_string(lit->value)
+                    << "\", " << lit->value.size() << ")) {\n";
                 cg_expr(ctx, alt, out, indent + 1);
                 out << ind << "} else ";
             } else {
@@ -266,7 +267,8 @@ void cg_not(Ctx* ctx, Not* n, std::ostream& out, int indent) {
 void cg_literal(Ctx* ctx, Literal* lit, std::ostream& out, int indent) {
     std::string ind = indent_str(indent);
     if (!ctx->in_lex_mode) out << ind << "peg_skip(p);\n";
-    out << ind << "if (!peg_match(p, \"" << escape_string(lit->value) << "\")) " << ctx->fail << ";\n";
+    out << ind << "if (!peg_match_n(p, \"" << escape_string(lit->value)
+        << "\", " << lit->value.size() << ")) " << ctx->fail << ";\n";
 }
 
 // ── Rule call: parse_Foo(p, args) ──────────────────────────

@@ -621,6 +621,7 @@ std::string render_emit(const CompilerCtx& ctx, const Emitter& em, json function
     for (auto& fn : functions) {
         json h = em.fn_header(fn["rule"].get<std::string>());
         for (auto it = h.begin(); it != h.end(); ++it) fn[it.key()] = it.value();
+        fn["rule_name"] = fn["rule"];   // kept for failure messages
         fn.erase("rule");
     }
     // Fold-pass: the owning reader folds struct boundaries into the path and drops the
@@ -629,6 +630,24 @@ std::string render_emit(const CompilerCtx& ctx, const Emitter& em, json function
     fold_bitfield_constraints(functions);
     annotate_bytes_field_refs(functions);
     em.post_lower(functions);
+    // A parse failure has to name the field it happened at. burg builds the message
+    // from the BARE leaf, which is empty for anything nested, so a reader that
+    // rejected a deeply-buried field could only say ": read failed". Now that the
+    // fold has resolved the real path, put it back.
+    for (auto& fn : functions) {
+        std::string rule = fn.value("rule_name", std::string());
+        for (auto& op : fn["ops"]) {
+            if (!op.contains("msg")) continue;
+            std::string m = op["msg"].get<std::string>();
+            std::string t = op.value("target", std::string());
+            if (t.empty()) t = op.value("field", std::string());
+            if (!t.empty() && !m.empty() && m[0] == ':')
+                m = t + m;                      // "<path>: read failed"
+            else if (!t.empty() && m.rfind(t, 0) != 0)
+                m = t + ": " + m;
+            op["msg"] = rule.empty() ? m : rule + "." + m;
+        }
+    }
     // Spell the neutral expr records: burg emitted backend-blind expr trees; the
     // Emitter spells the leaves (builtins/refs/path-nav) here.
     for (auto& fn : functions)

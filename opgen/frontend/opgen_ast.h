@@ -59,41 +59,6 @@ enum class ValueType {
     TyAddr
 };
 
-enum class InvokeKind {
-    InvkStatic,
-    InvkVirtual,
-    InvkSpecial,
-    InvkInterface,
-    InvkSuper
-};
-
-enum class TargetKind {
-    TgtClass,
-    TgtInterface,
-    TgtStaticMethod,
-    TgtInstanceMethod,
-    TgtNonAbstract,
-    TgtNonInit,
-    TgtNonClinit,
-    TgtTypeByte,
-    TgtTypeShort,
-    TgtTypeInt,
-    TgtTypeRef
-};
-
-enum class RequireKind {
-    ReqAccInt,
-    ReqInstanceMethodContext
-};
-
-enum class CpTagKind {
-    CpClassref,
-    CpInstanceFieldref,
-    CpStaticFieldref,
-    CpStaticMethodref,
-    CpVirtualMethodref
-};
-
 enum class LocalValueKind {
     LvShort,
     LvInt,
@@ -112,10 +77,8 @@ struct VerifyRejectCase;
 struct EdgeCase;
 struct Branch;
 struct SpecRef;
-struct InvokeDecl;
-struct TargetDecl;
-struct RequireDecl;
-struct CpTagDecl;
+struct FactDecl;
+struct AnnotationFact;
 struct LocalIndexDecl;
 struct SwitchPayloadDecl;
 struct NarrowFormDecl;
@@ -135,10 +98,8 @@ struct VerifyRejectCase;
 struct EdgeCase;
 struct Branch;
 struct SpecRef;
-struct InvokeDecl;
-struct TargetDecl;
-struct RequireDecl;
-struct CpTagDecl;
+struct FactDecl;
+struct AnnotationFact;
 struct LocalIndexDecl;
 struct SwitchPayloadDecl;
 struct NarrowFormDecl;
@@ -323,32 +284,20 @@ struct SpecRef : public ASTNode {
     int32_t patch;
 };
 
-struct InvokeDecl : public ASTNode {
-    InvokeDecl(InvokeKind kind)
-        : kind(kind){}
+struct FactDecl : public ASTNode {
+    FactDecl(const char* name, std::vector<const char*> members)
+        : name(name), members(std::move(members)){}
 
-    InvokeKind kind;
+    const char* name;
+    std::vector<const char*> members;
 };
 
-struct TargetDecl : public ASTNode {
-    TargetDecl(TargetKind kind)
-        : kind(kind){}
+struct AnnotationFact : public ASTNode {
+    AnnotationFact(const char* name, const char* value)
+        : name(name), value(value){}
 
-    TargetKind kind;
-};
-
-struct RequireDecl : public ASTNode {
-    RequireDecl(RequireKind kind)
-        : kind(kind){}
-
-    RequireKind kind;
-};
-
-struct CpTagDecl : public ASTNode {
-    CpTagDecl(CpTagKind kind)
-        : kind(kind){}
-
-    CpTagKind kind;
+    const char* name;
+    const char* value;
 };
 
 struct LocalIndexDecl : public ASTNode {
@@ -626,8 +575,8 @@ struct TypeDecl : public ASTNode {
 };
 
 struct Opcode : public ASTNode {
-    Opcode(const char* mnemonic, int32_t opcode_val, int32_t subop, std::vector<OperandParam*> operands, std::vector<StackParam*> stack_in, std::vector<StackParam*> stack_out, std::vector<ErrorCase*> errors, std::vector<const char*> flags, std::optional<LocalValueDecl*> local_value, std::vector<VerifyRejectCase*> verify_rejects, std::vector<EdgeCase*> edges, std::optional<Branch*> br, std::optional<InvokeDecl*> invoke, std::vector<TargetDecl*> expects, std::vector<RequireDecl*> requires_, std::optional<CpTagDecl*> cp_tag, std::optional<LocalIndexDecl*> local_index, std::optional<SwitchPayloadDecl*> switch_payload, std::optional<NarrowFormDecl*> narrow_form, std::optional<SpecRef*> spec, std::optional<const char*> setup, std::optional<const char*> verify, std::vector<SemStmt*> sem_body)
-        : mnemonic(mnemonic), opcode_val(opcode_val), subop(subop), operands(std::move(operands)), stack_in(std::move(stack_in)), stack_out(std::move(stack_out)), errors(std::move(errors)), flags(std::move(flags)), local_value(std::move(local_value)), verify_rejects(std::move(verify_rejects)), edges(std::move(edges)), br(std::move(br)), invoke(std::move(invoke)), expects(std::move(expects)), requires_(std::move(requires_)), cp_tag(std::move(cp_tag)), local_index(std::move(local_index)), switch_payload(std::move(switch_payload)), narrow_form(std::move(narrow_form)), spec(std::move(spec)), setup(std::move(setup)), verify(std::move(verify)), sem_body(std::move(sem_body)){}
+    Opcode(const char* mnemonic, int32_t opcode_val, int32_t subop, std::vector<OperandParam*> operands, std::vector<StackParam*> stack_in, std::vector<StackParam*> stack_out, std::vector<ErrorCase*> errors, std::vector<const char*> flags, std::optional<LocalValueDecl*> local_value, std::vector<VerifyRejectCase*> verify_rejects, std::vector<EdgeCase*> edges, std::optional<Branch*> br, std::vector<AnnotationFact*> facts, std::optional<LocalIndexDecl*> local_index, std::optional<SwitchPayloadDecl*> switch_payload, std::optional<NarrowFormDecl*> narrow_form, std::optional<SpecRef*> spec, std::optional<const char*> setup, std::optional<const char*> verify, std::vector<SemStmt*> sem_body)
+        : mnemonic(mnemonic), opcode_val(opcode_val), subop(subop), operands(std::move(operands)), stack_in(std::move(stack_in)), stack_out(std::move(stack_out)), errors(std::move(errors)), flags(std::move(flags)), local_value(std::move(local_value)), verify_rejects(std::move(verify_rejects)), edges(std::move(edges)), br(std::move(br)), facts(std::move(facts)), local_index(std::move(local_index)), switch_payload(std::move(switch_payload)), narrow_form(std::move(narrow_form)), spec(std::move(spec)), setup(std::move(setup)), verify(std::move(verify)), sem_body(std::move(sem_body)){}
 
     const char* mnemonic;
     int32_t opcode_val;
@@ -641,10 +590,7 @@ struct Opcode : public ASTNode {
     std::vector<VerifyRejectCase*> verify_rejects;
     std::vector<EdgeCase*> edges;
     std::optional<Branch*> br;
-    std::optional<InvokeDecl*> invoke;
-    std::vector<TargetDecl*> expects;
-    std::vector<RequireDecl*> requires_;
-    std::optional<CpTagDecl*> cp_tag;
+    std::vector<AnnotationFact*> facts;
     std::optional<LocalIndexDecl*> local_index;
     std::optional<SwitchPayloadDecl*> switch_payload;
     std::optional<NarrowFormDecl*> narrow_form;
@@ -655,13 +601,14 @@ struct Opcode : public ASTNode {
 };
 
 struct Module : public ASTNode {
-    Module(std::vector<Opcode*> opcodes, std::vector<MethodDecl*> methods, std::optional<StatusDecl*> status, std::vector<TypeDecl*> types, std::vector<const char*> headers, std::optional<const char*> body_c, std::optional<const char*> backend, bool sidetable)
-        : opcodes(std::move(opcodes)), methods(std::move(methods)), status(std::move(status)), types(std::move(types)), headers(std::move(headers)), body_c(std::move(body_c)), backend(std::move(backend)), sidetable(sidetable){}
+    Module(std::vector<Opcode*> opcodes, std::vector<MethodDecl*> methods, std::optional<StatusDecl*> status, std::vector<TypeDecl*> types, std::vector<FactDecl*> fact_decls, std::vector<const char*> headers, std::optional<const char*> body_c, std::optional<const char*> backend, bool sidetable)
+        : opcodes(std::move(opcodes)), methods(std::move(methods)), status(std::move(status)), types(std::move(types)), fact_decls(std::move(fact_decls)), headers(std::move(headers)), body_c(std::move(body_c)), backend(std::move(backend)), sidetable(sidetable){}
 
     std::vector<Opcode*> opcodes;
     std::vector<MethodDecl*> methods;
     std::optional<StatusDecl*> status;
     std::vector<TypeDecl*> types;
+    std::vector<FactDecl*> fact_decls;
     std::vector<const char*> headers;
     std::optional<const char*> body_c;
     std::optional<const char*> backend;

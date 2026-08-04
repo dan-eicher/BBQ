@@ -94,12 +94,9 @@ private:
     bool parse_OperandParam(std::vector<opgen::OperandParam*>& list);
     bool parse_StackParam(std::vector<opgen::StackParam*>& list);
     bool parse_ValueType(opgen::ValueType& out);
-    bool parse_InvokeKind(opgen::InvokeKind& out);
-    bool parse_TargetKind(opgen::TargetKind& out);
-    bool parse_RequireKind(opgen::RequireKind& out);
-    bool parse_CpTagKind(opgen::CpTagKind& out);
     bool parse_LocalValueKind(opgen::LocalValueKind& out);
-    bool parse_Annotation(std::vector<opgen::ErrorCase*>& errs, std::vector<const char*>& flags, std::optional<opgen::LocalValueDecl*>& local_value, std::vector<opgen::VerifyRejectCase*>& vrs, std::vector<opgen::EdgeCase*>& edges, std::optional<opgen::Branch*>& br, std::optional<opgen::InvokeDecl*>& invoke, std::vector<opgen::TargetDecl*>& expects, std::vector<opgen::RequireDecl*>& requires_, std::optional<opgen::CpTagDecl*>& cp_tag, std::optional<opgen::LocalIndexDecl*>& local_index, std::optional<opgen::SwitchPayloadDecl*>& switch_payload, std::optional<opgen::NarrowFormDecl*>& narrow_form, std::optional<opgen::SpecRef*>& spec, std::optional<const char*>& setup, std::optional<const char*>& verify);
+    bool parse_Annotation(std::vector<opgen::ErrorCase*>& errs, std::vector<const char*>& flags, std::optional<opgen::LocalValueDecl*>& local_value, std::vector<opgen::VerifyRejectCase*>& vrs, std::vector<opgen::EdgeCase*>& edges, std::optional<opgen::Branch*>& br, std::vector<opgen::AnnotationFact*>& facts, std::optional<opgen::LocalIndexDecl*>& local_index, std::optional<opgen::SwitchPayloadDecl*>& switch_payload, std::optional<opgen::NarrowFormDecl*>& narrow_form, std::optional<opgen::SpecRef*>& spec, std::optional<const char*>& setup, std::optional<const char*>& verify);
+    bool parse_FactsDecl(std::vector<opgen::FactDecl*>& out);
     bool parse_SemBody(std::vector<opgen::SemStmt*>& body);
     bool parse_SemCond(opgen::SemExpr*& out);
     bool parse_SemBlockStmt(std::vector<opgen::SemStmt*>& list);

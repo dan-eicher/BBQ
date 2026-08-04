@@ -189,6 +189,7 @@ bool Parser::parse_Opgen() {
        std::vector<opgen::MethodDecl*> methods;
        std::optional<opgen::StatusDecl*> status;
        std::vector<opgen::TypeDecl*> types;
+       std::vector<opgen::FactDecl*> fact_decls;
        std::optional<const char*> body_c;
        std::optional<const char*> backend;
        bool sidetable = false;
@@ -234,6 +235,12 @@ bool Parser::parse_Opgen() {
                 restore(_m2);
                 if ([&]() -> bool {
                     skip();
+                    if (!parse_FactsDecl(fact_decls)) return false;
+                    return true;
+                }()) {} else {
+                restore(_m2);
+                if ([&]() -> bool {
+                    skip();
                     if (!parse_MethodDecl(methods)) return false;
                     return true;
                 }()) {} else {
@@ -247,6 +254,7 @@ bool Parser::parse_Opgen() {
                 skip();
                 if (!parse_OpcodeDef(op)) return false;
                 ops.push_back(op);
+                }
                 }
                 }
                 }
@@ -273,7 +281,8 @@ bool Parser::parse_Opgen() {
     }
     skip(); if (!at_end()) return false;
     ast = new opgen::Module(std::move(ops), std::move(methods), status,
-           std::move(types), std::move(headers), body_c, backend, sidetable);
+           std::move(types), std::move(fact_decls),
+           std::move(headers), body_c, backend, sidetable);
     return true;
 }
 
@@ -289,10 +298,7 @@ bool Parser::parse_OpcodeDef(opgen::Opcode*& result) {
        std::vector<opgen::VerifyRejectCase*> verify_rejects;
        std::vector<opgen::EdgeCase*> edges;
        std::optional<opgen::Branch*> br;
-       std::optional<opgen::InvokeDecl*> invoke;
-       std::vector<opgen::TargetDecl*> expects;
-       std::vector<opgen::RequireDecl*> requires_;
-       std::optional<opgen::CpTagDecl*> cp_tag;
+       std::vector<opgen::AnnotationFact*> facts;
        std::optional<opgen::LocalIndexDecl*> local_index;
        std::optional<opgen::SwitchPayloadDecl*> switch_payload;
        std::optional<opgen::NarrowFormDecl*> narrow_form;
@@ -390,7 +396,7 @@ bool Parser::parse_OpcodeDef(opgen::Opcode*& result) {
         if (![&]() -> bool {
             skip();
             if (!parse_Annotation(errors, flags, local_value, verify_rejects, edges, br,
-                   invoke, expects, requires_, cp_tag, local_index,
+                   facts, local_index,
                    switch_payload, narrow_form, spec, setup, verify)) return false;
             return true;
         }()) { restore(_m8); break; }
@@ -408,7 +414,7 @@ bool Parser::parse_OpcodeDef(opgen::Opcode*& result) {
              std::move(operands), std::move(stack_in), std::move(stack_out),
              std::move(errors), std::move(flags), local_value,
              std::move(verify_rejects), std::move(edges), br,
-             invoke, std::move(expects), std::move(requires_), cp_tag,
+             std::move(facts),
              local_index, switch_payload, narrow_form, spec, setup, verify,
              std::move(sem_body));
     return true;
@@ -424,10 +430,7 @@ bool Parser::parse_FamilyDef(std::vector<opgen::Opcode*>& ops) {
        std::vector<opgen::VerifyRejectCase*> verify_rejects;
        std::vector<opgen::EdgeCase*> edges;
        std::optional<opgen::Branch*> br;
-       std::optional<opgen::InvokeDecl*> invoke;
-       std::vector<opgen::TargetDecl*> expects;
-       std::vector<opgen::RequireDecl*> requires_;
-       std::optional<opgen::CpTagDecl*> cp_tag;
+       std::vector<opgen::AnnotationFact*> facts;
        std::optional<opgen::LocalIndexDecl*> local_index;
        std::optional<opgen::SwitchPayloadDecl*> switch_payload;
        std::optional<opgen::NarrowFormDecl*> narrow_form;
@@ -524,7 +527,7 @@ bool Parser::parse_FamilyDef(std::vector<opgen::Opcode*>& ops) {
         if (![&]() -> bool {
             skip();
             if (!parse_Annotation(errors, flags, local_value, verify_rejects, edges, br,
-                   invoke, expects, requires_, cp_tag, local_index,
+                   facts, local_index,
                    switch_payload, narrow_form, spec, setup, verify)) return false;
             return true;
         }()) { restore(_m8); break; }
@@ -567,7 +570,7 @@ bool Parser::parse_FamilyDef(std::vector<opgen::Opcode*>& ops) {
                  operands, std::move(nin), std::move(nout),
                  errors, flags, local_value,
                  verify_rejects, edges, br,
-                 invoke, expects, requires_, cp_tag,
+                 facts,
                  local_index, switch_payload, narrow_form, spec, setup, verify,
                  sem_body));
          }
@@ -1333,428 +1336,6 @@ bool Parser::parse_ValueType(opgen::ValueType& out) {
     return true;
 }
 
-bool Parser::parse_InvokeKind(opgen::InvokeKind& out) {
-    {
-        auto _m0 = save();
-        if ([&]() -> bool {
-            skip();
-            if (!match("static")) return false;
-            {
-                auto _m1 = save();
-                bool _ok1 = [&]() -> bool {
-                    if (at_end() || !is_ident_continue(peek())) return false;
-                    advance();
-                    return true;
-                }();
-                restore(_m1);
-                if (_ok1) return false;
-            }
-            out = opgen::InvokeKind::InvkStatic;
-            return true;
-        }()) {} else {
-        restore(_m0);
-        if ([&]() -> bool {
-            skip();
-            if (!match("virtual")) return false;
-            {
-                auto _m2 = save();
-                bool _ok2 = [&]() -> bool {
-                    if (at_end() || !is_ident_continue(peek())) return false;
-                    advance();
-                    return true;
-                }();
-                restore(_m2);
-                if (_ok2) return false;
-            }
-            out = opgen::InvokeKind::InvkVirtual;
-            return true;
-        }()) {} else {
-        restore(_m0);
-        if ([&]() -> bool {
-            skip();
-            if (!match("special")) return false;
-            {
-                auto _m3 = save();
-                bool _ok3 = [&]() -> bool {
-                    if (at_end() || !is_ident_continue(peek())) return false;
-                    advance();
-                    return true;
-                }();
-                restore(_m3);
-                if (_ok3) return false;
-            }
-            out = opgen::InvokeKind::InvkSpecial;
-            return true;
-        }()) {} else {
-        restore(_m0);
-        if ([&]() -> bool {
-            skip();
-            if (!match("interface")) return false;
-            {
-                auto _m4 = save();
-                bool _ok4 = [&]() -> bool {
-                    if (at_end() || !is_ident_continue(peek())) return false;
-                    advance();
-                    return true;
-                }();
-                restore(_m4);
-                if (_ok4) return false;
-            }
-            out = opgen::InvokeKind::InvkInterface;
-            return true;
-        }()) {} else {
-        restore(_m0);
-        skip();
-        if (!match("super")) return false;
-        {
-            auto _m5 = save();
-            bool _ok5 = [&]() -> bool {
-                if (at_end() || !is_ident_continue(peek())) return false;
-                advance();
-                return true;
-            }();
-            restore(_m5);
-            if (_ok5) return false;
-        }
-        out = opgen::InvokeKind::InvkSuper;
-        }
-        }
-        }
-        }
-    }
-    return true;
-}
-
-bool Parser::parse_TargetKind(opgen::TargetKind& out) {
-    {
-        auto _m0 = save();
-        if ([&]() -> bool {
-            skip();
-            if (!match("static_method")) return false;
-            {
-                auto _m1 = save();
-                bool _ok1 = [&]() -> bool {
-                    if (at_end() || !is_ident_continue(peek())) return false;
-                    advance();
-                    return true;
-                }();
-                restore(_m1);
-                if (_ok1) return false;
-            }
-            out = opgen::TargetKind::TgtStaticMethod;
-            return true;
-        }()) {} else {
-        restore(_m0);
-        if ([&]() -> bool {
-            skip();
-            if (!match("instance_method")) return false;
-            {
-                auto _m2 = save();
-                bool _ok2 = [&]() -> bool {
-                    if (at_end() || !is_ident_continue(peek())) return false;
-                    advance();
-                    return true;
-                }();
-                restore(_m2);
-                if (_ok2) return false;
-            }
-            out = opgen::TargetKind::TgtInstanceMethod;
-            return true;
-        }()) {} else {
-        restore(_m0);
-        if ([&]() -> bool {
-            skip();
-            if (!match("non_abstract")) return false;
-            {
-                auto _m3 = save();
-                bool _ok3 = [&]() -> bool {
-                    if (at_end() || !is_ident_continue(peek())) return false;
-                    advance();
-                    return true;
-                }();
-                restore(_m3);
-                if (_ok3) return false;
-            }
-            out = opgen::TargetKind::TgtNonAbstract;
-            return true;
-        }()) {} else {
-        restore(_m0);
-        if ([&]() -> bool {
-            skip();
-            if (!match("non_clinit")) return false;
-            {
-                auto _m4 = save();
-                bool _ok4 = [&]() -> bool {
-                    if (at_end() || !is_ident_continue(peek())) return false;
-                    advance();
-                    return true;
-                }();
-                restore(_m4);
-                if (_ok4) return false;
-            }
-            out = opgen::TargetKind::TgtNonClinit;
-            return true;
-        }()) {} else {
-        restore(_m0);
-        if ([&]() -> bool {
-            skip();
-            if (!match("non_init")) return false;
-            {
-                auto _m5 = save();
-                bool _ok5 = [&]() -> bool {
-                    if (at_end() || !is_ident_continue(peek())) return false;
-                    advance();
-                    return true;
-                }();
-                restore(_m5);
-                if (_ok5) return false;
-            }
-            out = opgen::TargetKind::TgtNonInit;
-            return true;
-        }()) {} else {
-        restore(_m0);
-        if ([&]() -> bool {
-            skip();
-            if (!match("type_byte")) return false;
-            {
-                auto _m6 = save();
-                bool _ok6 = [&]() -> bool {
-                    if (at_end() || !is_ident_continue(peek())) return false;
-                    advance();
-                    return true;
-                }();
-                restore(_m6);
-                if (_ok6) return false;
-            }
-            out = opgen::TargetKind::TgtTypeByte;
-            return true;
-        }()) {} else {
-        restore(_m0);
-        if ([&]() -> bool {
-            skip();
-            if (!match("type_short")) return false;
-            {
-                auto _m7 = save();
-                bool _ok7 = [&]() -> bool {
-                    if (at_end() || !is_ident_continue(peek())) return false;
-                    advance();
-                    return true;
-                }();
-                restore(_m7);
-                if (_ok7) return false;
-            }
-            out = opgen::TargetKind::TgtTypeShort;
-            return true;
-        }()) {} else {
-        restore(_m0);
-        if ([&]() -> bool {
-            skip();
-            if (!match("type_int")) return false;
-            {
-                auto _m8 = save();
-                bool _ok8 = [&]() -> bool {
-                    if (at_end() || !is_ident_continue(peek())) return false;
-                    advance();
-                    return true;
-                }();
-                restore(_m8);
-                if (_ok8) return false;
-            }
-            out = opgen::TargetKind::TgtTypeInt;
-            return true;
-        }()) {} else {
-        restore(_m0);
-        if ([&]() -> bool {
-            skip();
-            if (!match("type_ref")) return false;
-            {
-                auto _m9 = save();
-                bool _ok9 = [&]() -> bool {
-                    if (at_end() || !is_ident_continue(peek())) return false;
-                    advance();
-                    return true;
-                }();
-                restore(_m9);
-                if (_ok9) return false;
-            }
-            out = opgen::TargetKind::TgtTypeRef;
-            return true;
-        }()) {} else {
-        restore(_m0);
-        if ([&]() -> bool {
-            skip();
-            if (!match("interface")) return false;
-            {
-                auto _m10 = save();
-                bool _ok10 = [&]() -> bool {
-                    if (at_end() || !is_ident_continue(peek())) return false;
-                    advance();
-                    return true;
-                }();
-                restore(_m10);
-                if (_ok10) return false;
-            }
-            out = opgen::TargetKind::TgtInterface;
-            return true;
-        }()) {} else {
-        restore(_m0);
-        skip();
-        if (!match("class")) return false;
-        {
-            auto _m11 = save();
-            bool _ok11 = [&]() -> bool {
-                if (at_end() || !is_ident_continue(peek())) return false;
-                advance();
-                return true;
-            }();
-            restore(_m11);
-            if (_ok11) return false;
-        }
-        out = opgen::TargetKind::TgtClass;
-        }
-        }
-        }
-        }
-        }
-        }
-        }
-        }
-        }
-        }
-    }
-    return true;
-}
-
-bool Parser::parse_RequireKind(opgen::RequireKind& out) {
-    {
-        auto _m0 = save();
-        if ([&]() -> bool {
-            skip();
-            if (!match("acc_int")) return false;
-            {
-                auto _m1 = save();
-                bool _ok1 = [&]() -> bool {
-                    if (at_end() || !is_ident_continue(peek())) return false;
-                    advance();
-                    return true;
-                }();
-                restore(_m1);
-                if (_ok1) return false;
-            }
-            out = opgen::RequireKind::ReqAccInt;
-            return true;
-        }()) {} else {
-        restore(_m0);
-        skip();
-        if (!match("instance_method_context")) return false;
-        {
-            auto _m2 = save();
-            bool _ok2 = [&]() -> bool {
-                if (at_end() || !is_ident_continue(peek())) return false;
-                advance();
-                return true;
-            }();
-            restore(_m2);
-            if (_ok2) return false;
-        }
-        out = opgen::RequireKind::ReqInstanceMethodContext;
-        }
-    }
-    return true;
-}
-
-bool Parser::parse_CpTagKind(opgen::CpTagKind& out) {
-    {
-        auto _m0 = save();
-        if ([&]() -> bool {
-            skip();
-            if (!match("classref")) return false;
-            {
-                auto _m1 = save();
-                bool _ok1 = [&]() -> bool {
-                    if (at_end() || !is_ident_continue(peek())) return false;
-                    advance();
-                    return true;
-                }();
-                restore(_m1);
-                if (_ok1) return false;
-            }
-            out = opgen::CpTagKind::CpClassref;
-            return true;
-        }()) {} else {
-        restore(_m0);
-        if ([&]() -> bool {
-            skip();
-            if (!match("instance_fieldref")) return false;
-            {
-                auto _m2 = save();
-                bool _ok2 = [&]() -> bool {
-                    if (at_end() || !is_ident_continue(peek())) return false;
-                    advance();
-                    return true;
-                }();
-                restore(_m2);
-                if (_ok2) return false;
-            }
-            out = opgen::CpTagKind::CpInstanceFieldref;
-            return true;
-        }()) {} else {
-        restore(_m0);
-        if ([&]() -> bool {
-            skip();
-            if (!match("static_fieldref")) return false;
-            {
-                auto _m3 = save();
-                bool _ok3 = [&]() -> bool {
-                    if (at_end() || !is_ident_continue(peek())) return false;
-                    advance();
-                    return true;
-                }();
-                restore(_m3);
-                if (_ok3) return false;
-            }
-            out = opgen::CpTagKind::CpStaticFieldref;
-            return true;
-        }()) {} else {
-        restore(_m0);
-        if ([&]() -> bool {
-            skip();
-            if (!match("static_methodref")) return false;
-            {
-                auto _m4 = save();
-                bool _ok4 = [&]() -> bool {
-                    if (at_end() || !is_ident_continue(peek())) return false;
-                    advance();
-                    return true;
-                }();
-                restore(_m4);
-                if (_ok4) return false;
-            }
-            out = opgen::CpTagKind::CpStaticMethodref;
-            return true;
-        }()) {} else {
-        restore(_m0);
-        skip();
-        if (!match("virtual_methodref")) return false;
-        {
-            auto _m5 = save();
-            bool _ok5 = [&]() -> bool {
-                if (at_end() || !is_ident_continue(peek())) return false;
-                advance();
-                return true;
-            }();
-            restore(_m5);
-            if (_ok5) return false;
-        }
-        out = opgen::CpTagKind::CpVirtualMethodref;
-        }
-        }
-        }
-        }
-    }
-    return true;
-}
-
 bool Parser::parse_LocalValueKind(opgen::LocalValueKind& out) {
     {
         auto _m0 = save();
@@ -1865,13 +1446,11 @@ bool Parser::parse_LocalValueKind(opgen::LocalValueKind& out) {
     return true;
 }
 
-bool Parser::parse_Annotation(std::vector<opgen::ErrorCase*>& errs, std::vector<const char*>& flags, std::optional<opgen::LocalValueDecl*>& local_value, std::vector<opgen::VerifyRejectCase*>& vrs, std::vector<opgen::EdgeCase*>& edges, std::optional<opgen::Branch*>& br, std::optional<opgen::InvokeDecl*>& invoke, std::vector<opgen::TargetDecl*>& expects, std::vector<opgen::RequireDecl*>& requires_, std::optional<opgen::CpTagDecl*>& cp_tag, std::optional<opgen::LocalIndexDecl*>& local_index, std::optional<opgen::SwitchPayloadDecl*>& switch_payload, std::optional<opgen::NarrowFormDecl*>& narrow_form, std::optional<opgen::SpecRef*>& spec, std::optional<const char*>& setup, std::optional<const char*>& verify) {
+bool Parser::parse_Annotation(std::vector<opgen::ErrorCase*>& errs, std::vector<const char*>& flags, std::optional<opgen::LocalValueDecl*>& local_value, std::vector<opgen::VerifyRejectCase*>& vrs, std::vector<opgen::EdgeCase*>& edges, std::optional<opgen::Branch*>& br, std::vector<opgen::AnnotationFact*>& facts, std::optional<opgen::LocalIndexDecl*>& local_index, std::optional<opgen::SwitchPayloadDecl*>& switch_payload, std::optional<opgen::NarrowFormDecl*>& narrow_form, std::optional<opgen::SpecRef*>& spec, std::optional<const char*>& setup, std::optional<const char*>& verify) {
     peg::Span fname; peg::Span vr_name; peg::Span s1; peg::Span s2;
        peg::Span maj_s; peg::Span min_s; peg::Span pat_s;
-       peg::Span li_s; peg::Span sp_s;
+       peg::Span li_s; peg::Span sp_s; peg::Span fact_name; peg::Span fact_val;
        opgen::LocalValueKind lvk;
-       opgen::InvokeKind ik; opgen::TargetKind tk;
-       opgen::RequireKind rk; opgen::CpTagKind ctk;
        opgen::SemExpr* cond = nullptr;
        std::string blk;
     {
@@ -1996,42 +1575,6 @@ bool Parser::parse_Annotation(std::vector<opgen::ErrorCase*>& errs, std::vector<
         restore(_m0);
         if ([&]() -> bool {
             skip();
-            if (!match("invoke_kind:")) return false;
-            skip();
-            if (!parse_InvokeKind(ik)) return false;
-            invoke = new opgen::InvokeDecl(ik);
-            return true;
-        }()) {} else {
-        restore(_m0);
-        if ([&]() -> bool {
-            skip();
-            if (!match("expects_target:")) return false;
-            skip();
-            if (!parse_TargetKind(tk)) return false;
-            expects.push_back(new opgen::TargetDecl(tk));
-            return true;
-        }()) {} else {
-        restore(_m0);
-        if ([&]() -> bool {
-            skip();
-            if (!match("requires:")) return false;
-            skip();
-            if (!parse_RequireKind(rk)) return false;
-            requires_.push_back(new opgen::RequireDecl(rk));
-            return true;
-        }()) {} else {
-        restore(_m0);
-        if ([&]() -> bool {
-            skip();
-            if (!match("cp_tag:")) return false;
-            skip();
-            if (!parse_CpTagKind(ctk)) return false;
-            cp_tag = new opgen::CpTagDecl(ctk);
-            return true;
-        }()) {} else {
-        restore(_m0);
-        if ([&]() -> bool {
-            skip();
             if (!match("local_index:")) return false;
             skip();
             if (!integer(li_s)) return false;
@@ -2048,14 +1591,23 @@ bool Parser::parse_Annotation(std::vector<opgen::ErrorCase*>& errs, std::vector<
             return true;
         }()) {} else {
         restore(_m0);
+        if ([&]() -> bool {
+            skip();
+            if (!match("narrow_form:")) return false;
+            skip();
+            if (!ident(fname)) return false;
+            narrow_form = new opgen::NarrowFormDecl(opgen_dup(fname));
+            return true;
+        }()) {} else {
+        restore(_m0);
         skip();
-        if (!match("narrow_form:")) return false;
+        if (!ident(fact_name)) return false;
         skip();
-        if (!ident(fname)) return false;
-        narrow_form = new opgen::NarrowFormDecl(opgen_dup(fname));
-        }
-        }
-        }
+        if (!match(":")) return false;
+        skip();
+        if (!ident(fact_val)) return false;
+        facts.push_back(new opgen::AnnotationFact(opgen_dup(fact_name),
+                                                     opgen_dup(fact_val)));
         }
         }
         }
@@ -2069,6 +1621,42 @@ bool Parser::parse_Annotation(std::vector<opgen::ErrorCase*>& errs, std::vector<
         }
         }
     }
+    return true;
+}
+
+bool Parser::parse_FactsDecl(std::vector<opgen::FactDecl*>& out) {
+    peg::Span ns; peg::Span ms; std::vector<const char*> members;
+    skip();
+    if (!match("facts")) return false;
+    {
+        auto _m0 = save();
+        bool _ok0 = [&]() -> bool {
+            if (at_end() || !is_ident_continue(peek())) return false;
+            advance();
+            return true;
+        }();
+        restore(_m0);
+        if (_ok0) return false;
+    }
+    skip();
+    if (!ident(ns)) return false;
+    skip();
+    if (!match("=")) return false;
+    skip();
+    if (!ident(ms)) return false;
+    members.push_back(opgen_dup(ms));
+    for (;;) {
+        auto _m1 = save();
+        if (![&]() -> bool {
+            skip();
+            if (!match(",")) return false;
+            skip();
+            if (!ident(ms)) return false;
+            members.push_back(opgen_dup(ms));
+            return true;
+        }()) { restore(_m1); break; }
+    }
+    out.push_back(new opgen::FactDecl(opgen_dup(ns), std::move(members)));
     return true;
 }
 

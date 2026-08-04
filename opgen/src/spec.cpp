@@ -193,6 +193,30 @@ int Spec::compute_cp_ref_offset(const Opcode* op) const {
 }
 
 Spec::Spec(const Module* m) : mod_(m) {
+    // A fact must name a declared vocabulary and one of its members. opgen
+    // does not know what the names mean, but it does know whether the spec
+    // declared them — an undeclared one is a typo that would otherwise reach
+    // a consumer as a fact that is simply never true.
+    for (auto* op : m->opcodes) {
+        for (auto* f : op->facts) {
+            const FactDecl* decl = nullptr;
+            for (auto* d : m->fact_decls)
+                if (std::strcmp(d->name, f->name) == 0) { decl = d; break; }
+            if (!decl) {
+                fprintf(stderr, "opgen: %s: no `facts %s` declaration\n",
+                        op->mnemonic, f->name);
+                std::exit(1);
+            }
+            bool member = false;
+            for (auto* mem : decl->members)
+                if (std::strcmp(mem, f->value) == 0) { member = true; break; }
+            if (!member) {
+                fprintf(stderr, "opgen: %s: `%s` is not a declared member of `facts %s`\n",
+                        op->mnemonic, f->value, f->name);
+                std::exit(1);
+            }
+        }
+    }
     for (auto* op : m->opcodes) {
         unsigned idx = static_cast<unsigned>(op->opcode_val) & 0xff;
         Derived& d = derived_[idx];

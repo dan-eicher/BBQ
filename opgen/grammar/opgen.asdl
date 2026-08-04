@@ -88,39 +88,15 @@ module opgen {
     // Spec reference: the manual section the opcode is defined by.
     spec_ref = SpecRef(int32 major, int32 minor, int32 patch)
 
-    // Invoke discipline. Drives invoke-related corpus probes.
-    invoke_kind = InvkStatic | InvkVirtual | InvkSpecial
-                | InvkInterface | InvkSuper
-    invoke_decl = InvokeDecl(invoke_kind kind)
-
-    // Constraint on the resolved constant-pool target. Each kind is
-    // independently invertible into a probe (plant an entry violating it).
-    //
-    // non_init rejects when the target is an instance initializer,
-    // non_clinit when it is a class initializer. Distinct because a special
-    // invoke CAN target the former but MUST NOT target the latter, while
-    // static/virtual invokes reject both.
-    target_kind = TgtClass         | TgtInterface
-                | TgtStaticMethod  | TgtInstanceMethod
-                | TgtNonAbstract
-                | TgtNonInit       | TgtNonClinit
-                | TgtTypeByte | TgtTypeShort | TgtTypeInt | TgtTypeRef
-    target_decl = TargetDecl(target_kind kind)
-
-    // Context preconditions the opcode needs beyond its own signature.
-    // acc_int is needed only where the stack/operand signature does not
-    // already say `i32` (an increment operating on an int local via its
-    // index operand).
-    require_kind = ReqAccInt | ReqInstanceMethodContext
-    require_decl = RequireDecl(require_kind kind)
-
-    // Constant-pool entry tag the opcode's cp_ref operand must point at.
-    // Every cp_ref-using opcode carries one so a corpus can plant a
-    // correctly-tagged target without mnemonic-grep heuristics.
-    cp_tag_kind = CpClassref         | CpInstanceFieldref
-                | CpStaticFieldref   | CpStaticMethodref
-                | CpVirtualMethodref
-    cp_tag_decl = CpTagDecl(cp_tag_kind kind)
+    // A declarative fact attached to an opcode, drawn from a vocabulary the
+    // SPEC declares — the same treatment the value model (`type` rows) and the
+    // control-flow outcomes (`status`) already get, and for the same reason:
+    // the moment a second target needs a different set, a built-in enum is
+    // the thing that has to be edited. opgen carries the two names and checks
+    // that the value is a declared member; what "classref" or "funcidx" MEANS
+    // belongs to the consumer that reads it back.
+    fact_decl = FactDecl(ident name, ident *members)
+    annotation_fact = AnnotationFact(ident name, ident value)
 
     // Implicit local index for shorthand opcodes whose index is baked into
     // the mnemonic. Variable forms (an index operand) omit this.
@@ -220,10 +196,7 @@ module opgen {
                     verify_reject_case *verify_rejects,
                     edge_case     *edges,
                     branch        ?br,
-                    invoke_decl       ?invoke,
-                    target_decl       *expects,
-                    require_decl      *requires_,
-                    cp_tag_decl       ?cp_tag,
+                    annotation_fact   *facts,
                     local_index_decl  ?local_index,
                     switch_payload_decl ?switch_payload,
                     narrow_form_decl    ?narrow_form,
@@ -254,6 +227,7 @@ module opgen {
                     method_decl *methods,
                     status_decl ?status,
                     type_decl *types,
+                    fact_decl *fact_decls,
                     rawcode *headers,
                     rawcode ?body_c,
                     rawcode ?backend,

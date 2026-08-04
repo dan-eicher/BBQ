@@ -61,6 +61,11 @@ const char* kAnnotatedSpec = R"OPGEN(
 type i16 s2 u2 1 s
 type i32 s4 u4 2 i
 
+facts cp_tag         = classref, instance_fieldref, static_fieldref, static_methodref, virtual_methodref
+facts expects_target = class, interface, static_method, instance_method, non_abstract, non_init, non_clinit, type_byte, type_short, type_int, type_ref
+facts requires       = acc_int, instance_method_context
+facts invoke_kind    = static, virtual, special, interface, super
+
 getfield_a 0x83 [ u8 index ] (ref objectref -- ref result)
     spec: 7.5.20
     cp_tag: instance_fieldref
@@ -99,6 +104,47 @@ stableswitch 0x75 ( i16 index -- )
     switch_payload: 8
 )OPGEN";
 
+// The vocabulary an opcode's declarative facts draw from is declared BY the
+// spec, the same way the value model and the status outcomes are. opgen
+// carries the names and checks membership; it does not know what a constant
+// pool or an invoke discipline is, so a target with neither still parses and
+// a target with something else entirely names its own.
+const char* kFactVocabSpec = R"OPGEN(
+type i32 s4 u4 1 i
+
+facts refs    = funcidx, typeidx, memidx
+facts expects = defined, imported
+
+call 0x10 [ u16 idx ] ( -- )
+    refs: funcidx
+    expects: defined
+    expects: imported
+
+load 0x11 [ u16 m ] ( -- i32 r )
+    refs: memidx
+)OPGEN";
+
+TEST(OpgenParse, FactVocabularyIsSpecDeclared) {
+    auto* m = parse(kFactVocabSpec);
+    ASSERT_NE(m, nullptr);
+    ASSERT_EQ(m->fact_decls.size(), 2u);
+    EXPECT_STREQ(m->fact_decls[0]->name, "refs");
+    ASSERT_EQ(m->fact_decls[0]->members.size(), 3u);
+    EXPECT_STREQ(m->fact_decls[0]->members[0], "funcidx");
+
+    auto* call = m->opcodes[0];
+    ASSERT_EQ(call->facts.size(), 3u);
+    EXPECT_STREQ(call->facts[0]->name, "refs");
+    EXPECT_STREQ(call->facts[0]->value, "funcidx");
+    EXPECT_STREQ(call->facts[1]->name, "expects");
+    EXPECT_STREQ(call->facts[1]->value, "defined");
+    EXPECT_STREQ(call->facts[2]->value, "imported");
+
+    auto* load = m->opcodes[1];
+    ASSERT_EQ(load->facts.size(), 1u);
+    EXPECT_STREQ(load->facts[0]->value, "memidx");
+}
+
 TEST(OpgenParse, VerifierAnnotationVocabulary) {
     auto* m = parse(kAnnotatedSpec);
     ASSERT_NE(m, nullptr);
@@ -109,10 +155,13 @@ TEST(OpgenParse, VerifierAnnotationVocabulary) {
     EXPECT_EQ((*getfield->spec)->major, 7);
     EXPECT_EQ((*getfield->spec)->minor, 5);
     EXPECT_EQ((*getfield->spec)->patch, 20);
-    ASSERT_TRUE(getfield->cp_tag.has_value());
-    EXPECT_EQ((*getfield->cp_tag)->kind, opgen::CpTagKind::CpInstanceFieldref);
-    ASSERT_EQ(getfield->expects.size(), 1u);
-    ASSERT_EQ(getfield->requires_.size(), 1u);
+    ASSERT_EQ(getfield->facts.size(), 3u);
+    EXPECT_STREQ(getfield->facts[0]->name, "cp_tag");
+    EXPECT_STREQ(getfield->facts[0]->value, "instance_fieldref");
+    EXPECT_STREQ(getfield->facts[1]->name, "expects_target");
+    EXPECT_STREQ(getfield->facts[1]->value, "type_ref");
+    EXPECT_STREQ(getfield->facts[2]->name, "requires");
+    EXPECT_STREQ(getfield->facts[2]->value, "instance_method_context");
 
     auto* sload = m->opcodes[1];
     ASSERT_TRUE(sload->local_index.has_value());
@@ -133,8 +182,9 @@ TEST(OpgenParse, VerifierAnnotationVocabulary) {
     EXPECT_STREQ(dup_x->verify_rejects[0]->error_code, "TYPE_MISMATCH");
 
     auto* invoke = m->opcodes[5];
-    ASSERT_TRUE(invoke->invoke.has_value());
-    EXPECT_EQ((*invoke->invoke)->kind, opgen::InvokeKind::InvkVirtual);
+    ASSERT_EQ(invoke->facts.size(), 2u);
+    EXPECT_STREQ(invoke->facts[0]->name, "invoke_kind");
+    EXPECT_STREQ(invoke->facts[0]->value, "virtual");
 
     auto* sswitch = m->opcodes[6];
     ASSERT_TRUE(sswitch->switch_payload.has_value());

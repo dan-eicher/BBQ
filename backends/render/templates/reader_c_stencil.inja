@@ -47,9 +47,13 @@ static bool {{ fn.kpfx }}_k{{ o.id }}(bbq_ctx_t* ctx, {{ fn.type }}* out, size_t
     if (!({{ o.expr }})) return bbq_fail(ctx, "{{ o.msg }}");
     BBQ_MUSTTAIL return {{ fn.kpfx }}_k{{ o.next }}(ctx, out, _struct_start);
 {% else if o.op == "invoke" %}
+{% if o.scope %}
     bbq_push_scope(ctx, out);
+{% endif %}
     if (!{{ kfn(o.fn) }}_read(ctx, &{{ o.target }})) return bbq_fail(ctx, "{{ o.msg }}");
+{% if o.scope %}
     bbq_pop_scope(ctx);
+{% endif %}
     BBQ_MUSTTAIL return {{ fn.kpfx }}_k{{ o.next }}(ctx, out, _struct_start);
 {% else if o.op == "advance" %}
     bbq_seek(ctx, bbq_pos(ctx) + {{ o.by }});

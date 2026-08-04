@@ -46,9 +46,13 @@ static bool {{ fn.kpfx }}_w{{ o.id }}(bbq_write_ctx_t* ctx, const {{ fn.type }}*
     /* checked on read — nothing to write */
     BBQ_MUSTTAIL return {{ fn.kpfx }}_w{{ o.next }}(ctx, in);
 {% else if o.op == "invoke" %}
+{% if o.scope %}
     bbq_w_push_scope(ctx, in);
+{% endif %}
     if (!{{ kfn(o.fn) }}_write(ctx, &{{ o.target }})) return false;
+{% if o.scope %}
     bbq_w_pop_scope(ctx);
+{% endif %}
     BBQ_MUSTTAIL return {{ fn.kpfx }}_w{{ o.next }}(ctx, in);
 {% else if o.op == "advance" %}
     if (!bbq_w_advance(ctx, {{ o.by }})) return false;

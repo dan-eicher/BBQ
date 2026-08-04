@@ -332,7 +332,11 @@ void Emitter::fold_owning_paths(json& functions) const {
                 continue;
             }
             if (k == "array_next_grow") { op["field"] = array_stack.back(); kept.push_back(op); continue; }
-            if (k == "invoke") { op["target"] = container(prefix); kept.push_back(op); continue; }
+            if (k == "invoke") {
+                op["target"] = container(prefix);
+                op["scope"] = fn.value("scope", true);
+                kept.push_back(op); continue;
+            }
             // Leaf bake (BEFORE the prefix-prepend): a scalar switch arm becomes its union
             // slot; an optional present-element gains `.value` (empty leaf → bare `value`).
             int id = op["id"].get<int>();
@@ -538,6 +542,13 @@ json lower_grammar(const CompilerCtx& ctx) {
         fn["rule"]  = g->rules[i].name;
         fn["entry"] = m.emit.next_id(g->rules[i].entry);
         fn["ops"]   = m.emit.nodes;
+        // Only a struct rule is an addressable scope: Sema counts a cross-rule
+        // reference's depth over enclosing STRUCT rules alone, so a switch that
+        // pushed a frame would shift every reference below it by one.
+        fn["scope"] = false;
+        for (auto* r : ctx.ast->rules)
+            if (r->name == g->rules[i].name)
+                fn["scope"] = (dynamic_cast<BBQ::Struct*>(r->body) != nullptr);
         functions.push_back(std::move(fn));
     }
     return functions;

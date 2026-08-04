@@ -13,7 +13,14 @@ trap 'rm -rf "$WORK"' EXIT
 
 cat > "$WORK/smoke.bbq" <<'EOF'
 @endian big
-Inner = struct { a: uint8, b: uint16 }
+# `ext` reaches out to the ENCLOSING rule's `tag`: a cross-rule scope
+# reference, which the reader/writer spell as a cast through the scope
+# pointer. Under -prefix that cast must name the PREFIXED struct type.
+Inner = struct {
+    a:   uint8,
+    b:   uint16,
+    ext: optional<uint8> where tag >= 5
+}
 Blob  = struct { len: uint8, data: bytes[len] }
 Msg = struct {
     tag:   uint8,
@@ -34,8 +41,9 @@ cat > "$WORK/main.c" <<'EOF'
 #include <assert.h>
 
 int main(void) {
-    /* tag=9, inner.a=1 inner.b=0x0203, blob.len=2 data=0xAA,0xBB */
-    const uint8_t buf[] = { 9, 1, 0x02, 0x03, 2, 0xAA, 0xBB };
+    /* tag=9, inner.a=1 inner.b=0x0203, inner.ext=0x7E (present, tag>=5),
+     * blob.len=2 data=0xAA,0xBB */
+    const uint8_t buf[] = { 9, 1, 0x02, 0x03, 0x7E, 2, 0xAA, 0xBB };
     bbq_ctx_t ctx;
     bbq_ctx_init(&ctx, buf, sizeof buf);
     smk_msg_t m;
@@ -43,6 +51,8 @@ int main(void) {
     assert(m.tag == 9);
     assert(m.inner.a == 1);
     assert(m.inner.b == 0x0203);
+    assert(m.inner.ext.has_value);
+    assert(m.inner.ext.value == 0x7E);
     assert(m.blob.len == 2);
 
     uint8_t out[64];

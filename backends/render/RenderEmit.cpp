@@ -128,7 +128,7 @@ struct Emitter {
     virtual std::string path_value(const std::string& expr) const { return expr; }
     virtual std::string cross_ref(const std::string& parent, int depth,
                                   const std::string& path) const {
-        return "((" + snake(parent) + "_t*)bbq_scope_ptr(ctx, " +
+        return "((" + cname(parent, type_prefix()) + "_t*)bbq_scope_ptr(ctx, " +
                std::to_string(depth) + "))->" + path;
     }
     virtual std::string builtin(const std::string& which) const {
@@ -651,7 +651,7 @@ struct OwningCWriter : Emitter {
     std::string path_start(const std::string& name) const override { return "in->" + name; }
     std::string cross_ref(const std::string& parent, int depth,
                           const std::string& path) const override {
-        return "((const " + snake(parent) + "_t*)bbq_w_scope_ptr(ctx, " +
+        return "((const " + cname(parent, type_prefix()) + "_t*)bbq_w_scope_ptr(ctx, " +
                std::to_string(depth) + "))->" + path;
     }
     std::string builtin(const std::string& which) const override {

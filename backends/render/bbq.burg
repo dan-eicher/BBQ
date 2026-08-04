@@ -222,6 +222,9 @@ spine: EvalConstraintNode(expr) = 1 (. json cond = E.epop();
             if (on_true->kind() == KontKind::BeginStructNode) {
                 const char* sn = ((BeginStructNode*)on_true)->struct_name;
                 fname = sn ? sn : "";
+            } else if (on_true->kind() == KontKind::BeginArrayNode) {
+                const char* an = ((BeginArrayNode*)on_true)->array_name;
+                fname = an ? an : "";
             } else if (on_true->kind() == KontKind::MatchBytesNode) {
                 const KontNode* c = on_true->succ(0);
                 const char* nm = (c->kind() == KontKind::CaptureKont) ? ((CaptureKont*)c)->name
@@ -310,6 +313,8 @@ spine: BeginOptionalNode  = 1 (. const KontNode* inner = node->succ(1);
         std::string fname;
         if (inner->kind() == KontKind::BeginStructNode) {
             const char* sn = ((BeginStructNode*)inner)->struct_name; fname = sn ? sn : "";
+        } else if (inner->kind() == KontKind::BeginArrayNode) {
+            const char* an = ((BeginArrayNode*)inner)->array_name; fname = an ? an : "";
         } else if (inner->kind() == KontKind::MatchPrimitiveNode ||
                    inner->kind() == KontKind::MatchBytesNode) {
             const KontNode* c = inner->succ(0);

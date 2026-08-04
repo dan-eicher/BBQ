@@ -72,6 +72,9 @@ static bool {{ fn.kpfx }}_k{{ o.id }}(bbq_view_ctx_t* ctx) {
       uint64_t _bf = bbq_view_read_at(ctx, _s, {{ prim_bytes(o.prim) }}, {{ o.prim.be }}, {{ o.prim.native }});
 {% for m in o.members %}
       bbq_view_add_computed_int(ctx, "{{ m.target }}", (int64_t)((_bf >> {{ m.shift }}) & {{ m.mask }}));
+{% if existsIn(m, "where") %}
+      if (!({{ m.where }})) return bbq_fail(&ctx->cur, "{{ m.where_msg }}");
+{% endif %}
 {% endfor %}
     }
     BBQ_MUSTTAIL return {{ fn.kpfx }}_k{{ o.next }}(ctx);

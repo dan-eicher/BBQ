@@ -210,6 +210,9 @@ static bool {{ fn.kpfx }}_k{{ o.id }}(bbq_ctx_t* ctx, {{ fn.type }}* out, size_t
         if (!{{ read_fn(o.prim) }}(ctx, &_bf)) return bbq_fail(ctx, "{{ o.msg }}");
 {% for m in o.members %}
         {{ m.target }} = (_bf >> {{ m.shift }}) & {{ m.mask }};
+{% if existsIn(m, "where") %}
+        if (!({{ m.where }})) return bbq_fail(ctx, "{{ m.where_msg }}");
+{% endif %}
 {% endfor %}
     }
     BBQ_MUSTTAIL return {{ fn.kpfx }}_k{{ o.next }}(ctx, out, _struct_start);

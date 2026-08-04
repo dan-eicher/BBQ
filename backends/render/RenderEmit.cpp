@@ -198,6 +198,20 @@ void Emitter::fold_owning_paths(json& functions) const {
     auto prepend = [](json& op, const char* key, const std::string& pfx) {
         if (op.contains(key)) op[key] = pfx + op[key].get<std::string>();
     };
+    // A same-scope reference inside an EXPRESSION names its field the way the grammar
+    // wrote it, so it needs the same compile-time path a target gets: a `where` on a
+    // bitfield entry says `acc_extended`, but the field lives at `flags.acc_extended`.
+    // cross_ref carries its own path off the scope pointer and is left alone.
+    std::function<void(json&, const std::string&)> qualify_refs =
+        [&](json& n, const std::string& pfx) -> void {
+        if (n.is_array()) { for (auto& c : n) qualify_refs(c, pfx); return; }
+        if (!n.is_object()) return;
+        if (n.value("e", std::string()) == "field_ref") {
+            n["name"] = pfx + n["name"].get<std::string>();
+            return;
+        }
+        for (auto& c : n) qualify_refs(c, pfx);
+    };
     auto is_boundary = [](const std::string& k) {
         return k == "begin_struct" || k == "end_struct" || k == "end_array";
     };
@@ -247,13 +261,35 @@ void Emitter::fold_owning_paths(json& functions) const {
         // `.value.` / array slots `.items[i]`), bake the scalar-arm + optional-value leaf,
         // and drop the boundary ops.
         std::string prefix;
-        std::vector<std::string> scope, array_stack;  // scope shared by struct + array (balanced)
+        // A reference inside an EXPRESSION resolves in the STRUCT nesting it was written
+        // in, which is not the target prefix: an array's element slot (`f.items[i].`)
+        // extends the target path but not the scope a `where`/interval expression sees,
+        // so `@[base + @index]` on an element still means the enclosing struct's `base`.
+        std::string struct_prefix;
+        std::vector<std::string> scope, sscope, array_stack;  // pushed/popped together
         int loop_level = 0;
         json kept = json::array();
+        // Constraint ops folded into a bitfield member (its entry's `where`): the member
+        // carries the check, so the standalone op is dropped rather than emitted after
+        // the run — which would have split the container read in two.
+        std::unordered_set<int> folded_constraints;
         for (auto& op : fn["ops"]) {
             std::string k = op.value("op", std::string());
+            if (k == "bitfield") {
+                for (auto& mem : op["members"]) {
+                    if (!mem.contains("where_id")) continue;
+                    auto it = by_id.find(mem["where_id"].get<int>());
+                    if (it == by_id.end()) continue;
+                    mem["where"] = (*it->second)["expr"];
+                    mem["where_msg"] = (*it->second)["msg"];
+                    folded_constraints.insert(mem["where_id"].get<int>());
+                    mem.erase("where_id");
+                }
+            }
+            if (folded_constraints.count(op["id"].get<int>())) continue;
             if (k == "begin_struct") {
                 scope.push_back(prefix);
+                sscope.push_back(struct_prefix);
                 if (op.contains("case_member")) {
                     std::string cf = op.value("case_field", std::string());
                     prefix += (cf.empty() ? "" : cf + ".") + "u." +
@@ -265,17 +301,30 @@ void Emitter::fold_owning_paths(json& functions) const {
                 }
                 else { std::string nm = op.value("name", std::string());
                        if (!nm.empty()) prefix += nm + "."; }
+                struct_prefix = prefix;
                 continue;  // boundary: drop
             }
-            if (k == "end_struct") { prefix = scope.back(); scope.pop_back(); continue; }
+            if (k == "end_struct") {
+                prefix = scope.back(); scope.pop_back();
+                struct_prefix = sscope.back(); sscope.pop_back();
+                continue;
+            }
             if (k == "end_array") {
-                prefix = scope.back(); scope.pop_back(); loop_level--; array_stack.pop_back();
+                prefix = scope.back(); scope.pop_back();
+                struct_prefix = sscope.back(); sscope.pop_back();
+                loop_level--; array_stack.pop_back();
                 continue;
             }
             if (k == "array_begin" || k == "array_begin_grow" || k == "array_begin_resync") {
-                std::string full = prefix + op["field"].get<std::string>();
+                // An array that IS an optional's present element lives in `<field>.value`,
+                // the same retarget the leaf bake below applies to scalar elements.
+                std::string leaf = op["field"].get<std::string>();
+                if (opt_value_ids.count(op["id"].get<int>()))
+                    leaf = leaf.empty() ? "value" : leaf + ".value";
+                std::string full = prefix + leaf;
                 op["field"] = full;
                 scope.push_back(prefix);
+                sscope.push_back(struct_prefix);
                 array_stack.push_back(full);
                 prefix = full + ".items[" + array_index(loop_level) + "]";
                 loop_level++;
@@ -298,6 +347,7 @@ void Emitter::fold_owning_paths(json& functions) const {
                     op["target"] = t.empty() ? "value" : t + ".value";
                 }
             }
+            if (!struct_prefix.empty()) qualify_refs(op, struct_prefix);
             prepend(op, "target", prefix);
             prepend(op, "tag_target", prefix);
             prepend(op, "field", prefix);

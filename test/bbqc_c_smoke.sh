@@ -24,8 +24,14 @@ Inner = struct {
 Blob  = struct { len: uint8, data: bytes[len] }
 Msg = struct {
     tag:   uint8,
+    # A `where` on a bitfield entry names the entry, but the field lives under the
+    # container: the constraint must read flags.hi, not a non-existent top-level hi.
+    flags: bitfield<uint8> { hi: 4 where hi == 3, lo: 4 },
     inner: Inner,
-    blob:  Blob
+    blob:  Blob,
+    # An optional whose element is an ARRAY: presence is `tail.has_value` and the
+    # array itself lives at `tail.value`, not at `tail`.
+    tail:  optional<array<uint8>[2]> where tag >= 5
 }
 EOF
 
@@ -41,19 +47,26 @@ cat > "$WORK/main.c" <<'EOF'
 #include <assert.h>
 
 int main(void) {
-    /* tag=9, inner.a=1 inner.b=0x0203, inner.ext=0x7E (present, tag>=5),
-     * blob.len=2 data=0xAA,0xBB */
-    const uint8_t buf[] = { 9, 1, 0x02, 0x03, 0x7E, 2, 0xAA, 0xBB };
+    /* tag=9, flags=0x35 (hi=3 lo=5), inner.a=1 inner.b=0x0203,
+     * inner.ext=0x7E (present, tag>=5), blob.len=2 data=0xAA,0xBB,
+     * tail present = 0xC1,0xC2 */
+    const uint8_t buf[] = { 9, 0x35, 1, 0x02, 0x03, 0x7E, 2, 0xAA, 0xBB, 0xC1, 0xC2 };
     bbq_ctx_t ctx;
     bbq_ctx_init(&ctx, buf, sizeof buf);
     smk_msg_t m;
     assert(smk_msg_read(&ctx, &m));
     assert(m.tag == 9);
+    assert(m.flags.hi == 3);
+    assert(m.flags.lo == 5);
     assert(m.inner.a == 1);
     assert(m.inner.b == 0x0203);
     assert(m.inner.ext.has_value);
     assert(m.inner.ext.value == 0x7E);
     assert(m.blob.len == 2);
+    assert(m.tail.has_value);
+    assert(m.tail.value.count == 2);
+    assert(m.tail.value.items[0] == 0xC1);
+    assert(m.tail.value.items[1] == 0xC2);
 
     uint8_t out[64];
     bbq_write_ctx_t w;

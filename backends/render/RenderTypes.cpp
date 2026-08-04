@@ -452,6 +452,17 @@ json lower_type_model(const CompilerCtx& ctx) {
 std::string render_types_c(const CompilerCtx& ctx, const std::string& template_path) {
     json model = lower_type_model(ctx);
 
+    // Two grammars' headers can meet in one translation unit. A fixed guard makes
+    // the second one vanish, so derive it from the prefix that already namespaces
+    // every type in the file; unprefixed output keeps the generic guard.
+    std::string tp = ctx.type_prefix();
+    std::string guard = "BBQ_GENERATED_TYPES_H";
+    if (!tp.empty()) {
+        guard = tp + "_TYPES_H";
+        for (char& c : guard) c = (char)std::toupper((unsigned char)c);
+    }
+    model["guard"] = guard;
+
     std::ifstream tf(template_path);
     std::stringstream ss;
     ss << tf.rdbuf();

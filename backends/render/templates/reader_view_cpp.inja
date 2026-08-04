@@ -72,6 +72,9 @@ static bool {{ fn.kpfx }}_k{{ o.id }}(bbq::reader& r) {
       uint64_t _bf = r.read_at(_s, {{ prim_bytes(o.prim) }}, {{ o.prim.be }}, {{ o.prim.native }});
 {% for m in o.members %}
       r.add_computed_int("{{ m.target }}", (int64_t)((_bf >> {{ m.shift }}) & {{ m.mask }}));
+{% if existsIn(m, "where") %}
+      if (!({{ m.where }})) return r.fail("{{ m.where_msg }}");
+{% endif %}
 {% endfor %}
     }
     return {{ fn.kpfx }}_k{{ o.next }}(r);

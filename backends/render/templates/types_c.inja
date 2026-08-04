@@ -2,8 +2,8 @@
    neutral node spelled by c_type(); every name is the canonical CamelCase rule
    name spelled by c_sname() (struct tag) / c_tname() (typedef). The template holds
    no C naming or type logic of its own. #}
-#ifndef BBQ_GENERATED_TYPES_H
-#define BBQ_GENERATED_TYPES_H
+#ifndef {{ guard }}
+#define {{ guard }}
 
 #include <stdint.h>
 #include <stdbool.h>
@@ -88,4 +88,4 @@ static inline void {{ c_sname(fr.name) }}_free({{ c_tname(fr.name) }}* p) {
 
 {% endfor %}
 {% endif %}
-{{ user_header }}#endif /* BBQ_GENERATED_TYPES_H */
+{{ user_header }}#endif /* {{ guard }} */

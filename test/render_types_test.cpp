@@ -14,7 +14,7 @@ using namespace BBQ;
 
 namespace {
 
-std::string render(const std::string& spec) {
+std::string render(const std::string& spec, const std::string& prefix = "") {
     Parser parser;
     parser.init(spec.c_str(), (int)spec.size());
     EXPECT_TRUE(parser.parse()) << "parse failed";
@@ -22,7 +22,7 @@ std::string render(const std::string& spec) {
     bbqgen::Sema sema(rep);
     EXPECT_TRUE(sema.analyze(parser.ast)) << "sema failed";
     std::string tmpl = std::string(SOURCE_DIR) + "/backends/render/templates/types_c.inja";
-    bbq::render::CompilerCtx ctx{parser.ast, &sema, nullptr, ""};
+    bbq::render::CompilerCtx ctx{parser.ast, &sema, nullptr, prefix};
     return bbq::render::render_types_c(ctx, tmpl);
 }
 
@@ -99,4 +99,17 @@ TEST(RenderTypes, UserHeader) {
     auto h = render("@header (. typedef int my_t; .)\nFoo = struct { x: uint8 }");
     EXPECT_TRUE(has(h, "typedef int my_t;"));          // verbatim user block
     EXPECT_TRUE(has(h, "#endif /* BBQ_GENERATED_TYPES_H */"));
+}
+
+// Two prefixed headers can be included by one translation unit; a guard shared
+// between them would make the second include expand to nothing.
+TEST(RenderTypes, IncludeGuardFollowsPrefix) {
+    auto cap = render("Foo = struct { x: uint8 }", "Cap");
+    EXPECT_TRUE(has(cap, "#ifndef CAP_TYPES_H"));
+    EXPECT_TRUE(has(cap, "#define CAP_TYPES_H"));
+    EXPECT_TRUE(has(cap, "#endif /* CAP_TYPES_H */"));
+
+    auto exp = render("Bar = struct { y: uint8 }", "Exp");
+    EXPECT_TRUE(has(exp, "#ifndef EXP_TYPES_H"));
+    EXPECT_FALSE(has(exp, "CAP_TYPES_H"));
 }

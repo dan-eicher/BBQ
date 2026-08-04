@@ -261,6 +261,20 @@ inline BitfieldInfo collapse_bitfield(Emit& e, const KontNode* first) {
         int64_t mask = (int64_t)((1ull << eb->width_bits) - 1);
         members.push_back({{"target", name}, {"shift", shift}, {"mask", mask}});  // leaf; fold prepends
         if (m != first) e.absorbed.insert(m);
+        // An entry's `where` sits between its extract and the next one. The run is one
+        // container read, so the check belongs INSIDE it, against the entry just
+        // extracted — stopping here would restart the run and re-read the container.
+        // The constraint kont still emits its own op so its expr renders; post_lower
+        // folds that op into this member and drops it.
+        if (after && after->kind() == KontKind::EvalConstraintNode) {
+            const KontNode* on_false = after->succ(0);
+            bool hard = on_false->kind() == KontKind::AbortRuleKont ||
+                        on_false->kind() == KontKind::OnFailKont;
+            if (hard) {
+                members.back()["where_id"] = e.nid(after);
+                after = after->succ(1);
+            }
+        }
         m = after;
     }
     if (m && m->kind() == KontKind::AdvancePosNode) { e.absorbed.insert(m); m = m->succ(0); }

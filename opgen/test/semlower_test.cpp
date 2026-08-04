@@ -32,7 +32,7 @@ std::string lower_body(const opgen::Module* m, const opgen::Opcode* op,
 }
 
 const char* kSpec = R"OPGEN(
-type i32 int32_t uint32_t 1 i
+type i32 s4 u4 1 i
 
 native int helper(int a);
 
@@ -62,20 +62,20 @@ using Mode = opgen::SemLowerer::Mode;
 TEST(OpgenLower, Binop) {
     auto* m = parse(kSpec); ASSERT_NE(m, nullptr);
     EXPECT_EQ(lower_body(m, op_named(m, "add"), Mode::Interp),
-              "    r = (int32_t)((a + b));\n");
+              "    r = (s4)((a + b));\n");
 }
 
 TEST(OpgenLower, ShiftMasksToWidth) {
     auto* m = parse(kSpec); ASSERT_NE(m, nullptr);
     // i32 → shift count masked to 31 bits.
     EXPECT_EQ(lower_body(m, op_named(m, "shl"), Mode::Interp),
-              "    r = (int32_t)((a << (b & 31)));\n");
+              "    r = (s4)((a << (b & 31)));\n");
 }
 
 TEST(OpgenLower, JavaPrimCast) {
     auto* m = parse(kSpec); ASSERT_NE(m, nullptr);
     EXPECT_EQ(lower_body(m, op_named(m, "cast"), Mode::Interp),
-              "    r = (int32_t)(((s2)a));\n");
+              "    r = (s4)(((s2)a));\n");
 }
 
 TEST(OpgenLower, NativeCallInterpVsStencil) {
@@ -83,11 +83,11 @@ TEST(OpgenLower, NativeCallInterpVsStencil) {
     // INTERP: direct call. The leading runtime context is the NATIVE_ARGS seam
     // (default `vm, vm->heap`; a backend redefines it to change the calling convention).
     EXPECT_EQ(lower_body(m, op_named(m, "callop"), Mode::Interp),
-              "    r = (int32_t)((helper(NATIVE_ARGS, a)));\n");
+              "    r = (s4)((helper(NATIVE_ARGS, a)));\n");
     // STENCIL: indirect call through the _HOLE_ fn-pointer, with the synthesized
     // (ret(*)(vm_t*, heap_t*, params)) cast.
     EXPECT_EQ(lower_body(m, op_named(m, "callop"), Mode::Stencil),
-              "    r = (int32_t)((((s4(*)(vm_t*, heap_t*, s4))(uintptr_t)_HOLE_helper)"
+              "    r = (s4)((((s4(*)(vm_t*, heap_t*, s4))(uintptr_t)_HOLE_helper)"
               "(NATIVE_ARGS, a)));\n");
 }
 
@@ -98,9 +98,9 @@ TEST(OpgenLower, IfElse) {
     auto* m = parse(kSpec); ASSERT_NE(m, nullptr);
     EXPECT_EQ(lower_body(m, op_named(m, "ifop"), Mode::Interp),
               "    if ((_Bool)(a > b)) {\n"
-              "    r = (int32_t)(a);\n"
+              "    r = (s4)(a);\n"
               "    } else {\n"
-              "    r = (int32_t)(b);\n"
+              "    r = (s4)(b);\n"
               "    }\n");
 }
 

@@ -70,7 +70,11 @@ const char* SemLowerer::java_c(const char* jt) {
     if (!strcmp(jt, "double"))  return "f8";
     if (!strcmp(jt, "boolean")) return "s1";
     if (!strcmp(jt, "any"))     return "any_t";
-    return "s4";
+    /* The action language's type names are a closed set. An unlisted one is a
+     * spec error, and answering `s4` narrows or widens it silently — which is
+     * how a `ulong` native once got an s4 prototype. */
+    fprintf(stderr, "opgen: `%s` is not an action-language type\n", jt);
+    std::exit(1);
 }
 
 ValueType SemLowerer::local_vt(const Opcode* op) const {
@@ -152,10 +156,17 @@ int SemLowerer::scalar_bits(const char* s) {
     if (!strcmp(s, "s2") || !strcmp(s, "u2")) return 16;
     if (!strcmp(s, "s4") || !strcmp(s, "u4") || !strcmp(s, "f4")) return 32;
     if (!strcmp(s, "s8") || !strcmp(s, "u8") || !strcmp(s, "f8")) return 64;
-    return 32;
+    /* The spellings are a closed set and Spec rejects a type row outside it,
+     * so reaching here means an internal caller synthesised a scalar name.
+     * Defaulting to 32 would emit a plausible wrong width silently. */
+    fprintf(stderr, "opgen: internal: no width for scalar `%s`\n", s);
+    std::exit(1);
 }
 
 void SemLowerer::int_slot_view(char* fld, const char** islot, const char** uw, int* w) const {
+    /* Derived from the widest single-slot integer row the spec declares. Spec
+     * refuses a spec that declares none, so the scan always finds one; the
+     * initial values are overwritten rather than used as a fallback. */
     *fld = 's'; *islot = "s2"; *uw = "u2"; *w = 16;
     int best = -1;
     if (mod_) for (auto* td : mod_->types) {
@@ -390,6 +401,7 @@ const char* SemLowerer::api_c_type_for(const char* t, const char* status_ty) {
     if (!strcmp(t, "byte"))    return "s1";
     if (!strcmp(t, "short"))   return "s2";
     if (!strcmp(t, "char"))    return "u2";
+    if (!strcmp(t, "int"))     return "s4";
     if (!strcmp(t, "long"))    return "s8";
     // The unsigned widths the action language already accepts (java_c maps them). Left
     // out here, a native declared `ulong` got an s4 prototype — a SILENT narrowing of
@@ -401,7 +413,8 @@ const char* SemLowerer::api_c_type_for(const char* t, const char* status_ty) {
     if (!strcmp(t, "any"))     return "any_t";
     if (!strcmp(t, "boolean")) return "s1";
     if (!strcmp(t, "v128"))    return "v128_t";
-    return "s4";
+    fprintf(stderr, "opgen: `%s` is not an action-language type\n", t);
+    std::exit(1);
 }
 
 void SemLowerer::emit_native_fnptr_cast(const MethodDecl* md) {

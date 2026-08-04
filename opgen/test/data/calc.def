@@ -4,7 +4,7 @@
 # This tests the tool end-to-end: lowering, the slot model, operand decode,
 # threaded dispatch, locals.
 
-type i32 int32_t uint32_t 1 i
+type i32 s4 u4 1 i
 
 iconst 0x01 [ i32 v ] ( -- i32 r )
     (. r = v; .)

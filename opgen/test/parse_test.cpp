@@ -22,8 +22,8 @@ const char* kSpec = R"OPGEN(
 
 status int OK ERR HALT
 
-type i32 int32_t uint32_t 1 i
-type i64 int64_t uint64_t 2 l
+type i32 s4 u4 1 i
+type i64 s8 u8 2 l
 
 native void push(int v);
 

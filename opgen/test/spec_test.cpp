@@ -17,8 +17,8 @@ opgen::Module* parse(const char* src) {
 
 // `type` table makes i32 one slot, i64 two — so stack deltas follow the spec.
 const char* kSpec = R"OPGEN(
-type i32 int32_t uint32_t 1 i
-type i64 int64_t uint64_t 2 l
+type i32 s4 u4 1 i
+type i64 s8 u8 2 l
 
 iconst 0x10 [ u16 imm ] ( -- i32 r )
 
@@ -110,6 +110,30 @@ TEST(OpgenSpec, BodylessSpecDerivesLocalAndBranchFacts) {
     EXPECT_EQ(spec.derived(0x16).local_index, -1);   // variable form
     EXPECT_EQ(spec.derived(0x96).narrow_form, 0x59); // sinc_w narrows to sinc
     EXPECT_EQ(spec.derived(0x59).narrow_form, 0);    // no narrower form
+}
+
+// A `type` row's scalar is one of opgen's own spellings — s1/u1 … f8 — and
+// widths are read back off those names. A row that misses the set has no
+// answerable width, so it is refused. Guessing one produces a generator that
+// silently emits the wrong width: `int16_t` read as 32 bits would widen a
+// 16-bit slot model everywhere at once, with nothing to notice it.
+void spec_of(const char* src) {
+    auto* m = parse(src);
+    if (!m) std::exit(2);
+    opgen::Spec s(m);
+    (void)s;
+}
+
+TEST(OpgenSpecDeathTest, TypeRowScalarMustBeAnOpgenSpelling) {
+    EXPECT_EXIT(spec_of("type i16 int16_t uint16_t 1 s\n"
+                        "op 0x10 ( -- i16 r)\n"),
+                ::testing::ExitedWithCode(1), "int16_t");
+}
+
+TEST(OpgenSpecDeathTest, SpecWithNoIntegerTypeRowIsRefused) {
+    EXPECT_EXIT(spec_of("type f64 f8 f8 1 d\n"
+                        "op 0x10 ( -- f64 r)\n"),
+                ::testing::ExitedWithCode(1), "single-slot integer");
 }
 
 TEST(OpgenSpec, SpecialOpcodesGetVariableSentinels) {

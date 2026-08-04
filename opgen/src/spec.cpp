@@ -192,7 +192,41 @@ int Spec::compute_cp_ref_offset(const Opcode* op) const {
     return 0;
 }
 
+// The scalar spellings a `type` row may use. Widths are read back off these
+// names, so the set is closed: anything else has no answerable width.
+static bool is_opgen_scalar(const char* s) {
+    static const char* kSpellings[] = { "s1","u1","s2","u2","s4","u4","f4",
+                                        "s8","u8","f8","v128_t","any_t" };
+    for (const char* k : kSpellings) if (std::strcmp(k, s) == 0) return true;
+    return false;
+}
+
 Spec::Spec(const Module* m) : mod_(m) {
+    // A type row is the spec's answer to "how wide is this, and how many slots
+    // does it take". Both are read off the scalar's name, so a name outside
+    // opgen's own set leaves the question unanswered — and guessing produces a
+    // generator that emits a plausible wrong width everywhere at once.
+    bool have_int_row = false;
+    for (auto* td : m->types) {
+        if (!is_opgen_scalar(td->scalar) || !is_opgen_scalar(td->uscalar)) {
+            fprintf(stderr,
+                    "opgen: type row with scalar `%s`/`%s`: not an opgen "
+                    "spelling (s1/u1 … s8/u8, f4/f8)\n",
+                    td->scalar, td->uscalar);
+            std::exit(1);
+        }
+        if (td->slots == 1 && (td->scalar[0] == 's' || td->scalar[0] == 'u'))
+            have_int_row = true;
+    }
+    // The integer slot view — the width an untyped slot is read and written
+    // through — is derived from the widest single-slot integer row. With none
+    // declared there is nothing to derive it from.
+    if (!m->types.empty() && !have_int_row) {
+        fprintf(stderr, "opgen: the spec declares no single-slot integer type "
+                        "row; the slot view has no width to derive\n");
+        std::exit(1);
+    }
+
     // A fact must name a declared vocabulary and one of its members. opgen
     // does not know what the names mean, but it does know whether the spec
     // declared them — an undeclared one is a typo that would otherwise reach

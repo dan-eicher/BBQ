@@ -88,14 +88,20 @@ echo "bbqc C smoke OK"
 # The c-lite view reader shares the lowering with the owning backend but has its
 # own path handling, so a lowering change that suits one can leave the other
 # tail-calling a continuation that was absorbed. Compiling its output catches
-# that. The grammar omits cross-rule references: ViewCReader does not override
-# cross_ref, so it would spell a cast to an owning type this backend never emits.
+# that. `Rec.vals` is gated on a field of the ENCLOSING rule: the view resolves
+# that through its capture index, which is the scope chain, so it must not spell
+# the owning backend's cast to a types header this backend never emits.
 cat > "$WORK/lite.bbq" <<'EOF'
 @endian big
+Hdr = struct { ver: uint8 }
 Rec = struct {
     flags: bitfield<uint8> { hi: 4 where hi == 3, lo: 4 },
     n:     uint8,
-    vals:  optional<array<uint8>[n]> where n > 0
+    vals:  optional<array<uint8>[n]> where ver >= 2
+}
+Doc = struct {
+    hdr:  Hdr,
+    recs: array<Rec>[1]
 }
 EOF
 

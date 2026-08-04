@@ -183,6 +183,25 @@ struct Emitter {
     void derive_write_prefixes(json& functions) const;   // C writer + C++ writer
 };
 
+// A view resolves a cross-rule reference the way it resolves any other name. Its
+// capture index IS the scope chain — closing a scope packs that scope's fields out
+// of the open list — so a lookup walks innermost-to-outermost and the path selects
+// the binding, exactly like a lexical lookup. `parent` and `depth` are the owning
+// backends' scope-pointer machinery; a scope chain needs neither. A sibling's field
+// is not in the chain and has to be spelled as a path, which is what the resolved
+// path already is.
+static std::string cross_ref_via_path(const Emitter& em, const std::string& path) {
+    size_t dot = path.find('.');
+    std::string e = em.path_start(path.substr(0, dot));
+    while (dot != std::string::npos) {
+        size_t next = path.find('.', dot + 1);
+        e = em.path_field(e, path.substr(dot + 1, next == std::string::npos
+                                                  ? std::string::npos : next - dot - 1));
+        dot = next;
+    }
+    return em.path_value(e);
+}
+
 // The owning-C path machine. burg emits bare leaf targets plus neutral
 // begin_struct/end_struct/array boundary ops; this fold walks each function's ops in
 // program order, reconstructing the compile-time path prefix (struct fields `f.` /
@@ -836,6 +855,9 @@ struct ZCowReader : Emitter {
     std::string path_value(const std::string& expr) const override {
         return "bbq::node_int(" + expr + ", r.data)";
     }
+    std::string cross_ref(const std::string&, int, const std::string& path) const override {
+        return cross_ref_via_path(*this, path);
+    }
     std::string builtin(const std::string& which) const override {
         if (which == "pos")        return "r.pos";
         if (which == "remaining")  return "r.remaining()";
@@ -935,6 +957,9 @@ struct ViewCReader : Emitter {
     }
     std::string path_value(const std::string& expr) const override {
         return "bbq_node_int(" + expr + ", ctx->cur.data)";
+    }
+    std::string cross_ref(const std::string&, int, const std::string& path) const override {
+        return cross_ref_via_path(*this, path);
     }
     // C is an unfaithful host for the BBQ expression-type model: its relational/equality/
     // logical operators yield `int`, but the model (and C++) says `bool`. Cast those to

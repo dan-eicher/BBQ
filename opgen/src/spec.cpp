@@ -148,7 +148,7 @@ int Spec::compute_sp_pops(const Opcode* op) const {
 
 unsigned Spec::compute_flags(const Opcode* op) const {
     unsigned f = 0;
-    if (has_flag(op, "branch")) f |= OPCF_BRANCH;
+    if (op->br.has_value() || has_flag(op, "branch")) f |= OPCF_BRANCH;
     if (std::strcmp(op->mnemonic, "sreturn") == 0 ||
         std::strcmp(op->mnemonic, "ireturn") == 0 ||
         std::strcmp(op->mnemonic, "areturn") == 0 ||
@@ -168,6 +168,17 @@ unsigned Spec::compute_flags(const Opcode* op) const {
     // `local_value` annotation (the `_this` field ops carry `local_value`
     // for the implicit `this` slot but neither load nor store a local).
     for (auto* s : op->sem_body) local_access_flags(s, f);
+    // A spec whose semantics live in a hand-written interpreter declares its
+    // opcodes without bodies, so there is no effect to read. The declaration
+    // then says it: a local_value opcode that pushes is a load, one that pops
+    // is a store, and one with no stack effect that falls through is a
+    // read-modify-write. `ret` reads a slot but ends the block, so it is
+    // none of the three and excludes itself through the ENDS_BB test above.
+    if (op->sem_body.empty() && op->local_value.has_value()) {
+        if (!op->stack_out.empty())     f |= OPCF_LOCAL_LOAD;
+        else if (!op->stack_in.empty()) f |= OPCF_LOCAL_STORE;
+        else if (!(f & OPCF_ENDS_BB))   f |= OPCF_LOCAL_STORE;
+    }
     return f;
 }
 
@@ -192,6 +203,21 @@ Spec::Spec(const Module* m) : mod_(m) {
         d.flags         = compute_flags(op);
         d.cp_ref_offset = compute_cp_ref_offset(op);
         d.sp_pops       = compute_sp_pops(op);
+        d.local_index   = op->local_index.has_value()
+                              ? (*op->local_index)->index : -1;
+    }
+    // narrow_form names another opcode by mnemonic, so it resolves only once
+    // every opcode is in the table.
+    for (auto* op : m->opcodes) {
+        if (!op->narrow_form.has_value()) continue;
+        const char* want = (*op->narrow_form)->mnemonic;
+        for (auto* other : m->opcodes) {
+            if (std::strcmp(other->mnemonic, want) == 0) {
+                derived_[static_cast<unsigned>(op->opcode_val) & 0xff].narrow_form =
+                    other->opcode_val;
+                break;
+            }
+        }
     }
 }
 

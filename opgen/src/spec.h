@@ -37,6 +37,8 @@ public:
         unsigned      flags = 0;           // OPCF_* bitmask
         int           cp_ref_offset = 0;   // 0 if no CP-ref operand
         int           sp_pops = 0;         // cells popped; OPCD_VARIABLE for per-call-site
+        int           local_index = -1;    // implicit local slot; -1 when the index is an operand
+        int           narrow_form = 0;     // opcode of the narrower encoding; 0 when there is none
     };
 
     explicit Spec(const Module* m);

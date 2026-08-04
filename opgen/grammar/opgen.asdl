@@ -62,6 +62,81 @@ module opgen {
     // what gets emitted as the guard, not a description of it.
     error_case = ErrorCase(sem_expr ?condition, ident error_name)
 
+    // ── Verifier-facing annotations ────────────────────────────
+    // Per-opcode declarative facts about the target's verifier rules. They
+    // carry no weight in either execution tier: a corpus emitter inverts each
+    // into a probe that plants a violating input and expects a rejection.
+    // Each is a typed decl rather than free text, so a malformed one is a
+    // parse error instead of a probe that silently never fires.
+
+    // Verifier-reject annotation: names a spec rule that, when violated,
+    // must cause the verifier to reject. `condition` is the human-readable
+    // spec condition; `error_code` is the verifier error the probe expects.
+    verify_reject_case = VerifyRejectCase(ident name,
+                                          rawcode condition,
+                                          ident error_code)
+
+    // Edge annotation: a boundary input and the result it must produce, for
+    // the values where the operation's own arithmetic is the interesting part
+    // (MIN / -1 overflow and the like).
+    edge_case = EdgeCase(rawcode condition, rawcode assignment)
+
+    // Branch annotation: the condition under which the opcode transfers, and
+    // the expression giving the target pc.
+    branch = Branch(rawcode condition, rawcode target)
+
+    // Spec reference: the manual section the opcode is defined by.
+    spec_ref = SpecRef(int32 major, int32 minor, int32 patch)
+
+    // Invoke discipline. Drives invoke-related corpus probes.
+    invoke_kind = InvkStatic | InvkVirtual | InvkSpecial
+                | InvkInterface | InvkSuper
+    invoke_decl = InvokeDecl(invoke_kind kind)
+
+    // Constraint on the resolved constant-pool target. Each kind is
+    // independently invertible into a probe (plant an entry violating it).
+    //
+    // non_init rejects when the target is an instance initializer,
+    // non_clinit when it is a class initializer. Distinct because a special
+    // invoke CAN target the former but MUST NOT target the latter, while
+    // static/virtual invokes reject both.
+    target_kind = TgtClass         | TgtInterface
+                | TgtStaticMethod  | TgtInstanceMethod
+                | TgtNonAbstract
+                | TgtNonInit       | TgtNonClinit
+                | TgtTypeByte | TgtTypeShort | TgtTypeInt | TgtTypeRef
+    target_decl = TargetDecl(target_kind kind)
+
+    // Context preconditions the opcode needs beyond its own signature.
+    // acc_int is needed only where the stack/operand signature does not
+    // already say `i32` (an increment operating on an int local via its
+    // index operand).
+    require_kind = ReqAccInt | ReqInstanceMethodContext
+    require_decl = RequireDecl(require_kind kind)
+
+    // Constant-pool entry tag the opcode's cp_ref operand must point at.
+    // Every cp_ref-using opcode carries one so a corpus can plant a
+    // correctly-tagged target without mnemonic-grep heuristics.
+    cp_tag_kind = CpClassref         | CpInstanceFieldref
+                | CpStaticFieldref   | CpStaticMethodref
+                | CpVirtualMethodref
+    cp_tag_decl = CpTagDecl(cp_tag_kind kind)
+
+    // Implicit local index for shorthand opcodes whose index is baked into
+    // the mnemonic. Variable forms (an index operand) omit this.
+    local_index_decl = LocalIndexDecl(int32 index)
+
+    // Minimum bytecode payload after the opcode byte for variable-length
+    // switch opcodes, encoding the metadata an empty switch table still
+    // carries. Drives bytecode padding in stack-shape probes.
+    switch_payload_decl = SwitchPayloadDecl(int32 bytes)
+
+    // Narrow-form mnemonic for a wide-encoded variant. Codegen emits the
+    // wide form when the immediate exceeds the narrow form's range; a
+    // peephole substitutes the narrow form when the operand fits. The
+    // named narrow form must itself be a declared opcode in the file.
+    narrow_form_decl = NarrowFormDecl(ident mnemonic)
+
     // Type of a local-variable-referencing opcode's referenced slot:
     // sload/sstore touch a short, iload/istore an int (2 slots), aload
     // /astore a reference. ret reads the slot as a return address but
@@ -142,6 +217,19 @@ module opgen {
                     error_case    *errors,
                     ident         *flags,
                     local_value_decl  ?local_value,
+                    verify_reject_case *verify_rejects,
+                    edge_case     *edges,
+                    branch        ?br,
+                    invoke_decl       ?invoke,
+                    target_decl       *expects,
+                    require_decl      *requires_,
+                    cp_tag_decl       ?cp_tag,
+                    local_index_decl  ?local_index,
+                    switch_payload_decl ?switch_payload,
+                    narrow_form_decl    ?narrow_form,
+                    spec_ref          ?spec,
+                    rawcode       ?setup,
+                    rawcode       ?verify,
                     sem_stmt      *sem_body)
 
     // `headers`: raw `(. ... .)` blocks at the top of opcodes.def —

@@ -144,6 +144,19 @@ OpcodeDef <. opgen::Opcode*& result .>
        std::vector<opgen::ErrorCase*> errors;
        std::vector<const char*> flags;
        std::optional<opgen::LocalValueDecl*> local_value;
+       std::vector<opgen::VerifyRejectCase*> verify_rejects;
+       std::vector<opgen::EdgeCase*> edges;
+       std::optional<opgen::Branch*> br;
+       std::optional<opgen::InvokeDecl*> invoke;
+       std::vector<opgen::TargetDecl*> expects;
+       std::vector<opgen::RequireDecl*> requires_;
+       std::optional<opgen::CpTagDecl*> cp_tag;
+       std::optional<opgen::LocalIndexDecl*> local_index;
+       std::optional<opgen::SwitchPayloadDecl*> switch_payload;
+       std::optional<opgen::NarrowFormDecl*> narrow_form;
+       std::optional<opgen::SpecRef*> spec;
+       std::optional<const char*> setup;
+       std::optional<const char*> verify;
        std::vector<opgen::SemStmt*> sem_body; .)
     = ident<ms>          (. mnemonic = opgen_dup(ms); .)
       integer<isp>       (. opcode_val = opgen_parse_int(isp); .)
@@ -155,12 +168,17 @@ OpcodeDef <. opgen::Opcode*& result .>
       "--" [ StackParam<stack_out>
              { "," StackParam<stack_out> } ]
       ")"
-      { Annotation<errors, flags, local_value> }
+      { Annotation<errors, flags, local_value, verify_rejects, edges, br,
+                   invoke, expects, requires_, cp_tag, local_index,
+                   switch_payload, narrow_form, spec, setup, verify> }
       [ SemBody<sem_body> ]
       (. result = new opgen::Opcode(
              mnemonic, (int32_t)opcode_val, subop,
              std::move(operands), std::move(stack_in), std::move(stack_out),
              std::move(errors), std::move(flags), local_value,
+             std::move(verify_rejects), std::move(edges), br,
+             invoke, std::move(expects), std::move(requires_), cp_tag,
+             local_index, switch_payload, narrow_form, spec, setup, verify,
              std::move(sem_body)); .)
 .
 
@@ -183,6 +201,19 @@ FamilyDef <. std::vector<opgen::Opcode*>& ops .>
        std::vector<opgen::ErrorCase*> errors;
        std::vector<const char*> flags;
        std::optional<opgen::LocalValueDecl*> local_value;
+       std::vector<opgen::VerifyRejectCase*> verify_rejects;
+       std::vector<opgen::EdgeCase*> edges;
+       std::optional<opgen::Branch*> br;
+       std::optional<opgen::InvokeDecl*> invoke;
+       std::vector<opgen::TargetDecl*> expects;
+       std::vector<opgen::RequireDecl*> requires_;
+       std::optional<opgen::CpTagDecl*> cp_tag;
+       std::optional<opgen::LocalIndexDecl*> local_index;
+       std::optional<opgen::SwitchPayloadDecl*> switch_payload;
+       std::optional<opgen::NarrowFormDecl*> narrow_form;
+       std::optional<opgen::SpecRef*> spec;
+       std::optional<const char*> setup;
+       std::optional<const char*> verify;
        std::vector<opgen::SemStmt*> sem_body;
        std::vector<opgen::ValueType> mvts; std::vector<const char*> mnames;
        std::vector<int64_t> mhexes; std::vector<int64_t> msubs; .)
@@ -194,7 +225,9 @@ FamilyDef <. std::vector<opgen::Opcode*>& ops .>
       "--" [ FamilyStackParam<tout, out_var>
              { "," FamilyStackParam<tout, out_var> } ]
       ")"
-      { Annotation<errors, flags, local_value> }
+      { Annotation<errors, flags, local_value, verify_rejects, edges, br,
+                   invoke, expects, requires_, cp_tag, local_index,
+                   switch_payload, narrow_form, spec, setup, verify> }
       [ SemBody<sem_body> ]
       "{"
         FamilyMember<mvts, mnames, mhexes, msubs>
@@ -215,6 +248,9 @@ FamilyDef <. std::vector<opgen::Opcode*>& ops .>
                  mnames[m], (int32_t)mhexes[m], (int32_t)msubs[m],
                  operands, std::move(nin), std::move(nout),
                  errors, flags, local_value,
+                 verify_rejects, edges, br,
+                 invoke, expects, requires_, cp_tag,
+                 local_index, switch_payload, narrow_form, spec, setup, verify,
                  sem_body));
          } .)
 .
@@ -313,6 +349,41 @@ ValueType <. opgen::ValueType& out .>
     | "any"   !ident_continue (. out = opgen::ValueType::TyAny;   .)
 .
 
+InvokeKind <. opgen::InvokeKind& out .>
+    = "static"    !ident_continue (. out = opgen::InvokeKind::InvkStatic;    .)
+    | "virtual"   !ident_continue (. out = opgen::InvokeKind::InvkVirtual;   .)
+    | "special"   !ident_continue (. out = opgen::InvokeKind::InvkSpecial;   .)
+    | "interface" !ident_continue (. out = opgen::InvokeKind::InvkInterface; .)
+    | "super"     !ident_continue (. out = opgen::InvokeKind::InvkSuper;     .)
+.
+
+TargetKind <. opgen::TargetKind& out .>
+    = "static_method"   !ident_continue (. out = opgen::TargetKind::TgtStaticMethod;   .)
+    | "instance_method" !ident_continue (. out = opgen::TargetKind::TgtInstanceMethod; .)
+    | "non_abstract"    !ident_continue (. out = opgen::TargetKind::TgtNonAbstract;    .)
+    | "non_clinit"      !ident_continue (. out = opgen::TargetKind::TgtNonClinit;      .)
+    | "non_init"        !ident_continue (. out = opgen::TargetKind::TgtNonInit;        .)
+    | "type_byte"       !ident_continue (. out = opgen::TargetKind::TgtTypeByte;       .)
+    | "type_short"      !ident_continue (. out = opgen::TargetKind::TgtTypeShort;      .)
+    | "type_int"        !ident_continue (. out = opgen::TargetKind::TgtTypeInt;        .)
+    | "type_ref"        !ident_continue (. out = opgen::TargetKind::TgtTypeRef;        .)
+    | "interface"       !ident_continue (. out = opgen::TargetKind::TgtInterface;      .)
+    | "class"           !ident_continue (. out = opgen::TargetKind::TgtClass;          .)
+.
+
+RequireKind <. opgen::RequireKind& out .>
+    = "acc_int"                 !ident_continue (. out = opgen::RequireKind::ReqAccInt;                .)
+    | "instance_method_context" !ident_continue (. out = opgen::RequireKind::ReqInstanceMethodContext; .)
+.
+
+CpTagKind <. opgen::CpTagKind& out .>
+    = "classref"          !ident_continue (. out = opgen::CpTagKind::CpClassref;         .)
+    | "instance_fieldref" !ident_continue (. out = opgen::CpTagKind::CpInstanceFieldref; .)
+    | "static_fieldref"   !ident_continue (. out = opgen::CpTagKind::CpStaticFieldref;   .)
+    | "static_methodref"  !ident_continue (. out = opgen::CpTagKind::CpStaticMethodref;  .)
+    | "virtual_methodref" !ident_continue (. out = opgen::CpTagKind::CpVirtualMethodref; .)
+.
+
 LocalValueKind <. opgen::LocalValueKind& out .>
     = "short"  !ident_continue (. out = opgen::LocalValueKind::LvShort;  .)
     | "int"    !ident_continue (. out = opgen::LocalValueKind::LvInt;    .)
@@ -328,10 +399,28 @@ LocalValueKind <. opgen::LocalValueKind& out .>
 
 Annotation <. std::vector<opgen::ErrorCase*>& errs,
               std::vector<const char*>& flags,
-              std::optional<opgen::LocalValueDecl*>& local_value .>
-    (. peg::Span fname;
+              std::optional<opgen::LocalValueDecl*>& local_value,
+              std::vector<opgen::VerifyRejectCase*>& vrs,
+              std::vector<opgen::EdgeCase*>& edges,
+              std::optional<opgen::Branch*>& br,
+              std::optional<opgen::InvokeDecl*>& invoke,
+              std::vector<opgen::TargetDecl*>& expects,
+              std::vector<opgen::RequireDecl*>& requires_,
+              std::optional<opgen::CpTagDecl*>& cp_tag,
+              std::optional<opgen::LocalIndexDecl*>& local_index,
+              std::optional<opgen::SwitchPayloadDecl*>& switch_payload,
+              std::optional<opgen::NarrowFormDecl*>& narrow_form,
+              std::optional<opgen::SpecRef*>& spec,
+              std::optional<const char*>& setup,
+              std::optional<const char*>& verify .>
+    (. peg::Span fname; peg::Span vr_name; peg::Span s1; peg::Span s2;
+       peg::Span maj_s; peg::Span min_s; peg::Span pat_s;
+       peg::Span li_s; peg::Span sp_s;
        opgen::LocalValueKind lvk;
-       opgen::SemExpr* cond = nullptr; .)
+       opgen::InvokeKind ik; opgen::TargetKind tk;
+       opgen::RequireKind rk; opgen::CpTagKind ctk;
+       opgen::SemExpr* cond = nullptr;
+       std::string blk; .)
     = "error:" [ SemCond<cond> "->" ]
         ident<fname>
         (. errs.push_back(new opgen::ErrorCase(opgen_opt(cond), opgen_dup(fname))); .)
@@ -341,6 +430,50 @@ Annotation <. std::vector<opgen::ErrorCase*>& errs,
 
     | "local_value:" LocalValueKind<lvk>
         (. local_value = new opgen::LocalValueDecl(lvk); .)
+
+    | "verify_reject:" ident<vr_name> string_lit<s1> "->" ident<fname>
+        (. vrs.push_back(new opgen::VerifyRejectCase(
+               opgen_dup(vr_name), opgen_dup(s1), opgen_dup(fname))); .)
+
+    | "edge:" string_lit<s1> "->" string_lit<s2>
+        (. edges.push_back(new opgen::EdgeCase(opgen_dup(s1), opgen_dup(s2))); .)
+
+    | "branch:" string_lit<s1> "->" string_lit<s2>
+        (. br = new opgen::Branch(opgen_dup(s1), opgen_dup(s2)); .)
+
+    | "setup:" "(."
+        (. if (!scan_to("." ")", blk)) return false;
+           setup = opgen_trim_intern(blk); .)
+
+    | "verify:" "(."
+        (. if (!scan_to("." ")", blk)) return false;
+           verify = opgen_trim_intern(blk); .)
+
+    | "spec:" integer<maj_s> "." integer<min_s> "." integer<pat_s>
+        (. spec = new opgen::SpecRef((int32_t)opgen_parse_int(maj_s),
+                                     (int32_t)opgen_parse_int(min_s),
+                                     (int32_t)opgen_parse_int(pat_s)); .)
+
+    | "invoke_kind:" InvokeKind<ik>
+        (. invoke = new opgen::InvokeDecl(ik); .)
+
+    | "expects_target:" TargetKind<tk>
+        (. expects.push_back(new opgen::TargetDecl(tk)); .)
+
+    | "requires:" RequireKind<rk>
+        (. requires_.push_back(new opgen::RequireDecl(rk)); .)
+
+    | "cp_tag:" CpTagKind<ctk>
+        (. cp_tag = new opgen::CpTagDecl(ctk); .)
+
+    | "local_index:" integer<li_s>
+        (. local_index = new opgen::LocalIndexDecl((int32_t)opgen_parse_int(li_s)); .)
+
+    | "switch_payload:" integer<sp_s>
+        (. switch_payload = new opgen::SwitchPayloadDecl((int32_t)opgen_parse_int(sp_s)); .)
+
+    | "narrow_form:" ident<fname>
+        (. narrow_form = new opgen::NarrowFormDecl(opgen_dup(fname)); .)
 .
 
 // ═══════════════════════════════════════════════════════════════

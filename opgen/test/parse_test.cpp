@@ -52,6 +52,95 @@ family ( T a, T b -- T r )
 /* trailing body_c */
 )OPGEN";
 
+// The verifier-facing annotation vocabulary. These are per-opcode declarative
+// facts about the target's verifier rules, which a corpus emitter inverts into
+// probes; they carry no weight in either execution tier. Each is a typed decl,
+// not free text, so a malformed one is a parse error rather than a probe that
+// silently never fires.
+const char* kAnnotatedSpec = R"OPGEN(
+type i16 s2 u2 1 s
+type i32 s4 u4 2 i
+
+getfield_a 0x83 [ u8 index ] (ref objectref -- ref result)
+    spec: 7.5.20
+    cp_tag: instance_fieldref
+    expects_target: type_ref
+    requires: instance_method_context
+    (. result = get_field(objectref, index); .)
+
+sload 0x16 [ u8 index ] ( -- i16 result)
+    spec: 7.5.92
+    local_value: short
+    local_index: 0
+    narrow_form: sload_0
+    (. result = locals[index]; .)
+
+sdiv 0x47 (i16 a, i16 b -- i16 result)
+    spec: 7.5.28
+    edge: "a == -32768 && b == -1" -> "result == -32768"
+    (. result = a / b; .)
+
+ifeq 0x60 [ i16 offset ] (i16 value -- )
+    spec: 7.5.42
+    branch: "value == 0" -> "pc - 2 + offset"
+    (. if (value == 0) do_branch(offset); .)
+
+dup_x 0x3F [ u8 mn ] ( -- )
+    spec: 7.5.18
+    verify_reject: split_int "m-boundary splits an int pair" -> TYPE_MISMATCH
+
+invokevirtual 0x8B [ u8 index ] ( -- )
+    spec: 7.5.57
+    invoke_kind: virtual
+    cp_tag: virtual_methodref
+
+stableswitch 0x75 ( i16 index -- )
+    spec: 7.5.94
+    switch_payload: 8
+)OPGEN";
+
+TEST(OpgenParse, VerifierAnnotationVocabulary) {
+    auto* m = parse(kAnnotatedSpec);
+    ASSERT_NE(m, nullptr);
+    ASSERT_EQ(m->opcodes.size(), 7u);
+
+    auto* getfield = m->opcodes[0];
+    ASSERT_TRUE(getfield->spec.has_value());
+    EXPECT_EQ((*getfield->spec)->major, 7);
+    EXPECT_EQ((*getfield->spec)->minor, 5);
+    EXPECT_EQ((*getfield->spec)->patch, 20);
+    ASSERT_TRUE(getfield->cp_tag.has_value());
+    EXPECT_EQ((*getfield->cp_tag)->kind, opgen::CpTagKind::CpInstanceFieldref);
+    ASSERT_EQ(getfield->expects.size(), 1u);
+    ASSERT_EQ(getfield->requires_.size(), 1u);
+
+    auto* sload = m->opcodes[1];
+    ASSERT_TRUE(sload->local_index.has_value());
+    EXPECT_EQ((*sload->local_index)->index, 0);
+    ASSERT_TRUE(sload->narrow_form.has_value());
+    EXPECT_STREQ((*sload->narrow_form)->mnemonic, "sload_0");
+
+    // A branch/edge condition is a parsed expression in the action language,
+    // matching how `error:` already carries its guard.
+    auto* sdiv = m->opcodes[2];
+    ASSERT_EQ(sdiv->edges.size(), 1u);
+    auto* ifeq = m->opcodes[3];
+    ASSERT_TRUE(ifeq->br.has_value());
+
+    auto* dup_x = m->opcodes[4];
+    ASSERT_EQ(dup_x->verify_rejects.size(), 1u);
+    EXPECT_STREQ(dup_x->verify_rejects[0]->name, "split_int");
+    EXPECT_STREQ(dup_x->verify_rejects[0]->error_code, "TYPE_MISMATCH");
+
+    auto* invoke = m->opcodes[5];
+    ASSERT_TRUE(invoke->invoke.has_value());
+    EXPECT_EQ((*invoke->invoke)->kind, opgen::InvokeKind::InvkVirtual);
+
+    auto* sswitch = m->opcodes[6];
+    ASSERT_TRUE(sswitch->switch_payload.has_value());
+    EXPECT_EQ((*sswitch->switch_payload)->bytes, 8);
+}
+
 TEST(OpgenParse, TopLevelCounts) {
     auto* m = parse(kSpec);
     ASSERT_NE(m, nullptr);

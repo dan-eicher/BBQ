@@ -60,6 +60,58 @@ TEST(OpgenSpec, Flags) {
     EXPECT_TRUE(spec.derived(0x40).flags & opgen::OPCF_INVOKE);     // "invoke" prefix
 }
 
+// A spec that declares its opcodes without writing bodies for them: the
+// semantics live in a hand-written interpreter and the spec exists for the
+// tables. Every derived fact must then come from the declarations, because
+// there is no body to read an effect out of.
+const char* kBodylessSpec = R"OPGEN(
+type i16 s2 u2 1 s
+type i32 s4 u4 2 i
+
+sload 0x16 [ u8 index ] ( -- i16 result)
+    local_value: short
+
+sstore 0x29 [ u8 index ] (i16 value -- )
+    local_value: short
+
+sload_2 0x1E ( -- i16 result)
+    local_value: short
+    local_index: 2
+
+sinc 0x59 [ u8 index, i8 delta ] ( -- )
+    local_value: short
+
+sinc_w 0x96 [ u8 index, i16 delta ] ( -- )
+    local_value: short
+    narrow_form: sinc
+
+ifeq 0x60 [ i8 offset ] (i16 value -- )
+    branch: "value == 0" -> "pc - 2 + offset"
+)OPGEN";
+
+TEST(OpgenSpec, BodylessSpecDerivesLocalAndBranchFacts) {
+    auto* m = parse(kBodylessSpec);
+    ASSERT_NE(m, nullptr);
+    opgen::Spec spec(m);
+
+    // A local_value opcode that pushes is a load; one that pops is a store;
+    // one with no stack effect that falls through is a read-modify-write.
+    EXPECT_TRUE(spec.derived(0x16).flags & opgen::OPCF_LOCAL_LOAD);
+    EXPECT_TRUE(spec.derived(0x29).flags & opgen::OPCF_LOCAL_STORE);
+    EXPECT_TRUE(spec.derived(0x59).flags & opgen::OPCF_LOCAL_STORE);
+
+    // The branch: annotation is what says an opcode branches.
+    EXPECT_TRUE(spec.derived(0x60).flags & opgen::OPCF_BRANCH);
+    EXPECT_TRUE(spec.derived(0x60).flags & opgen::OPCF_ENDS_BB);
+
+    // local_index and narrow_form reach the derived table so the emitted
+    // tables can carry them.
+    EXPECT_EQ(spec.derived(0x1E).local_index, 2);
+    EXPECT_EQ(spec.derived(0x16).local_index, -1);   // variable form
+    EXPECT_EQ(spec.derived(0x96).narrow_form, 0x59); // sinc_w narrows to sinc
+    EXPECT_EQ(spec.derived(0x59).narrow_form, 0);    // no narrower form
+}
+
 TEST(OpgenSpec, SpecialOpcodesGetVariableSentinels) {
     auto* m = parse(kSpec);
     ASSERT_NE(m, nullptr);

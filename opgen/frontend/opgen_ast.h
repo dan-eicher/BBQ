@@ -59,6 +59,41 @@ enum class ValueType {
     TyAddr
 };
 
+enum class InvokeKind {
+    InvkStatic,
+    InvkVirtual,
+    InvkSpecial,
+    InvkInterface,
+    InvkSuper
+};
+
+enum class TargetKind {
+    TgtClass,
+    TgtInterface,
+    TgtStaticMethod,
+    TgtInstanceMethod,
+    TgtNonAbstract,
+    TgtNonInit,
+    TgtNonClinit,
+    TgtTypeByte,
+    TgtTypeShort,
+    TgtTypeInt,
+    TgtTypeRef
+};
+
+enum class RequireKind {
+    ReqAccInt,
+    ReqInstanceMethodContext
+};
+
+enum class CpTagKind {
+    CpClassref,
+    CpInstanceFieldref,
+    CpStaticFieldref,
+    CpStaticMethodref,
+    CpVirtualMethodref
+};
+
 enum class LocalValueKind {
     LvShort,
     LvInt,
@@ -73,6 +108,17 @@ enum class LocalValueKind {
 struct StackParam;
 struct OperandParam;
 struct ErrorCase;
+struct VerifyRejectCase;
+struct EdgeCase;
+struct Branch;
+struct SpecRef;
+struct InvokeDecl;
+struct TargetDecl;
+struct RequireDecl;
+struct CpTagDecl;
+struct LocalIndexDecl;
+struct SwitchPayloadDecl;
+struct NarrowFormDecl;
 struct LocalValueDecl;
 struct SemExpr;
 struct SemStmt;
@@ -85,6 +131,17 @@ struct Module;
 struct StackParam;
 struct OperandParam;
 struct ErrorCase;
+struct VerifyRejectCase;
+struct EdgeCase;
+struct Branch;
+struct SpecRef;
+struct InvokeDecl;
+struct TargetDecl;
+struct RequireDecl;
+struct CpTagDecl;
+struct LocalIndexDecl;
+struct SwitchPayloadDecl;
+struct NarrowFormDecl;
 struct LocalValueDecl;
 struct SBinOp;
 struct SUnary;
@@ -230,6 +287,89 @@ struct ErrorCase : public ASTNode {
 
     std::optional<SemExpr*> condition;
     const char* error_name;
+};
+
+struct VerifyRejectCase : public ASTNode {
+    VerifyRejectCase(const char* name, const char* condition, const char* error_code)
+        : name(name), condition(condition), error_code(error_code){}
+
+    const char* name;
+    const char* condition;
+    const char* error_code;
+};
+
+struct EdgeCase : public ASTNode {
+    EdgeCase(const char* condition, const char* assignment)
+        : condition(condition), assignment(assignment){}
+
+    const char* condition;
+    const char* assignment;
+};
+
+struct Branch : public ASTNode {
+    Branch(const char* condition, const char* target)
+        : condition(condition), target(target){}
+
+    const char* condition;
+    const char* target;
+};
+
+struct SpecRef : public ASTNode {
+    SpecRef(int32_t major, int32_t minor, int32_t patch)
+        : major(major), minor(minor), patch(patch){}
+
+    int32_t major;
+    int32_t minor;
+    int32_t patch;
+};
+
+struct InvokeDecl : public ASTNode {
+    InvokeDecl(InvokeKind kind)
+        : kind(kind){}
+
+    InvokeKind kind;
+};
+
+struct TargetDecl : public ASTNode {
+    TargetDecl(TargetKind kind)
+        : kind(kind){}
+
+    TargetKind kind;
+};
+
+struct RequireDecl : public ASTNode {
+    RequireDecl(RequireKind kind)
+        : kind(kind){}
+
+    RequireKind kind;
+};
+
+struct CpTagDecl : public ASTNode {
+    CpTagDecl(CpTagKind kind)
+        : kind(kind){}
+
+    CpTagKind kind;
+};
+
+struct LocalIndexDecl : public ASTNode {
+    LocalIndexDecl(int32_t index)
+        : index(index){}
+
+    int32_t index;
+};
+
+struct SwitchPayloadDecl : public ASTNode {
+    SwitchPayloadDecl(int32_t bytes)
+        : bytes(bytes){}
+
+    int32_t bytes;
+};
+
+struct NarrowFormDecl : public ASTNode {
+    NarrowFormDecl(const char* mnemonic)
+        : mnemonic(mnemonic){}
+
+    const char* mnemonic;
 };
 
 struct LocalValueDecl : public ASTNode {
@@ -486,8 +626,8 @@ struct TypeDecl : public ASTNode {
 };
 
 struct Opcode : public ASTNode {
-    Opcode(const char* mnemonic, int32_t opcode_val, int32_t subop, std::vector<OperandParam*> operands, std::vector<StackParam*> stack_in, std::vector<StackParam*> stack_out, std::vector<ErrorCase*> errors, std::vector<const char*> flags, std::optional<LocalValueDecl*> local_value, std::vector<SemStmt*> sem_body)
-        : mnemonic(mnemonic), opcode_val(opcode_val), subop(subop), operands(std::move(operands)), stack_in(std::move(stack_in)), stack_out(std::move(stack_out)), errors(std::move(errors)), flags(std::move(flags)), local_value(std::move(local_value)), sem_body(std::move(sem_body)){}
+    Opcode(const char* mnemonic, int32_t opcode_val, int32_t subop, std::vector<OperandParam*> operands, std::vector<StackParam*> stack_in, std::vector<StackParam*> stack_out, std::vector<ErrorCase*> errors, std::vector<const char*> flags, std::optional<LocalValueDecl*> local_value, std::vector<VerifyRejectCase*> verify_rejects, std::vector<EdgeCase*> edges, std::optional<Branch*> br, std::optional<InvokeDecl*> invoke, std::vector<TargetDecl*> expects, std::vector<RequireDecl*> requires_, std::optional<CpTagDecl*> cp_tag, std::optional<LocalIndexDecl*> local_index, std::optional<SwitchPayloadDecl*> switch_payload, std::optional<NarrowFormDecl*> narrow_form, std::optional<SpecRef*> spec, std::optional<const char*> setup, std::optional<const char*> verify, std::vector<SemStmt*> sem_body)
+        : mnemonic(mnemonic), opcode_val(opcode_val), subop(subop), operands(std::move(operands)), stack_in(std::move(stack_in)), stack_out(std::move(stack_out)), errors(std::move(errors)), flags(std::move(flags)), local_value(std::move(local_value)), verify_rejects(std::move(verify_rejects)), edges(std::move(edges)), br(std::move(br)), invoke(std::move(invoke)), expects(std::move(expects)), requires_(std::move(requires_)), cp_tag(std::move(cp_tag)), local_index(std::move(local_index)), switch_payload(std::move(switch_payload)), narrow_form(std::move(narrow_form)), spec(std::move(spec)), setup(std::move(setup)), verify(std::move(verify)), sem_body(std::move(sem_body)){}
 
     const char* mnemonic;
     int32_t opcode_val;
@@ -498,6 +638,19 @@ struct Opcode : public ASTNode {
     std::vector<ErrorCase*> errors;
     std::vector<const char*> flags;
     std::optional<LocalValueDecl*> local_value;
+    std::vector<VerifyRejectCase*> verify_rejects;
+    std::vector<EdgeCase*> edges;
+    std::optional<Branch*> br;
+    std::optional<InvokeDecl*> invoke;
+    std::vector<TargetDecl*> expects;
+    std::vector<RequireDecl*> requires_;
+    std::optional<CpTagDecl*> cp_tag;
+    std::optional<LocalIndexDecl*> local_index;
+    std::optional<SwitchPayloadDecl*> switch_payload;
+    std::optional<NarrowFormDecl*> narrow_form;
+    std::optional<SpecRef*> spec;
+    std::optional<const char*> setup;
+    std::optional<const char*> verify;
     std::vector<SemStmt*> sem_body;
 };
 

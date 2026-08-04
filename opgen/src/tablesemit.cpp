@@ -56,7 +56,13 @@ void TablesEmitter::emit_opcodes_h(FILE* out) {
         "extern const unsigned char opcode_cp_ref_offset[256];\n"
         "/* Stack cells popped by an opcode (sum of stack_in widths).\n"
         " * OPCD_VARIABLE for per-call-site opcodes (invokes/dup_x/switch). */\n"
-        "extern const signed char   opcode_stack_pops[256];\n");
+        "extern const signed char   opcode_stack_pops[256];\n"
+        "/* The narrower encoding of a wide-form opcode, 0 when there is none.\n"
+        " * A peephole substitutes it once the operand is known to fit. */\n"
+        "extern const unsigned char opcode_narrow_form[256];\n"
+        "/* The local slot a shorthand opcode implies, -1 when the index is an\n"
+        " * operand instead of being baked into the mnemonic. */\n"
+        "extern const signed char   opcode_local_index[256];\n");
 
     if (!mod_->headers.empty()) {
         fprintf(out, "\n/* ===== User header blocks (from opcodes.def) ===== */\n\n");
@@ -106,6 +112,8 @@ void TablesEmitter::emit_opcode_tables_c(FILE* out) {
     emit_schar_table(out, "opcode_stack_delta",   [&](int op){ return s.derived(op).sp_delta; });
     emit_uchar_table(out, "opcode_flags",         [&](int op){ return (int)s.derived(op).flags; });
     emit_uchar_table(out, "opcode_cp_ref_offset", [&](int op){ return s.derived(op).cp_ref_offset; });
+    emit_uchar_table(out, "opcode_narrow_form",   [&](int op){ return s.derived(op).narrow_form; });
+    emit_schar_table(out, "opcode_local_index",   [&](int op){ return s.derived(op).present ? s.derived(op).local_index : -1; });
     emit_schar_table(out, "opcode_stack_pops",    [&](int op){ return s.derived(op).present ? s.derived(op).sp_pops : 0; });
 
     fprintf(out, "const char* const opcode_name[256] = {\n");

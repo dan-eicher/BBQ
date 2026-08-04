@@ -206,8 +206,15 @@ bbq_capture_metadata bbq_view_finish(bbq_view_ctx_t* c, bool ok) {
     bbq_capture_metadata meta;
     meta.success = ok;
     meta.bytes_consumed = c->cur.pos;
-    meta.error_message = (!ok && c->cur.has_error) ? c->cur.error : NULL;
-    meta.error_offset = 0;
+    /* The cursor's error buffer lives on the caller's frame and dies with it,
+     * so the message has to be copied into the arena the metadata outlives. */
+    meta.error_message = NULL;
+    if (!ok && c->cur.has_error) {
+        size_t n = strlen(c->cur.error) + 1;
+        char* copy = (char*)bbq_arena_alloc(b->arena, n);
+        if (copy) { memcpy(copy, c->cur.error, n); meta.error_message = copy; }
+    }
+    meta.error_offset = c->cur.pos;
     meta.root = NULL;
 
     int n = bbq_vec_len(b->fields);

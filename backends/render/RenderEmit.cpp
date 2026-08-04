@@ -269,24 +269,8 @@ void Emitter::fold_owning_paths(json& functions) const {
         std::vector<std::string> scope, sscope, array_stack;  // pushed/popped together
         int loop_level = 0;
         json kept = json::array();
-        // Constraint ops folded into a bitfield member (its entry's `where`): the member
-        // carries the check, so the standalone op is dropped rather than emitted after
-        // the run — which would have split the container read in two.
-        std::unordered_set<int> folded_constraints;
         for (auto& op : fn["ops"]) {
             std::string k = op.value("op", std::string());
-            if (k == "bitfield") {
-                for (auto& mem : op["members"]) {
-                    if (!mem.contains("where_id")) continue;
-                    auto it = by_id.find(mem["where_id"].get<int>());
-                    if (it == by_id.end()) continue;
-                    mem["where"] = (*it->second)["expr"];
-                    mem["where_msg"] = (*it->second)["msg"];
-                    folded_constraints.insert(mem["where_id"].get<int>());
-                    mem.erase("where_id");
-                }
-            }
-            if (folded_constraints.count(op["id"].get<int>())) continue;
             if (k == "begin_struct") {
                 scope.push_back(prefix);
                 sscope.push_back(struct_prefix);
@@ -569,6 +553,38 @@ static void tag_bytes_refs(json& node, const std::set<std::string>& bf) {
         for (auto& el : node) tag_bytes_refs(el, bf);
     }
 }
+// A `where` on a bitfield entry belongs INSIDE the container read, so collapse_bitfield
+// keeps the run going across it and tags the member with the constraint op's id. Move
+// that op's expression onto the member and drop it. This is a property of the lowering,
+// not of one backend's path folding: the continuation extracts are absorbed for every
+// emitter, so an emitter that still saw the standalone op would tail-call an id that
+// emits nothing.
+static void fold_bitfield_constraints(json& functions) {
+    for (auto& fn : functions) {
+        std::unordered_map<int, const json*> by_id;
+        for (auto& op : fn["ops"]) by_id[op["id"].get<int>()] = &op;
+        std::unordered_set<int> folded;
+        for (auto& op : fn["ops"]) {
+            if (op.value("op", std::string()) != "bitfield") continue;
+            for (auto& mem : op["members"]) {
+                if (!mem.contains("where_id")) continue;
+                auto it = by_id.find(mem["where_id"].get<int>());
+                if (it != by_id.end()) {
+                    mem["where"] = (*it->second)["expr"];
+                    mem["where_msg"] = (*it->second)["msg"];
+                    folded.insert(mem["where_id"].get<int>());
+                }
+                mem.erase("where_id");
+            }
+        }
+        if (folded.empty()) continue;
+        json kept = json::array();
+        for (auto& op : fn["ops"])
+            if (!folded.count(op["id"].get<int>())) kept.push_back(op);
+        fn["ops"] = std::move(kept);
+    }
+}
+
 static void annotate_bytes_field_refs(json& functions) {
     for (auto& fn : functions) {
         std::set<std::string> bf;
@@ -591,6 +607,7 @@ std::string render_emit(const CompilerCtx& ctx, const Emitter& em, json function
     // Fold-pass: the owning reader folds struct boundaries into the path and drops the
     // begin_struct/end_struct ops (remapping successors); the view leaves them as
     // runtime stencils (its post_lower is a no-op).
+    fold_bitfield_constraints(functions);
     annotate_bytes_field_refs(functions);
     em.post_lower(functions);
     // Spell the neutral expr records: burg emitted backend-blind expr trees; the

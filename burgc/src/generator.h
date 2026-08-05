@@ -66,6 +66,9 @@ private:
 
     void collect_nonterms();
     void classify_rules();
+    // REWRITE section: pattern/template operators are declared terminals,
+    // template binders were bound by the pattern, patterns stay linear.
+    void validate_rewrites();
     void check_coverage();
 };
 
@@ -163,3 +166,11 @@ public:
 
 std::unique_ptr<BurgBackend> create_cpp_backend();
 std::unique_ptr<BurgBackend> create_c_backend();
+
+// ── --rewrite ─────────────────────────────────────────────
+// Emit a saturating rewriter from the REWRITE section: one matcher per rule
+// plus `<name>_rewrite_region(egraph*, eg_caps)`. Separate from the backends
+// above because it produces a different artifact entirely — a pass that runs
+// BEFORE the tiler, over an e-graph rather than a tree.
+void emit_rewriter(std::ostream& out, const BurgAnalysis& a,
+                   const std::string& name);

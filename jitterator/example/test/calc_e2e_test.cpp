@@ -11,6 +11,7 @@
  */
 #include "calc_natives.h"      /* calc_br / calc_call / calc_ret + the VM headers */
 #include "calc_runner.h"       /* calc_compile + lower (burg cg_jump) */
+#include "opcodes.h"           /* OP_* — the rewrite pins read the emitted bytes */
 #include <cstdio>
 #include <vector>
 
@@ -40,6 +41,22 @@ static bool calc_eval(const char* src, s4* out) {
     std::vector<uint8_t> code = calc_runner::lower(ir);
     *out = run_bytecode(code);
     return true;
+}
+
+// Compare an emitted sequence against a pinned one. The whole byte string is
+// the assertion: counting occurrences of an opcode would have to decode
+// instructions to avoid counting operand payloads (a sleb128 byte equal to
+// OP_MUL is not a multiply), and the pinned sequence says more anyway — it
+// says exactly what the compiler emitted.
+static bool seq_is(const std::vector<uint8_t>& got,
+                   const std::vector<uint8_t>& want, const char* what) {
+    if (got == want) return true;
+    printf("FAIL: %s\n      got: ", what);
+    for (uint8_t b : got) printf("%02X ", b);
+    printf("\n      want:");
+    for (uint8_t b : want) printf(" %02X", b);
+    printf("\n");
+    return false;
 }
 
 static int fails = 0;
@@ -100,6 +117,77 @@ int main(void) {
             printf("ok:   %-44s = %d\n", c.src, got);
         }
     }
+    // ── The rewrite pass ────────────────────────────────────────────
+    // Every case above already pins pin (1): the pass must not change what a
+    // program COMPUTES. The two below pin what it changes and what it does
+    // not, which the numeric results cannot distinguish.
+
+    // (2) A pinned expression lowers to the REWRITTEN sequence. `$a * 2`
+    // has no shift on this target, so `mul_two` turns it into `$a + $a`:
+    // the emitted code loads the local twice and adds, with no constant
+    // push and no multiply anywhere in it.
+    {
+        int fs = 0;
+        calc_ir::Node* ir = calc_runner::calc_compile("let $a = 7; $a * 2", &fs);
+        std::vector<uint8_t> code = ir ? calc_runner::lower(ir)
+                                       : std::vector<uint8_t>();
+        // `let $a = 7; $a * 2` = 14. The ddcg emits ANF, so the multiply's
+        // operands are loads of temps; resolving each to its definition
+        // within the region reassembles `7 * 2`, which folds to 14. The
+        // stores stay — this pass rewrites expressions and does no DCE.
+        const std::vector<uint8_t> want_rewritten = {
+            OP_CONST, 0x07, OP_STORE, 0x00,
+            OP_CONST, 0x07, OP_STORE, 0x01,
+            OP_CONST, 0x02, OP_STORE, 0x02,
+            OP_CONST, 0x0E, OP_RET                 /* 14 */
+        };
+        // Without the pass: the loads and the multiply are still there.
+        const std::vector<uint8_t> want_plain = {
+            OP_CONST, 0x07, OP_STORE, 0x00,
+            OP_LOAD,  0x00, OP_STORE, 0x01,
+            OP_CONST, 0x02, OP_STORE, 0x02,
+            OP_LOAD,  0x01, OP_LOAD,  0x02, OP_MUL, OP_RET
+        };
+#ifdef CALC_EQSAT
+        if (!seq_is(code, want_rewritten, "rewrite: `let $a = 7; $a * 2`")) fails++;
+        else printf("ok:   rewrite: `$a * 2` lowered as a self-add\n");
+#else
+        // (3) the falsifier. If the plain build ALSO emits the rewritten
+        // sequence, the pass was never what changed the output and pin (2)
+        // proves nothing.
+        if (!seq_is(code, want_plain, "falsifier: `let $a = 7; $a * 2`")) fails++;
+        else printf("ok:   falsifier: without the pass, the multiply stays\n");
+#endif
+    }
+
+    // Constant folding reaches the same conclusion by a different route:
+    // `2 * 3 + 1` is one pushed constant once the rules have run.
+    {
+        int fs = 0;
+        calc_ir::Node* ir = calc_runner::calc_compile("2 * 3 + 1", &fs);
+        std::vector<uint8_t> code = ir ? calc_runner::lower(ir)
+                                       : std::vector<uint8_t>();
+        const std::vector<uint8_t> folded = { OP_CONST, 0x07, OP_RET };
+        // The DDCG is destination-driven: every binop operand is spilled to a
+        // temp and reloaded, so this is `2*3+1` in ANF with the let-bindings
+        // realized as slots. It is also exactly why the pass cannot run here —
+        // the multiply's operands are loads, not the constants.
+        const std::vector<uint8_t> unfolded = {
+            OP_CONST, 0x02, OP_STORE, 0x02,
+            OP_CONST, 0x03, OP_STORE, 0x03,
+            OP_LOAD,  0x02, OP_LOAD,  0x03, OP_MUL, OP_STORE, 0x00,
+            OP_CONST, 0x01, OP_STORE, 0x01,
+            OP_LOAD,  0x00, OP_LOAD,  0x01, OP_ADD, OP_RET
+        };
+#ifdef CALC_EQSAT
+        if (!seq_is(code, folded, "rewrite: `2 * 3 + 1`")) fails++;
+        else printf("ok:   rewrite: `2 * 3 + 1` folded to one constant\n");
+#else
+        if (!seq_is(code, unfolded, "falsifier: `2 * 3 + 1`")) fails++;
+        else printf("ok:   falsifier: without the pass, the arithmetic stays\n");
+#endif
+    }
+
     if (!fails) { printf("\ncalc e2e (parse → ddcg → IR → bytecode → opgen VM): all passed\n"); return 0; }
     printf("\ncalc e2e: %d FAILED\n", fails);
     return 1;

@@ -1,6 +1,9 @@
 #include "calc_runner.h"
 
 #include "CalcMatcher.h"
+#ifdef CALC_EQSAT
+#include "calc_eqsat.h"
+#endif
 #include "calc_compile.h"
 #include "Parser.h"
 
@@ -320,6 +323,13 @@ calc_ir::Node* calc_compile(const char* input, int* main_frame_size) {
 }
 
 std::vector<uint8_t> lower(calc_ir::Node* ir) {
+#ifdef CALC_EQSAT
+    // The rewrite pass runs HERE, at the IR→tile seam: it replaces each pure
+    // value subtree with the cheapest equivalent one and hands back a tree.
+    // Everything below is unchanged by its presence — that is the point of
+    // extract-then-tile, and compiling this out is what the falsifier does.
+    calc::eqsat_run(ir, calc::eqsat_default_caps());
+#endif
     // The burg matcher tiles the value sub-trees and walks the spine,
     // emitting opgen calc bytecode via cg_jump (CalcMatcher.h's rule
     // actions over calc::Emit). backpatch resolves every branch's

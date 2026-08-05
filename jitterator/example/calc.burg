@@ -38,6 +38,51 @@ TERM Halt       = calc_ir::Halt::kind_value
 TERM Leave      = calc_ir::Leave::kind_value
 TERM Call       = calc_ir::Call::kind_value
 
+// Auxiliaries the rewrite rules call. Each takes the class its binder
+// matched and returns the class of its result — that is the only currency
+// the rewriter has. The VALUE behind a class arrives on the class payload,
+// recorded by the stage that built the e-graph from the IR and had the
+// LoadConst in hand; nothing here reconstructs it.
+AUXILIARIES
+  calc_fold_add : (class, class) -> class
+  calc_fold_mul : (class, class) -> class
+
+// Directed equality axioms. `=>` only; nothing here reads memory or has an
+// effect, so every rule is a pure expression identity that holds in both
+// directions of the compiler's reasoning.
+//
+// calc has no shift node (CalcIR.h: LoadConst/LoadLocal/Add/Sub/Mul/Div/
+// Neg/Cmp*/Call and the control nodes), so the strength reduction is
+// `x*2 => x+x`, which uses only nodes that exist here.
+REWRITE {
+  // Constant folding: both operands are known, so the sum/product is too.
+  fold_add: Add($a, $b) => calc_fold_add($a, $b)
+      where (. calc_both_const(g, $a, $b) .);
+  fold_mul: Mul($a, $b) => calc_fold_mul($a, $b)
+      where (. calc_both_const(g, $a, $b) .);
+
+  // Identities.
+  add_zero: Add($x, $z) => $x where (. calc_is_const(g, $z, 0) .);
+  mul_one:  Mul($x, $o) => $x where (. calc_is_const(g, $o, 1) .);
+
+  // Strength reduction, guard-bearing: only when the multiplier is 2.
+  mul_two:  Mul($x, $t) => Add($x, $x) where (. calc_is_const(g, $t, 2) .);
+
+  // Nested pattern: the match descends into the second operand's class and
+  // binds inside it. `x + (-y)` is `x - y` — an identity that needs the
+  // shape, not a guard, which is what makes it the case that holds
+  // multi-level matching down.
+  add_neg:  Add($x, Neg($y)) => Sub($x, $y);
+  sub_neg:  Sub($x, Neg($y)) => Add($x, $y);
+
+  // Reassociation, and the case where an auxiliary is a CHILD of the node
+  // being built rather than the whole template: (x*a)*b is x*(a*b), and the
+  // a*b is folded on the spot. Holds down aux-nested-in-template, which no
+  // other rule here reaches.
+  mul_assoc: Mul(Mul($x, $a), $b) => Mul($x, calc_fold_mul($a, $b))
+      where (. calc_both_const(g, $a, $b) .);
+}
+
 MEMBERS (. bbq::Emit emit; .)
 
 (. #include "calc_codegen.h"

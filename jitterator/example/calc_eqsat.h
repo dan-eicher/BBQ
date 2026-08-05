@@ -1,0 +1,246 @@
+// calc_eqsat.h — the rewrite pass, slotted at calc's IR→tile seam.
+//
+// Build an e-graph from a value tree, saturate it with the axioms in
+// calc.burg's REWRITE section, extract the cheapest equivalent tree, and hand
+// THAT to the existing burg tiler, which is untouched. The tiler still
+// consumes a tree; it never learns an e-graph exists.
+//
+// What distinguishes a leaf travels in the e-node's `data`, because that is
+// part of what the node IS: two LoadLocals differ by slot and two LoadConsts
+// by value, and neither has children to tell them apart. Putting it anywhere
+// else would let the graph decide local 0 equals local 1. It also means the
+// value is still there at extraction — nothing has to reconstruct it from a
+// representation that dropped it.
+#pragma once
+
+#include "frontend/CalcIR.h"
+#include "calc_codegen.h"
+extern "C" {
+#include "egraph.h"
+}
+#include <cstdint>
+#include <vector>
+
+// ── Guards and auxiliaries the generated rewriter calls ────────────
+// Free functions: the emitted matcher is generated C over an opaque graph and
+// knows nothing of calc's namespaces. A guard reads a class's node data; an
+// auxiliary returns the class of its result, which is the rewriter's only
+// currency.
+
+// The value of `c`, when it is a known constant.
+inline bool calc_const_of(egraph* g, eg_id c, int64_t* out) {
+    for (int i = 0; i < eg_class_nodes(g, c); i++) {
+        if (eg_class_node_op(g, c, i) != calc_ir::LoadConst::kind_value) continue;
+        *out = eg_class_node_data(g, c, i);
+        return true;
+    }
+    return false;
+}
+
+inline bool calc_is_const(egraph* g, eg_id c, int64_t want) {
+    int64_t v;
+    return calc_const_of(g, c, &v) && v == want;
+}
+
+inline bool calc_both_const(egraph* g, eg_id a, eg_id b) {
+    int64_t x, y;
+    return calc_const_of(g, a, &x) && calc_const_of(g, b, &y);
+}
+
+inline eg_id calc_fold_add(egraph* g, eg_id a, eg_id b) {
+    int64_t x = 0, y = 0;
+    calc_const_of(g, a, &x);
+    calc_const_of(g, b, &y);
+    return eg_add(g, calc_ir::LoadConst::kind_value, x + y, nullptr, 0);
+}
+
+inline eg_id calc_fold_mul(egraph* g, eg_id a, eg_id b) {
+    int64_t x = 0, y = 0;
+    calc_const_of(g, a, &x);
+    calc_const_of(g, b, &y);
+    return eg_add(g, calc_ir::LoadConst::kind_value, x * y, nullptr, 0);
+}
+
+// The generated rewriter, included AFTER the guards and auxiliaries above:
+// it names calc's terminal ids and calls those functions, so it compiles
+// inside a translation unit that has them. Its own only #include is
+// egraph.h — it knows the graph and nothing else.
+#include "calc_rewrite.h"
+
+namespace calc {
+
+// ── IR → e-graph → IR ──────────────────────────────────────────────
+
+// Only pure value nodes enter the graph. Control and effects are the region's
+// boundary, not its content: a Branch or a StoreLocal is where a region ends,
+// and rewriting across one would be rewriting control flow. An impure node
+// enters as an opaque leaf keyed by its own identity, so it keeps its place
+// and no rule can look inside it.
+inline bool eqsat_is_pure(const calc_ir::Node* n) {
+    using T = calc_ir::NodeTag;
+    switch (n->tag) {
+    case T::LoadConst: case T::LoadLocal:
+    case T::Add: case T::Sub: case T::Mul: case T::Div: case T::Neg:
+    case T::CmpEq: case T::CmpNeq:
+    case T::CmpLt: case T::CmpLe: case T::CmpGt: case T::CmpGe:
+        return true;
+    default:
+        return false;   // Call, StoreLocal, Branch, Goto, Nop, …
+    }
+}
+
+inline eg_id eqsat_build(egraph* g, calc_ir::Node* n) {
+    // An opaque node is its own class, told apart by its identity — the same
+    // treatment Click gives one (`cp_new_opaque`: "an opaque source value —
+    // its own congruence class, no inputs").
+    if (!eqsat_is_pure(n))
+        return eg_add(g, ir_tag(n), (int64_t)(intptr_t)n, nullptr, 0);
+
+    if (n->tag == calc_ir::NodeTag::LoadConst)
+        return eg_add(g, ir_tag(n),
+                      static_cast<calc_ir::LoadConst*>(n)->value, nullptr, 0);
+    if (n->tag == calc_ir::NodeTag::LoadLocal)
+        return eg_add(g, ir_tag(n),
+                      static_cast<calc_ir::LoadLocal*>(n)->src, nullptr, 0);
+
+    int nk = operand_count(n);
+    std::vector<eg_id> kids;
+    kids.reserve((size_t)nk);
+    for (int i = 0; i < nk; i++)
+        kids.push_back(eqsat_build(g, operand_producer(n, i)));
+    return eg_add(g, ir_tag(n), 0, kids.empty() ? nullptr : kids.data(), nk);
+}
+
+// Rebuild IR from an extracted term. The runtime hands back (op, data, kids);
+// what those mean is this file's business, which is why the e-graph never had
+// to know.
+inline calc_ir::Node* eqsat_rebuild(const eg_extract_result& r, int i,
+                                    std::vector<calc_ir::Node*>& memo) {
+    if (memo[(size_t)i]) return memo[(size_t)i];
+    using T = calc_ir::NodeTag;
+    int op = r.ops[i];
+    int64_t d = r.data[i];
+    calc_ir::Node* out = nullptr;
+
+    if (op == calc_ir::LoadConst::kind_value) {
+        out = new calc_ir::LoadConst(d);
+    } else if (op == calc_ir::LoadLocal::kind_value) {
+        out = new calc_ir::LoadLocal(d);
+    } else if (r.nkids[i] == 0) {
+        // An opaque leaf: `data` is the node it came from, returned as-is.
+        out = (calc_ir::Node*)(intptr_t)d;
+    } else {
+        calc_ir::Node* a = eqsat_rebuild(r, r.kids[r.kid_off[i]], memo);
+        calc_ir::Node* b = r.nkids[i] > 1
+            ? eqsat_rebuild(r, r.kids[r.kid_off[i] + 1], memo) : nullptr;
+        switch ((T)op) {
+        case T::Add:    out = new calc_ir::Add(a, b);    break;
+        case T::Sub:    out = new calc_ir::Sub(a, b);    break;
+        case T::Mul:    out = new calc_ir::Mul(a, b);    break;
+        case T::Div:    out = new calc_ir::Div(a, b);    break;
+        case T::Neg:    out = new calc_ir::Neg(a);       break;
+        case T::CmpEq:  out = new calc_ir::CmpEq(a, b);  break;
+        case T::CmpNeq: out = new calc_ir::CmpNeq(a, b); break;
+        case T::CmpLt:  out = new calc_ir::CmpLt(a, b);  break;
+        case T::CmpLe:  out = new calc_ir::CmpLe(a, b);  break;
+        case T::CmpGt:  out = new calc_ir::CmpGt(a, b);  break;
+        case T::CmpGe:  out = new calc_ir::CmpGe(a, b);  break;
+        default:        out = nullptr;                   break;
+        }
+    }
+    memo[(size_t)i] = out;
+    return out;
+}
+
+// Per-terminal size cost. Extraction is size-first, so the table is what the
+// operator costs to emit — one opcode byte each here, except that a constant
+// carries its immediate.
+inline const int* eqsat_cost_table(int* len) {
+    static int cost[256];
+    static bool init = false;
+    if (!init) {
+        for (int i = 0; i < 256; i++) cost[i] = 1;
+        cost[calc_ir::LoadConst::kind_value] = 2;   // opcode + sleb immediate
+        init = true;
+    }
+    *len = 256;
+    return cost;
+}
+
+// The pass: one pure value tree in, its cheapest equivalent out.
+inline calc_ir::Node* eqsat_optimize(calc_ir::Node* root, eg_caps caps) {
+    if (!root || !eqsat_is_pure(root)) return root;
+
+    egraph g;
+    eg_init(&g);
+    eg_id c = eqsat_build(&g, root);
+    calc_rewrite_region(&g, caps);
+
+    int clen = 0;
+    const int* cost = eqsat_cost_table(&clen);
+    eg_extract_result r;
+    calc_ir::Node* out = root;
+    if (eg_extract(&g, c, cost, clen, &r)) {
+        std::vector<calc_ir::Node*> memo((size_t)r.count, nullptr);
+        out = eqsat_rebuild(r, r.root, memo);
+        eg_extract_free(&r);
+    }
+    eg_free(&g);
+    return out ? out : root;
+}
+
+// Walk the spine and rewrite each value operand hanging off it. The spine —
+// StoreLocal, Branch, Goto, Nop, the landing pads — is never touched: those
+// nodes are the region boundaries, and a Nop in particular is the label the
+// assembler resolves branches through, so moving one would break jump
+// resolution rather than optimise anything.
+inline void eqsat_run(calc_ir::Node* root, eg_caps caps) {
+    // Rewrite each pure value subtree hanging off the spine, and touch nothing
+    // else. The spine's control nodes are region boundaries, and a Nop in
+    // particular is the label the assembler resolves branches through.
+    //
+    // NOTE, and this is why the pins below are red: by the time the IR reaches
+    // this seam the DDCG has assigned destinations, so a binop's operands are
+    // LoadLocals rather than the values themselves. An e-graph built from
+    // `Mul(LoadLocal, LoadLocal)` cannot see that either operand is a constant,
+    // so no axiom fires. Resolving a load back to its binding is a real step,
+    // but it is a READ of the DDCG's recorded scope rows — the binding
+    // structure the DDCG knows as it builds — and calc records none. It is NOT
+    // a spine walk that clears a slot map on seeing a Nop or a Branch: that is
+    // rediscovering the scope nesting by matching on the lowering's shape.
+    std::vector<calc_ir::Node*> stack{root};
+    std::vector<calc_ir::Node*> seen;
+    while (!stack.empty()) {
+        calc_ir::Node* n = stack.back(); stack.pop_back();
+        if (!n) continue;
+        bool dup = false;
+        for (auto* s : seen) if (s == n) { dup = true; break; }
+        if (dup) continue;
+        seen.push_back(n);
+
+        for (int i = 0; i < operand_count(n); i++) {
+            calc_ir::Node* v = operand_producer(n, i);
+            if (!v) continue;
+            if (eqsat_is_pure(v)) {
+                calc_ir::Node* better = eqsat_optimize(v, caps);
+                if (better && better != v) set_operand_producer(n, i, better);
+            } else {
+                stack.push_back(v);
+            }
+        }
+        for (int i = 0; i < successor_count(n); i++)
+            stack.push_back(successor(n, i));
+    }
+}
+
+// The caps calc runs with. Small on purpose: a calculator's regions are
+// tiny, and a bound that is never reached would not demonstrate that the
+// bound exists.
+inline eg_caps eqsat_default_caps() {
+    eg_caps c;
+    c.rounds = 8;
+    c.node_budget = 4096;
+    return c;
+}
+
+}  // namespace calc

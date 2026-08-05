@@ -4,6 +4,7 @@
 #include <fstream>
 #include <algorithm>
 #include <cstring>
+#include <set>
 
 // ══════════════════════════════════════════════════════════
 // BurgGenerator — frontend (parse + analyze)
@@ -77,6 +78,116 @@ void BurgGenerator::classify_rules() {
     }
 }
 
+// Collect every `$name` a pattern binds. A binder may appear at any leaf;
+// the same name twice is a non-linear pattern, which the matcher would have
+// to prove equal — rejected rather than silently matching the first.
+static void collect_binders(const burg_ast::RewritePat* p,
+                            std::set<std::string>& out,
+                            std::vector<std::string>& dups) {
+    if (!p) return;
+    if (p->is_binder) {
+        if (!out.insert(p->name).second) dups.push_back(p->name);
+        return;
+    }
+    for (auto* c : p->children) collect_binders(c, out, dups);
+}
+
+void BurgGenerator::validate_rewrites() {
+    auto& a = analysis_;
+
+    // An auxiliary takes and returns e-classes, because that is the only
+    // currency a rewriter has: a binder binds a class, and a template's child
+    // must be a class. A signature naming anything else describes a domain
+    // the DSL does not have, and would disagree with the prototype emitted
+    // against it. Values reach an auxiliary on the class payload, recorded by
+    // whichever stage built the graph and knew them.
+    for (auto* d : a.spec->auxiliaries) {
+        for (auto& p : d->params)
+            if (p != "class")
+                errors_.push_back("auxiliary '" + d->name + "': parameter type '" +
+                                  p + "' — a rewrite auxiliary takes `class`; a "
+                                  "value reaches it on that class's payload");
+        if (d->ret != "class")
+            errors_.push_back("auxiliary '" + d->name + "': return type '" +
+                              d->ret + "' — a rewrite auxiliary returns `class`");
+    }
+
+    for (auto* rw : a.spec->rewrites) {
+        const std::string where = "rewrite '" + rw->name + "': ";
+
+        // Every operator named in the pattern is a terminal of THIS grammar —
+        // a rewrite that mentions a node the tiler cannot see would never fire.
+        std::vector<const burg_ast::RewritePat*> pstack{ rw->pattern };
+        while (!pstack.empty()) {
+            const burg_ast::RewritePat* p = pstack.back(); pstack.pop_back();
+            if (!p) continue;
+            if (!p->is_binder && !a.term_names.count(p->name))
+                errors_.push_back(where + "pattern operator '" + p->name +
+                                  "' is not a declared terminal");
+            for (auto* c : p->children) pstack.push_back(c);
+        }
+
+        std::set<std::string> bound;
+        std::vector<std::string> dups;
+        collect_binders(rw->pattern, bound, dups);
+        for (auto& d : dups)
+            errors_.push_back(where + "binder '$" + d +
+                              "' is bound twice; a non-linear pattern needs an "
+                              "equality the matcher cannot assume");
+
+        // The template builds over the same terminals, references binders the
+        // pattern bound, and calls declared auxiliaries. Which of the three a
+        // name denotes is resolved HERE against the declarations — the parser
+        // does not guess, so a name that is none of them is an error rather
+        // than an assumed helper call.
+        std::vector<burg_ast::RewriteTmpl*> tstack{ rw->tmpl };
+        while (!tstack.empty()) {
+            burg_ast::RewriteTmpl* t = tstack.back(); tstack.pop_back();
+            if (!t) continue;
+            if (t->kind == burg_ast::RewriteTmpl::Binder) {
+                if (!bound.count(t->name))
+                    errors_.push_back(where + "template references '$" + t->name +
+                                      "', which the pattern does not bind");
+            } else if (a.term_names.count(t->name)) {
+                t->kind = burg_ast::RewriteTmpl::Term;
+                // A template builds a node, so it names the constructor's real
+                // arity. A tiling PATTERN may be narrower than the constructor
+                // — a slot-based IR's BURG arity need not equal its node-field
+                // count — but construction has no such latitude. Only the ASDL
+                // overlay knows the true arity, so this holds when one is given.
+                if (completeness_cfg_.asdl) {
+                    auto it = completeness_cfg_.asdl->constructor_node_fields
+                                  .find(t->name);
+                    if (it != completeness_cfg_.asdl->constructor_node_fields.end() &&
+                        t->children.size() != it->second.size()) {
+                        errors_.push_back(where + "template builds '" + t->name +
+                            "' with " + std::to_string(t->children.size()) +
+                            " child(ren); the schema declares " +
+                            std::to_string(it->second.size()));
+                    }
+                }
+            } else {
+                const burg_ast::AuxDecl* aux = nullptr;
+                for (auto* d : a.spec->auxiliaries)
+                    if (d->name == t->name) { aux = d; break; }
+                if (!aux) {
+                    errors_.push_back(where + "'" + t->name +
+                                      "' is neither a declared terminal nor a "
+                                      "declared auxiliary");
+                } else {
+                    t->kind = burg_ast::RewriteTmpl::Helper;
+                    if (t->children.size() != aux->params.size())
+                        errors_.push_back(where + "auxiliary '" + t->name +
+                            "' takes " + std::to_string(aux->params.size()) +
+                            " argument(s), called with " +
+                            std::to_string(t->children.size()));
+                }
+            }
+            for (auto* c : t->children) tstack.push_back(c);
+        }
+    }
+}
+
 bool BurgGenerator::analyze(burg_ast::Spec* spec) {
     analysis_ = BurgAnalysis{};
     analysis_.spec = spec;
@@ -112,6 +223,8 @@ bool BurgGenerator::analyze(burg_ast::Spec* spec) {
             }
         }
     }
+
+    validate_rewrites();
 
     // ENTRY nonterminals must exist. A typo that silently did nothing would hand
     // back exactly the dead-rule warnings the declaration exists to remove, so

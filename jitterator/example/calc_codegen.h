@@ -82,6 +82,45 @@ static inline calc_ir::Node* operand_producer(const calc_ir::Node* n, int i) {
     }
 }
 
+// The write half of operand_producer. A pass that replaces a value subtree
+// with an equivalent one — the rewrite pass does exactly that — needs to put
+// the new tree back where the old one was. Kept beside the reader so the two
+// cannot describe different operand orders.
+static inline void set_operand_producer(calc_ir::Node* n, int i,
+                                        calc_ir::Node* v) {
+    using T = calc_ir::NodeTag;
+    switch (n->tag) {
+    case T::Add:    (i == 0 ? static_cast<calc_ir::Add*   >(n)->left
+                            : static_cast<calc_ir::Add*   >(n)->right) = v; break;
+    case T::Sub:    (i == 0 ? static_cast<calc_ir::Sub*   >(n)->left
+                            : static_cast<calc_ir::Sub*   >(n)->right) = v; break;
+    case T::Mul:    (i == 0 ? static_cast<calc_ir::Mul*   >(n)->left
+                            : static_cast<calc_ir::Mul*   >(n)->right) = v; break;
+    case T::Div:    (i == 0 ? static_cast<calc_ir::Div*   >(n)->left
+                            : static_cast<calc_ir::Div*   >(n)->right) = v; break;
+    case T::CmpEq:  (i == 0 ? static_cast<calc_ir::CmpEq* >(n)->left
+                            : static_cast<calc_ir::CmpEq* >(n)->right) = v; break;
+    case T::CmpNeq: (i == 0 ? static_cast<calc_ir::CmpNeq*>(n)->left
+                            : static_cast<calc_ir::CmpNeq*>(n)->right) = v; break;
+    case T::CmpLt:  (i == 0 ? static_cast<calc_ir::CmpLt* >(n)->left
+                            : static_cast<calc_ir::CmpLt* >(n)->right) = v; break;
+    case T::CmpLe:  (i == 0 ? static_cast<calc_ir::CmpLe* >(n)->left
+                            : static_cast<calc_ir::CmpLe* >(n)->right) = v; break;
+    case T::CmpGt:  (i == 0 ? static_cast<calc_ir::CmpGt* >(n)->left
+                            : static_cast<calc_ir::CmpGt* >(n)->right) = v; break;
+    case T::CmpGe:  (i == 0 ? static_cast<calc_ir::CmpGe* >(n)->left
+                            : static_cast<calc_ir::CmpGe* >(n)->right) = v; break;
+    case T::Neg:        static_cast<calc_ir::Neg*       >(n)->operand = v; break;
+    case T::StoreLocal: static_cast<calc_ir::StoreLocal*>(n)->value   = v; break;
+    case T::ExprEffect: static_cast<calc_ir::ExprEffect*>(n)->value   = v; break;
+    case T::Branch:     static_cast<calc_ir::Branch*    >(n)->test    = v; break;
+    case T::Leave:      static_cast<calc_ir::Leave*     >(n)->value   = v; break;
+    case T::Halt:       static_cast<calc_ir::Halt*      >(n)->value   = v; break;
+    case T::Call:       static_cast<calc_ir::Call*      >(n)->args[i] = v; break;
+    default: break;
+    }
+}
+
 static inline int successor_count(const calc_ir::Node* n) {
     using T = calc_ir::NodeTag;
     switch (n->tag) {

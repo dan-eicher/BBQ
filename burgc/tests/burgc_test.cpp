@@ -1456,6 +1456,229 @@ TEST(BurgCBackend, NoClassWrapper) {
 
 // ── COMPILER (namespace) tests ────────────────────────────
 
+// ── REWRITE section ────────────────────────────────────────────────
+// Directed rewrite rules over the SAME terminals the tiling rules use.
+// Patterns bind leaves with $name; templates build a tree from those
+// binders, terminals, and @helper() escapes for computed immediates.
+// The section is pure data — no statements, no control flow.
+
+static burg_ast::Spec* parse_spec(const char* input, Parser& parser) {
+    parser.init(input, (int)strlen(input));
+    return parser.parse() ? parser.ast : nullptr;
+}
+
+TEST(BurgRewrite, ParsesSectionIntoRules) {
+    Parser parser;
+    auto* ast = parse_spec(
+        "TERM Add=1 TERM Mul=2 TERM Shl=3 TERM Const=4\n"
+        "AUXILIARIES\n"
+        "  ctz : (class) -> class\n"
+        "REWRITE {\n"
+        "  mul_pow2: Mul($x, Const($k)) => Shl($x, ctz($k)) where (. is_pow2($k) .);\n"
+        "  add_zero: Add($x, Const($z)) => $x;\n"
+        "}\n"
+        "RULES r: Add(r, r) = 1;", parser);
+    ASSERT_NE(ast, nullptr);
+    ASSERT_EQ(ast->auxiliaries.size(), 1u);
+    EXPECT_EQ(ast->auxiliaries[0]->name, "ctz");
+    ASSERT_EQ(ast->auxiliaries[0]->params.size(), 1u);
+    EXPECT_EQ(ast->auxiliaries[0]->ret, "class");
+    ASSERT_EQ(ast->rewrites.size(), 2u);
+
+    // Terminal-vs-auxiliary is resolved during analysis against the
+    // declarations, so classify before asserting on the kinds.
+    BurgGenerator gen;
+    ASSERT_TRUE(gen.analyze(ast)) << gen.errors().empty();
+
+    auto* mp = ast->rewrites[0];
+    EXPECT_EQ(mp->name, "mul_pow2");
+    EXPECT_EQ(mp->pattern->name, "Mul");
+    ASSERT_EQ(mp->pattern->children.size(), 2u);
+    EXPECT_TRUE(mp->pattern->children[0]->is_binder);
+    EXPECT_EQ(mp->pattern->children[0]->name, "x");
+    EXPECT_EQ(mp->pattern->children[1]->name, "Const");
+    EXPECT_TRUE(mp->pattern->children[1]->children[0]->is_binder);
+    EXPECT_EQ(mp->guard, " is_pow2($k) ");
+
+    // Template: Shl($x, ctz($k)) — a terminal over a binder and an auxiliary.
+    EXPECT_EQ(mp->tmpl->kind, burg_ast::RewriteTmpl::Term);
+    EXPECT_EQ(mp->tmpl->name, "Shl");
+    ASSERT_EQ(mp->tmpl->children.size(), 2u);
+    EXPECT_EQ(mp->tmpl->children[0]->kind, burg_ast::RewriteTmpl::Binder);
+    EXPECT_EQ(mp->tmpl->children[1]->kind, burg_ast::RewriteTmpl::Helper);
+    EXPECT_EQ(mp->tmpl->children[1]->name, "ctz");
+
+    // A template may be a bare binder — that is the identity rewrite.
+    EXPECT_EQ(ast->rewrites[1]->tmpl->kind, burg_ast::RewriteTmpl::Binder);
+    EXPECT_EQ(ast->rewrites[1]->tmpl->name, "x");
+}
+
+// A template BUILDS a node, so it must name the constructor's real arity.
+// Tiling patterns may legitimately be narrower than the constructor (a
+// slot-based IR's BURG arity need not equal its node-field count), but
+// construction has no such latitude: the wrong arity is a node that cannot
+// exist. Checked only when an ASDL schema is supplied, since that is the
+// only thing that knows the true arity.
+TEST(BurgRewrite, RejectsTemplateArityAgainstAsdlSchema) {
+    Parser parser;
+    auto* ast = parse_spec(
+        "TERM Add=1 TERM Shl=2\n"
+        "REWRITE { bad: Add($x, $y) => Shl($x); }\n"
+        "RULES r: Add(r, r) = 1;", parser);
+    ASSERT_NE(ast, nullptr);
+
+    AsdlSchema schema;
+    schema.constructor_node_fields["Add"] = {"Node", "Node"};
+    schema.constructor_node_fields["Shl"] = {"Node", "Node"};  // Shl takes two
+    AnalysisConfig cfg;
+    cfg.asdl = &schema;
+
+    BurgGenerator gen;
+    gen.set_completeness_config(cfg);
+    EXPECT_FALSE(gen.analyze(ast));
+    EXPECT_FALSE(gen.errors().empty());
+}
+
+TEST(BurgRewrite, AcceptsTemplateAtSchemaArity) {
+    Parser parser;
+    auto* ast = parse_spec(
+        "TERM Add=1 TERM Shl=2\n"
+        "REWRITE { ok: Add($x, $y) => Shl($x, $y); }\n"
+        "RULES r: Add(r, r) = 1;", parser);
+    ASSERT_NE(ast, nullptr);
+
+    AsdlSchema schema;
+    schema.constructor_node_fields["Add"] = {"Node", "Node"};
+    schema.constructor_node_fields["Shl"] = {"Node", "Node"};
+    AnalysisConfig cfg;
+    cfg.asdl = &schema;
+
+    BurgGenerator gen;
+    gen.set_completeness_config(cfg);
+    EXPECT_TRUE(gen.analyze(ast));
+}
+
+TEST(BurgRewrite, RejectsUnboundTemplateBinder) {
+    Parser parser;
+    auto* ast = parse_spec(
+        "TERM Add=1 TERM Mul=2\n"
+        "REWRITE { bad: Add($x, $y) => Mul($x, $zzz); }\n"
+        "RULES r: Add(r, r) = 1;", parser);
+    ASSERT_NE(ast, nullptr);
+    BurgGenerator gen;
+    EXPECT_FALSE(gen.analyze(ast));
+    EXPECT_FALSE(gen.errors().empty());
+}
+
+TEST(BurgRewrite, RejectsUndeclaredTemplateTerminal) {
+    Parser parser;
+    auto* ast = parse_spec(
+        "TERM Add=1\n"
+        "REWRITE { bad: Add($x, $y) => Nonesuch($x, $y); }\n"
+        "RULES r: Add(r, r) = 1;", parser);
+    ASSERT_NE(ast, nullptr);
+    BurgGenerator gen;
+    EXPECT_FALSE(gen.analyze(ast));
+    EXPECT_FALSE(gen.errors().empty());
+}
+
+// The declaration and the emitted prototype must agree, so the signature can
+// only name the domain the rewriter has. `(int)` would describe a value the
+// auxiliary is never handed — values arrive on the class payload.
+TEST(BurgRewrite, RejectsAuxiliarySignatureOutsideTheDslDomain) {
+    Parser parser;
+    auto* ast = parse_spec(
+        "TERM Add=1 TERM Const=2\n"
+        "AUXILIARIES\n"
+        "  ctz : (int) -> int\n"
+        "REWRITE { r1: Add($x, $y) => Const(ctz($x)); }\n"
+        "RULES r: Add(r, r) = 1;", parser);
+    ASSERT_NE(ast, nullptr);
+    BurgGenerator gen;
+    EXPECT_FALSE(gen.analyze(ast));
+    EXPECT_FALSE(gen.errors().empty());
+}
+
+// An auxiliary is called at its declared arity. Getting this wrong emits a
+// call the C compiler rejects much later, with the .burg file out of sight.
+TEST(BurgRewrite, RejectsAuxiliaryArityMismatch) {
+    Parser parser;
+    auto* ast = parse_spec(
+        "TERM Add=1 TERM Const=2\n"
+        "AUXILIARIES\n"
+        "  ctz : (class) -> class\n"
+        "REWRITE { bad: Add($x, $y) => Const(ctz($x, $y)); }\n"
+        "RULES r: Add(r, r) = 1;", parser);
+    ASSERT_NE(ast, nullptr);
+    BurgGenerator gen;
+    EXPECT_FALSE(gen.analyze(ast));
+    EXPECT_FALSE(gen.errors().empty());
+}
+
+TEST(BurgRewrite, RejectsUndeclaredPatternTerminal) {
+    Parser parser;
+    auto* ast = parse_spec(
+        "TERM Add=1\n"
+        "REWRITE { bad: Nonesuch($x) => $x; }\n"
+        "RULES r: Add(r, r) = 1;", parser);
+    ASSERT_NE(ast, nullptr);
+    BurgGenerator gen;
+    EXPECT_FALSE(gen.analyze(ast));
+    EXPECT_FALSE(gen.errors().empty());
+}
+
+// ── C4: the generated rewriter ─────────────────────────────────────
+
+static std::string gen_rewrite(const char* input) {
+    Parser parser;
+    parser.init(input, (int)strlen(input));
+    if (!parser.parse() || !parser.ast) return "";
+    BurgGenerator gen;
+    if (!gen.analyze(parser.ast)) return "";
+    std::ostringstream out;
+    emit_rewriter(out, gen.analysis(), "calc");
+    return out.str();
+}
+
+static const char* kRewriteSpec =
+    "TERM Add=1 TERM Mul=2 TERM Shl=3 TERM Const=4\n"
+    "AUXILIARIES\n"
+    "  ctz : (class) -> class\n"
+    "REWRITE {\n"
+    "  mul_pow2: Mul($x, Const($k)) => Shl($x, ctz($k)) where (. is_pow2($k) .);\n"
+    "  add_zero: Add($x, $z) => $x;\n"
+    "}\n"
+    "RULES r: Add(r, r) = 1;";
+
+TEST(BurgRewriteEmit, EmitsEntryPointAndRuleTable) {
+    std::string code = gen_rewrite(kRewriteSpec);
+    ASSERT_FALSE(code.empty());
+    // One entry point, named for the grammar, taking the graph and its caps.
+    EXPECT_NE(code.find("calc_rewrite_region(egraph* g, eg_caps caps)"),
+              std::string::npos) << code;
+    // Each rule becomes a matcher function carrying its own name.
+    EXPECT_NE(code.find("mul_pow2"), std::string::npos);
+    EXPECT_NE(code.find("add_zero"), std::string::npos);
+    // The guard escape is inlined verbatim, not described.
+    EXPECT_NE(code.find("is_pow2("), std::string::npos);
+    // The auxiliary is called by plain name.
+    EXPECT_NE(code.find("ctz("), std::string::npos);
+}
+
+// The emitted rewriter talks to the e-graph and to nothing else: any other
+// dependency is a coupling that would have to be satisfied by every
+// consumer of every grammar.
+TEST(BurgRewriteEmit, CallsOnlyTheEgraphApi) {
+    std::string code = gen_rewrite(kRewriteSpec);
+    ASSERT_FALSE(code.empty());
+    EXPECT_NE(code.find("#include \"egraph.h\""), std::string::npos);
+    // No other include, and no libc pulled in behind the caller's back.
+    size_t inc = code.find("#include");
+    int includes = 0;
+    while (inc != std::string::npos) { includes++; inc = code.find("#include", inc + 1); }
+    EXPECT_EQ(includes, 1) << code;
+}
+
 TEST(BurgParser, ParsesNamespace) {
     Parser parser;
     const char* input = "TERM X=1 COMPILER foo RULES r: X = 1;";

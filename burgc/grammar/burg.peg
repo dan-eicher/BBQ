@@ -32,8 +32,10 @@ Burg
        std::string private_block;
        std::vector<std::string> headers;
        std::vector<burg_ast::Rule*> rules;
+       std::vector<burg_ast::RewriteRule*> rewrites;
+       std::vector<burg_ast::AuxDecl*> auxes;
        burg_ast::Rule* r; .)
-    = { Decl<terms, start_sym, entry_syms, ns, members_block, private_block, headers> }
+    = { Decl<terms, start_sym, entry_syms, ns, members_block, private_block, headers, auxes, rewrites> }
       "RULES"
       { RuleDecl<&r>  (. rules.push_back(r); .) }
       (. skip(); if (!at_end()) return false; .)
@@ -46,11 +48,15 @@ Burg
        ast->private_helpers = std::move(private_block);
        ast->headers = std::move(headers);
        ast->rules = std::move(rules);
+       ast->auxiliaries = std::move(auxes);
+       ast->rewrites = std::move(rewrites);
        ast->loc = {1, 1}; .)
 .
 
-Decl <. std::vector<burg_ast::TermDecl*> &terms, std::string &start, std::vector<std::string> &entries, std::string &ns, std::string &members, std::string &priv, std::vector<std::string> &headers .>
+Decl <. std::vector<burg_ast::TermDecl*> &terms, std::string &start, std::vector<std::string> &entries, std::string &ns, std::string &members, std::string &priv, std::vector<std::string> &headers, std::vector<burg_ast::AuxDecl*> &auxes, std::vector<burg_ast::RewriteRule*> &rewrites .>
     = TermDecl_<terms>
+    | AuxSection<auxes>
+    | RewriteSection<rewrites>
     | StartDecl<start>
     | EntryDecl<entries>
     | NamespaceDecl<ns>
@@ -161,6 +167,126 @@ TreePat <. burg_ast::TreePattern* *result .>
         ")"
       ]
     (. *result = new burg_ast::TreePattern();
+       (*result)->name = std::move(name);
+       (*result)->children = std::move(children);
+       (*result)->loc = loc; .)
+.
+
+// ── AUXILIARIES ────────────────────────────────────────────────────
+// Foreign helpers a rewrite template may call, declared with signatures
+// exactly as ddcgc's AUXILIARIES and opgen's `native` declare theirs:
+//
+//   AUXILIARIES
+//     ctz : (int) -> int
+//
+// One declaration form across the toolchain's DSLs, and a name a template
+// uses without declaring stays an error instead of silently becoming a call.
+
+AuxSection <. std::vector<burg_ast::AuxDecl*> &out .>
+    (. burg_ast::AuxDecl* ad; .)
+    = "AUXILIARIES"
+      { AuxDecl_<&ad>  (. out.push_back(ad); .) }
+.
+
+AuxDecl_ <. burg_ast::AuxDecl* *result .>
+    (. peg::Span name_span; peg::Span ty_span;
+       std::string name; std::string ret;
+       std::vector<std::string> params; .)
+    = ident<name_span>  (. name = name_span.to_string();
+                          burg_ast::SourceLoc loc = {line(), col()}; .)
+      ":" "("
+      [ ident<ty_span>       (. params.push_back(ty_span.to_string()); .)
+        { "," ident<ty_span> (. params.push_back(ty_span.to_string()); .) }
+      ]
+      ")" "->" ident<ty_span>  (. ret = ty_span.to_string(); .)
+    (. *result = new burg_ast::AuxDecl();
+       (*result)->name = std::move(name);
+       (*result)->params = std::move(params);
+       (*result)->ret = std::move(ret);
+       (*result)->loc = loc; .)
+.
+
+// ── REWRITE section ────────────────────────────────────────────────
+//
+//   REWRITE {
+//     name: Pattern => Template [where (. guard .)] ;
+//   }
+//
+// Patterns are the tiling grammar's tree patterns with `$name` binders at
+// leaves. Templates build a tree from terminals, those binders, and
+// `@helper(...)` escapes for computed immediates. `=>` only: a
+// bidirectional axiom is two rules.
+
+RewriteSection <. std::vector<burg_ast::RewriteRule*> &out .>
+    (. burg_ast::RewriteRule* rr; .)
+    = "REWRITE" "{"
+      { RewriteRule_<&rr>  (. out.push_back(rr); .) }
+      "}"
+.
+
+RewriteRule_ <. burg_ast::RewriteRule* *result .>
+    (. peg::Span name_span;
+       std::string name;
+       burg_ast::RewritePat* pat;
+       burg_ast::RewriteTmpl* tmpl;
+       std::string guard; .)
+    = ident<name_span>  (. name = name_span.to_string();
+                          burg_ast::SourceLoc loc = {line(), col()}; .)
+      ":"
+      RewritePat_<&pat>
+      "=>"
+      RewriteTmpl_<&tmpl>
+      [ "where"
+        "(." (. if (!scan_to("." ")", guard)) return false; .) ]
+      ";"
+    (. *result = new burg_ast::RewriteRule();
+       (*result)->name = std::move(name);
+       (*result)->pattern = pat;
+       (*result)->tmpl = tmpl;
+       (*result)->guard = std::move(guard);
+       (*result)->loc = loc; .)
+.
+
+RewritePat_ <. burg_ast::RewritePat* *result .>
+    (. peg::Span name_span;
+       std::string name;
+       bool is_binder = false;
+       std::vector<burg_ast::RewritePat*> children;
+       burg_ast::RewritePat* child; .)
+    = ( "$" ident<name_span>  (. name = name_span.to_string(); is_binder = true; .)
+      | ident<name_span>      (. name = name_span.to_string(); .)
+        [ "("
+          RewritePat_<&child>     (. children.push_back(child); .)
+          { "," RewritePat_<&child> (. children.push_back(child); .) }
+          ")"
+        ]
+      )
+    (. burg_ast::SourceLoc loc = {line(), col()};
+       *result = new burg_ast::RewritePat();
+       (*result)->name = std::move(name);
+       (*result)->is_binder = is_binder;
+       (*result)->children = std::move(children);
+       (*result)->loc = loc; .)
+.
+
+RewriteTmpl_ <. burg_ast::RewriteTmpl* *result .>
+    (. peg::Span name_span;
+       std::string name;
+       burg_ast::RewriteTmpl::Kind kind = burg_ast::RewriteTmpl::Term;
+       std::vector<burg_ast::RewriteTmpl*> children;
+       burg_ast::RewriteTmpl* child; .)
+    = ( "$" ident<name_span>
+          (. name = name_span.to_string(); kind = burg_ast::RewriteTmpl::Binder; .)
+      | ident<name_span>  (. name = name_span.to_string(); .)
+        [ "("
+          RewriteTmpl_<&child>     (. children.push_back(child); .)
+          { "," RewriteTmpl_<&child> (. children.push_back(child); .) }
+          ")"
+        ]
+      )
+    (. burg_ast::SourceLoc loc = {line(), col()};
+       *result = new burg_ast::RewriteTmpl();
+       (*result)->kind = kind;
        (*result)->name = std::move(name);
        (*result)->children = std::move(children);
        (*result)->loc = loc; .)

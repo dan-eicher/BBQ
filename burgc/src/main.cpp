@@ -23,6 +23,13 @@ static void usage() {
         "                     completeness analysis uses precise per-position\n"
         "                     demand from the IR's constructor schema instead of\n"
         "                     the heuristic derived from rule patterns alone.\n"
+        "  --rewrite          Emit the REWRITE section as a saturating pass\n"
+        "                     instead of a tiling matcher: one matcher per rule\n"
+        "                     plus <name>_rewrite_region(egraph*, eg_caps). The\n"
+        "                     pass runs BEFORE the tiler, over an e-graph, and\n"
+        "                     hands back a tree the tiler consumes unchanged.\n"
+        "                     Requires -o; -name sets the entry point's prefix.\n"
+        "  -name <prefix>     Entry-point prefix for --rewrite (default: burg).\n"
         "  --strict           Treat warnings as errors (CI gating).\n"
         "  --coverage         Run the full tree-automaton analysis: dead-rule\n"
         "                     warnings plus shape-enumeration warnings for\n"
@@ -43,6 +50,8 @@ int main(int argc, char** argv) {
     bool strict = false;
     bool coverage = false;
     bool rule_table = false;
+    bool rewrite_mode = false;
+    std::string rewrite_name = "burg";
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-i") == 0 && i + 1 < argc) {
@@ -61,6 +70,10 @@ int main(int argc, char** argv) {
             coverage = true;
         } else if (strcmp(argv[i], "--emit-rule-table") == 0) {
             rule_table = true;
+        } else if (strcmp(argv[i], "--rewrite") == 0) {
+            rewrite_mode = true;
+        } else if (strcmp(argv[i], "-name") == 0 && i + 1 < argc) {
+            rewrite_name = argv[++i];
         } else if (strcmp(argv[i], "-h") == 0) {
             usage();
             return 0;
@@ -118,6 +131,24 @@ int main(int argc, char** argv) {
     // checks where the user just wants the warnings.
     if (output_file.empty() && frame_dir.empty())
         return 0;
+
+    // --rewrite emits a different artifact entirely: a saturating pass that
+    // runs BEFORE the tiler, over an e-graph rather than a tree. It shares
+    // the spec's terminals and nothing else, so it does not go through a
+    // BurgBackend.
+    if (rewrite_mode) {
+        if (spec->rewrites.empty()) {
+            fprintf(stderr, "error: --rewrite but the spec has no REWRITE section\n");
+            return 1;
+        }
+        std::ofstream out(output_file);
+        if (!out) {
+            fprintf(stderr, "error: cannot write %s\n", output_file.c_str());
+            return 1;
+        }
+        emit_rewriter(out, gen.analysis(), rewrite_name);
+        return 0;
+    }
 
     std::unique_ptr<BurgBackend> backend;
     if (lang == "c")

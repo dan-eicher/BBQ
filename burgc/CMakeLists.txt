@@ -33,7 +33,8 @@ add_library(burgc_lib STATIC
     src/generator.cpp
     src/completeness.cpp
     src/cpp_backend.cpp
-    src/c_backend.cpp)
+    src/c_backend.cpp
+    src/rewrite_backend.cpp)
 target_include_directories(burgc_lib PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_SOURCE_DIR}/lib
@@ -48,7 +49,13 @@ target_link_libraries(burgc PRIVATE burgc_lib)
 find_package(GTest REQUIRED)
 enable_testing()
 add_executable(burgc_tests
-    tests/burgc_test.cpp)
+    tests/burgc_test.cpp
+    tests/egraph_test.cpp
+    runtime/egraph.c
+    ${CMAKE_SOURCE_DIR}/crt/bbq_hmap.c)
+target_include_directories(burgc_tests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/runtime
+    ${CMAKE_SOURCE_DIR}/crt)
 target_link_libraries(burgc_tests PRIVATE burgc_lib GTest::GTest GTest::Main)
 target_compile_definitions(burgc_tests PRIVATE
     SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")

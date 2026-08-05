@@ -107,12 +107,14 @@ bool Parser::parse_Burg() {
        std::string private_block;
        std::vector<std::string> headers;
        std::vector<burg_ast::Rule*> rules;
+       std::vector<burg_ast::RewriteRule*> rewrites;
+       std::vector<burg_ast::AuxDecl*> auxes;
        burg_ast::Rule* r;
     for (;;) {
         auto _m0 = save();
         if (![&]() -> bool {
             skip();
-            if (!parse_Decl(terms, start_sym, entry_syms, ns, members_block, private_block, headers)) return false;
+            if (!parse_Decl(terms, start_sym, entry_syms, ns, members_block, private_block, headers, auxes, rewrites)) return false;
             return true;
         }()) { restore(_m0); break; }
     }
@@ -137,16 +139,30 @@ bool Parser::parse_Burg() {
        ast->private_helpers = std::move(private_block);
        ast->headers = std::move(headers);
        ast->rules = std::move(rules);
+       ast->auxiliaries = std::move(auxes);
+       ast->rewrites = std::move(rewrites);
        ast->loc = {1, 1};
     return true;
 }
 
-bool Parser::parse_Decl(std::vector<burg_ast::TermDecl*>& terms, std::string& start, std::vector<std::string>& entries, std::string& ns, std::string& members, std::string& priv, std::vector<std::string>& headers) {
+bool Parser::parse_Decl(std::vector<burg_ast::TermDecl*>& terms, std::string& start, std::vector<std::string>& entries, std::string& ns, std::string& members, std::string& priv, std::vector<std::string>& headers, std::vector<burg_ast::AuxDecl*>& auxes, std::vector<burg_ast::RewriteRule*>& rewrites) {
     {
         auto _m0 = save();
         if ([&]() -> bool {
             skip();
             if (!parse_TermDecl_(terms)) return false;
+            return true;
+        }()) {} else {
+        restore(_m0);
+        if ([&]() -> bool {
+            skip();
+            if (!parse_AuxSection(auxes)) return false;
+            return true;
+        }()) {} else {
+        restore(_m0);
+        if ([&]() -> bool {
+            skip();
+            if (!parse_RewriteSection(rewrites)) return false;
             return true;
         }()) {} else {
         restore(_m0);
@@ -182,6 +198,8 @@ bool Parser::parse_Decl(std::vector<burg_ast::TermDecl*>& terms, std::string& st
         restore(_m0);
         skip();
         if (!parse_HeaderAction_(headers)) return false;
+        }
+        }
         }
         }
         }
@@ -382,6 +400,239 @@ bool Parser::parse_TreePat(burg_ast::TreePattern* * result) {
         }()) restore(_m0);
     }
     *result = new burg_ast::TreePattern();
+       (*result)->name = std::move(name);
+       (*result)->children = std::move(children);
+       (*result)->loc = loc;
+    return true;
+}
+
+bool Parser::parse_AuxSection(std::vector<burg_ast::AuxDecl*>& out) {
+    burg_ast::AuxDecl* ad;
+    skip();
+    if (!match("AUXILIARIES")) return false;
+    for (;;) {
+        auto _m0 = save();
+        if (![&]() -> bool {
+            skip();
+            if (!parse_AuxDecl_(&ad)) return false;
+            out.push_back(ad);
+            return true;
+        }()) { restore(_m0); break; }
+    }
+    return true;
+}
+
+bool Parser::parse_AuxDecl_(burg_ast::AuxDecl* * result) {
+    peg::Span name_span; peg::Span ty_span;
+       std::string name; std::string ret;
+       std::vector<std::string> params;
+    skip();
+    if (!ident(name_span)) return false;
+    name = name_span.to_string();
+                          burg_ast::SourceLoc loc = {line(), col()};
+    skip();
+    if (!match(":")) return false;
+    skip();
+    if (!match("(")) return false;
+    {
+        auto _m0 = save();
+        if (![&]() -> bool {
+            skip();
+            if (!ident(ty_span)) return false;
+            params.push_back(ty_span.to_string());
+            for (;;) {
+                auto _m1 = save();
+                if (![&]() -> bool {
+                    skip();
+                    if (!match(",")) return false;
+                    skip();
+                    if (!ident(ty_span)) return false;
+                    params.push_back(ty_span.to_string());
+                    return true;
+                }()) { restore(_m1); break; }
+            }
+            return true;
+        }()) restore(_m0);
+    }
+    skip();
+    if (!match(")")) return false;
+    skip();
+    if (!match("->")) return false;
+    skip();
+    if (!ident(ty_span)) return false;
+    ret = ty_span.to_string();
+    *result = new burg_ast::AuxDecl();
+       (*result)->name = std::move(name);
+       (*result)->params = std::move(params);
+       (*result)->ret = std::move(ret);
+       (*result)->loc = loc;
+    return true;
+}
+
+bool Parser::parse_RewriteSection(std::vector<burg_ast::RewriteRule*>& out) {
+    burg_ast::RewriteRule* rr;
+    skip();
+    if (!match("REWRITE")) return false;
+    skip();
+    if (!match("{")) return false;
+    for (;;) {
+        auto _m0 = save();
+        if (![&]() -> bool {
+            skip();
+            if (!parse_RewriteRule_(&rr)) return false;
+            out.push_back(rr);
+            return true;
+        }()) { restore(_m0); break; }
+    }
+    skip();
+    if (!match("}")) return false;
+    return true;
+}
+
+bool Parser::parse_RewriteRule_(burg_ast::RewriteRule* * result) {
+    peg::Span name_span;
+       std::string name;
+       burg_ast::RewritePat* pat;
+       burg_ast::RewriteTmpl* tmpl;
+       std::string guard;
+    skip();
+    if (!ident(name_span)) return false;
+    name = name_span.to_string();
+                          burg_ast::SourceLoc loc = {line(), col()};
+    skip();
+    if (!match(":")) return false;
+    skip();
+    if (!parse_RewritePat_(&pat)) return false;
+    skip();
+    if (!match("=>")) return false;
+    skip();
+    if (!parse_RewriteTmpl_(&tmpl)) return false;
+    {
+        auto _m0 = save();
+        if (![&]() -> bool {
+            skip();
+            if (!match("where")) return false;
+            skip();
+            if (!match("(.")) return false;
+            if (!scan_to("." ")", guard)) return false;
+            return true;
+        }()) restore(_m0);
+    }
+    skip();
+    if (!match(";")) return false;
+    *result = new burg_ast::RewriteRule();
+       (*result)->name = std::move(name);
+       (*result)->pattern = pat;
+       (*result)->tmpl = tmpl;
+       (*result)->guard = std::move(guard);
+       (*result)->loc = loc;
+    return true;
+}
+
+bool Parser::parse_RewritePat_(burg_ast::RewritePat* * result) {
+    peg::Span name_span;
+       std::string name;
+       bool is_binder = false;
+       std::vector<burg_ast::RewritePat*> children;
+       burg_ast::RewritePat* child;
+    {
+        auto _m0 = save();
+        if ([&]() -> bool {
+            skip();
+            if (!match("$")) return false;
+            skip();
+            if (!ident(name_span)) return false;
+            name = name_span.to_string(); is_binder = true;
+            return true;
+        }()) {} else {
+        restore(_m0);
+        skip();
+        if (!ident(name_span)) return false;
+        name = name_span.to_string();
+        {
+            auto _m1 = save();
+            if (![&]() -> bool {
+                skip();
+                if (!match("(")) return false;
+                skip();
+                if (!parse_RewritePat_(&child)) return false;
+                children.push_back(child);
+                for (;;) {
+                    auto _m2 = save();
+                    if (![&]() -> bool {
+                        skip();
+                        if (!match(",")) return false;
+                        skip();
+                        if (!parse_RewritePat_(&child)) return false;
+                        children.push_back(child);
+                        return true;
+                    }()) { restore(_m2); break; }
+                }
+                skip();
+                if (!match(")")) return false;
+                return true;
+            }()) restore(_m1);
+        }
+        }
+    }
+    burg_ast::SourceLoc loc = {line(), col()};
+       *result = new burg_ast::RewritePat();
+       (*result)->name = std::move(name);
+       (*result)->is_binder = is_binder;
+       (*result)->children = std::move(children);
+       (*result)->loc = loc;
+    return true;
+}
+
+bool Parser::parse_RewriteTmpl_(burg_ast::RewriteTmpl* * result) {
+    peg::Span name_span;
+       std::string name;
+       burg_ast::RewriteTmpl::Kind kind = burg_ast::RewriteTmpl::Term;
+       std::vector<burg_ast::RewriteTmpl*> children;
+       burg_ast::RewriteTmpl* child;
+    {
+        auto _m0 = save();
+        if ([&]() -> bool {
+            skip();
+            if (!match("$")) return false;
+            skip();
+            if (!ident(name_span)) return false;
+            name = name_span.to_string(); kind = burg_ast::RewriteTmpl::Binder;
+            return true;
+        }()) {} else {
+        restore(_m0);
+        skip();
+        if (!ident(name_span)) return false;
+        name = name_span.to_string();
+        {
+            auto _m1 = save();
+            if (![&]() -> bool {
+                skip();
+                if (!match("(")) return false;
+                skip();
+                if (!parse_RewriteTmpl_(&child)) return false;
+                children.push_back(child);
+                for (;;) {
+                    auto _m2 = save();
+                    if (![&]() -> bool {
+                        skip();
+                        if (!match(",")) return false;
+                        skip();
+                        if (!parse_RewriteTmpl_(&child)) return false;
+                        children.push_back(child);
+                        return true;
+                    }()) { restore(_m2); break; }
+                }
+                skip();
+                if (!match(")")) return false;
+                return true;
+            }()) restore(_m1);
+        }
+        }
+    }
+    burg_ast::SourceLoc loc = {line(), col()};
+       *result = new burg_ast::RewriteTmpl();
+       (*result)->kind = kind;
        (*result)->name = std::move(name);
        (*result)->children = std::move(children);
        (*result)->loc = loc;

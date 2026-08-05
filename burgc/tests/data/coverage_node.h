@@ -29,11 +29,19 @@ enum {
     COV_CALL   = 4
 };
 
+/* Children capacity. BURG_NODE_CHILD promises kids[i] is valid for every
+ * i < nkids, and the matcher's variable-arity tail reduces children BEYOND
+ * the rule's declared pattern — a Call whose rule names no children still
+ * has its extras covered. So the storage has to admit more than any rule
+ * declares, or the contract this fixture publishes is false and the
+ * generated code walks off the end of it. */
+#define COV_MAX_KIDS 4
+
 typedef struct CovNode {
     int             op;
     int             id;         /* small, explicit — see BURG_NODE_ID below */
-    int             nkids;
-    struct CovNode* kids[2];
+    int             nkids;      /* <= COV_MAX_KIDS */
+    struct CovNode* kids[COV_MAX_KIDS];
     int             nsucc;
     struct CovNode* succs[2];
 } CovNode;

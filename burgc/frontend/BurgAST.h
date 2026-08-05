@@ -46,6 +46,59 @@ struct Rule {
     SourceLoc loc;
 };
 
+// ── REWRITE section ────────────────────────────────────────────────
+// Directed equality rules over the SAME terminals the tiling rules use,
+// for a saturating rewriter rather than the tree-DP tiler. A rule is
+// data: a pattern to match, a template to build, an optional guard.
+// There are no statements and no control flow — a template is a tree.
+
+// The left-hand side. A node is either a terminal application, or a
+// `$name` binder standing for whatever subtree sits at that leaf.
+struct RewritePat {
+    std::string name;                    // terminal name, or binder name
+    bool is_binder = false;
+    std::vector<RewritePat*> children;   // empty for leaves and binders
+    SourceLoc loc;
+};
+
+// A foreign helper a template may call for a computed immediate, declared
+// with its signature the way ddcgc's AUXILIARIES and opgen's `native` are:
+//
+//   AUXILIARIES
+//     ctz : (int) -> int
+//
+// Declaring it is what lets a template call it by plain name while an
+// undeclared name stays an error rather than being read as a helper.
+struct AuxDecl {
+    std::string name;
+    std::vector<std::string> params;   // parameter type names, for arity
+    std::string ret;
+    SourceLoc loc;
+};
+
+// The right-hand side. A node builds a terminal, references a binder the
+// pattern bound, or calls a declared auxiliary for a computed immediate.
+// Which of the three a name denotes is resolved against the declarations
+// during analysis, not guessed at parse time.
+struct RewriteTmpl {
+    enum Kind { Term, Binder, Helper };
+    Kind kind = Term;
+    std::string name;                    // terminal / binder / helper name
+    std::vector<RewriteTmpl*> children;
+    SourceLoc loc;
+};
+
+// name: Pattern => Template [where (. guard over binders .)] ;
+// Direction is `=>` only; a bidirectional axiom is written as two rules,
+// so the rule set never has to be read as a fixpoint of itself.
+struct RewriteRule {
+    std::string name;
+    RewritePat*  pattern = nullptr;
+    RewriteTmpl* tmpl = nullptr;
+    std::string guard;                   // where-clause predicate, empty if none
+    SourceLoc loc;
+};
+
 // Top-level specification
 struct Spec {
     std::vector<TermDecl*> terminals;
@@ -63,6 +116,8 @@ struct Spec {
                                         // of BurgMatcher. C: file-local in .c.
     std::vector<std::string> headers;   // (. .) header blocks (user includes/decls)
     std::vector<Rule*> rules;
+    std::vector<AuxDecl*> auxiliaries;  // AUXILIARIES block, empty when absent
+    std::vector<RewriteRule*> rewrites; // REWRITE section, empty when absent
     SourceLoc loc;
 };
 

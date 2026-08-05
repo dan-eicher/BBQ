@@ -158,15 +158,42 @@ add_custom_command(
 # binary. Encapsulates the parse → compile → JIT → execute pipeline so
 # callers don't have to deal with the JIT context, slot tracker, or
 # BURG matcher directly.
+# The rewrite pass: burgc --rewrite turns calc.burg's REWRITE section into a
+# saturating matcher over the e-graph. Generated like every other artifact
+# here — the example shows the tool being run, not a checked-in output.
+# Emitted as a header and included by calc_eqsat.h, the same way CalcMatcher.h
+# is included by calc_runner.cpp: the rewriter names the consumer's terminal
+# ids and calls its guards, so it compiles inside a translation unit that has
+# already declared them. Its own only #include is egraph.h.
+set(CALC_REWRITE_H ${CMAKE_CURRENT_BINARY_DIR}/calc_rewrite.h)
+add_custom_command(
+    OUTPUT ${CALC_REWRITE_H}
+    COMMAND $<TARGET_FILE:burgc> -i ${CMAKE_CURRENT_SOURCE_DIR}/example/calc.burg
+            --rewrite -name calc -o ${CALC_REWRITE_H}
+    DEPENDS burgc ${CMAKE_CURRENT_SOURCE_DIR}/example/calc.burg
+    COMMENT "burgc --rewrite: calc.burg REWRITE section -> calc_rewrite.h"
+    VERBATIM
+)
+
 add_library(calc_runner STATIC
     example/calc_runner.cpp
     example/frontend/Parser.cpp
+    ${CALC_REWRITE_H}
+    ${CMAKE_SOURCE_DIR}/burgc/runtime/egraph.c
+    ${CMAKE_SOURCE_DIR}/crt/bbq_hmap.c
     ${CALC_AST_HEADER}
     ${CALC_IR_HEADER}
     ${CALC_COMPILE_H}
     ${CMAKE_CURRENT_BINARY_DIR}/CalcMatcher.h
     ${CALC_VM_DIR}/opcodes.h
 )
+# CALC_EQSAT is deliberately NOT defined. The rewrite pass is written and its
+# generated matcher builds, but the seam it would run at receives IR whose
+# binop operands are already LoadLocals — the DDCG has assigned destinations
+# by then — so an e-graph built there cannot see a constant and no axiom can
+# fire. Turning this on requires the binding structure the DDCG records, which
+# calc does not yet record. The e2e's pinned sequences assert the pre-rewrite
+# form; they are what must change when the pass can actually run.
 target_include_directories(calc_runner PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/example
     ${CMAKE_CURRENT_SOURCE_DIR}/example/frontend
@@ -177,6 +204,7 @@ target_include_directories(calc_runner PUBLIC
     ${CALC_VM_DIR}                                     # opcodes.h (OP_* from calc.def)
     ${CMAKE_SOURCE_DIR}/backends/c/runtime             # bbq_runtime.h, via opcodes.h
     ${CMAKE_SOURCE_DIR}/crt                            # bbq_read.h, via bbq_runtime.h
+    ${CMAKE_SOURCE_DIR}/burgc/runtime                  # egraph.h (the rewrite pass)
 )
 
 find_package(GTest REQUIRED)
@@ -249,14 +277,20 @@ add_custom_command(
     OUTPUT ${CALC_VM_E2E}
     COMMAND ${CLANG_CXX_COMPILER} -std=c++17 ${CALC_VM_INCS}
             ${CMAKE_CURRENT_SOURCE_DIR}/example/test/calc_e2e_test.cpp
-            $<TARGET_FILE:calc_runner> ${CALC_INTERP_O} -lm -o ${CALC_VM_E2E}
-    DEPENDS ${CALC_INTERP_O} calc_runner
+            $<TARGET_FILE:calc_runner> ${CALC_INTERP_O}
+            ${CALC_VM_DIR}/opcode_tables.c -lm -o ${CALC_VM_E2E}
+    DEPENDS ${CALC_INTERP_O} calc_runner ${CALC_REWRITE_H}
             ${CMAKE_CURRENT_SOURCE_DIR}/example/test/calc_e2e_test.cpp
     COMMENT "clang: calc VM e2e (parse -> ddcg -> IR -> bytecode -> interp)"
     VERBATIM
 )
 add_custom_target(calc_vm_e2e_build ALL DEPENDS ${CALC_VM_E2E})
 add_test(NAME calc_vm_e2e COMMAND ${CALC_VM_E2E})
+
+# The falsifier target belongs here — same sources, the rewrite pass compiled
+# out, so the pinned sequences must revert. It is absent while CALC_EQSAT is
+# never defined, because a second target building the identical binary proves
+# nothing. It comes back with the knob.
 
 # Tier 0 == Tier 1 — the same bytecode on interp and JIT must agree.
 set(CALC_VM_JIT ${CALC_VM_DIR}/calc_vm_jit)

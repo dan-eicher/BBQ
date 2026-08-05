@@ -187,13 +187,11 @@ add_library(calc_runner STATIC
     ${CMAKE_CURRENT_BINARY_DIR}/CalcMatcher.h
     ${CALC_VM_DIR}/opcodes.h
 )
-# CALC_EQSAT is deliberately NOT defined. The rewrite pass is written and its
-# generated matcher builds, but the seam it would run at receives IR whose
-# binop operands are already LoadLocals — the DDCG has assigned destinations
-# by then — so an e-graph built there cannot see a constant and no axiom can
-# fire. Turning this on requires the binding structure the DDCG records, which
-# calc does not yet record. The e2e's pinned sequences assert the pre-rewrite
-# form; they are what must change when the pass can actually run.
+# The rewrite pass. It works because Figure 8 case 1 leaves a simple binop's
+# operands inlined: the e-graph sees `Mul(LoadLocal, LoadConst)` and a rule can
+# read the constant off the node. Under the old uniform-spill lowering both
+# operands were LoadLocals and no axiom could fire.
+target_compile_definitions(calc_runner PUBLIC CALC_EQSAT)
 target_include_directories(calc_runner PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/example
     ${CMAKE_CURRENT_SOURCE_DIR}/example/frontend
@@ -275,7 +273,7 @@ add_custom_command(
 set(CALC_VM_E2E ${CALC_VM_DIR}/calc_vm_e2e)
 add_custom_command(
     OUTPUT ${CALC_VM_E2E}
-    COMMAND ${CLANG_CXX_COMPILER} -std=c++17 ${CALC_VM_INCS}
+    COMMAND ${CLANG_CXX_COMPILER} -std=c++17 -DCALC_EQSAT ${CALC_VM_INCS}
             ${CMAKE_CURRENT_SOURCE_DIR}/example/test/calc_e2e_test.cpp
             $<TARGET_FILE:calc_runner> ${CALC_INTERP_O}
             ${CALC_VM_DIR}/opcode_tables.c -lm -o ${CALC_VM_E2E}
@@ -287,10 +285,27 @@ add_custom_command(
 add_custom_target(calc_vm_e2e_build ALL DEPENDS ${CALC_VM_E2E})
 add_test(NAME calc_vm_e2e COMMAND ${CALC_VM_E2E})
 
-# The falsifier target belongs here — same sources, the rewrite pass compiled
-# out, so the pinned sequences must revert. It is absent while CALC_EQSAT is
-# never defined, because a second target building the identical binary proves
-# nothing. It comes back with the knob.
+# The falsifier: same sources, same test, the rewrite pass compiled OUT, so
+# the pinned sequences must revert to their pre-rewrite form. Without it, pin
+# (2) cannot tell "the rules fired" from "the tiler was always going to emit
+# that", and the pass could be a no-op unnoticed.
+set(CALC_VM_E2E_NOREWRITE ${CALC_VM_DIR}/calc_vm_e2e_norewrite)
+add_custom_command(
+    OUTPUT ${CALC_VM_E2E_NOREWRITE}
+    COMMAND ${CLANG_CXX_COMPILER} -std=c++17 ${CALC_VM_INCS}
+            ${CMAKE_CURRENT_SOURCE_DIR}/example/test/calc_e2e_test.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/example/calc_runner.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/example/frontend/Parser.cpp
+            ${CALC_INTERP_O} ${CALC_VM_DIR}/opcode_tables.c -lm
+            -o ${CALC_VM_E2E_NOREWRITE}
+    DEPENDS ${CALC_INTERP_O} calc_runner ${CALC_REWRITE_H}
+            ${CMAKE_CURRENT_SOURCE_DIR}/example/test/calc_e2e_test.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/example/calc_runner.cpp
+    COMMENT "clang: calc e2e with the rewrite pass compiled out (falsifier)"
+    VERBATIM
+)
+add_custom_target(calc_vm_e2e_norewrite_build ALL DEPENDS ${CALC_VM_E2E_NOREWRITE})
+add_test(NAME calc_vm_e2e_norewrite COMMAND ${CALC_VM_E2E_NOREWRITE})
 
 # Tier 0 == Tier 1 — the same bytecode on interp and JIT must agree.
 set(CALC_VM_JIT ${CALC_VM_DIR}/calc_vm_jit)

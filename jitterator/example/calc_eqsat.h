@@ -152,19 +152,23 @@ inline calc_ir::Node* eqsat_rebuild(const eg_extract_result& r, int i,
     return out;
 }
 
-// Per-terminal size cost. Extraction is size-first, so the table is what the
-// operator costs to emit — one opcode byte each here, except that a constant
-// carries its immediate.
-inline const int* eqsat_cost_table(int* len) {
-    static int cost[256];
-    static bool init = false;
-    if (!init) {
-        for (int i = 0; i < 256; i++) cost[i] = 1;
-        cost[calc_ir::LoadConst::kind_value] = 2;   // opcode + sleb immediate
-        init = true;
+// What a node costs to emit, in bytes. Extraction is size-first, so this is
+// the emitter's own encoding read back: one opcode byte for an operation,
+// and a constant additionally carries its sleb128 immediate — whose width
+// depends on the VALUE, which is why the cost is asked per node rather than
+// per operator.
+inline int eqsat_node_cost(int op, int64_t data, void* /*user*/) {
+    if (op != calc_ir::LoadConst::kind_value) return 1;
+    int bytes = 1;                       // OP_CONST
+    int64_t v = data;
+    for (;;) {                           // sleb128, as Emit::sleb writes it
+        uint8_t b = (uint8_t)(v & 0x7f);
+        v >>= 7;
+        bytes++;
+        bool last = (v == 0 && !(b & 0x40)) || (v == -1 && (b & 0x40));
+        if (last) break;
     }
-    *len = 256;
-    return cost;
+    return bytes;
 }
 
 // The pass: one pure value tree in, its cheapest equivalent out.
@@ -176,11 +180,9 @@ inline calc_ir::Node* eqsat_optimize(calc_ir::Node* root, eg_caps caps) {
     eg_id c = eqsat_build(&g, root);
     calc_rewrite_region(&g, caps);
 
-    int clen = 0;
-    const int* cost = eqsat_cost_table(&clen);
     eg_extract_result r;
     calc_ir::Node* out = root;
-    if (eg_extract(&g, c, cost, clen, &r)) {
+    if (eg_extract(&g, c, eqsat_node_cost, nullptr, &r)) {
         std::vector<calc_ir::Node*> memo((size_t)r.count, nullptr);
         out = eqsat_rebuild(r, r.root, memo);
         eg_extract_free(&r);
@@ -199,15 +201,13 @@ inline void eqsat_run(calc_ir::Node* root, eg_caps caps) {
     // else. The spine's control nodes are region boundaries, and a Nop in
     // particular is the label the assembler resolves branches through.
     //
-    // NOTE, and this is why the pins below are red: by the time the IR reaches
-    // this seam the DDCG has assigned destinations, so a binop's operands are
-    // LoadLocals rather than the values themselves. An e-graph built from
-    // `Mul(LoadLocal, LoadLocal)` cannot see that either operand is a constant,
-    // so no axiom fires. Resolving a load back to its binding is a real step,
-    // but it is a READ of the DDCG's recorded scope rows — the binding
-    // structure the DDCG knows as it builds — and calc records none. It is NOT
-    // a spine walk that clears a slot map on seeing a Nop or a Branch: that is
-    // rediscovering the scope nesting by matching on the lowering's shape.
+    // What makes the axioms able to fire at all is upstream of here: the DDCG
+    // implements Dybvig §3.2 Figure 8's four-case binop fanout, so a binop
+    // whose operands are simple keeps them INLINE. `2 * 3` arrives as
+    // `Mul(LoadConst 2, LoadConst 3)` and folds. Under a lowering that spilled
+    // every operand it would arrive as `Mul(LoadLocal, LoadLocal)` and no rule
+    // could see a constant — the answer to which is the missing Figure 8 case,
+    // never a pass here that walks back to find what a load was bound to.
     std::vector<calc_ir::Node*> stack{root};
     std::vector<calc_ir::Node*> seen;
     while (!stack.empty()) {

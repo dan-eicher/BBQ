@@ -131,22 +131,17 @@ int main(void) {
         calc_ir::Node* ir = calc_runner::calc_compile("let $a = 7; $a * 2", &fs);
         std::vector<uint8_t> code = ir ? calc_runner::lower(ir)
                                        : std::vector<uint8_t>();
-        // `let $a = 7; $a * 2` = 14. The ddcg emits ANF, so the multiply's
-        // operands are loads of temps; resolving each to its definition
-        // within the region reassembles `7 * 2`, which folds to 14. The
-        // stores stay — this pass rewrites expressions and does no DCE.
+        // `let $a = 7; $a * 2` = 14. Figure 8 case 1 leaves the multiply as
+        // `Mul(LoadLocal 0, LoadConst 2)`, so `mul_two` can read the 2 off
+        // the node and rewrite to `$a + $a` — this target has no shift.
         const std::vector<uint8_t> want_rewritten = {
             OP_CONST, 0x07, OP_STORE, 0x00,
-            OP_CONST, 0x07, OP_STORE, 0x01,
-            OP_CONST, 0x02, OP_STORE, 0x02,
-            OP_CONST, 0x0E, OP_RET                 /* 14 */
+            OP_LOAD,  0x00, OP_LOAD,  0x00, OP_ADD, OP_RET
         };
-        // Without the pass: the loads and the multiply are still there.
+        // Without the pass: the multiply stays.
         const std::vector<uint8_t> want_plain = {
             OP_CONST, 0x07, OP_STORE, 0x00,
-            OP_LOAD,  0x00, OP_STORE, 0x01,
-            OP_CONST, 0x02, OP_STORE, 0x02,
-            OP_LOAD,  0x01, OP_LOAD,  0x02, OP_MUL, OP_RET
+            OP_LOAD,  0x00, OP_CONST, 0x02, OP_MUL, OP_RET
         };
 #ifdef CALC_EQSAT
         if (!seq_is(code, want_rewritten, "rewrite: `let $a = 7; $a * 2`")) fails++;
@@ -167,17 +162,16 @@ int main(void) {
         calc_ir::Node* ir = calc_runner::calc_compile("2 * 3 + 1", &fs);
         std::vector<uint8_t> code = ir ? calc_runner::lower(ir)
                                        : std::vector<uint8_t>();
-        const std::vector<uint8_t> folded = { OP_CONST, 0x07, OP_RET };
-        // The DDCG is destination-driven: every binop operand is spilled to a
-        // temp and reloaded, so this is `2*3+1` in ANF with the let-bindings
-        // realized as slots. It is also exactly why the pass cannot run here —
-        // the multiply's operands are loads, not the constants.
+        // `2 * 3` is two simple operands: case 1 inlines them and `fold_mul`
+        // folds the pair to 6. The outer `+` has a complex left and a simple
+        // right, which is case 3 — one temp for the left, the 1 inlined.
+        const std::vector<uint8_t> folded = {
+            OP_CONST, 0x06, OP_STORE, 0x00,
+            OP_LOAD,  0x00, OP_CONST, 0x01, OP_ADD, OP_RET
+        };
         const std::vector<uint8_t> unfolded = {
-            OP_CONST, 0x02, OP_STORE, 0x02,
-            OP_CONST, 0x03, OP_STORE, 0x03,
-            OP_LOAD,  0x02, OP_LOAD,  0x03, OP_MUL, OP_STORE, 0x00,
-            OP_CONST, 0x01, OP_STORE, 0x01,
-            OP_LOAD,  0x00, OP_LOAD,  0x01, OP_ADD, OP_RET
+            OP_CONST, 0x02, OP_CONST, 0x03, OP_MUL, OP_STORE, 0x00,
+            OP_LOAD,  0x00, OP_CONST, 0x01, OP_ADD, OP_RET
         };
 #ifdef CALC_EQSAT
         if (!seq_is(code, folded, "rewrite: `2 * 3 + 1`")) fails++;

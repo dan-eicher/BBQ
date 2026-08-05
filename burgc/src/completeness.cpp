@@ -763,11 +763,22 @@ bool load_asdl_schema(const std::string& path,
     // types whose type names match a defined sum-type — those are
     // structural (node) children. Primitive-typed fields (int64,
     // string, etc.) are data, not children.
+    //
+    // An ENUM-LIKE sum — every constructor nullary — is data too, and the
+    // `is_enum` flag on the definition is asdl's own answer, carried in
+    // the sidecar for exactly this. Reading it keeps one definition of
+    // enum-ness; re-deriving it here would be a second one to drift from.
+    // It matters because such a field IS a field: `Add(datatype
+    // data_type, node left, node right)` has two children and three
+    // fields, and counting the discriminant as a child makes every arity
+    // check off by one for the consumers whose IR carries types on its
+    // nodes.
     std::set<std::string> sum_type_names;
     if (doc.contains("definitions")) {
         for (auto& def : doc["definitions"]) {
-            if (def.value("type", "") == "sum")
-                sum_type_names.insert(def.value("name", ""));
+            if (def.value("type", "") != "sum") continue;
+            if (def.value("is_enum", false)) continue;
+            sum_type_names.insert(def.value("name", ""));
         }
     }
 

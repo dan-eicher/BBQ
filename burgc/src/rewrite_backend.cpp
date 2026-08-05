@@ -64,6 +64,11 @@ int emit_match(std::ostream& o, const burg_ast::RewritePat* p,
         kid_names.push_back(kid);
         o << ind << "    eg_id " << kid << " = eg_class_node_kid(g, " << cls
           << ", " << ni << ", " << k << ");\n";
+        /* A binder is part of the MATCH, so it is bound whether or not
+         * the template names it — `Mul($x, $z) => $z` still has to
+         * match two children. Voided here so an unused one is not a
+         * warning in the consumer's build. */
+        o << ind << "    (void)" << kid << ";\n";
     }
     int opened = 1;
     for (size_t k = 0; k < p->children.size(); k++)
@@ -72,13 +77,16 @@ int emit_match(std::ostream& o, const burg_ast::RewritePat* p,
 }
 
 // Emit the construction of a template, returning the C expression for the
-// class it produces.
+// class it produces. `root_data` is the C expression for the discriminant of
+// the e-node the rule MATCHED.
 std::string emit_build(std::ostream& o, const burg_ast::RewriteTmpl* t,
-                       const std::string& ind, int& tmp) {
+                       const std::string& ind, int& tmp,
+                       const std::string& root_data) {
     if (t->kind == burg_ast::RewriteTmpl::Binder) return t->name;
 
     std::vector<std::string> kids;
-    for (auto* c : t->children) kids.push_back(emit_build(o, c, ind, tmp));
+    for (auto* c : t->children)
+        kids.push_back(emit_build(o, c, ind, tmp, root_data));
 
     std::string v = "b" + std::to_string(tmp++);
     if (t->kind == burg_ast::RewriteTmpl::Helper) {
@@ -94,11 +102,15 @@ std::string emit_build(std::ostream& o, const burg_ast::RewriteTmpl* t,
     for (size_t i = 0; i < kids.size(); i++) o << (i ? ", " : "") << kids[i];
     if (kids.empty()) o << "0";
     o << " };\n";
-    // data 0: a template builds a structural node. A leaf that needs a
-    // discriminant is produced by an auxiliary, which is the only thing that
-    // knows the value to put there.
-    o << ind << "eg_id " << v << " = eg_add(g, BURG_" << t->name << ", 0, "
-      << v << "_k, " << kids.size() << ");\n";
+    // The built node INHERITS the matched node's discriminant. A rewrite
+    // states an equality between two forms of one value, so whatever the
+    // discriminant distinguishes about that value — a JCVM operand's
+    // data_type, say — is the same on both sides, and a template that
+    // defaulted it to 0 would silently assert whichever thing 0 encodes.
+    // A rule that genuinely needs a DIFFERENT discriminant builds through an
+    // auxiliary, which is handed classes and can put anything it likes there.
+    o << ind << "eg_id " << v << " = eg_add(g, BURG_" << t->name << ", "
+      << root_data << ", " << v << "_k, " << kids.size() << ");\n";
     return v;
 }
 
@@ -141,11 +153,16 @@ void emit_rewriter(std::ostream& o, const BurgAnalysis& a,
         // Depth 2 == inside `for (c) {`; each nested pattern level opens one
         // more loop, and the closers unwind them in step so the emitted file
         // reads like something a person wrote.
+        //
+        // The root pattern's node index is the first temporary emit_match
+        // hands out, so it is `n0` — and it exists, because a rule's pattern
+        // root is a constructor (a bare binder would match everything).
         int opened = emit_match(o, rw->pattern, "c", 2, tmp);
+        std::string root_data = "eg_class_node_data(g, c, n0)";
         std::string ind((size_t)(opened + 2) * 4, ' ');
         if (!rw->guard.empty())
             o << ind << "if (!(" << subst_binders(rw->guard) << ")) continue;\n";
-        std::string built = emit_build(o, rw->tmpl, ind, tmp);
+        std::string built = emit_build(o, rw->tmpl, ind, tmp, root_data);
         o << ind << "if (eg_merge(g, c, " << built << ")) changed = true;\n";
         for (int i = opened; i > 0; i--)
             o << std::string((size_t)(i + 1) * 4, ' ') << "}\n";

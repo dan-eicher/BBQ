@@ -69,6 +69,11 @@ DESTINATIONS
   ir_root ir.node
 
 AUXILIARIES
+  // Figure 8's CG_operand: a simple expression as an inline operand tree.
+  // Case 1 allocates NO temporary; the stack is used "only if both operands
+  // are complex".
+  cg_operand_tree       : (ast.expr) -> ir_root
+
   // Per-function frame allocator (case-4-like spills allocate fresh
   // frame slots above the user's max). The driver resets between
   // function compiles.
@@ -94,6 +99,17 @@ AUXILIARIES
   // wraps via cg_deliver per outer δ/γ — same as any binop value).
   compile_call          : (ident, list<ast.expr>, rho, delta, gamma, ir_root) -> ir_root
 
+PREDICATES
+  // Dybvig §3.2 Figure 8's operand classifier: "Simple operands consist of
+  // variable references and constants." A where-guard, so it is pure — it
+  // inspects the AST node and allocates nothing.
+  is_simple_operand     : (ast.expr) -> bool
+
+  // Tighter than simple, for Figure 8 case 2 only. That case evaluates the
+  // RHS first, so a LocalRef LHS could have its slot assigned by the RHS
+  // before the read happens; a constant has no slot to disturb.
+  is_constant_operand   : (ast.expr) -> bool
+
 MEMBERS (.
     SourceLoc current_loc;
 
@@ -118,6 +134,30 @@ MEMBERS (.
     calc_ir::Node* make_call(calc_ir::Node* target,
                              std::vector<calc_ir::Node*> args, int fs) {
         return new calc_ir::Call(target, std::move(args), fs);
+    }
+
+    // Dybvig §3.2 Figure 8's `S` — "Simple operands consist of variable
+    // references and constants." A simple operand needs no temporary: CG
+    // inlines it via CG_operand, and Figure 8 uses the stack "only if both
+    // operands are complex". calc has no side effects inside an expression
+    // except a call, so the classifier is the paper's own set.
+    bool is_simple_operand(calc::Expr* e) {
+        return dynamic_cast<calc::IntLit*>(e) != nullptr
+            || dynamic_cast<calc::LocalRef*>(e) != nullptr;
+    }
+
+    bool is_constant_operand(calc::Expr* e) {
+        return dynamic_cast<calc::IntLit*>(e) != nullptr;
+    }
+
+    // CG_operand: a simple expression as an inline operand tree, no temp
+    // and no spine. The counterpart of make_load_const/make_load_local
+    // used when the operand is NOT being delivered to a destination.
+    calc_ir::Node* cg_operand_tree(calc::Expr* e) {
+        if (auto* i = dynamic_cast<calc::IntLit*>(e))
+            return new calc_ir::LoadConst(i->value);
+        auto* v = dynamic_cast<calc::LocalRef*>(e);
+        return new calc_ir::LoadLocal(v->index);
     }
     // Wrap a node in a Nop landing pad if it isn't already one — the
     // yoctojc ddcg_label convention. A branch target must be a Nop so
@@ -278,10 +318,121 @@ rule if_two : ast.If(test: t, then_: th, else_: el) {
 //
 // Operands are sequenced right-then-left so the left runs first; at
 // each step γ AND L_next are the same continuation, so cg_jump falls
-// through with no goto. BURG owns figure 8's case dispatch at lowering
-// time over the LoadLocal/op shape; no case specializations, constant
-// folds, or commutativity carve-outs in DDCG.
+// through with no goto.
+//
+// Figure 8's FIRST case lives here, not in BURG: when both operands are
+// simple the paper allocates no temporary at all and inlines them, and a
+// temp allocated here is real slot traffic by the time BURG runs — the
+// tiler cannot un-allocate it. Emitting `2 * 3` as CONST/STORE, CONST/
+// STORE, LOAD, LOAD, MUL leaves two dead slots for a later pass to clean
+// up, which is the cost yoctojc's own case-1 rule cites. The remaining
+// cases (one or both operands complex) keep the uniform spill path below;
+// no constant folds or commutativity carve-outs in DDCG either way.
 // =============================================================
+
+// Dybvig §3.2 Figure 8 case 1: `CG [[ binop op S1 S2 ]] ρ δ γ ⇒
+// CG_binop [[op]] (CG_operand [[S1]]ρ) (CG_operand [[S2]]ρ) δ γ` — the
+// operands are inlined and nothing is spilled. This is also the shape an
+// expression-level analysis needs: the operands ARE the values, so a
+// reader sees `Mul(LoadConst 2, LoadConst 3)` rather than two loads whose
+// definitions it would have to go looking for.
+rule bin_op_add_ss : ast.BinOp(op: Add, left: l, right: r)
+                     where is_simple_operand(l) and is_simple_operand(r) {
+    cg_deliver(build ir.Add(cg_operand_tree(l), cg_operand_tree(r)),
+               delta, gamma, Lnext);
+}
+
+rule bin_op_sub_ss : ast.BinOp(op: Sub, left: l, right: r)
+                     where is_simple_operand(l) and is_simple_operand(r) {
+    cg_deliver(build ir.Sub(cg_operand_tree(l), cg_operand_tree(r)),
+               delta, gamma, Lnext);
+}
+
+rule bin_op_mul_ss : ast.BinOp(op: Mul, left: l, right: r)
+                     where is_simple_operand(l) and is_simple_operand(r) {
+    cg_deliver(build ir.Mul(cg_operand_tree(l), cg_operand_tree(r)),
+               delta, gamma, Lnext);
+}
+
+rule bin_op_div_ss : ast.BinOp(op: Div, left: l, right: r)
+                     where is_simple_operand(l) and is_simple_operand(r) {
+    cg_deliver(build ir.Div(cg_operand_tree(l), cg_operand_tree(r)),
+               delta, gamma, Lnext);
+}
+
+// Figure 8 case 3: `CG [[ binop op E S ]] ρ δ γ ⇒ CG[[E]] ρ ac L; L:
+// CG_binop [[op]] (CG_operand [[S]]ρ) ac δ γ` — only the complex operand
+// takes a temporary. Safe for any simple RHS: the left runs first, so a
+// right-hand slot read cannot be disturbed by it.
+rule bin_op_add_cs : ast.BinOp(op: Add, left: l, right: r)
+                     where not is_simple_operand(l) and is_simple_operand(r) {
+    let tl = alloc_local();
+    let after = cg_deliver(build ir.Add(make_load_local(tl), cg_operand_tree(r)),
+                           delta, gamma, Lnext);
+    gen(l, rho, local(tl), jump(after), after);
+}
+
+rule bin_op_sub_cs : ast.BinOp(op: Sub, left: l, right: r)
+                     where not is_simple_operand(l) and is_simple_operand(r) {
+    let tl = alloc_local();
+    let after = cg_deliver(build ir.Sub(make_load_local(tl), cg_operand_tree(r)),
+                           delta, gamma, Lnext);
+    gen(l, rho, local(tl), jump(after), after);
+}
+
+rule bin_op_mul_cs : ast.BinOp(op: Mul, left: l, right: r)
+                     where not is_simple_operand(l) and is_simple_operand(r) {
+    let tl = alloc_local();
+    let after = cg_deliver(build ir.Mul(make_load_local(tl), cg_operand_tree(r)),
+                           delta, gamma, Lnext);
+    gen(l, rho, local(tl), jump(after), after);
+}
+
+rule bin_op_div_cs : ast.BinOp(op: Div, left: l, right: r)
+                     where not is_simple_operand(l) and is_simple_operand(r) {
+    let tl = alloc_local();
+    let after = cg_deliver(build ir.Div(make_load_local(tl), cg_operand_tree(r)),
+                           delta, gamma, Lnext);
+    gen(l, rho, local(tl), jump(after), after);
+}
+
+// Figure 8 case 2: `CG [[ binop op S E ]]` — inline the simple LHS, spill
+// the complex RHS. The LHS is restricted to CONSTANTS, not all simple
+// operands: case 2 evaluates the RHS first, and a complex RHS can assign
+// to the slot a LocalRef LHS reads (`$a + ($a = 5)`), which would defer
+// the read past the write. A constant cannot be disturbed. A LocalRef LHS
+// falls through to the case-4 path below, which spills it left-first.
+rule bin_op_add_sc : ast.BinOp(op: Add, left: l, right: r)
+                     where is_constant_operand(l) and not is_simple_operand(r) {
+    let tr = alloc_local();
+    let after = cg_deliver(build ir.Add(cg_operand_tree(l), make_load_local(tr)),
+                           delta, gamma, Lnext);
+    gen(r, rho, local(tr), jump(after), after);
+}
+
+rule bin_op_sub_sc : ast.BinOp(op: Sub, left: l, right: r)
+                     where is_constant_operand(l) and not is_simple_operand(r) {
+    let tr = alloc_local();
+    let after = cg_deliver(build ir.Sub(cg_operand_tree(l), make_load_local(tr)),
+                           delta, gamma, Lnext);
+    gen(r, rho, local(tr), jump(after), after);
+}
+
+rule bin_op_mul_sc : ast.BinOp(op: Mul, left: l, right: r)
+                     where is_constant_operand(l) and not is_simple_operand(r) {
+    let tr = alloc_local();
+    let after = cg_deliver(build ir.Mul(cg_operand_tree(l), make_load_local(tr)),
+                           delta, gamma, Lnext);
+    gen(r, rho, local(tr), jump(after), after);
+}
+
+rule bin_op_div_sc : ast.BinOp(op: Div, left: l, right: r)
+                     where is_constant_operand(l) and not is_simple_operand(r) {
+    let tr = alloc_local();
+    let after = cg_deliver(build ir.Div(cg_operand_tree(l), make_load_local(tr)),
+                           delta, gamma, Lnext);
+    gen(r, rho, local(tr), jump(after), after);
+}
 
 rule bin_op_add : ast.BinOp(op: Add, left: l, right: r) {
     let tl = alloc_local();
@@ -328,6 +479,46 @@ rule neg_op : ast.NegOp(operand: e) {
     let le = make_load_local(te);
     let after = cg_deliver(build ir.Neg(le), delta, gamma, Lnext);
     gen(e, rho, local(te), jump(after), after);
+}
+
+// Figure 8 case 1 for the comparisons. The paper introduces the fanout
+// FOR the relational operators — "The relational operators require their
+// operands in suitably simple forms" — so `$i < 10` inlining both sides is
+// the case it was written for, and it is the shape every loop test has.
+rule cmp_eq_ss : ast.CmpEq(left: l, right: r)
+                 where is_simple_operand(l) and is_simple_operand(r) {
+    cg_deliver(build ir.CmpEq(cg_operand_tree(l), cg_operand_tree(r)),
+               delta, gamma, Lnext);
+}
+
+rule cmp_neq_ss : ast.CmpNeq(left: l, right: r)
+                  where is_simple_operand(l) and is_simple_operand(r) {
+    cg_deliver(build ir.CmpNeq(cg_operand_tree(l), cg_operand_tree(r)),
+               delta, gamma, Lnext);
+}
+
+rule cmp_lt_ss : ast.CmpLt(left: l, right: r)
+                 where is_simple_operand(l) and is_simple_operand(r) {
+    cg_deliver(build ir.CmpLt(cg_operand_tree(l), cg_operand_tree(r)),
+               delta, gamma, Lnext);
+}
+
+rule cmp_le_ss : ast.CmpLe(left: l, right: r)
+                 where is_simple_operand(l) and is_simple_operand(r) {
+    cg_deliver(build ir.CmpLe(cg_operand_tree(l), cg_operand_tree(r)),
+               delta, gamma, Lnext);
+}
+
+rule cmp_gt_ss : ast.CmpGt(left: l, right: r)
+                 where is_simple_operand(l) and is_simple_operand(r) {
+    cg_deliver(build ir.CmpGt(cg_operand_tree(l), cg_operand_tree(r)),
+               delta, gamma, Lnext);
+}
+
+rule cmp_ge_ss : ast.CmpGe(left: l, right: r)
+                 where is_simple_operand(l) and is_simple_operand(r) {
+    cg_deliver(build ir.CmpGe(cg_operand_tree(l), cg_operand_tree(r)),
+               delta, gamma, Lnext);
 }
 
 rule cmp_eq : ast.CmpEq(left: l, right: r) {

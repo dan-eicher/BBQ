@@ -1665,6 +1665,39 @@ TEST(BurgRewriteEmit, EmitsEntryPointAndRuleTable) {
     EXPECT_NE(code.find("ctz("), std::string::npos);
 }
 
+// A structural template inherits the discriminant of the node it matched.
+// A rewrite states that two forms denote the SAME value, so whatever the
+// discriminant distinguishes about that value holds on both sides. Emitting
+// a literal 0 would make every rule-built node assert whichever thing the
+// consumer encodes as 0 — for a JCVM grammar whose discriminant is the
+// operand data_type, that is "byte", silently, on every rewritten node.
+TEST(BurgRewriteEmit, StructuralTemplateInheritsMatchedDiscriminant) {
+    std::string code = gen_rewrite(
+        "TERM Add=1 TERM Mul=2 TERM Shl=3 TERM Const=4\n"
+        "REWRITE {\n"
+        "  distribute: Mul(Add($a, $b), $m) => Add(Mul($a, $m), Mul($b, $m));\n"
+        "}\n"
+        "RULES r: Add(r, r) = 1;");
+    ASSERT_FALSE(code.empty());
+    // Every structural build reads the matched root's data...
+    EXPECT_NE(code.find("eg_add(g, BURG_Mul, eg_class_node_data(g, c, n0)"),
+              std::string::npos) << code;
+    EXPECT_NE(code.find("eg_add(g, BURG_Add, eg_class_node_data(g, c, n0)"),
+              std::string::npos) << code;
+    // ...and none of them hardcodes a discriminant.
+    EXPECT_EQ(code.find("eg_add(g, BURG_Add, 0,"), std::string::npos) << code;
+    EXPECT_EQ(code.find("eg_add(g, BURG_Mul, 0,"), std::string::npos) << code;
+}
+
+// An auxiliary is the escape hatch: it is handed classes and returns one, so
+// a rule that must produce a DIFFERENT discriminant than it matched goes
+// through one. The emitted call therefore passes no data at all.
+TEST(BurgRewriteEmit, AuxiliaryTemplateTakesNoDiscriminant) {
+    std::string code = gen_rewrite(kRewriteSpec);
+    ASSERT_FALSE(code.empty());
+    EXPECT_NE(code.find("ctz(g, "), std::string::npos) << code;
+}
+
 // The emitted rewriter talks to the e-graph and to nothing else: any other
 // dependency is a coupling that would have to be satisfied by every
 // consumer of every grammar.

@@ -21,6 +21,13 @@ struct Graph {
     ~Graph() { eg_free(&g); }
 };
 
+// The op-indexed cost most of these tests want, expressed as what the
+// runtime actually takes: a callback over the caller's own table.
+static int by_op(int op, int64_t /*data*/, void* user) {
+    const int* tbl = (const int*)user;
+    return (op >= 0 && op < 64) ? tbl[op] : 1;
+}
+
 // Hashconsing: the same op over the same children is the same e-class, so
 // building a term twice does not grow the graph.
 TEST(EGraph, HashconsDedupsIdenticalNodes) {
@@ -183,24 +190,266 @@ TEST(EGraph, ExtractionPicksTheCheaperEquivalentForm) {
     eg_merge(&gr.g, mul, shl);
     eg_rebuild(&gr.g);
 
-    // Cost by op: everything 1, but MUL is dear.
+    // Everything costs 1, but MUL is dear. The table is the caller's; the
+    // runtime only calls back.
     int cost[64];
     for (int i = 0; i < 64; i++) cost[i] = 1;
     cost[OP_MUL] = 10;
 
     eg_extract_result r;
-    ASSERT_TRUE(eg_extract(&gr.g, eg_find(&gr.g, mul), cost, 64, &r));
+    ASSERT_TRUE(eg_extract(&gr.g, eg_find(&gr.g, mul), by_op, cost, &r));
     EXPECT_EQ(eg_extracted_op(&r, r.root), OP_SHL);
 
     // And with the costs reversed, the same class yields the mul.
     cost[OP_MUL] = 1;
     cost[OP_SHL] = 10;
     eg_extract_result r2;
-    ASSERT_TRUE(eg_extract(&gr.g, eg_find(&gr.g, mul), cost, 64, &r2));
+    ASSERT_TRUE(eg_extract(&gr.g, eg_find(&gr.g, mul), by_op, cost, &r2));
     EXPECT_EQ(eg_extracted_op(&r2, r2.root), OP_MUL);
 
     eg_extract_free(&r);
     eg_extract_free(&r2);
+}
+
+// A cost that depends on the node's PAYLOAD, not just its operator —
+// the case an operator-indexed table cannot express, and the reason
+// extraction asks per node. Here a constant costs a byte per magnitude
+// step, as a real encoder's immediate does.
+TEST(EGraph, CostMayDependOnTheNodePayload) {
+    Graph gr;
+    eg_id x = eg_add(&gr.g, OP_A, 0, nullptr, 0);
+    eg_id big = eg_add(&gr.g, OP_CONST, 1000, nullptr, 0);
+    eg_id mk[2] = { x, big };
+    eg_id mul = eg_add(&gr.g, OP_MUL, 0, mk, 2);
+    eg_id small = eg_add(&gr.g, OP_CONST, 3, nullptr, 0);
+    eg_id sk[2] = { x, small };
+    eg_id shl = eg_add(&gr.g, OP_SHL, 0, sk, 2);
+    eg_merge(&gr.g, mul, shl);
+    eg_rebuild(&gr.g);
+
+    // Operators tie at 1 each; only the constants differ, and only by
+    // value. An op-indexed table would have to call both the same and
+    // could never prefer the shift.
+    auto by_value = [](int op, int64_t data, void*) -> int {
+        if (op != OP_CONST) return 1;
+        int64_t v = data < 0 ? -data : data;
+        return v <= 5 ? 1 : (v <= 127 ? 2 : 3);
+    };
+    eg_extract_result r;
+    ASSERT_TRUE(eg_extract(&gr.g, eg_find(&gr.g, mul), by_value, nullptr, &r));
+    EXPECT_EQ(eg_extracted_op(&r, r.root), OP_SHL);
+    eg_extract_free(&r);
+}
+
+// A consumer with let-bindings puts the bound VARIABLE in the same class as
+// the expression it names, so a rewrite can see through the binding. The
+// binding's own right-hand side then cannot be extracted as that variable —
+// `t = t` discards the value — and the variable is the cheapest member of
+// the class by construction, so an unguarded extraction always picks it.
+TEST(EGraph, ExtractionCanExcludeTheBoundVariable) {
+    Graph gr;
+    // t = 2 * 3, folded to 6, with `t` itself merged in. OP_A[7] stands for
+    // the variable; its data is what tells one variable from another.
+    eg_id two = eg_add(&gr.g, OP_CONST, 2, nullptr, 0);
+    eg_id three = eg_add(&gr.g, OP_CONST, 3, nullptr, 0);
+    eg_id mk[2] = { two, three };
+    eg_id mul = eg_add(&gr.g, OP_MUL, 0, mk, 2);
+    eg_id six = eg_add(&gr.g, OP_CONST, 6, nullptr, 0);
+    eg_id var = eg_add(&gr.g, OP_A, 7, nullptr, 0);
+    eg_merge(&gr.g, mul, six);
+    eg_merge(&gr.g, mul, var);
+    eg_rebuild(&gr.g);
+
+    int cost[64];
+    for (int i = 0; i < 64; i++) cost[i] = 1;
+    cost[OP_CONST] = 2;    // a constant carries its immediate
+    cost[OP_MUL]   = 1;
+
+    // Unguarded, the variable wins on cost — which as the binding's own
+    // right-hand side would be `t = t`.
+    eg_extract_result r;
+    ASSERT_TRUE(eg_extract(&gr.g, eg_find(&gr.g, mul), by_op, cost, &r));
+    EXPECT_EQ(eg_extracted_op(&r, r.root), OP_A);
+    eg_extract_free(&r);
+
+    // Excluded, the next cheapest is the folded constant — the answer the
+    // binding actually wants, and NOT a fallback to the original product.
+    eg_extract_result r2;
+    ASSERT_TRUE(eg_extract_excluding(&gr.g, eg_find(&gr.g, mul), by_op, cost,
+                                     OP_A, 7, &r2));
+    EXPECT_EQ(eg_extracted_op(&r2, r2.root), OP_CONST);
+    EXPECT_EQ(r2.data[r2.root], 6);
+    eg_extract_free(&r2);
+
+    // The exclusion is by (op, data), so a DIFFERENT variable of the same
+    // operator is untouched — excluding one binding must not blind the
+    // extractor to every other name in scope.
+    eg_extract_result r3;
+    ASSERT_TRUE(eg_extract_excluding(&gr.g, eg_find(&gr.g, mul), by_op, cost,
+                                     OP_A, 9, &r3));
+    EXPECT_EQ(eg_extracted_op(&r3, r3.root), OP_A);
+    eg_extract_free(&r3);
+}
+
+// Exclusion reaches below the root: a term that reached the bound variable
+// through any depth of children would be just as circular as naming it
+// outright.
+TEST(EGraph, ExclusionAppliesBelowTheRoot) {
+    Graph gr;
+    eg_id var = eg_add(&gr.g, OP_A, 7, nullptr, 0);
+    eg_id leaf = eg_add(&gr.g, OP_B, 0, nullptr, 0);
+    eg_merge(&gr.g, var, leaf);          // the variable also equals a plain leaf
+    eg_rebuild(&gr.g);
+    eg_id k[1] = { var };
+    eg_id f = eg_add(&gr.g, OP_F, 0, k, 1);
+
+    int cost[64];
+    for (int i = 0; i < 64; i++) cost[i] = 1;
+    cost[OP_B] = 5;                       // the leaf is dear, the variable cheap
+
+    eg_extract_result r;
+    ASSERT_TRUE(eg_extract(&gr.g, eg_find(&gr.g, f), by_op, cost, &r));
+    EXPECT_EQ(eg_extracted_op(&r, r.kids[r.kid_off[r.root]]), OP_A);
+    eg_extract_free(&r);
+
+    eg_extract_result r2;
+    ASSERT_TRUE(eg_extract_excluding(&gr.g, eg_find(&gr.g, f), by_op, cost,
+                                     OP_A, 7, &r2));
+    EXPECT_EQ(eg_extracted_op(&r2, r2.kids[r2.kid_off[r2.root]]), OP_B);
+    eg_extract_free(&r2);
+}
+
+// ── E-class analyses (egg §4.1) ──────────────────────────────────
+//
+// The domain here is the one egg uses to introduce them: "this class is
+// a known constant, or it is not". It is a semilattice of finite height,
+// so no widening is needed to make these terminate — a domain with
+// infinite ascending chains would have to widen inside join.
+namespace {
+struct KnownConst { bool known; int64_t value; };
+
+void kc_make(egraph* g, int op, int64_t data, const eg_id* kids, int nkids,
+             void* out, void*) {
+    KnownConst* d = (KnownConst*)out;
+    d->known = false;
+    d->value = 0;
+    if (op == OP_CONST) { d->known = true; d->value = data; return; }
+    if (op == OP_ADD && nkids == 2) {
+        const KnownConst* a = (const KnownConst*)eg_class_data(g, kids[0]);
+        const KnownConst* b = (const KnownConst*)eg_class_data(g, kids[1]);
+        if (a && b && a->known && b->known) {
+            d->known = true;
+            d->value = a->value + b->value;
+        }
+    }
+}
+
+// The strongest fact consistent with both: two e-nodes in one class
+// denote the SAME value, so if either is known the class is known.
+void kc_join(const void* pa, const void* pb, void* out, void*) {
+    const KnownConst* a = (const KnownConst*)pa;
+    const KnownConst* b = (const KnownConst*)pb;
+    KnownConst* d = (KnownConst*)out;
+    *d = a->known ? *a : *b;
+}
+
+void kc_modify(egraph* g, eg_id c, const void* pd, void*) {
+    const KnownConst* d = (const KnownConst*)pd;
+    if (d->known) eg_merge(g, c, eg_add(g, OP_CONST, d->value, nullptr, 0));
+}
+
+eg_analysis kc_analysis() {
+    eg_analysis a;
+    a.size = sizeof(KnownConst);
+    a.make = kc_make;
+    a.join = kc_join;
+    a.modify = kc_modify;
+    a.user = nullptr;
+    return a;
+}
+}  // namespace
+
+// make() reads its children's facts, so a fact is computed bottom-up as
+// the term is interned — no rule involved.
+TEST(EGraph, AnalysisComputesAFactFromChildren) {
+    Graph gr;
+    eg_analysis a = kc_analysis();
+    eg_set_analysis(&gr.g, &a);
+
+    eg_id two = eg_add(&gr.g, OP_CONST, 2, nullptr, 0);
+    eg_id three = eg_add(&gr.g, OP_CONST, 3, nullptr, 0);
+    eg_id k[2] = { two, three };
+    eg_id sum = eg_add(&gr.g, OP_ADD, 0, k, 2);
+
+    const KnownConst* d = (const KnownConst*)eg_class_data(&gr.g, sum);
+    ASSERT_NE(d, nullptr);
+    EXPECT_TRUE(d->known);
+    EXPECT_EQ(d->value, 5);
+}
+
+// An opaque leaf has no fact, and neither does anything built over it.
+TEST(EGraph, AnalysisStaysUnknownOverAnOpaqueLeaf) {
+    Graph gr;
+    eg_analysis a = kc_analysis();
+    eg_set_analysis(&gr.g, &a);
+
+    eg_id x = eg_add(&gr.g, OP_A, 0, nullptr, 0);
+    eg_id two = eg_add(&gr.g, OP_CONST, 2, nullptr, 0);
+    eg_id k[2] = { x, two };
+    eg_id sum = eg_add(&gr.g, OP_ADD, 0, k, 2);
+
+    EXPECT_FALSE(((const KnownConst*)eg_class_data(&gr.g, sum))->known);
+}
+
+// THE POINT OF ANALYSES OVER PER-NODE FACTS: a fact proved about one form
+// of a value holds for every form of it. `x` is opaque and `x + 0` says
+// nothing; merge it with a known constant and the whole class is known.
+TEST(EGraph, AFactFlowsAlongAnEquality) {
+    Graph gr;
+    eg_analysis a = kc_analysis();
+    eg_set_analysis(&gr.g, &a);
+
+    eg_id x = eg_add(&gr.g, OP_A, 0, nullptr, 0);
+    eg_id zero = eg_add(&gr.g, OP_CONST, 0, nullptr, 0);
+    eg_id k[2] = { x, zero };
+    eg_id sum = eg_add(&gr.g, OP_ADD, 0, k, 2);
+    EXPECT_FALSE(((const KnownConst*)eg_class_data(&gr.g, sum))->known);
+
+    // Somewhere else, x turns out to be 7.
+    eg_merge(&gr.g, x, eg_add(&gr.g, OP_CONST, 7, nullptr, 0));
+    eg_rebuild(&gr.g);
+
+    const KnownConst* d = (const KnownConst*)eg_class_data(&gr.g, sum);
+    EXPECT_TRUE(d->known);
+    EXPECT_EQ(d->value, 7);
+}
+
+// modify() is what makes the fact usable downstream: the class gains a
+// LoadConst e-node, so extraction can pick it. Idempotent because
+// interning a term that exists returns its class.
+TEST(EGraph, ModifyAddsTheImpliedConstantAndIsIdempotent) {
+    Graph gr;
+    eg_analysis a = kc_analysis();
+    eg_set_analysis(&gr.g, &a);
+
+    eg_id two = eg_add(&gr.g, OP_CONST, 2, nullptr, 0);
+    eg_id three = eg_add(&gr.g, OP_CONST, 3, nullptr, 0);
+    eg_id k[2] = { two, three };
+    eg_id sum = eg_add(&gr.g, OP_ADD, 0, k, 2);
+    eg_rebuild(&gr.g);
+
+    // The class now holds both the sum and the constant 5.
+    eg_id c = eg_find(&gr.g, sum);
+    bool has_const5 = false;
+    for (int i = 0; i < eg_class_nodes(&gr.g, c); i++)
+        if (eg_class_node_op(&gr.g, c, i) == OP_CONST &&
+            eg_class_node_data(&gr.g, c, i) == 5) has_const5 = true;
+    EXPECT_TRUE(has_const5);
+
+    size_t before = eg_node_count(&gr.g);
+    eg_rebuild(&gr.g);
+    eg_rebuild(&gr.g);
+    EXPECT_EQ(eg_node_count(&gr.g), before) << "modify must be idempotent";
 }
 
 }  // namespace

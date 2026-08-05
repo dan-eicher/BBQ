@@ -52,7 +52,38 @@ void eg_free(egraph* g) {
     bbq_vec_free(g->classes);
     bbq_vec_free(g->parent);
     bbq_vec_free(g->worklist);
+    bbq_vec_free(g->class_data);
+    free(g->analysis);
     memset(g, 0, sizeof *g);
+}
+
+/* ── e-class analysis (egg §4.1) ─────────────────────────────────── */
+
+void eg_set_analysis(egraph* g, const eg_analysis* a) {
+    free(g->analysis);
+    g->analysis = NULL;
+    bbq_vec_truncate(g->class_data, 0);
+    if (!a || a->size == 0) return;
+    g->analysis = (eg_analysis*)malloc(sizeof *g->analysis);
+    if (!g->analysis) return;
+    *g->analysis = *a;
+}
+
+void* eg_class_data(egraph* g, eg_id c) {
+    if (!g->analysis) return NULL;
+    return g->class_data + (size_t)eg_find(g, c) * g->analysis->size;
+}
+
+/* Reserve and zero the fact slot for a freshly created class. Zeroing is
+ * what lets facts be compared with memcmp: two equal facts then have
+ * equal bytes, padding included. */
+static void analysis_reserve(egraph* g, eg_id cls) {
+    if (!g->analysis) return;
+    size_t sz = g->analysis->size;
+    size_t need = ((size_t)cls + 1) * sz;
+    while ((size_t)bbq_vec_len(g->class_data) < need)
+        bbq_vec_push(g->class_data, (unsigned char)0);
+    memset(g->class_data + (size_t)cls * sz, 0, sz);
 }
 
 size_t eg_node_count(const egraph* g) { return (size_t)bbq_vec_len(g->nodes); }
@@ -162,6 +193,27 @@ eg_id eg_add(egraph* g, int op, int64_t data, const eg_id* kids, int nkids) {
     bbq_vec_push(g->nodes, n);
     class_push(g, cls, idx);
     hashcons_insert(g, (size_t)idx, h);
+
+    /* egg Fig. 9 lines 10-11: a new singleton's fact is make() of its one
+     * e-node, and modify() may then add to the class. */
+    analysis_reserve(g, cls);
+    if (g->analysis) {
+        size_t sz = g->analysis->size;
+        g->analysis->make(g, op, data, g->kids + off, nkids,
+                          g->class_data + (size_t)cls * sz,
+                          g->analysis->user);
+        if (g->analysis->modify) {
+            /* On a COPY: modify may intern a node, which grows the fact
+             * array and moves it, so a pointer into it would dangle the
+             * moment modify used the graph it was handed. */
+            unsigned char* snap = (unsigned char*)malloc(sz);
+            if (snap) {
+                memcpy(snap, g->class_data + (size_t)cls * sz, sz);
+                g->analysis->modify(g, cls, snap, g->analysis->user);
+                free(snap);
+            }
+        }
+    }
     return cls;
 }
 
@@ -188,10 +240,82 @@ bool eg_merge(egraph* g, eg_id a, eg_id b) {
     }
     bbq_vec_truncate(g->classes[b].node_idx, 0);
 
+    /* egg Fig. 9 lines 17-18: the survivor's fact is the join of both. */
+    if (g->analysis) {
+        size_t sz = g->analysis->size;
+        unsigned char* tmp = (unsigned char*)calloc(1, sz);
+        if (tmp) {
+            g->analysis->join(g->class_data + (size_t)a * sz,
+                              g->class_data + (size_t)b * sz,
+                              tmp, g->analysis->user);
+            memcpy(g->class_data + (size_t)a * sz, tmp, sz);
+            free(tmp);
+        }
+    }
+
     /* Every node in the graph may now have a stale child; the repair pass
      * is what re-canonicalises and re-hashconses them. */
     work_push(g, a);
     return true;
+}
+
+/* Restore egg's analysis invariant: `d_c = ⋀ make(n)` over the class's
+ * e-nodes, then `modify(c) = c`.
+ *
+ * egg Fig. 9 lines 37-44 walk each repaired class's PARENTS and re-join
+ * them. This file repairs by re-canonicalising and re-hashconsing every
+ * node instead of keeping parent lists, so the fact pass takes the same
+ * shape: sweep every live node joining its make() into its class, to a
+ * fixpoint. It reaches the same answer — the invariant is a property of
+ * the finished graph, not of the order it is restored in — and it needs
+ * no structure the repair does not already maintain. Terms are
+ * applet-sized, so the sweep is cheap; the fixpoint terminates because
+ * join is a semilattice operation and the caller's domain has finite
+ * height (widening is the caller's, see egraph.h). */
+static void analysis_restore(egraph* g) {
+    if (!g->analysis) return;
+    size_t sz = g->analysis->size;
+    unsigned char* made = (unsigned char*)calloc(1, sz);
+    unsigned char* joined = (unsigned char*)calloc(1, sz);
+    if (!made || !joined) { free(made); free(joined); return; }
+
+    /* Bounded, for the same reason saturation is: a congruence cycle can
+     * let a fact keep moving, and a bound is a parameter rather than a
+     * hope. A domain of finite height reaches its fixpoint long before
+     * this; one that does not has a join that is not widening, which is
+     * the caller's contract to keep. */
+    int rounds = 64;
+    bool changed = true;
+    while (changed && rounds-- > 0) {
+        changed = false;
+        for (int i = 0; i < bbq_vec_len(g->nodes); i++) {
+            struct eg_node* n = &g->nodes[i];
+            if (!n->live) continue;
+            eg_id c = eg_find(g, n->cls);
+            memset(made, 0, sz);
+            g->analysis->make(g, n->op, n->data, node_kids(g, n), n->nkids,
+                              made, g->analysis->user);
+            unsigned char* cur = g->class_data + (size_t)c * sz;
+            memset(joined, 0, sz);
+            g->analysis->join(cur, made, joined, g->analysis->user);
+            if (memcmp(cur, joined, sz) != 0) {
+                memcpy(cur, joined, sz);
+                changed = true;
+            }
+        }
+    }
+
+    if (g->analysis->modify) {
+        for (eg_id c = 0; c < (eg_id)bbq_vec_len(g->classes); c++) {
+            if (eg_find(g, c) != c) continue;
+            /* Same copy as in eg_add, for the same reason: modify interns
+             * nodes, and interning moves this array. */
+            memcpy(made, g->class_data + (size_t)c * sz, sz);
+            g->analysis->modify(g, c, made, g->analysis->user);
+        }
+    }
+    free(made);
+    free(joined);
 }
 
 void eg_rebuild(egraph* g) {
@@ -228,6 +352,8 @@ void eg_rebuild(egraph* g) {
             }
             hashcons_insert(g, (size_t)i, h);
         }
+
+        analysis_restore(g);
     }
 }
 
@@ -305,8 +431,8 @@ typedef struct {
 
 static long long node_cost(egraph* g, const ext_state* st,
                            const struct eg_node* n,
-                           const int* cost_by_op, int cost_len) {
-    long long c = (n->op >= 0 && n->op < cost_len) ? cost_by_op[n->op] : 1;
+                           eg_cost_fn cost, void* user) {
+    long long c = cost(n->op, n->data, user);
     for (int i = 0; i < n->nkids; i++) {
         long long kc = st->cost[eg_find(g, node_kids(g, n)[i])];
         if (kc < 0) return -1;   /* a child has no finite term yet */
@@ -315,8 +441,9 @@ static long long node_cost(egraph* g, const ext_state* st,
     return c;
 }
 
-bool eg_extract(egraph* g, eg_id root, const int* cost_by_op, int cost_len,
-                eg_extract_result* out) {
+bool eg_extract_excluding(egraph* g, eg_id root, eg_cost_fn cost, void* user,
+                          int excl_op, int64_t excl_data,
+                          eg_extract_result* out) {
     memset(out, 0, sizeof *out);
     size_t nc = (size_t)bbq_vec_len(g->classes);
     ext_state st;
@@ -329,8 +456,13 @@ bool eg_extract(egraph* g, eg_id root, const int* cost_by_op, int cost_len,
         improved = false;
         for (int i = 0; i < bbq_vec_len(g->nodes); i++) {
             if (!g->nodes[i].live) continue;
+            /* The excluded term is not a candidate anywhere in the result.
+             * See eg_extract_excluding's header comment for why a caller
+             * needs this and why "anywhere", not just at the root. */
+            if (g->nodes[i].op == excl_op && g->nodes[i].data == excl_data)
+                continue;
             eg_id c = eg_find(g, g->nodes[i].cls);
-            long long nc2 = node_cost(g, &st, &g->nodes[i], cost_by_op, cost_len);
+            long long nc2 = node_cost(g, &st, &g->nodes[i], cost, user);
             if (nc2 < 0) continue;
             if (st.cost[c] < 0 || nc2 < st.cost[c]) {
                 st.cost[c] = nc2;
@@ -385,6 +517,13 @@ bool eg_extract(egraph* g, eg_id root, const int* cost_by_op, int cost_len,
 
     free(memo); free(st.cost); free(st.best);
     return true;
+}
+
+bool eg_extract(egraph* g, eg_id root, eg_cost_fn cost, void* user,
+                eg_extract_result* out) {
+    /* An op of -1 matches no e-node: every op a consumer interns comes from
+     * its own terminal table, and eg_add stores it unchanged. */
+    return eg_extract_excluding(g, root, cost, user, -1, 0, out);
 }
 
 int eg_extracted_op(const eg_extract_result* r, int node) {

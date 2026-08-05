@@ -93,6 +93,65 @@ int   eg_class_node_op(egraph* g, eg_id cls, int i);
 int   eg_class_node_nkids(egraph* g, eg_id cls, int i);
 eg_id eg_class_node_kid(egraph* g, eg_id cls, int i, int k);
 
+/* ── E-class analyses ──────────────────────────────────────────────
+ * egg §4.1 (Willsey et al., POPL 2021), whose interface this is.
+ *
+ * A rewrite rule can only say that two terms are EQUAL. It cannot say
+ * that a value lies in [0, 255], which is what a width-narrowing or a
+ * bounds-check elimination needs — those are abstract interpretation,
+ * not rewriting. An e-class analysis attaches a fact from a domain D to
+ * each e-class and maintains egg's invariant:
+ *
+ *     ∀c ∈ G .  d_c = ⋀ make(n)  for n ∈ c,  and  modify(c) = c
+ *
+ * i.e. a class's fact is the join of `make` over every e-node in it, and
+ * `modify`'s additions are driven to a fixed point.
+ *
+ * The payoff over a per-node analysis is that facts flow ALONG
+ * equalities: when two e-nodes are known equal, the class carries the
+ * strongest fact consistent with both, so proving something about one
+ * form of a value sharpens every other form of it.
+ *
+ * TERMINATION IS THE CALLER'S. egg requires a join-semilattice and says
+ * nothing about chain height; a domain with infinite ascending chains
+ * (intervals: [0,1] ⊑ [0,2] ⊑ …) will not stabilise here any more than
+ * under Kleene iteration, because saturation IS that iteration. Such a
+ * domain must widen inside `join`.
+ *
+ * D is a fixed-size blob the runtime never interprets. Its bytes are
+ * zeroed before every `make` and `join`, so the runtime can compare two
+ * facts with memcmp without padding making equal facts look different. */
+typedef struct {
+    size_t size;                  /* bytes of analysis data per e-class */
+
+    /* The fact for an e-node, read as if it alone were in its class. A
+     * child's fact is available through eg_class_data. */
+    void (*make)(egraph* g, int op, int64_t data,
+                 const eg_id* kids, int nkids, void* out, void* user);
+
+    /* Combine the facts of two classes being merged, or of a class and
+     * one of its members. Must be commutative, associative and
+     * idempotent, and must widen if D has infinite ascending chains. */
+    void (*join)(const void* a, const void* b, void* out, void* user);
+
+    /* Optionally add an e-node implied by the fact — a constant, say,
+     * once the fact says the class is that constant. Must be idempotent;
+     * interning an existing term already is, so adding through eg_add
+     * satisfies this for free. May be NULL. */
+    void (*modify)(egraph* g, eg_id c, const void* d, void* user);
+
+    void* user;
+} eg_analysis;
+
+/* Install an analysis. Call before the first eg_add: facts are computed
+ * as nodes are added, and a class created earlier would have none. The
+ * struct is copied. */
+void eg_set_analysis(egraph* g, const eg_analysis* a);
+
+/* The fact for `c`, or NULL when no analysis is installed. Valid until
+ * the next merge or rebuild. */
+void* eg_class_data(egraph* g, eg_id c);
+
 /* Saturation bounds. Both are caller-supplied: the graph cannot know what
  * a reasonable size is for the consumer's terms. */
 typedef struct {
@@ -121,12 +180,47 @@ typedef struct {
     int      root;
 } eg_extract_result;
 
-/* Extract the cheapest term for `root`'s class under `cost_by_op`, a table
- * indexed by operator. Returns false when the class has no finite-cost
- * term (every candidate cycles back through itself). */
+/* What one e-node costs, asked of the consumer per NODE rather than read
+ * from a table indexed by operator.
+ *
+ * Per-node because a cost is frequently not a property of the operator
+ * alone: a target that encodes a small constant in one byte and a large
+ * one in three prices `Const` by its VALUE, and an operator-indexed table
+ * has to pick an average that is wrong in both directions. Under a
+ * size-first model that average is the difference between choosing a
+ * shift and choosing a multiply. The runtime still interprets nothing —
+ * `op` and `data` are the consumer's own, handed straight back.
+ *
+ * Costs are summed over the chosen term, so they must be non-negative;
+ * a negative one would make a cycle look cheap. */
+typedef int (*eg_cost_fn)(int op, int64_t data, void* user);
+
+/* Extract the cheapest term for `root`'s class under `cost`. Returns false
+ * when the class has no finite-cost term (every candidate cycles back
+ * through itself). */
 bool eg_extract(egraph* g, eg_id root,
-                const int* cost_by_op, int cost_len,
+                eg_cost_fn cost, void* user,
                 eg_extract_result* out);
+
+/* As eg_extract, but the e-node `excl_op[excl_data]` is not a candidate.
+ *
+ * WHY A CALLER NEEDS THIS. A consumer whose IR has let-bindings puts the
+ * bound variable in the SAME class as the expression it is bound to —
+ * that is what lets a rewrite see through the binding, and it is pure
+ * added information. But the binding's own right-hand side may not then
+ * be extracted AS that variable: `t = t` is not a definition of t, it
+ * discards the value. The variable is the cheapest member of the class
+ * almost by construction (a name is smaller than what it names), so
+ * without an exclusion the binding could never be rewritten at all.
+ *
+ * Excluded EVERYWHERE in the result, not merely at the root: a term that
+ * reached the bound variable through any depth of children would be just
+ * as circular. Extraction still interprets nothing — it compares an int
+ * and an int64, both of which the consumer chose. */
+bool eg_extract_excluding(egraph* g, eg_id root,
+                          eg_cost_fn cost, void* user,
+                          int excl_op, int64_t excl_data,
+                          eg_extract_result* out);
 
 int  eg_extracted_op(const eg_extract_result* r, int node);
 void eg_extract_free(eg_extract_result* r);
@@ -145,6 +239,10 @@ struct egraph {
     struct eg_class* classes;
     eg_id*           parent;    /* union-find */
     eg_id*           worklist;  /* classes needing congruence repair */
+    /* The installed e-class analysis, or NULL. `class_data` is a bbq_vec
+     * of bytes holding analysis->size per class, indexed by class id. */
+    eg_analysis*     analysis;
+    unsigned char*   class_data;
     /* hash → first node index with that hash; nodes chain via next_hash.
      * The chain exists because a hash is not an identity: a hit is a
      * candidate to compare, never an answer. */

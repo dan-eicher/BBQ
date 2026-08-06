@@ -1276,7 +1276,11 @@ std::string CBackend::field_check_expr(DdcgAst::Pattern* sub,
             }
         }
         // C has no operator== on strings; use strcmp via <string.h>.
-        return "(strcmp(" + field_expr + ", \"" + lit + "\") == 0)";
+        // Unparenthesised: the caller adds a pair when it joins several
+        // checks, and wrapping here too would emit `if ((… == 0))` for a
+        // lone check — which clang rejects under -Werror as an equality
+        // meant to be an assignment (-Wparentheses-equality).
+        return "strcmp(" + field_expr + ", \"" + lit + "\") == 0";
     }
     if (dynamic_cast<DdcgAst::NilPat*>(sub)) {
         return field_expr + " == NULL";
@@ -1404,7 +1408,14 @@ int CBackend::emit_match(const Schema& schema,
         std::string combined;
         for (size_t i = 0; i < leaf_checks.size(); ++i) {
             if (i) combined += " && ";
-            combined += "(" + leaf_checks[i] + ")";
+            // Parenthesise only when joining. A lone check already sits
+            // inside the `if (...)`, and the extra pair emits
+            // `if ((a == b))`, which clang reads as a comparison the
+            // author meant to be an assignment
+            // (-Wparentheses-equality) — an error under -Werror.
+            combined += leaf_checks.size() > 1
+                          ? "(" + leaf_checks[i] + ")"
+                          : leaf_checks[i];
         }
         indent() << "if (" << combined << ") {\n";
         indent_depth_++;

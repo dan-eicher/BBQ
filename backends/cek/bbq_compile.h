@@ -1382,7 +1382,7 @@ private:
         if (auto* _n0 = dynamic_cast<BBQ::BinOp*>(node)) {
             auto l = _n0->left;
             auto r = _n0->right;
-            if ((_n0->op == BBQ::Binop::Add)) {
+            if (_n0->op == BBQ::Binop::Add) {
                 bbq_ir::StaticKont* lv = compile_expr(l, rho, ac(), jump(Lnext), Lnext);
                 bbq_ir::StaticKont* rv = compile_expr(r, rho, ac(), jump(Lnext), Lnext);
                 return cg_deliver(make_add(lv, rv), delta, gamma, Lnext);
@@ -1391,7 +1391,7 @@ private:
         if (auto* _n0 = dynamic_cast<BBQ::BinOp*>(node)) {
             auto l = _n0->left;
             auto r = _n0->right;
-            if ((_n0->op == BBQ::Binop::Sub)) {
+            if (_n0->op == BBQ::Binop::Sub) {
                 bbq_ir::StaticKont* lv = compile_expr(l, rho, ac(), jump(Lnext), Lnext);
                 bbq_ir::StaticKont* rv = compile_expr(r, rho, ac(), jump(Lnext), Lnext);
                 return cg_deliver(make_sub(lv, rv), delta, gamma, Lnext);
@@ -1400,7 +1400,7 @@ private:
         if (auto* _n0 = dynamic_cast<BBQ::BinOp*>(node)) {
             auto l = _n0->left;
             auto r = _n0->right;
-            if ((_n0->op == BBQ::Binop::Mul)) {
+            if (_n0->op == BBQ::Binop::Mul) {
                 bbq_ir::StaticKont* lv = compile_expr(l, rho, ac(), jump(Lnext), Lnext);
                 bbq_ir::StaticKont* rv = compile_expr(r, rho, ac(), jump(Lnext), Lnext);
                 return cg_deliver(make_mul(lv, rv), delta, gamma, Lnext);
@@ -1409,7 +1409,7 @@ private:
         if (auto* _n0 = dynamic_cast<BBQ::BinOp*>(node)) {
             auto l = _n0->left;
             auto r = _n0->right;
-            if ((_n0->op == BBQ::Binop::Div)) {
+            if (_n0->op == BBQ::Binop::Div) {
                 bbq_ir::StaticKont* lv = compile_expr(l, rho, ac(), jump(Lnext), Lnext);
                 bbq_ir::StaticKont* rv = compile_expr(r, rho, ac(), jump(Lnext), Lnext);
                 return cg_deliver(make_div(lv, rv), delta, gamma, Lnext);
@@ -1418,7 +1418,7 @@ private:
         if (auto* _n0 = dynamic_cast<BBQ::BinOp*>(node)) {
             auto l = _n0->left;
             auto r = _n0->right;
-            if ((_n0->op == BBQ::Binop::Mod)) {
+            if (_n0->op == BBQ::Binop::Mod) {
                 bbq_ir::StaticKont* lv = compile_expr(l, rho, ac(), jump(Lnext), Lnext);
                 bbq_ir::StaticKont* rv = compile_expr(r, rho, ac(), jump(Lnext), Lnext);
                 return cg_deliver(make_mod(lv, rv), delta, gamma, Lnext);
@@ -1427,7 +1427,7 @@ private:
         if (auto* _n0 = dynamic_cast<BBQ::BinOp*>(node)) {
             auto l = _n0->left;
             auto r = _n0->right;
-            if ((_n0->op == BBQ::Binop::BitAnd)) {
+            if (_n0->op == BBQ::Binop::BitAnd) {
                 bbq_ir::StaticKont* lv = compile_expr(l, rho, ac(), jump(Lnext), Lnext);
                 bbq_ir::StaticKont* rv = compile_expr(r, rho, ac(), jump(Lnext), Lnext);
                 return cg_deliver(make_bit_and(lv, rv), delta, gamma, Lnext);
@@ -1436,7 +1436,7 @@ private:
         if (auto* _n0 = dynamic_cast<BBQ::BinOp*>(node)) {
             auto l = _n0->left;
             auto r = _n0->right;
-            if ((_n0->op == BBQ::Binop::BitOr)) {
+            if (_n0->op == BBQ::Binop::BitOr) {
                 bbq_ir::StaticKont* lv = compile_expr(l, rho, ac(), jump(Lnext), Lnext);
                 bbq_ir::StaticKont* rv = compile_expr(r, rho, ac(), jump(Lnext), Lnext);
                 return cg_deliver(make_bit_or(lv, rv), delta, gamma, Lnext);
@@ -1445,7 +1445,7 @@ private:
         if (auto* _n0 = dynamic_cast<BBQ::BinOp*>(node)) {
             auto l = _n0->left;
             auto r = _n0->right;
-            if ((_n0->op == BBQ::Binop::BitXor)) {
+            if (_n0->op == BBQ::Binop::BitXor) {
                 bbq_ir::StaticKont* lv = compile_expr(l, rho, ac(), jump(Lnext), Lnext);
                 bbq_ir::StaticKont* rv = compile_expr(r, rho, ac(), jump(Lnext), Lnext);
                 return cg_deliver(make_bit_xor(lv, rv), delta, gamma, Lnext);
@@ -1454,7 +1454,7 @@ private:
         if (auto* _n0 = dynamic_cast<BBQ::BinOp*>(node)) {
             auto l = _n0->left;
             auto r = _n0->right;
-            if ((_n0->op == BBQ::Binop::Shl)) {
+            if (_n0->op == BBQ::Binop::Shl) {
                 bbq_ir::StaticKont* lv = compile_expr(l, rho, ac(), jump(Lnext), Lnext);
                 bbq_ir::StaticKont* rv = compile_expr(r, rho, ac(), jump(Lnext), Lnext);
                 return cg_deliver(make_shl(lv, rv), delta, gamma, Lnext);
@@ -1463,7 +1463,7 @@ private:
         if (auto* _n0 = dynamic_cast<BBQ::BinOp*>(node)) {
             auto l = _n0->left;
             auto r = _n0->right;
-            if ((_n0->op == BBQ::Binop::Shr)) {
+            if (_n0->op == BBQ::Binop::Shr) {
                 bbq_ir::StaticKont* lv = compile_expr(l, rho, ac(), jump(Lnext), Lnext);
                 bbq_ir::StaticKont* rv = compile_expr(r, rho, ac(), jump(Lnext), Lnext);
                 return cg_deliver(make_shr(lv, rv), delta, gamma, Lnext);
@@ -1472,7 +1472,7 @@ private:
         if (auto* _n0 = dynamic_cast<BBQ::BinOp*>(node)) {
             auto l = _n0->left;
             auto r = _n0->right;
-            if ((_n0->op == BBQ::Binop::Eq)) {
+            if (_n0->op == BBQ::Binop::Eq) {
                 bbq_ir::StaticKont* lv = compile_expr(l, rho, ac(), jump(Lnext), Lnext);
                 bbq_ir::StaticKont* rv = compile_expr(r, rho, ac(), jump(Lnext), Lnext);
                 return cg_deliver(make_eq(lv, rv), delta, gamma, Lnext);
@@ -1481,7 +1481,7 @@ private:
         if (auto* _n0 = dynamic_cast<BBQ::BinOp*>(node)) {
             auto l = _n0->left;
             auto r = _n0->right;
-            if ((_n0->op == BBQ::Binop::Ne)) {
+            if (_n0->op == BBQ::Binop::Ne) {
                 bbq_ir::StaticKont* lv = compile_expr(l, rho, ac(), jump(Lnext), Lnext);
                 bbq_ir::StaticKont* rv = compile_expr(r, rho, ac(), jump(Lnext), Lnext);
                 return cg_deliver(make_ne(lv, rv), delta, gamma, Lnext);
@@ -1490,7 +1490,7 @@ private:
         if (auto* _n0 = dynamic_cast<BBQ::BinOp*>(node)) {
             auto l = _n0->left;
             auto r = _n0->right;
-            if ((_n0->op == BBQ::Binop::Lt)) {
+            if (_n0->op == BBQ::Binop::Lt) {
                 bbq_ir::StaticKont* lv = compile_expr(l, rho, ac(), jump(Lnext), Lnext);
                 bbq_ir::StaticKont* rv = compile_expr(r, rho, ac(), jump(Lnext), Lnext);
                 return cg_deliver(make_lt(lv, rv), delta, gamma, Lnext);
@@ -1499,7 +1499,7 @@ private:
         if (auto* _n0 = dynamic_cast<BBQ::BinOp*>(node)) {
             auto l = _n0->left;
             auto r = _n0->right;
-            if ((_n0->op == BBQ::Binop::Le)) {
+            if (_n0->op == BBQ::Binop::Le) {
                 bbq_ir::StaticKont* lv = compile_expr(l, rho, ac(), jump(Lnext), Lnext);
                 bbq_ir::StaticKont* rv = compile_expr(r, rho, ac(), jump(Lnext), Lnext);
                 return cg_deliver(make_le(lv, rv), delta, gamma, Lnext);
@@ -1508,7 +1508,7 @@ private:
         if (auto* _n0 = dynamic_cast<BBQ::BinOp*>(node)) {
             auto l = _n0->left;
             auto r = _n0->right;
-            if ((_n0->op == BBQ::Binop::Gt)) {
+            if (_n0->op == BBQ::Binop::Gt) {
                 bbq_ir::StaticKont* lv = compile_expr(l, rho, ac(), jump(Lnext), Lnext);
                 bbq_ir::StaticKont* rv = compile_expr(r, rho, ac(), jump(Lnext), Lnext);
                 return cg_deliver(make_gt(lv, rv), delta, gamma, Lnext);
@@ -1517,7 +1517,7 @@ private:
         if (auto* _n0 = dynamic_cast<BBQ::BinOp*>(node)) {
             auto l = _n0->left;
             auto r = _n0->right;
-            if ((_n0->op == BBQ::Binop::Ge)) {
+            if (_n0->op == BBQ::Binop::Ge) {
                 bbq_ir::StaticKont* lv = compile_expr(l, rho, ac(), jump(Lnext), Lnext);
                 bbq_ir::StaticKont* rv = compile_expr(r, rho, ac(), jump(Lnext), Lnext);
                 return cg_deliver(make_ge(lv, rv), delta, gamma, Lnext);
@@ -1526,7 +1526,7 @@ private:
         if (auto* _n0 = dynamic_cast<BBQ::BinOp*>(node)) {
             auto l = _n0->left;
             auto r = _n0->right;
-            if ((_n0->op == BBQ::Binop::And)) {
+            if (_n0->op == BBQ::Binop::And) {
                 bbq_ir::StaticKont* lv = compile_expr(l, rho, ac(), jump(Lnext), Lnext);
                 bbq_ir::StaticKont* rv = compile_expr(r, rho, ac(), jump(Lnext), Lnext);
                 return cg_deliver(make_logical_and(lv, rv), delta, gamma, Lnext);
@@ -1535,7 +1535,7 @@ private:
         if (auto* _n0 = dynamic_cast<BBQ::BinOp*>(node)) {
             auto l = _n0->left;
             auto r = _n0->right;
-            if ((_n0->op == BBQ::Binop::Or)) {
+            if (_n0->op == BBQ::Binop::Or) {
                 bbq_ir::StaticKont* lv = compile_expr(l, rho, ac(), jump(Lnext), Lnext);
                 bbq_ir::StaticKont* rv = compile_expr(r, rho, ac(), jump(Lnext), Lnext);
                 return cg_deliver(make_logical_or(lv, rv), delta, gamma, Lnext);
@@ -1543,21 +1543,21 @@ private:
         }
         if (auto* _n0 = dynamic_cast<BBQ::UnaryOp*>(node)) {
             auto e = _n0->operand;
-            if ((_n0->op == BBQ::Unaryop::Neg)) {
+            if (_n0->op == BBQ::Unaryop::Neg) {
                 bbq_ir::StaticKont* ev = compile_expr(e, rho, ac(), jump(Lnext), Lnext);
                 return cg_deliver(make_neg(ev), delta, gamma, Lnext);
             }
         }
         if (auto* _n0 = dynamic_cast<BBQ::UnaryOp*>(node)) {
             auto e = _n0->operand;
-            if ((_n0->op == BBQ::Unaryop::BitNot)) {
+            if (_n0->op == BBQ::Unaryop::BitNot) {
                 bbq_ir::StaticKont* ev = compile_expr(e, rho, ac(), jump(Lnext), Lnext);
                 return cg_deliver(make_bit_not(ev), delta, gamma, Lnext);
             }
         }
         if (auto* _n0 = dynamic_cast<BBQ::UnaryOp*>(node)) {
             auto e = _n0->operand;
-            if ((_n0->op == BBQ::Unaryop::Not)) {
+            if (_n0->op == BBQ::Unaryop::Not) {
                 bbq_ir::StaticKont* ev = compile_expr(e, rho, ac(), jump(Lnext), Lnext);
                 return cg_deliver(make_not(ev), delta, gamma, Lnext);
             }

@@ -600,9 +600,16 @@ void EmitBackend::emit_stmt(DdcgAst::Stmt* s, bool is_tail) {
         return;
     }
     if (auto* ifs = dynamic_cast<DdcgAst::IfStmt*>(s)) {
-        indent() << "if (";
+        // Same as the rule-guard site: emit_expr already parenthesises
+        // a binary operator, so adding the if's own pair would give
+        // `if ((a == b))` — rejected by clang under -Werror.
+        const bool self_parens =
+            dynamic_cast<DdcgAst::BinOp*>(ifs->cond) != nullptr;
+        indent() << "if ";
+        if (!self_parens) out() << "(";
         emit_expr(ifs->cond);
-        out() << ") {\n";
+        if (!self_parens) out() << ")";
+        out() << " {\n";
         indent_depth_++;
         emit_stmts(ifs->then_body, /*tail=*/false);
         indent_depth_--;
@@ -656,9 +663,19 @@ void EmitBackend::emit_rule_branch(const Schema& schema,
     int blocks_open = emit_match(schema, cp, "node", name_ctr);
 
     if (rule->guard.has_value()) {
-        indent() << "if (";
+        // emit_expr parenthesises a binary operator to fix precedence,
+        // so a top-level one already reads `(a == b)`. Adding the if's
+        // own pair gives `if ((a == b))`, which clang rejects under
+        // -Werror as an equality meant to be an assignment
+        // (-Wparentheses-equality). gcc has no such warning, which is
+        // why the -Werror e2e targets never caught it.
+        const bool self_parens =
+            dynamic_cast<DdcgAst::BinOp*>(*rule->guard) != nullptr;
+        indent() << "if ";
+        if (!self_parens) out() << "(";
         emit_expr(*rule->guard);
-        out() << ") {\n";
+        if (!self_parens) out() << ")";
+        out() << " {\n";
         indent_depth_++;
         emit_stmts(rule->body, /*tail=*/true);
         if (tail_break_after_guard_match_) {

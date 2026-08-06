@@ -853,7 +853,14 @@ int CppBackend::emit_match(const Schema& schema,
         std::string combined;
         for (size_t i = 0; i < leaf_checks.size(); ++i) {
             if (i) combined += " && ";
-            combined += "(" + leaf_checks[i] + ")";
+            // Parenthesise only when joining — see c_backend.cpp: a
+            // lone check already sits inside the `if (...)`, and the
+            // extra pair emits `if ((a == b))`, which clang reads as a
+            // comparison the author meant to be an assignment
+            // (-Wparentheses-equality), an error under -Werror.
+            combined += leaf_checks.size() > 1
+                          ? "(" + leaf_checks[i] + ")"
+                          : leaf_checks[i];
         }
         indent() << "if (" << combined << ") {\n";
         indent_depth_++;

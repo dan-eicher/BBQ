@@ -186,6 +186,19 @@ target_include_directories(ddcgc_kitchensink_c_e2e PRIVATE
 target_link_libraries(ddcgc_kitchensink_c_e2e PRIVATE bbq_crt)
 add_test(NAME ddcgc_kitchensink_c_e2e COMMAND ddcgc_kitchensink_c_e2e)
 
+# The emitted C must never contain `if ((expr))`. clang reads a doubly
+# parenthesised equality as an assignment the author meant to write
+# (-Wparentheses-equality) and rejects it under -Werror; gcc has no such
+# warning, so the -Werror e2e targets above compile it happily and a
+# clang-built consumer is the first thing to break.
+#
+# Checking the emitted TEXT rather than adding a clang build keeps the
+# pin independent of whichever compiler CMake picked.
+add_test(NAME ddcgc_no_redundant_parens
+    COMMAND ${CMAKE_COMMAND}
+            -DGENERATED=${DDCG_TEST_OUT}/kitchensink_compile.c
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/no_redundant_parens.cmake)
+
 # ── scoped — Phase 1 fixture for chained-rho-pangolin (recursive ρ). ──
 add_custom_command(
     OUTPUT ${DDCG_TEST_OUT}/scoped_ast.json

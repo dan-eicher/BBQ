@@ -113,7 +113,10 @@ static void class_push(egraph* g, eg_id cls, int node_idx) {
 /* ── hashcons ────────────────────────────────────────────────────── */
 
 static eg_id* node_kids(egraph* g, const struct eg_node* n) {
-    return g->kids + n->kid_off;
+    /* `kids` is unallocated until a node with children is added, and
+     * NULL + 0 is undefined. Every caller guards on nkids before
+     * reading through the result. */
+    return g->kids ? g->kids + n->kid_off : NULL;
 }
 
 static void canonicalise(egraph* g, struct eg_node* n) {
@@ -176,8 +179,12 @@ eg_id eg_add(egraph* g, int op, int64_t data, const eg_id* kids, int nkids) {
     size_t off = (size_t)bbq_vec_len(g->kids);
     for (int i = 0; i < nkids; i++) bbq_vec_push(g->kids, eg_find(g, kids[i]));
 
-    uint64_t h = node_hash(g, op, data, g->kids + off, nkids);
-    eg_id found = hashcons_lookup(g, op, data, g->kids + off, nkids, h);
+    /* A childless node adds nothing, so `g->kids` may still be NULL —
+     * and NULL + 0 is undefined even though nkids == 0 means nothing
+     * ever reads through it. */
+    const eg_id* kbase = g->kids ? g->kids + off : NULL;
+    uint64_t h = node_hash(g, op, data, kbase, nkids);
+    eg_id found = hashcons_lookup(g, op, data, kbase, nkids, h);
     if (found >= 0) { bbq_vec_truncate(g->kids, (int)off); return found; }
 
     eg_id cls = eg_new_class(g);
@@ -199,7 +206,7 @@ eg_id eg_add(egraph* g, int op, int64_t data, const eg_id* kids, int nkids) {
     analysis_reserve(g, cls);
     if (g->analysis) {
         size_t sz = g->analysis->size;
-        g->analysis->make(g, op, data, g->kids + off, nkids,
+        g->analysis->make(g, op, data, kbase, nkids,
                           g->class_data + (size_t)cls * sz,
                           g->analysis->user);
         if (g->analysis->modify) {

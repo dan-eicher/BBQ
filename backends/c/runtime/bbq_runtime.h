@@ -381,7 +381,11 @@ static inline bool bbq_write_bool(bbq_write_ctx_t* ctx, bool val) {
 static inline bool bbq_write_bytes(bbq_write_ctx_t* ctx,
                                     const uint8_t* data, size_t len) {
     if (!bbq_write_reserve(ctx, len)) return false;
-    memcpy(ctx->data + ctx->pos, data, len);
+    /* An empty bytes/string field legitimately carries a NULL pointer,
+     * and memcpy's arguments are declared non-null even when the length
+     * is zero — so passing one through is undefined behaviour rather
+     * than a harmless no-op. */
+    if (len > 0) memcpy(ctx->data + ctx->pos, data, len);
     ctx->pos += len;
     return true;
 }

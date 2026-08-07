@@ -39,10 +39,19 @@ analysis).
 : Output file for the rendered template. Defaults to stdout when
   templating; ignored without `-t`.
 
-**-lang** *c* | *c++*
+**-lang** *c* | *c++* | *java*
 : Target language for type registration. Default: `c++`. With
   `-lang c`, type names are registered using snake_case
-  conventions (`my_module_my_type_t` etc.).
+  conventions (`my_module_my_type_t` etc.). With `-lang java`,
+  primitives map to Java (`string`/`identifier` to `String`,
+  `int64` to `long`, `bool` to `boolean`), sums register as plain
+  references with no pointer suffix, and a field-free sum registers
+  as `int` because Java has no enums before 1.5. Pair it with
+  `templates/java.inja`.
+
+**-java-package** *name*
+: Emit a `package` declaration at the top of `-lang java` output.
+  Rejected with any other `-lang`.
 
 **--json** *file*
 : Write the processed module as JSON to *file*. The schema matches
@@ -135,6 +144,20 @@ Generate C++ AST from a template:
 ```
 asdl -i mymod.asdl -t templates/cpp_ast.inja -o MyAST.h
 ```
+
+Generate Java 1.0 AST classes into a package:
+
+```
+asdl -i peg.asdl -t templates/java.inja -lang java \
+     -java-package com.example.peg -o Peg.java
+```
+
+The Java output targets the 1.0 language, not modern Java: every class is
+top-level (nested classes are 1.1), sequences are arrays (collections are 1.2,
+generics 1.5), a field-free sum becomes `int` constants (enums are 1.5), and no
+field is declared `final` — JLS 1.0 section 8.3.1.2 requires a final field's
+declarator to carry its initializer, so blank finals are 1.1. `tests/
+test_java_generation.cpp` pins each of those.
 
 Emit JSON sidecar for tooling:
 

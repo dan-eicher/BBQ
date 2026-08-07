@@ -44,7 +44,8 @@ find_package(GTest REQUIRED)
 enable_testing()
 add_executable(asdl_tests
     tests/test_string_utils.cpp
-    tests/test_generation.cpp)
+    tests/test_generation.cpp
+    tests/test_java_generation.cpp)
 target_link_libraries(asdl_tests PRIVATE asdl_lib GTest::GTest GTest::Main)
 target_compile_definitions(asdl_tests PRIVATE
     SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")

@@ -1,0 +1,126 @@
+{% if exists("java_package") %}
+package {{java_package}};
+
+{% endif %}
+// ============================================================
+// Auto-generated from ASDL — do not edit by hand.
+//
+// Java 1.0 dialect: no nested classes, no generics, no enums, no collections.
+// Every class is top-level; an ASDL sequence is an array; a field-free sum is a
+// domain of int constants; a single-constructor sum is one final class. A
+// multi-constructor sum carries its constructor as a `kind` tag on the base
+// class, so consumers switch on an int rather than dispatching virtually over
+// every constructor.
+//
+// No field is declared final. JLS 1.0 section 8.3.1.2: "A field can be declared
+// final, in which case its declarator must include a variable initializer or a
+// compile-time error occurs." Blank finals — declared here, assigned in the
+// constructor — arrived in Java 1.1. Class-level final is 1.0 and is used.
+//
+// Parameter lists are built with concat() rather than a literal space before
+// the name: inja's lstrip_blocks eats whitespace adjacent to a block tag, and a
+// swallowed space produces `int value` written as one token.
+// ============================================================
+
+{% for def in definitions %}
+{% if def.type == "sum" and def.is_enum %}
+// {{def.name}} — every constructor is field-free, so this is a constant domain.
+public final class {{camelcase(def.name)}} {
+{% for type in def.types %}
+    public static final int KIND_{{upper(type.name)}} = {{loop.index}};
+{% endfor %}
+
+    private {{camelcase(def.name)}}() { }
+}
+
+{% endif %}
+{% endfor %}
+{% for def in definitions %}
+{% if def.type == "sum" and not def.is_enum and length(def.types) > 1 %}
+public abstract class {{camelcase(def.name)}} {
+{% for type in def.types %}
+    public static final int KIND_{{upper(type.name)}} = {{loop.index}};
+{% endfor %}
+
+    public int kind;
+{% if existsIn(def, "attributes") and length(def.attributes) > 0 %}
+{% for field in def.attributes %}
+{% if field.flag == "sequence" %}
+    public {{get_type(field.type)}}[]{{concat(" ", safe_name(field.name))}};
+{% else %}
+    public {{get_type(field.type)}}{{concat(" ", safe_name(field.name))}};
+{% endif %}
+{% endfor %}
+{% endif %}
+
+    {{camelcase(def.name)}}(int kind) {
+        this.kind = kind;
+    }
+}
+
+{% endif %}
+{% endfor %}
+{% for def in definitions %}
+{% if def.type == "sum" and not def.is_enum and length(def.types) > 1 %}
+{% for type in def.types %}
+public final class {{type.name}} extends {{camelcase(def.name)}} {
+{% for field in type.fields %}
+{% if field.flag == "sequence" %}
+    public {{get_type(field.type)}}[]{{concat(" ", safe_name(field.name))}};
+{% else %}
+    public {{get_type(field.type)}}{{concat(" ", safe_name(field.name))}};
+{% endif %}
+{% endfor %}
+
+    public {{type.name}}({% for field in type.fields %}{{get_type(field.type)}}{% if field.flag == "sequence" %}[]{% endif %}{{concat(" ", safe_name(field.name))}}{% if not loop.is_last %}, {% endif %}{% endfor %}) {
+        super({{camelcase(def.name)}}.KIND_{{upper(type.name)}});
+{% for field in type.fields %}
+        this.{{safe_name(field.name)}} = {{safe_name(field.name)}};
+{% endfor %}
+    }
+}
+
+{% endfor %}
+{% endif %}
+{% endfor %}
+{% for def in definitions %}
+{% if def.type == "sum" and not def.is_enum and length(def.types) == 1 %}
+{% set type = def.types.0 %}
+public final class {{type.name}} {
+{% for field in type.fields %}
+{% if field.flag == "sequence" %}
+    public {{get_type(field.type)}}[]{{concat(" ", safe_name(field.name))}};
+{% else %}
+    public {{get_type(field.type)}}{{concat(" ", safe_name(field.name))}};
+{% endif %}
+{% endfor %}
+
+    public {{type.name}}({% for field in type.fields %}{{get_type(field.type)}}{% if field.flag == "sequence" %}[]{% endif %}{{concat(" ", safe_name(field.name))}}{% if not loop.is_last %}, {% endif %}{% endfor %}) {
+{% for field in type.fields %}
+        this.{{safe_name(field.name)}} = {{safe_name(field.name)}};
+{% endfor %}
+    }
+}
+
+{% endif %}
+{% endfor %}
+{% for def in definitions %}
+{% if def.type == "product" %}
+public final class {{camelcase(def.name)}} {
+{% for field in def.fields %}
+{% if field.flag == "sequence" %}
+    public {{get_type(field.type)}}[]{{concat(" ", safe_name(field.name))}};
+{% else %}
+    public {{get_type(field.type)}}{{concat(" ", safe_name(field.name))}};
+{% endif %}
+{% endfor %}
+
+    public {{camelcase(def.name)}}({% for field in def.fields %}{{get_type(field.type)}}{% if field.flag == "sequence" %}[]{% endif %}{{concat(" ", safe_name(field.name))}}{% if not loop.is_last %}, {% endif %}{% endfor %}) {
+{% for field in def.fields %}
+        this.{{safe_name(field.name)}} = {{safe_name(field.name)}};
+{% endfor %}
+    }
+}
+
+{% endif %}
+{% endfor %}

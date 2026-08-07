@@ -19,8 +19,10 @@ target_include_directories(pegc_frontend PUBLIC
 add_library(pegc_backend STATIC
     backend/ParserEmitter.cpp
     backend/CParserEmitter.cpp
+    backend/JavaParserEmitter.cpp
     runtime/cpp_emit.cpp
     runtime/c_emit.cpp
+    runtime/java_emit.cpp
     ../frontend/FrameProcessor.cpp
 )
 target_include_directories(pegc_backend PUBLIC
@@ -86,6 +88,7 @@ add_executable(pegc_tests
     tests/test_peg_analysis.cpp
     tests/test_peg_analysis_kildall.cpp
     tests/test_codegen.cpp
+    tests/test_java_codegen.cpp
 )
 target_link_libraries(pegc_tests PRIVATE pegc_backend GTest::GTest GTest::Main)
 target_compile_definitions(pegc_tests PRIVATE

@@ -205,6 +205,30 @@ void Generator::process(json& module) {
                     types_.register_type(def_name, c_type + "*");
                     module["bases"].push_back(c_type);
                 }
+            } else if (types_.is_java_mode()) {
+                // Java has no enums before 1.5, so a field-free sum is a domain
+                // of int constants and its fields are plain ints.
+                //
+                // A single-constructor sum is one final class named for its
+                // constructor: there is no tag to switch on, and an abstract
+                // base would collide with the constructor whenever the two
+                // names camel-case alike (`unit = Unit(...)` is the common
+                // shape). A multi-constructor sum is an abstract base plus one
+                // final subclass each, carrying a `kind` tag.
+                if (is_enum) {
+                    types_.register_type(def_name, "int");
+                } else if (def["types"].size() == 1) {
+                    std::string only = def["types"][0]["name"];
+                    types_.register_type(def_name, only);
+                    module["bases"].push_back(only);
+                } else {
+                    std::string base = CamelCase(def_name);
+                    types_.register_type(def_name, base);
+                    module["bases"].push_back(base);
+                    for (json& value : def["types"]) {
+                        value["base"] = base;
+                    }
+                }
             } else {
                 if (is_enum) {
                     std::string name = CamelCase(def_name);
@@ -229,6 +253,8 @@ void Generator::process(json& module) {
             def["is_enum"] = false;
             if (types_.is_c_mode()) {
                 types_.register_type(def_name, c_type);
+            } else if (types_.is_java_mode()) {
+                types_.register_type(def_name, CamelCase(def_name));
             } else {
                 types_.register_type(def_name, def_name);
             }

@@ -879,12 +879,12 @@ void CBackend::emit_match_expr(DdcgAst::MatchExpr* m) {
     }
     if (result_ty.empty()) result_ty = "int";
 
-    // Pick a unique local-name suffix from the address of the node
-    // so nested matches don't collide on `_m` / `_r`.
-    char buf[32];
-    std::snprintf(buf, sizeof(buf), "_%p", (const void*)m);
-    std::string m_var = std::string("_m") + (buf + 2);
-    std::string r_var = std::string("_r") + (buf + 2);
+    // A unique local-name suffix so nested matches don't collide on
+    // `_m` / `_r`. Numbered, not taken from the node's address: the
+    // address varies run to run, so the emitted file did too.
+    std::string sfx = std::to_string(match_var_ctr_++);
+    std::string m_var = "_m" + sfx;
+    std::string r_var = "_r" + sfx;
 
     std::string saved_target = match_target_var_;
     match_target_var_ = r_var;
@@ -1188,7 +1188,8 @@ void CBackend::emit_let_destructure(DdcgAst::LetStmt* l) {
     std::vector<std::string> shape;
     for (const auto& te : vit->second.elems) shape.push_back(c_for_type(te));
     std::string tup_t = tuple_type_name(shape);
-    std::string tmp = "_tup_" + std::to_string((uintptr_t)l % 100000);
+    /* Numbered, not address-derived, for the reason match_var_ctr_ is. */
+    std::string tmp = "_tup_" + std::to_string(match_var_ctr_++);
     indent() << tup_t << " " << tmp << " = ";
     emit_expr(l->value);
     out() << ";\n";
@@ -1215,7 +1216,8 @@ void CBackend::emit_for_stmt(DdcgAst::ForStmt* f) {
     }
     std::string elem_ty = c_for_type(sit->second.elems[0]);
     std::string seq_str = emit_expr_to_string(f->seq);
-    std::string idx = "_i_" + std::to_string((uintptr_t)f % 100000);
+    /* Numbered, not address-derived, for the reason match_var_ctr_ is. */
+    std::string idx = "_i_" + std::to_string(match_var_ctr_++);
     indent() << "for (int " << idx << " = 0; " << idx
              << " < (" << seq_str << ").count; ++" << idx << ") {\n";
     indent_depth_++;

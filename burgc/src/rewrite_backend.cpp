@@ -17,9 +17,24 @@
 namespace {
 
 // Substitute `$name` with the C variable holding that binder's class.
-std::string subst_binders(const std::string& src) {
+// `$name` names a binder, which the matcher bound to an identically
+// named C variable, so substitution is just dropping the sigil.
+//
+// `$$` names the class the rule MATCHED. A guard often has to compare
+// the replacement against the thing being replaced rather than against
+// a sibling operand — an algebraic identity holds on VALUES, while a
+// target's types are on stack representations, and the two coincide
+// only when the operand and the matched node agree. Without a name for
+// the root a rule can only reason about its own operands, which is an
+// inference about the result instead of the result itself.
+std::string subst_binders(const std::string& src, const std::string& root) {
     std::string out;
     for (size_t i = 0; i < src.size(); i++) {
+        if (src[i] == '$' && i + 1 < src.size() && src[i + 1] == '$') {
+            out += root;
+            i++;
+            continue;
+        }
         if (src[i] == '$' && i + 1 < src.size() &&
             (isalpha((unsigned char)src[i + 1]) || src[i + 1] == '_')) {
             i++;
@@ -82,7 +97,10 @@ int emit_match(std::ostream& o, const burg_ast::RewritePat* p,
 std::string emit_build(std::ostream& o, const burg_ast::RewriteTmpl* t,
                        const std::string& ind, int& tmp,
                        const std::string& root_data) {
-    if (t->kind == burg_ast::RewriteTmpl::Binder) return t->name;
+    /* A binder names the C variable the matcher bound; `$$` names the
+     * class the rule matched, which is the loop's own variable. */
+    if (t->kind == burg_ast::RewriteTmpl::Binder)
+        return t->name == "$" ? std::string("c") : t->name;
 
     std::vector<std::string> kids;
     for (auto* c : t->children)
@@ -142,6 +160,43 @@ void emit_rewriter(std::ostream& o, const BurgAnalysis& a,
         o << "\n";
     }
 
+    if (!a.spec->analyses.empty()) {
+        const burg_ast::AnalysisDecl* an = a.spec->analyses[0];
+        o << "/* The e-class analysis this rule set reasons with (egg §4.1).\n"
+             " * A rule states an equality; that a value lies in a range is\n"
+             " * abstract interpretation and cannot be one, so the domain is\n"
+             " * declared and its hooks are the consumer's. Assembling the\n"
+             " * struct here is what stops each site that builds a graph from\n"
+             " * doing it by hand and drifting from the next one.\n"
+             " *\n"
+             " * The size is `sizeof` the declared type, so the consumer's own\n"
+             " * header owns the layout — this file never restates one. That\n"
+             " * type and these functions must be in scope where this header is\n"
+             " * included, which is the same requirement the auxiliaries make. */\n";
+        o << "extern void " << an->make
+          << "(egraph* g, int op, int64_t data,\n"
+             "                    const eg_id* kids, int nkids,\n"
+             "                    void* out, void* user);\n";
+        o << "extern void " << an->join
+          << "(const void* a, const void* b, void* out, void* user);\n";
+        if (!an->modify.empty())
+            o << "extern void " << an->modify
+              << "(egraph* g, eg_id c, const void* d, void* user);\n";
+        o << "\n/* Install it. Call before the first eg_add: egraph.h computes a\n"
+             " * fact as each node is added, and a class created earlier has\n"
+             " * none. `user` stays the caller's — it is the one thing the\n"
+             " * grammar cannot know. */\n"
+             "void " << name << "_set_analysis(egraph* g, void* user) {\n"
+             "    eg_analysis a;\n"
+             "    a.size   = sizeof(" << an->fact << ");\n"
+             "    a.make   = " << an->make << ";\n"
+             "    a.join   = " << an->join << ";\n"
+             "    a.modify = " << (an->modify.empty() ? "0" : an->modify) << ";\n"
+             "    a.user   = user;\n"
+             "    eg_set_analysis(g, &a);\n"
+             "}\n\n";
+    }
+
     for (auto* rw : a.spec->rewrites) {
         o << "/* " << rw->name << " */\n"
           << "static bool rw_" << rw->name << "(egraph* g) {\n"
@@ -161,7 +216,7 @@ void emit_rewriter(std::ostream& o, const BurgAnalysis& a,
         std::string root_data = "eg_class_node_data(g, c, n0)";
         std::string ind((size_t)(opened + 2) * 4, ' ');
         if (!rw->guard.empty())
-            o << ind << "if (!(" << subst_binders(rw->guard) << ")) continue;\n";
+            o << ind << "if (!(" << subst_binders(rw->guard, "c") << ")) continue;\n";
         std::string built = emit_build(o, rw->tmpl, ind, tmp, root_data);
         o << ind << "if (eg_merge(g, c, " << built << ")) changed = true;\n";
         for (int i = opened; i > 0; i--)

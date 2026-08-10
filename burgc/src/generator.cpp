@@ -112,6 +112,36 @@ void BurgGenerator::validate_rewrites() {
                               d->ret + "' — a rewrite auxiliary returns `class`");
     }
 
+    // An e-graph holds ONE fact per class (egraph.h: `class_data` is
+    // `analysis->size` bytes indexed by class id), so one declaration is
+    // the most a rule set can install. Two is not a merge to work out —
+    // it is a grammar that has not said which domain it reasons in.
+    if (a.spec->analyses.size() > 1)
+        errors_.push_back("REWRITE: " + std::to_string(a.spec->analyses.size()) +
+                          " ANALYSIS declarations; an e-class carries one fact, "
+                          "so a rule set declares at most one analysis");
+
+    for (auto* an : a.spec->analyses) {
+        const std::string where = "ANALYSIS '" + an->fact + "': ";
+        // egg's invariant is `d_c = ⋀ make(n)` over a class's e-nodes,
+        // maintained across merges by `join`. Without `make` there is no
+        // fact to have; without `join` two classes becoming one have no
+        // answer. `modify` is the only optional hook — egraph.h says it
+        // "may be NULL" — because a domain that merely observes adds
+        // nothing back to the graph.
+        if (an->make.empty())
+            errors_.push_back(where + "no `make` — a class's fact is the join "
+                              "of make() over its e-nodes, so there is none "
+                              "without it");
+        if (an->join.empty())
+            errors_.push_back(where + "no `join` — two classes merging have no "
+                              "way to combine their facts without it");
+        for (auto& h : an->unknown_hooks)
+            errors_.push_back(where + "unknown hook '" + h +
+                              "'; egraph.h's eg_analysis has make, join and "
+                              "modify");
+    }
+
     for (auto* rw : a.spec->rewrites) {
         const std::string where = "rewrite '" + rw->name + "': ";
 
@@ -145,7 +175,9 @@ void BurgGenerator::validate_rewrites() {
             burg_ast::RewriteTmpl* t = tstack.back(); tstack.pop_back();
             if (!t) continue;
             if (t->kind == burg_ast::RewriteTmpl::Binder) {
-                if (!bound.count(t->name))
+                /* `$$` is the matched class. Every rule has one by
+                 * construction, so it is bound wherever a rule is. */
+                if (t->name != "$" && !bound.count(t->name))
                     errors_.push_back(where + "template references '$" + t->name +
                                       "', which the pattern does not bind");
             } else if (a.term_names.count(t->name)) {

@@ -25,7 +25,7 @@ private:
 
 
     bool parse_Burg();
-    bool parse_Decl(std::vector<burg_ast::TermDecl*>& terms, std::string& start, std::vector<std::string>& entries, std::string& ns, std::string& members, std::string& priv, std::vector<std::string>& headers, std::vector<burg_ast::AuxDecl*>& auxes, std::vector<burg_ast::RewriteRule*>& rewrites);
+    bool parse_Decl(std::vector<burg_ast::TermDecl*>& terms, std::string& start, std::vector<std::string>& entries, std::string& ns, std::string& members, std::string& priv, std::vector<std::string>& headers, std::vector<burg_ast::AuxDecl*>& auxes, std::vector<burg_ast::RewriteRule*>& rewrites, std::vector<burg_ast::AnalysisDecl*>& analyses);
     bool parse_NamespaceDecl(std::string& ns);
     bool parse_MembersDecl(std::string& members);
     bool parse_PrivateDecl(std::string& priv);
@@ -37,7 +37,8 @@ private:
     bool parse_TreePat(burg_ast::TreePattern* * result);
     bool parse_AuxSection(std::vector<burg_ast::AuxDecl*>& out);
     bool parse_AuxDecl_(burg_ast::AuxDecl* * result);
-    bool parse_RewriteSection(std::vector<burg_ast::RewriteRule*>& out);
+    bool parse_RewriteSection(std::vector<burg_ast::RewriteRule*>& out, std::vector<burg_ast::AnalysisDecl*>& analyses);
+    bool parse_AnalysisDecl_(burg_ast::AnalysisDecl* * result);
     bool parse_RewriteRule_(burg_ast::RewriteRule* * result);
     bool parse_RewritePat_(burg_ast::RewritePat* * result);
     bool parse_RewriteTmpl_(burg_ast::RewriteTmpl* * result);

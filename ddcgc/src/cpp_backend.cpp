@@ -662,7 +662,8 @@ void CppBackend::emit_for_stmt(DdcgAst::ForStmt* f) {
     if (f->iter_index.has_value()) {
         // Indexed C++ for: walk by index so we can bind both i and elem.
         // Uses .size() (works for std::vector / span / array adapters).
-        std::string idx = "_i_" + std::to_string((uintptr_t)f % 100000);
+        /* Numbered, not address-derived: see match_var_ctr_. */
+        std::string idx = "_i_" + std::to_string(match_var_ctr_++);
         indent() << "for (size_t " << idx << " = 0; " << idx
                  << " < (";
         emit_expr(f->seq);

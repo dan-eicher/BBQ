@@ -88,6 +88,37 @@ struct RewriteTmpl {
     SourceLoc loc;
 };
 
+// The e-class analysis this rule set reasons with (egg §4.1, whose
+// interface egraph.h already carries):
+//
+//   ANALYSIS interval_t {
+//     make:   iv_make
+//     join:   iv_join
+//     modify: iv_modify
+//   }
+//
+// A rule can only state that two terms are EQUAL. That a value lies in
+// [0, 255] is not an equality — it is abstract interpretation — so the
+// domain and its hooks are DECLARED rather than written as rules.
+// Declaring them here is what keeps the choice beside the rule set,
+// instead of in whichever consumer remembers to assemble an eg_analysis
+// by hand at each site that builds a graph.
+//
+// `fact` is the C type of the per-class datum; its size is `sizeof` of
+// it, so the consumer's own header supplies the layout and the DSL never
+// restates one — the same arrangement TERM's symbolic form uses. `modify`
+// is optional because egraph.h says it "may be NULL". Unknown keys are
+// carried rather than judged: the parser does not decide what a hook is,
+// analysis does, and an unrecognised one is reported there.
+struct AnalysisDecl {
+    std::string fact;
+    std::string make;
+    std::string join;
+    std::string modify;                     // empty when not declared
+    std::vector<std::string> unknown_hooks; // reported during analysis
+    SourceLoc loc;
+};
+
 // name: Pattern => Template [where (. guard over binders .)] ;
 // Direction is `=>` only; a bidirectional axiom is written as two rules,
 // so the rule set never has to be read as a fixpoint of itself.
@@ -118,6 +149,10 @@ struct Spec {
     std::vector<Rule*> rules;
     std::vector<AuxDecl*> auxiliaries;  // AUXILIARIES block, empty when absent
     std::vector<RewriteRule*> rewrites; // REWRITE section, empty when absent
+    // ANALYSIS declarations found in the REWRITE section. A vector because
+    // the PARSER counts rather than judges; an e-graph holds exactly one
+    // fact per class, so analysis rejects a second.
+    std::vector<AnalysisDecl*> analyses;
     SourceLoc loc;
 };
 

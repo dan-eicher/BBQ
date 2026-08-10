@@ -33,9 +33,10 @@ Burg
        std::vector<std::string> headers;
        std::vector<burg_ast::Rule*> rules;
        std::vector<burg_ast::RewriteRule*> rewrites;
+       std::vector<burg_ast::AnalysisDecl*> analyses;
        std::vector<burg_ast::AuxDecl*> auxes;
        burg_ast::Rule* r; .)
-    = { Decl<terms, start_sym, entry_syms, ns, members_block, private_block, headers, auxes, rewrites> }
+    = { Decl<terms, start_sym, entry_syms, ns, members_block, private_block, headers, auxes, rewrites, analyses> }
       "RULES"
       { RuleDecl<&r>  (. rules.push_back(r); .) }
       (. skip(); if (!at_end()) return false; .)
@@ -50,13 +51,14 @@ Burg
        ast->rules = std::move(rules);
        ast->auxiliaries = std::move(auxes);
        ast->rewrites = std::move(rewrites);
+       ast->analyses = std::move(analyses);
        ast->loc = {1, 1}; .)
 .
 
-Decl <. std::vector<burg_ast::TermDecl*> &terms, std::string &start, std::vector<std::string> &entries, std::string &ns, std::string &members, std::string &priv, std::vector<std::string> &headers, std::vector<burg_ast::AuxDecl*> &auxes, std::vector<burg_ast::RewriteRule*> &rewrites .>
+Decl <. std::vector<burg_ast::TermDecl*> &terms, std::string &start, std::vector<std::string> &entries, std::string &ns, std::string &members, std::string &priv, std::vector<std::string> &headers, std::vector<burg_ast::AuxDecl*> &auxes, std::vector<burg_ast::RewriteRule*> &rewrites, std::vector<burg_ast::AnalysisDecl*> &analyses .>
     = TermDecl_<terms>
     | AuxSection<auxes>
-    | RewriteSection<rewrites>
+    | RewriteSection<rewrites, analyses>
     | StartDecl<start>
     | EntryDecl<entries>
     | NamespaceDecl<ns>
@@ -217,11 +219,61 @@ AuxDecl_ <. burg_ast::AuxDecl* *result .>
 // `@helper(...)` escapes for computed immediates. `=>` only: a
 // bidirectional axiom is two rules.
 
-RewriteSection <. std::vector<burg_ast::RewriteRule*> &out .>
-    (. burg_ast::RewriteRule* rr; .)
+RewriteSection <. std::vector<burg_ast::RewriteRule*> &out, std::vector<burg_ast::AnalysisDecl*> &analyses .>
+    (. burg_ast::RewriteRule* rr; burg_ast::AnalysisDecl* ad; .)
     = "REWRITE" "{"
-      { RewriteRule_<&rr>  (. out.push_back(rr); .) }
+      { ( AnalysisDecl_<&ad>  (. analyses.push_back(ad); .)
+        | RewriteRule_<&rr>   (. out.push_back(rr); .)
+        )
+      }
       "}"
+.
+
+// ── The e-class analysis (egg §4.1) ────────────────────────────────
+//
+//   ANALYSIS interval_t {
+//     make:   iv_make
+//     join:   iv_join
+//     modify: iv_modify
+//   }
+//
+// A rule states that two terms are EQUAL. That a value lies in a range
+// is not an equality but abstract interpretation, so the domain and its
+// hooks are DECLARED here rather than written as rules — which is what
+// puts the choice beside the rule set instead of in whichever consumer
+// remembers to assemble an eg_analysis by hand.
+//
+// The name after ANALYSIS is the C type of the per-class fact, emitted
+// verbatim into a `sizeof`, the same way TERM's symbolic form lets the
+// consumer's own header supply a value the DSL never restates.
+//
+// An unrecognised key is COLLECTED, not rejected here: what a hook name
+// means is settled against egraph.h during analysis, the same division
+// the template's terminal-vs-binder-vs-helper resolution already makes.
+AnalysisDecl_ <. burg_ast::AnalysisDecl* *result .>
+    (. peg::Span ty_span; peg::Span key_span; peg::Span fn_span;
+       std::string fact; std::string key;
+       std::string make_fn; std::string join_fn; std::string modify_fn;
+       std::vector<std::string> unknown; .)
+    = "ANALYSIS"
+      ident<ty_span>  (. fact = ty_span.to_string();
+                        burg_ast::SourceLoc loc = {line(), col()}; .)
+      "{"
+      { ident<key_span>  (. key = key_span.to_string(); .)
+        ":"
+        ident<fn_span>   (. if      (key == "make")   make_fn   = fn_span.to_string();
+                            else if (key == "join")   join_fn   = fn_span.to_string();
+                            else if (key == "modify") modify_fn = fn_span.to_string();
+                            else                      unknown.push_back(key); .)
+      }
+      "}"
+    (. *result = new burg_ast::AnalysisDecl();
+       (*result)->fact = std::move(fact);
+       (*result)->make = std::move(make_fn);
+       (*result)->join = std::move(join_fn);
+       (*result)->modify = std::move(modify_fn);
+       (*result)->unknown_hooks = std::move(unknown);
+       (*result)->loc = loc; .)
 .
 
 RewriteRule_ <. burg_ast::RewriteRule* *result .>
@@ -275,7 +327,14 @@ RewriteTmpl_ <. burg_ast::RewriteTmpl* *result .>
        burg_ast::RewriteTmpl::Kind kind = burg_ast::RewriteTmpl::Term;
        std::vector<burg_ast::RewriteTmpl*> children;
        burg_ast::RewriteTmpl* child; .)
-    = ( "$" ident<name_span>
+    // `$$` is the class the rule MATCHED. Ordered before `$ident` so the
+    // second sigil is not read as the start of a name. An auxiliary is
+    // how a rule produces a discriminant other than the one it matched;
+    // this is how it produces one AT the matched discriminant, which a
+    // structural template cannot express when the node carries a value.
+    = ( "$" "$"
+          (. name = "$"; kind = burg_ast::RewriteTmpl::Binder; .)
+      | "$" ident<name_span>
           (. name = name_span.to_string(); kind = burg_ast::RewriteTmpl::Binder; .)
       | ident<name_span>  (. name = name_span.to_string(); .)
         [ "("

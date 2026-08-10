@@ -61,6 +61,73 @@ inline eg_id calc_fold_mul(egraph* g, eg_id a, eg_id b) {
     return eg_add(g, calc_ir::LoadConst::kind_value, x * y, nullptr, 0);
 }
 
+// ── The e-class analysis calc.burg declares ────────────────────────
+//
+// egg §4.1's own worked example: "is this class a known constant" as a
+// FACT on the class rather than a scan of its nodes. The difference is
+// that a fact flows along equalities — proving one form of a value
+// constant makes every form of it constant — where the scan above only
+// sees a LoadConst somebody already put in the class.
+//
+// The domain is flat: unknown, or a value. `join` is the meet of two
+// facts about ONE value, so two knowns that disagree cannot both hold
+// and the result is unknown; it is idempotent, commutative and
+// associative, and the domain has height two, so it needs no widening.
+struct calc_fact {
+    bool    known;
+    int64_t value;
+};
+
+extern "C" {
+
+inline void calc_an_make(egraph* g, int op, int64_t data,
+                         const eg_id* kids, int nkids, void* out, void* user) {
+    (void)user;
+    calc_fact* d = (calc_fact*)out;
+    d->known = false;
+    d->value = 0;
+    if (op == calc_ir::LoadConst::kind_value) {
+        d->known = true;
+        d->value = data;
+        return;
+    }
+    // An operator over two known operands is known. The children's facts
+    // are read through eg_class_data, which is what makes this an
+    // analysis rather than a rule: no pattern had to match.
+    if (nkids != 2) return;
+    const calc_fact* a = (const calc_fact*)eg_class_data(g, kids[0]);
+    const calc_fact* b = (const calc_fact*)eg_class_data(g, kids[1]);
+    if (!a || !b || !a->known || !b->known) return;
+    if (op == calc_ir::Add::kind_value)      { d->known = true; d->value = a->value + b->value; }
+    else if (op == calc_ir::Sub::kind_value) { d->known = true; d->value = a->value - b->value; }
+    else if (op == calc_ir::Mul::kind_value) { d->known = true; d->value = a->value * b->value; }
+}
+
+inline void calc_an_join(const void* pa, const void* pb, void* out, void* user) {
+    (void)user;
+    const calc_fact* a = (const calc_fact*)pa;
+    const calc_fact* b = (const calc_fact*)pb;
+    calc_fact* d = (calc_fact*)out;
+    d->known = false;
+    d->value = 0;
+    if (a->known && b->known && a->value == b->value) { *d = *a; return; }
+    if (a->known && !b->known) { *d = *a; return; }
+    if (b->known && !a->known) { *d = *b; return; }
+}
+
+// Put the constant IN the class once the fact proves one, so extraction
+// can choose it. Idempotent for free: interning a term that already
+// exists returns its class.
+inline void calc_an_modify(egraph* g, eg_id c, const void* pd, void* user) {
+    (void)user;
+    const calc_fact* d = (const calc_fact*)pd;
+    if (!d->known) return;
+    eg_merge(g, c, eg_add(g, calc_ir::LoadConst::kind_value, d->value,
+                          nullptr, 0));
+}
+
+}  // extern "C"
+
 // The generated rewriter, included AFTER the guards and auxiliaries above:
 // it names calc's terminal ids and calls those functions, so it compiles
 // inside a translation unit that has them. Its own only #include is
@@ -177,6 +244,9 @@ inline calc_ir::Node* eqsat_optimize(calc_ir::Node* root, eg_caps caps) {
 
     egraph g;
     eg_init(&g);
+    // Before the first eg_add, as egraph.h requires: a fact is computed
+    // as each node is added, so a class created earlier would have none.
+    calc_set_analysis(&g, nullptr);
     eg_id c = eqsat_build(&g, root);
     calc_rewrite_region(&g, caps);
 

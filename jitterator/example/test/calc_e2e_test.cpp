@@ -182,6 +182,32 @@ int main(void) {
 #endif
     }
 
+    // The declared e-class ANALYSIS, on a case no RULE can reach.
+    //
+    // calc.burg folds Add and Mul with `fold_add` / `fold_mul`; it has no
+    // fold_sub, and its only Sub rule (`sub_neg`) needs a Neg child. So a
+    // constant subtraction folds here only because the analysis proved the
+    // class is a constant and `modify` put that constant in it — which is
+    // the whole point of declaring one: a fact about a VALUE, arrived at
+    // without a pattern matching.
+    {
+        int fs = 0;
+        calc_ir::Node* ir = calc_runner::calc_compile("5 - 3", &fs);
+        std::vector<uint8_t> code = ir ? calc_runner::lower(ir)
+                                       : std::vector<uint8_t>();
+        const std::vector<uint8_t> analysed = { OP_CONST, 0x02, OP_RET };
+        const std::vector<uint8_t> unfolded = {
+            OP_CONST, 0x05, OP_CONST, 0x03, OP_SUB, OP_RET
+        };
+#ifdef CALC_EQSAT
+        if (!seq_is(code, analysed, "analysis: `5 - 3`")) fails++;
+        else printf("ok:   analysis: `5 - 3` folded by the fact, not a rule\n");
+#else
+        if (!seq_is(code, unfolded, "falsifier: `5 - 3`")) fails++;
+        else printf("ok:   falsifier: without the pass, the subtraction stays\n");
+#endif
+    }
+
     if (!fails) { printf("\ncalc e2e (parse → ddcg → IR → bytecode → opgen VM): all passed\n"); return 0; }
     printf("\ncalc e2e: %d FAILED\n", fails);
     return 1;

@@ -55,6 +55,17 @@ AUXILIARIES
 // Neg/Cmp*/Call and the control nodes), so the strength reduction is
 // `x*2 => x+x`, which uses only nodes that exist here.
 REWRITE {
+  // The domain this rule set reasons in besides equalities. "This class
+  // is the constant k" is a fact about a VALUE, not an equality between
+  // two terms, so it is declared rather than written as a rule — and
+  // because it is a fact it flows along equalities, which a rule that
+  // scans a class for a LoadConst cannot do.
+  ANALYSIS calc_fact {
+    make:   calc_an_make
+    join:   calc_an_join
+    modify: calc_an_modify
+  }
+
   // Constant folding: both operands are known, so the sum/product is too.
   fold_add: Add($a, $b) => calc_fold_add($a, $b)
       where (. calc_both_const(g, $a, $b) .);

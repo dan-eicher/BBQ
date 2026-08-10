@@ -108,13 +108,14 @@ bool Parser::parse_Burg() {
        std::vector<std::string> headers;
        std::vector<burg_ast::Rule*> rules;
        std::vector<burg_ast::RewriteRule*> rewrites;
+       std::vector<burg_ast::AnalysisDecl*> analyses;
        std::vector<burg_ast::AuxDecl*> auxes;
        burg_ast::Rule* r;
     for (;;) {
         auto _m0 = save();
         if (![&]() -> bool {
             skip();
-            if (!parse_Decl(terms, start_sym, entry_syms, ns, members_block, private_block, headers, auxes, rewrites)) return false;
+            if (!parse_Decl(terms, start_sym, entry_syms, ns, members_block, private_block, headers, auxes, rewrites, analyses)) return false;
             return true;
         }()) { restore(_m0); break; }
     }
@@ -141,11 +142,12 @@ bool Parser::parse_Burg() {
        ast->rules = std::move(rules);
        ast->auxiliaries = std::move(auxes);
        ast->rewrites = std::move(rewrites);
+       ast->analyses = std::move(analyses);
        ast->loc = {1, 1};
     return true;
 }
 
-bool Parser::parse_Decl(std::vector<burg_ast::TermDecl*>& terms, std::string& start, std::vector<std::string>& entries, std::string& ns, std::string& members, std::string& priv, std::vector<std::string>& headers, std::vector<burg_ast::AuxDecl*>& auxes, std::vector<burg_ast::RewriteRule*>& rewrites) {
+bool Parser::parse_Decl(std::vector<burg_ast::TermDecl*>& terms, std::string& start, std::vector<std::string>& entries, std::string& ns, std::string& members, std::string& priv, std::vector<std::string>& headers, std::vector<burg_ast::AuxDecl*>& auxes, std::vector<burg_ast::RewriteRule*>& rewrites, std::vector<burg_ast::AnalysisDecl*>& analyses) {
     {
         auto _m0 = save();
         if ([&]() -> bool {
@@ -162,7 +164,7 @@ bool Parser::parse_Decl(std::vector<burg_ast::TermDecl*>& terms, std::string& st
         restore(_m0);
         if ([&]() -> bool {
             skip();
-            if (!parse_RewriteSection(rewrites)) return false;
+            if (!parse_RewriteSection(rewrites, analyses)) return false;
             return true;
         }()) {} else {
         restore(_m0);
@@ -469,8 +471,8 @@ bool Parser::parse_AuxDecl_(burg_ast::AuxDecl* * result) {
     return true;
 }
 
-bool Parser::parse_RewriteSection(std::vector<burg_ast::RewriteRule*>& out) {
-    burg_ast::RewriteRule* rr;
+bool Parser::parse_RewriteSection(std::vector<burg_ast::RewriteRule*>& out, std::vector<burg_ast::AnalysisDecl*>& analyses) {
+    burg_ast::RewriteRule* rr; burg_ast::AnalysisDecl* ad;
     skip();
     if (!match("REWRITE")) return false;
     skip();
@@ -478,14 +480,67 @@ bool Parser::parse_RewriteSection(std::vector<burg_ast::RewriteRule*>& out) {
     for (;;) {
         auto _m0 = save();
         if (![&]() -> bool {
-            skip();
-            if (!parse_RewriteRule_(&rr)) return false;
-            out.push_back(rr);
+            {
+                auto _m1 = save();
+                if ([&]() -> bool {
+                    skip();
+                    if (!parse_AnalysisDecl_(&ad)) return false;
+                    analyses.push_back(ad);
+                    return true;
+                }()) {} else {
+                restore(_m1);
+                skip();
+                if (!parse_RewriteRule_(&rr)) return false;
+                out.push_back(rr);
+                }
+            }
             return true;
         }()) { restore(_m0); break; }
     }
     skip();
     if (!match("}")) return false;
+    return true;
+}
+
+bool Parser::parse_AnalysisDecl_(burg_ast::AnalysisDecl* * result) {
+    peg::Span ty_span; peg::Span key_span; peg::Span fn_span;
+       std::string fact; std::string key;
+       std::string make_fn; std::string join_fn; std::string modify_fn;
+       std::vector<std::string> unknown;
+    skip();
+    if (!match("ANALYSIS")) return false;
+    skip();
+    if (!ident(ty_span)) return false;
+    fact = ty_span.to_string();
+                        burg_ast::SourceLoc loc = {line(), col()};
+    skip();
+    if (!match("{")) return false;
+    for (;;) {
+        auto _m0 = save();
+        if (![&]() -> bool {
+            skip();
+            if (!ident(key_span)) return false;
+            key = key_span.to_string();
+            skip();
+            if (!match(":")) return false;
+            skip();
+            if (!ident(fn_span)) return false;
+            if      (key == "make")   make_fn   = fn_span.to_string();
+                            else if (key == "join")   join_fn   = fn_span.to_string();
+                            else if (key == "modify") modify_fn = fn_span.to_string();
+                            else                      unknown.push_back(key);
+            return true;
+        }()) { restore(_m0); break; }
+    }
+    skip();
+    if (!match("}")) return false;
+    *result = new burg_ast::AnalysisDecl();
+       (*result)->fact = std::move(fact);
+       (*result)->make = std::move(make_fn);
+       (*result)->join = std::move(join_fn);
+       (*result)->modify = std::move(modify_fn);
+       (*result)->unknown_hooks = std::move(unknown);
+       (*result)->loc = loc;
     return true;
 }
 
@@ -596,6 +651,15 @@ bool Parser::parse_RewriteTmpl_(burg_ast::RewriteTmpl* * result) {
             skip();
             if (!match("$")) return false;
             skip();
+            if (!match("$")) return false;
+            name = "$"; kind = burg_ast::RewriteTmpl::Binder;
+            return true;
+        }()) {} else {
+        restore(_m0);
+        if ([&]() -> bool {
+            skip();
+            if (!match("$")) return false;
+            skip();
             if (!ident(name_span)) return false;
             name = name_span.to_string(); kind = burg_ast::RewriteTmpl::Binder;
             return true;
@@ -627,6 +691,7 @@ bool Parser::parse_RewriteTmpl_(burg_ast::RewriteTmpl* * result) {
                 if (!match(")")) return false;
                 return true;
             }()) restore(_m1);
+        }
         }
         }
     }

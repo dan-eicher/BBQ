@@ -1627,6 +1627,138 @@ TEST(BurgRewrite, RejectsUndeclaredPatternTerminal) {
     EXPECT_FALSE(gen.errors().empty());
 }
 
+// ── The e-class analysis declaration ───────────────────────────────
+//
+// A rewrite rule states that two terms are EQUAL. It cannot state that a
+// value lies in [0, 255] — that is abstract interpretation, and egg §4.1
+// calls the mechanism for it an e-class analysis. `egraph.h` already
+// takes one; what was missing is a way for the GRAMMAR to say which one
+// this rule set reasons with, so the choice lives beside the rules
+// instead of in whichever consumer remembers to assemble the struct.
+//
+// The declaration names the fact's C type — its size is `sizeof` of it,
+// the same trick TERM's symbolic form uses to let the consumer's own
+// header supply a value the DSL never has to restate — and the hooks.
+// `modify` is optional: egraph.h says it "may be NULL".
+
+TEST(BurgAnalysisDecl, ParsesIntoTheSpec) {
+    Parser parser;
+    auto* ast = parse_spec(
+        "TERM Add=1 TERM Const=2\n"
+        "REWRITE {\n"
+        "  ANALYSIS interval_t {\n"
+        "    make:   iv_make\n"
+        "    join:   iv_join\n"
+        "    modify: iv_modify\n"
+        "  }\n"
+        "  add_zero: Add($x, $z) => $x;\n"
+        "}\n"
+        "RULES r: Add(r, r) = 1;", parser);
+    ASSERT_NE(ast, nullptr);
+    ASSERT_EQ(ast->analyses.size(), 1u);
+    EXPECT_EQ(ast->analyses[0]->fact, "interval_t");
+    EXPECT_EQ(ast->analyses[0]->make, "iv_make");
+    EXPECT_EQ(ast->analyses[0]->join, "iv_join");
+    EXPECT_EQ(ast->analyses[0]->modify, "iv_modify");
+    // The rules in the same section are unaffected by it.
+    ASSERT_EQ(ast->rewrites.size(), 1u);
+    EXPECT_EQ(ast->rewrites[0]->name, "add_zero");
+    BurgGenerator gen;
+    EXPECT_TRUE(gen.analyze(ast));
+}
+
+// `modify` is the hook that ADDS a node the fact implies. A domain that
+// only observes needs none, and egraph.h permits NULL, so omitting it is
+// a declaration and not an omission.
+TEST(BurgAnalysisDecl, ModifyIsOptional) {
+    Parser parser;
+    auto* ast = parse_spec(
+        "TERM Add=1\n"
+        "REWRITE {\n"
+        "  ANALYSIS interval_t { make: iv_make  join: iv_join }\n"
+        "}\n"
+        "RULES r: Add(r, r) = 1;", parser);
+    ASSERT_NE(ast, nullptr);
+    ASSERT_EQ(ast->analyses.size(), 1u);
+    EXPECT_TRUE(ast->analyses[0]->modify.empty());
+    BurgGenerator gen;
+    EXPECT_TRUE(gen.analyze(ast));
+}
+
+// Two analyses would mean two facts per class, and egraph.h holds one.
+TEST(BurgAnalysisDecl, RejectsTwoDeclarations) {
+    Parser parser;
+    auto* ast = parse_spec(
+        "TERM Add=1\n"
+        "REWRITE {\n"
+        "  ANALYSIS a_t { make: a_make  join: a_join }\n"
+        "  ANALYSIS b_t { make: b_make  join: b_join }\n"
+        "}\n"
+        "RULES r: Add(r, r) = 1;", parser);
+    ASSERT_NE(ast, nullptr);
+    BurgGenerator gen;
+    EXPECT_FALSE(gen.analyze(ast));
+    EXPECT_FALSE(gen.errors().empty());
+}
+
+// egg's invariant is `d_c = ⋀ make(n)` over a class's e-nodes: without
+// `make` there is no fact to have, and without `join` there is no way to
+// combine two classes' facts when they merge. Neither is optional.
+TEST(BurgAnalysisDecl, RejectsMissingMake) {
+    Parser parser;
+    auto* ast = parse_spec(
+        "TERM Add=1\n"
+        "REWRITE { ANALYSIS interval_t { join: iv_join } }\n"
+        "RULES r: Add(r, r) = 1;", parser);
+    ASSERT_NE(ast, nullptr);
+    BurgGenerator gen;
+    EXPECT_FALSE(gen.analyze(ast));
+    EXPECT_FALSE(gen.errors().empty());
+}
+
+TEST(BurgAnalysisDecl, RejectsMissingJoin) {
+    Parser parser;
+    auto* ast = parse_spec(
+        "TERM Add=1\n"
+        "REWRITE { ANALYSIS interval_t { make: iv_make } }\n"
+        "RULES r: Add(r, r) = 1;", parser);
+    ASSERT_NE(ast, nullptr);
+    BurgGenerator gen;
+    EXPECT_FALSE(gen.analyze(ast));
+    EXPECT_FALSE(gen.errors().empty());
+}
+
+// A hook egraph.h does not have is a name that would be silently
+// dropped, which is how a consumer ends up believing it installed
+// something it did not.
+TEST(BurgAnalysisDecl, RejectsUnknownHook) {
+    Parser parser;
+    auto* ast = parse_spec(
+        "TERM Add=1\n"
+        "REWRITE {\n"
+        "  ANALYSIS interval_t { make: iv_make  join: iv_join  merge: iv_merge }\n"
+        "}\n"
+        "RULES r: Add(r, r) = 1;", parser);
+    ASSERT_NE(ast, nullptr);
+    BurgGenerator gen;
+    EXPECT_FALSE(gen.analyze(ast));
+    EXPECT_FALSE(gen.errors().empty());
+}
+
+// ANALYSIS is a keyword inside the section, and a rule whose name merely
+// STARTS with it is still a rule.
+TEST(BurgAnalysisDecl, KeywordDoesNotSwallowARuleName) {
+    Parser parser;
+    auto* ast = parse_spec(
+        "TERM Add=1\n"
+        "REWRITE { ANALYSISish: Add($x, $z) => $x; }\n"
+        "RULES r: Add(r, r) = 1;", parser);
+    ASSERT_NE(ast, nullptr);
+    EXPECT_TRUE(ast->analyses.empty());
+    ASSERT_EQ(ast->rewrites.size(), 1u);
+    EXPECT_EQ(ast->rewrites[0]->name, "ANALYSISish");
+}
+
 // ── C4: the generated rewriter ─────────────────────────────────────
 
 static std::string gen_rewrite(const char* input) {
@@ -1665,6 +1797,51 @@ TEST(BurgRewriteEmit, EmitsEntryPointAndRuleTable) {
     EXPECT_NE(code.find("ctz("), std::string::npos);
 }
 
+// `$$` in a guard names the class the rule MATCHED, so a rule can compare
+// its replacement against the thing being replaced rather than against a
+// sibling operand.
+//
+// An algebraic identity holds on VALUES, while a target's types are on
+// stack representations: `Op($x, $c) => $x` is only interchangeable when
+// $x and the matched node agree on representation, and $x-vs-$c is an
+// inference about that rather than the thing itself. Without a name for
+// the root, a consumer can only write the inference — which is how a rule
+// that is right about the value ships bytecode a verifier rejects.
+TEST(BurgRewriteEmit, GuardCanNameTheMatchedClass) {
+    std::string code = gen_rewrite(
+        "TERM Add=1 TERM Const=2\n"
+        "REWRITE {\n"
+        "  add_zero: Add($x, $z) => $x where (. same_repr(g, $$, $x) .);\n"
+        "}\n"
+        "RULES r: Add(r, r) = 1;");
+    ASSERT_FALSE(code.empty());
+    // `$$` becomes the loop's class variable, and `$x` its binder — the
+    // guard reaches both without either being described to it.
+    EXPECT_NE(code.find("same_repr(g, c, x)"), std::string::npos) << code;
+    // The sigil never survives into the emitted C.
+    EXPECT_EQ(code.find("$"), std::string::npos) << code;
+}
+
+// `$$` also works in a TEMPLATE, which is how a rule produces a value at
+// the matched discriminant. A structural template inherits that
+// discriminant but cannot carry a value; an auxiliary carries a value but
+// is told nothing about the match. Handing the matched class to an
+// auxiliary is the only way to say "a zero, at the width of the thing I
+// replaced" — the absorbing identities need exactly that.
+TEST(BurgRewriteEmit, TemplateCanNameTheMatchedClass) {
+    std::string code = gen_rewrite(
+        "TERM Mul=1 TERM Const=2\n"
+        "AUXILIARIES\n"
+        "  zero_like : (class) -> class\n"
+        "REWRITE {\n"
+        "  mul_zero: Mul($x, $z) => zero_like($$) where (. is_zero($z) .);\n"
+        "}\n"
+        "RULES r: Mul(r, r) = 1;");
+    ASSERT_FALSE(code.empty());
+    EXPECT_NE(code.find("zero_like(g, c)"), std::string::npos) << code;
+    EXPECT_EQ(code.find("$"), std::string::npos) << code;
+}
+
 // A structural template inherits the discriminant of the node it matched.
 // A rewrite states that two forms denote the SAME value, so whatever the
 // discriminant distinguishes about that value holds on both sides. Emitting
@@ -1696,6 +1873,54 @@ TEST(BurgRewriteEmit, AuxiliaryTemplateTakesNoDiscriminant) {
     std::string code = gen_rewrite(kRewriteSpec);
     ASSERT_FALSE(code.empty());
     EXPECT_NE(code.find("ctz(g, "), std::string::npos) << code;
+}
+
+// The declared analysis becomes the installer the consumer calls, so the
+// eg_analysis struct is assembled from the grammar rather than by hand at
+// each site that builds a graph. `user` stays the caller's, because it is
+// the one thing the grammar cannot know.
+TEST(BurgRewriteEmit, EmitsTheDeclaredAnalysisInstaller) {
+    std::string code = gen_rewrite(
+        "TERM Add=1 TERM Const=2\n"
+        "REWRITE {\n"
+        "  ANALYSIS interval_t {\n"
+        "    make:   iv_make\n"
+        "    join:   iv_join\n"
+        "    modify: iv_modify\n"
+        "  }\n"
+        "  add_zero: Add($x, $z) => $x;\n"
+        "}\n"
+        "RULES r: Add(r, r) = 1;");
+    ASSERT_FALSE(code.empty());
+    EXPECT_NE(code.find("calc_set_analysis(egraph* g, void* user)"),
+              std::string::npos) << code;
+    // The size is sizeof the declared type, so the consumer's own header
+    // supplies it and the DSL never restates a layout.
+    EXPECT_NE(code.find("sizeof(interval_t)"), std::string::npos) << code;
+    EXPECT_NE(code.find("a.make   = iv_make;"), std::string::npos) << code;
+    EXPECT_NE(code.find("a.join   = iv_join;"), std::string::npos) << code;
+    EXPECT_NE(code.find("a.modify = iv_modify;"), std::string::npos) << code;
+    EXPECT_NE(code.find("a.user   = user;"), std::string::npos) << code;
+    EXPECT_NE(code.find("eg_set_analysis(g, &a);"), std::string::npos) << code;
+}
+
+// An omitted `modify` emits the NULL egraph.h documents, not a call to a
+// name nobody defined.
+TEST(BurgRewriteEmit, OmittedModifyEmitsNull) {
+    std::string code = gen_rewrite(
+        "TERM Add=1\n"
+        "REWRITE { ANALYSIS interval_t { make: iv_make  join: iv_join } }\n"
+        "RULES r: Add(r, r) = 1;");
+    ASSERT_FALSE(code.empty());
+    EXPECT_NE(code.find("a.modify = 0;"), std::string::npos) << code;
+}
+
+// A grammar with no analysis emits no installer — the section is optional
+// and a consumer that reasons only with equalities owes nothing.
+TEST(BurgRewriteEmit, NoAnalysisEmitsNoInstaller) {
+    std::string code = gen_rewrite(kRewriteSpec);
+    ASSERT_FALSE(code.empty());
+    EXPECT_EQ(code.find("_set_analysis"), std::string::npos) << code;
 }
 
 // The emitted rewriter talks to the e-graph and to nothing else: any other

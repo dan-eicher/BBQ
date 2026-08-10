@@ -8,6 +8,7 @@
 #include "PegAnalysis.h"
 #include "ParserEmitter.h"
 #include "CParserEmitter.h"
+#include "JavaParserEmitter.h"
 
 using namespace PegGrammar;
 using namespace pegc;
@@ -40,7 +41,10 @@ static void usage() {
         "  -frames <dir>     Frame file directory\n"
         "  -prefix <name>    Generated file prefix (default: from grammar name)\n"
         "  -namespace <ns>   C++ namespace for generated code\n"
-        "  -lang c|c++       Target language (default: c++)\n"
+        "  -lang c|c++|java  Target language (default: c++)\n"
+        "  -java-package <p> Package declaration for -lang java output\n"
+        "  -java-runtime <p> Package supplying PegCursor/Span (-lang java);\n"
+        "                    omit when they share the parser's package\n"
         "  -trace <flags>    Debug: A(ST) P(arser) N(analysis)\n"
         "  --strict          Treat analysis warnings as errors (CI gating)\n"
         "  --coverage        Enable shape-enumeration warnings (ordered-choice\n"
@@ -56,6 +60,8 @@ int main(int argc, char* argv[]) {
     std::string prefix;
     bool prefix_set = false;
     std::string ns;
+    std::string java_package;
+    std::string java_runtime;
     std::string lang = "c++";
     std::string trace;
     bool strict = false;
@@ -73,6 +79,10 @@ int main(int argc, char* argv[]) {
             ns = argv[++i];
         } else if (strcmp(argv[i], "-lang") == 0 && i + 1 < argc) {
             lang = argv[++i];
+        } else if (strcmp(argv[i], "-java-package") == 0 && i + 1 < argc) {
+            java_package = argv[++i];
+        } else if (strcmp(argv[i], "-java-runtime") == 0 && i + 1 < argc) {
+            java_runtime = argv[++i];
         } else if (strcmp(argv[i], "-trace") == 0 && i + 1 < argc) {
             trace = argv[++i];
         } else if (strcmp(argv[i], "--strict") == 0) {
@@ -175,6 +185,33 @@ int main(int argc, char* argv[]) {
 
     // --- Code Generation ---
     bool c_mode = (lang == "c");
+    bool java_mode = (lang == "java");
+
+    if (!java_mode && (!java_package.empty() || !java_runtime.empty())) {
+        fprintf(stderr, "pegc: -java-package and -java-runtime require -lang java\n");
+        return 1;
+    }
+
+    // Java has no header/implementation split: one class, one file, one frame.
+    if (java_mode) {
+        std::string class_name = prefix + "Parser";
+        std::string java_frame = frame_dir + "/JavaParser.frame";
+        std::string java_file = output_dir + "/" + class_name + ".java";
+        std::ofstream out(java_file);
+        if (!out) {
+            fprintf(stderr, "pegc: cannot open %s for writing\n", java_file.c_str());
+            return 1;
+        }
+        JavaParserEmitter emitter(result, class_name, java_package, java_runtime);
+        if (!emitter.emit_to_frame(grammar, java_frame, out)) {
+            fprintf(stderr, "pegc: failed to process frame file %s\n", java_frame.c_str());
+            return 1;
+        }
+        if (trace.find('P') != std::string::npos)
+            fprintf(stderr, "[trace] Wrote %s\n", java_file.c_str());
+        fprintf(stderr, "pegc: generated %s.java\n", class_name.c_str());
+        return 0;
+    }
 
     // In C mode, snake_case the prefix for filenames and function names
     std::string c_prefix;

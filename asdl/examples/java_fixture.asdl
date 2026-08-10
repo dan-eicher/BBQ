@@ -1,0 +1,26 @@
+// Fixture for the Java backend (templates/java.inja).
+//
+// Exercises every shape the template has to emit: a multi-constructor sum, a
+// single-constructor sum, an enum-like sum (all constructors field-free), a
+// product, and one constructor carrying every primitive plus both field flags.
+module jfix
+{
+    // Multi-constructor sum: an abstract base plus one final subclass each.
+    expr  = Lit(int value)
+          | Add(expr lhs, expr rhs)
+          | Call(identifier name, expr *args)
+          | Nil
+
+    // Single-constructor sum: still a base plus one subclass, for uniformity.
+    unit  = Unit(identifier name)
+
+    // Enum-like sum: every constructor is field-free, so this is int constants.
+    color = Red | Green | Blue
+
+    // Product.
+    span  = (int start, int end)
+
+    // Every primitive, plus the optional and sequence flags.
+    prims = Prims(bool flag, int n, int64 big, float f, string s,
+                  identifier id, expr ?maybe, expr *many)
+}

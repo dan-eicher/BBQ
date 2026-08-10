@@ -7,18 +7,19 @@
 #include "exceptions.h"
 
 static void print_usage(const char* program_name) {
-    std::cerr << "Usage: " << program_name << " -i <input_file> [-t <template_file>] [-o <output_file>] [-lang c|c++] [--json <file>]" << std::endl;
+    std::cerr << "Usage: " << program_name << " -i <input_file> [-t <template_file>] [-o <output_file>] [-lang c|c++|java] [--json <file>]" << std::endl;
     std::cerr << "  -i <input_file>   : ASDL input file" << std::endl;
     std::cerr << "  -t <template_file>: Template file for code generation (omit with --json to skip)" << std::endl;
     std::cerr << "  -o <output_file>  : Output file (optional, defaults to stdout)" << std::endl;
-    std::cerr << "  -lang c|c++       : Target language (default: c++)" << std::endl;
+    std::cerr << "  -lang c|c++|java  : Target language (default: c++)" << std::endl;
+    std::cerr << "  -java-package <p> : Package declaration for -lang java output" << std::endl;
     std::cerr << "  --json <file>     : Write processed module JSON to <file> for downstream tools (e.g. burgc -asdl)" << std::endl;
     std::cerr << "  -h                : Show this help message" << std::endl;
 }
 
 int main(int argc, char** argv) {
     try {
-        std::string infile, templatefile, outfile, lang, jsonfile;
+        std::string infile, templatefile, outfile, lang, jsonfile, javapackage;
         bool show_help = false;
 
         // Custom arg parsing: getopt doesn't support --json long option
@@ -29,6 +30,7 @@ int main(int argc, char** argv) {
             else if (a == "-o" && i + 1 < argc) outfile = argv[++i];
             else if (a == "-t" && i + 1 < argc) templatefile = argv[++i];
             else if ((a == "-l" || a == "-lang") && i + 1 < argc) lang = argv[++i];
+            else if (a == "-java-package" && i + 1 < argc) javapackage = argv[++i];
             else if (a == "--json" && i + 1 < argc) jsonfile = argv[++i];
             else if (a == "-h") show_help = true;
             else {
@@ -63,6 +65,12 @@ int main(int argc, char** argv) {
 
         Generator gen;
         if (lang == "c") gen.types().set_lang_c();
+        else if (lang == "java") gen.types().set_lang_java();
+
+        if (!javapackage.empty() && lang != "java") {
+            std::cerr << "Error: -java-package requires -lang java" << std::endl;
+            return 1;
+        }
 
         std::cout << "Parsing input file: " << infile << std::endl;
         auto* module_ast = gen.parse(infile);
@@ -70,6 +78,7 @@ int main(int argc, char** argv) {
         std::cout << "Processing AST definitions..." << std::endl;
         auto module = gen.to_json(module_ast);
         gen.process(module);
+        if (!javapackage.empty()) module["java_package"] = javapackage;
 
         if (!jsonfile.empty()) {
             std::ofstream js(jsonfile);

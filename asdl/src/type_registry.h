@@ -9,8 +9,10 @@ class TypeRegistry {
 public:
     TypeRegistry();
 
-    void set_lang_c();   // Remap base types for C output
+    void set_lang_c();      // Remap base types for C output
+    void set_lang_java();   // Remap base types for Java output
     bool is_c_mode() const { return c_mode_; }
+    bool is_java_mode() const { return java_mode_; }
     void register_type(const std::string& asdl_type, const std::string& target_type);
     void register_alias(const std::string& asdl_type, const std::string& target_type);
     std::string get_type(const std::string& asdl_type) const;
@@ -19,6 +21,7 @@ public:
 
 private:
     bool c_mode_ = false;
+    bool java_mode_ = false;
     std::map<std::string, std::string> types_;
     std::set<std::string> aliases_;  // Types that are aliases (treated as base types)
 };

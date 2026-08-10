@@ -16,6 +16,14 @@ void TypeRegistry::set_lang_c() {
     types_["string"]     = "const char*";
 }
 
+void TypeRegistry::set_lang_java() {
+    java_mode_ = true;
+    types_["identifier"] = "String";
+    types_["string"]     = "String";
+    types_["int64"]      = "long";
+    types_["bool"]       = "boolean";
+}
+
 void TypeRegistry::register_type(const std::string& asdl_type, const std::string& target_type) {
     types_[asdl_type] = target_type;
 }
@@ -44,7 +52,8 @@ bool TypeRegistry::is_base_type(const std::string& type) const {
         throw TemplateException("Unknown type in base type check: " + type);
     }
     const std::string& mapped = it->second;
-    return mapped == "bool" || mapped == "int" || mapped == "int64_t" || mapped == "float" || mapped == "std::string";
+    return mapped == "bool" || mapped == "int" || mapped == "int64_t" || mapped == "float" || mapped == "std::string"
+        || mapped == "boolean" || mapped == "long" || mapped == "String";
 }
 
 bool TypeRegistry::has_type(const std::string& type) const {

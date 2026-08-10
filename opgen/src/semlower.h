@@ -64,7 +64,7 @@ public:
     static ValueType lane_elem(ValueType t, int* count, const char** ufield);
     static bool is_lane_type(ValueType t);
     static const char* slot_class(ValueType t);
-    static int  scalar_bits(const char* s);
+    int  scalar_bits(const char* s) const;   // `ref_t` reads its width off the slot view
     void int_slot_view(char* fld, const char** islot, const char** uw, int* w) const;
 
     // ── Status vocabulary + native resolution ──────────────
@@ -78,7 +78,7 @@ public:
 
     // ── Analysis the emitters query ────────────────────────
     int  expr_is_slot_valued(const Opcode* op, const SemExpr* e) const;
-    static int  const_eval(const SemExpr* e, const char* ct, uint64_t* bits);
+    int  const_eval(const SemExpr* e, const char* ct, uint64_t* bits) const;
     static int  expr_refs_name(const SemExpr* e, const char* name);
     // The type an `error:` condition is lowered at — lives here because both the
     // guard emitter and op_const_holes need it, and it is an expression question.

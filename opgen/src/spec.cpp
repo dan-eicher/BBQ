@@ -194,9 +194,18 @@ int Spec::compute_cp_ref_offset(const Opcode* op) const {
 
 // The scalar spellings a `type` row may use. Widths are read back off these
 // names, so the set is closed: anything else has no answerable width.
+//
+// `ref_t` is one of opgen's own spellings, not a target's: jtype() hands it
+// back for TyRef/TyFuncRef/TyExternRef/TyI31Ref, and the value model emits
+// `typedef <uw> ref_t` and gives any row whose field is `r` that member. Its
+// width is answerable for the same reason — a reference is word-sized by
+// construction, so it reads back off the slot view rather than off the name.
+// Leaving it out refuses exactly the specs that DECLARE their reference rows
+// instead of inheriting them; no fixture here declares one, which is why the
+// set could omit it and still pass.
 static bool is_opgen_scalar(const char* s) {
     static const char* kSpellings[] = { "s1","u1","s2","u2","s4","u4","f4",
-                                        "s8","u8","f8","v128_t","any_t" };
+                                        "s8","u8","f8","v128_t","any_t","ref_t" };
     for (const char* k : kSpellings) if (std::strcmp(k, s) == 0) return true;
     return false;
 }
@@ -211,7 +220,7 @@ Spec::Spec(const Module* m) : mod_(m) {
         if (!is_opgen_scalar(td->scalar) || !is_opgen_scalar(td->uscalar)) {
             fprintf(stderr,
                     "opgen: type row with scalar `%s`/`%s`: not an opgen "
-                    "spelling (s1/u1 … s8/u8, f4/f8)\n",
+                    "spelling (s1/u1 … s8/u8, f4/f8, v128_t, any_t, ref_t)\n",
                     td->scalar, td->uscalar);
             std::exit(1);
         }

@@ -151,11 +151,22 @@ const char* SemLowerer::slot_class(ValueType t) {
     return "I16";
 }
 
-int SemLowerer::scalar_bits(const char* s) {
+int SemLowerer::scalar_bits(const char* s) const {
     if (!strcmp(s, "s1") || !strcmp(s, "u1")) return 8;
     if (!strcmp(s, "s2") || !strcmp(s, "u2")) return 16;
     if (!strcmp(s, "s4") || !strcmp(s, "u4") || !strcmp(s, "f4")) return 32;
     if (!strcmp(s, "s8") || !strcmp(s, "u8") || !strcmp(s, "f8")) return 64;
+    /* A reference carries no width in its NAME, but it is word-sized by
+     * construction: the value model emits `typedef <uw> ref_t` off the slot
+     * view, so the width reads back off that same view rather than off the
+     * spelling. int_slot_view only consults integer rows, so this does not
+     * re-enter. Answering 32 here — as the old fallback did — masks a shift
+     * count against 31 on a 64-bit handle. */
+    if (!strcmp(s, "ref_t")) {
+        char fld; const char* islot; const char* uw; int w;
+        int_slot_view(&fld, &islot, &uw, &w);
+        return w;
+    }
     /* The spellings are a closed set and Spec rejects a type row outside it,
      * so reaching here means an internal caller synthesised a scalar name.
      * Defaulting to 32 would emit a plausible wrong width silently. */
@@ -311,9 +322,6 @@ void SemLowerer::lower_intrinsic(const SemExpr* e, const Opcode* op, ValueType r
     const SemExpr* a1 = call->args.size() > 1 ? call->args[1] : nullptr;
     ValueType at = arg_type(a0, op, rt);
     if (lane_) { int _ec; const char* _ef; ValueType le = lane_elem(at, &_ec, &_ef); if (_ec) at = le; }
-    int wide = scalar_bits(c_scalar(at)) >= 64;
-    int W = scalar_bits(c_scalar(at)), Msk = W - 1;
-    const char* u = c_unsigned(at); const char* sc = c_scalar(at);
 
     // int_min(): the most negative value of the surrounding expression's integer type. Nullary and
     // width-polymorphic — it takes its width from `rt`, so ONE declared guard covers a `( T a, T b -- T )`
@@ -341,6 +349,14 @@ void SemLowerer::lower_intrinsic(const SemExpr* e, const Opcode* op, ValueType r
         else    fputs("(JV_SP--, (any_t){ .bits = JV_STK[JV_SP].l, .kind = JV_STKT[JV_SP] })", out_);
         return;
     }
+
+    // The width the remaining intrinsics select on. Asked for HERE, below the
+    // ones that carry a value without computing on it: push/pop move a slot
+    // whatever it holds, so their argument need not have an arithmetic width,
+    // and asking up front refused them for a number none of them reads.
+    int wide = scalar_bits(c_scalar(at)) >= 64;
+    int W = scalar_bits(c_scalar(at)), Msk = W - 1;
+    const char* u = c_unsigned(at); const char* sc = c_scalar(at);
 
     const char* fn = nullptr;
     if      (!strcmp(n,"sqrt"))    fn = wide ? "sqrt"  : "sqrtf";
@@ -468,7 +484,12 @@ void SemLowerer::lower_expr(const SemExpr* e, const Opcode* op, ValueType rt) {
     case SemExprTag::SBinOp: {
         auto* b = static_cast<const SBinOp*>(e);
         const char* bop = b->op;
-        int shm = scalar_bits(c_scalar(rt)) - 1;
+        // Only a shift masks its count, so only a shift asks for the width. A
+        // comparison is a legitimate binop over a type that HAS no arithmetic
+        // width — `ref_eq`'s `a == b` over two externrefs — and asking up here
+        // refused it over a mask the operator never reads.
+        int is_shift = !strcmp(bop, ">>>") || !strcmp(bop, "<<") || !strcmp(bop, ">>");
+        int shm = is_shift ? scalar_bits(c_scalar(rt)) - 1 : 0;
         if (!strcmp(bop, ">>>")) {
             fprintf(out_, "(((%s)", c_unsigned(rt));
             lower_expr(b->left, op, rt);
@@ -669,8 +690,8 @@ void SemLowerer::lower_void_call(const SemExpr* e, const Opcode* op) {
     }
 }
 
-int SemLowerer::const_eval(const SemExpr* e, const char* ct, uint64_t* bits) {
-    int is_f = ct[0] == 'f', w = scalar_bits(ct), neg = 0;
+int SemLowerer::const_eval(const SemExpr* e, const char* ct, uint64_t* bits) const {
+    int is_f = ct[0] == 'f', neg = 0;
     const SemExpr* lit = e;
     if (e->tag == SemExprTag::SUnary && !strcmp(static_cast<const SUnary*>(e)->op, "-")) {
         neg = 1; lit = static_cast<const SUnary*>(e)->operand;
@@ -679,6 +700,10 @@ int SemLowerer::const_eval(const SemExpr* e, const char* ct, uint64_t* bits) {
     if      (lit->tag == SemExprTag::SInt)   { iv = static_cast<const SInt*>(lit)->value;   dv = (double)iv; }
     else if (lit->tag == SemExprTag::SFloat) { dv = static_cast<const SFloat*>(lit)->value; iv = (int64_t)dv; }
     else return 0;
+    // Only a literal has a width to be taken at. Asking above the tag test
+    // refused every NON-literal operand whose type has no arithmetic width,
+    // for a width the early return then threw away.
+    int w = scalar_bits(ct);
     if (neg) { dv = -dv; iv = -iv; }
     if (is_f) {
         if (w >= 64) memcpy(bits, &dv, 8);

@@ -266,6 +266,40 @@ static void check_trap(const char* msg, const u1* code, size_t len) {
 }
 
 int main(void) {
+    /* ── The `ref` row, on BOTH tiers ───────────────────────────────────────
+     * A reference is the one carrier with no arithmetic width in its name —
+     * opgen reads it off the slot view — so these are what keep that answer
+     * honest, and check() runs each through the interpreter AND the stencils.
+     *
+     * The last one is the assertion that would have caught javelina. `reftag`
+     * shifts by the literal 1, and 1 & 31 == 1 & 63, so a wrong mask is
+     * invisible to any execution of it. `refshl` takes the count as an
+     * immediate: 1<<33 against 1<<1 is 2^33 vs 2 masked with 63, and 2 vs 2
+     * masked with 31. Truncated to i32 for `ret`, 2^33 delivers 0. */
+    { static const u1 c[] = {OP_REFNULL, OP_REFNULL, OP_REFEQ, OP_RET};
+      check("refnull == refnull", c, sizeof c, 1); }
+    { static const u1 c[] = {OP_LCONST,0x05, OP_REFTAG, OP_LCONST,0x05, OP_REFTAG,
+                             OP_REFEQ, OP_RET};
+      check("reftag 5 == reftag 5", c, sizeof c, 1); }
+    { static const u1 c[] = {OP_LCONST,0x05, OP_REFTAG, OP_LCONST,0x06, OP_REFTAG,
+                             OP_REFEQ, OP_RET};
+      check("reftag 5 != reftag 6", c, sizeof c, 0); }
+    { static const u1 c[] = {OP_LCONST,0x05, OP_REFTAG, OP_REFNULL, OP_REFEQ, OP_RET};
+      check("reftag 5 != refnull", c, sizeof c, 0); }
+    { static const u1 c[] = {OP_LCONST,0x01, OP_REFSHL,33, OP_LCONST,0x01, OP_REFSHL,1,
+                             OP_REFEQ, OP_RET};
+      check("refshl mask is 63 not 31", c, sizeof c, 0); }
+
+    /* The `any` carrier through push()/pop(). A slot round-trips the intrinsics
+     * and must come back with BOTH halves intact: the value (l2i reads it) and
+     * the runtime tag (tagof reads it, and subtracting a plain i64's tag gives
+     * 0 only if the carrier preserved it). */
+    { static const u1 c[] = {OP_LCONST,0x05, OP_ANYROLL, OP_L2I, OP_RET};
+      check("push(pop()) keeps the value", c, sizeof c, 5); }
+    { static const u1 c[] = {OP_LCONST,0x05, OP_ANYROLL, OP_TAGOF,
+                             OP_LCONST,0x07, OP_TAGOF, OP_SUB, OP_RET};
+      check("push(pop()) keeps the tag", c, sizeof c, 0); }
+
     { static const u1 c[] = {0x01,0x03, 0x01,0x04, 0x02, 0x01,0x05, 0x04, 0x10};
       check("(3+4)*5", c, sizeof c, 35); }
     { static const u1 c[] = {0x01,0x08, 0x05, 0x10};

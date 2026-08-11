@@ -35,10 +35,19 @@ sidetable
 # Single-slot throughout (the WASM model, not the JVM's two-slot long/double), so the
 # whole set is exercised: an i64 that fills a slot, a double, and a v128 whose slot is
 # WIDER than 64 bits — which is what makes the runtime-typed carrier honest.
+#
+# `ref_t` is the fourth of opgen's own spellings, and the calc declares a row for it
+# for the same reason it declares v128: so that every spelling a consumer may write is
+# one a fixture writes too. A reference is the only carrier with no arithmetic width —
+# its width comes off the slot view, not its name — so it is also the only one that can
+# tell whether a lowering path asks for a width it does not use. A calculator has no
+# heap to point into; `ref` here is an opaque handle, which is all the type model needs
+# it to be.
 type i32  s4      u4      1 i
 type i64  s8      u8      1 l
 type f64  f8      f8      1 d
 type v128 v128_t  v128_t  1 v
+type ref  ref_t   ref_t   1 r
 
 # Control built-ins (the calc backend implements them). A status return marks
 # them as control transfers: the handler runs the native, then tail-dispatches.
@@ -154,6 +163,38 @@ dadd   0x19 (f64 a, f64 b -- f64 r)     (. r = a + b; .)
 # union in the test: the value model is opgen's, and reading it is an opcode's job.
 l2i   0x29 (i64 a -- i32 r)   (. r = (int)a; .)
 tagof 0x2A (any v -- i32 r)   (. r = calc_tag(v); .)
+
+# ── References ──────────────────────────────────────────────
+# The `ref` row's observable ops: produce the null handle, compare two handles for
+# identity, and derive one from an integer. Without a heap that is the whole of what a
+# reference carrier can do, and it is enough — the row's job here is to be DECLARED, so
+# that a lowering path which asks a reference for an arithmetic width has something to
+# fail against. `refeq` returns i32 so a program ending in `ret` can observe the result.
+#
+# `reftag` is the one that carries the width question: its RESULT is a reference, so the
+# arithmetic in its body lowers at reference type. That is the shape javelina hits with
+# ref.i31 (`(v << 1) | 1` producing an i31ref) and the reason the width has to read off
+# the slot view — 64 here — rather than off the name.
+refnull 0x2B ( -- ref r )                (. r = 0; .)
+refeq   0x2C (ref a, ref b -- i32 r)     (. r = (a == b) ? 1 : 0; .)
+reftag  0x2D (i64 v -- ref r)            (. r = (v << 1) | 1; .)
+
+# The shift MASK at reference type, made observable. reftag above shifts by the
+# literal 1, and 1 & 31 == 1 & 63 — so a lowering that answered 32 bits for a
+# 64-bit reference emits a wrong mask that no execution can detect. javelina
+# shipped exactly that. Here the count is an immediate: shift by 33 and the two
+# answers diverge, 1<<33 against 1<<(33 & 31) == 1<<1, which refeq can see.
+refshl  0x2E [ u8 n ] (i64 v -- ref r)   (. r = v << n; .)
+
+# `push`/`pop` — the runtime-typed carrier moved EXPLICITLY. A signature cannot
+# express this op (it moves a slot without changing the stack height), which is
+# the whole reason the two intrinsics exist: javelina uses them for br_on_null's
+# conditional re-push and for the variadic constructors, which pop their fields
+# after allocating. Round-tripping one slot is enough to put an `any_t` operand
+# through the intrinsic lowering — the path that must not ask an `any` for an
+# arithmetic width it does not have. The tag rides along, so `tagof` afterwards
+# still reports what the value was.
+anyroll 0x2F ( -- )   (. push(pop()); .)
 
 # ── Float constants INSIDE a guard ──────────────────────────
 #

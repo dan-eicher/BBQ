@@ -111,15 +111,26 @@ static bool {{ fn.kpfx }}_k{{ o.id }}(bbq_ctx_t* ctx, {{ fn.type }}* out, size_t
 {% endif %}
     }
 {% else if o.op == "array_begin" %}
+    // Counted array: the count bounds the loop, it does not size the store. The
+    // backing grows per element exactly as the uncounted path does, so a declared
+    // count the input cannot justify costs nothing until the element that runs off
+    // the interval — which is where IPG puts the failure (Fig 8 A-Seq/A-Fail; the
+    // count appears in no allocation anywhere in the semantics).
     { size_t _n = (size_t)({{ o.count }});
-      {{ o.field }}.count = _n;
-      {{ o.field }}.items = calloc(_n ? _n : 1, sizeof(*{{ o.field }}.items));
-      if (!{{ o.field }}.items) return bbq_fail(ctx, "{{ o.msg }}");
+      {{ o.field }}.count = 0; {{ o.field }}.items = NULL;
       if (_n == 0) { BBQ_MUSTTAIL return {{ fn.kpfx }}_k{{ o.end }}(ctx, out, _struct_start); }
       bbq_push_loop_n(ctx, (int64_t)_n); }
+    {{ o.field }}.items = bbq_array_grow(ctx, {{ o.field }}.items, sizeof(*{{ o.field }}.items));
+    if (!{{ o.field }}.items) return bbq_fail(ctx, "{{ o.msg }}");
+    {{ o.field }}.count = 1;
     BBQ_MUSTTAIL return {{ fn.kpfx }}_k{{ o.body }}(ctx, out, _struct_start);
 {% else if o.op == "array_next" %}
-    if (bbq_loop_next(ctx)) { BBQ_MUSTTAIL return {{ fn.kpfx }}_k{{ o.body }}(ctx, out, _struct_start); }
+    if (bbq_loop_next(ctx)) {
+        {{ o.field }}.items = bbq_array_grow(ctx, {{ o.field }}.items, sizeof(*{{ o.field }}.items));
+        if (!{{ o.field }}.items) return bbq_fail(ctx, "{{ o.msg }}");
+        {{ o.field }}.count = (size_t)(bbq_loop_index(ctx) + 1);
+        BBQ_MUSTTAIL return {{ fn.kpfx }}_k{{ o.body }}(ctx, out, _struct_start);
+    }
     bbq_pop_loop(ctx);
     BBQ_MUSTTAIL return {{ fn.kpfx }}_k{{ o.end }}(ctx, out, _struct_start);
 {% else if o.op == "array_begin_grow" %}
@@ -153,13 +164,11 @@ static bool {{ fn.kpfx }}_k{{ o.id }}(bbq_ctx_t* ctx, {{ fn.type }}* out, size_t
     // `count`, eof-before-count fails). The element body is called as a sub-unit;
     // its ArrayNext returns true, so the call's bool is parse success/failure.
     {{ o.field }}.count = 0;
-{% if o.counted %}
-    { size_t _n = (size_t)({{ o.count }});
-      {{ o.field }}.items = calloc(_n ? _n : 1, sizeof(*{{ o.field }}.items));
-      if (!{{ o.field }}.items) return bbq_fail(ctx, "{{ o.msg }}");
-      bbq_push_loop_n(ctx, (int64_t)_n); }
-{% else %}
     {{ o.field }}.items = NULL;
+{% if o.counted %}
+    // The count bounds the loop only — the store grows per element, same as uncounted.
+    bbq_push_loop_n(ctx, (int64_t)({{ o.count }}));
+{% else %}
     bbq_push_loop_unbounded(ctx);
 {% endif %}
     for (;;) {
@@ -172,10 +181,8 @@ static bool {{ fn.kpfx }}_k{{ o.id }}(bbq_ctx_t* ctx, {{ fn.type }}* out, size_t
         if (bbq_pos(ctx) >= bbq_effective_end(ctx)) break;  // eof: no count contract, stop
 {% endif %}
         bbq_checkpoint_t _cp = bbq_save(ctx);
-{% if not o.counted %}
         {{ o.field }}.items = bbq_array_grow(ctx, {{ o.field }}.items, sizeof(*{{ o.field }}.items));
         if (!{{ o.field }}.items) return bbq_fail(ctx, "{{ o.msg }}");
-{% endif %}
         if ({{ fn.kpfx }}_k{{ o.body }}(ctx, out, _struct_start)) {
             {{ o.field }}.count = (size_t)(bbq_loop_index(ctx) + 1);
             bbq_loop_advance(ctx);
@@ -194,6 +201,9 @@ static bool {{ fn.kpfx }}_k{{ o.id }}(bbq_ctx_t* ctx, {{ fn.type }}* out, size_t
     // advance the counter, then compare against the freshly evaluated count.
     bbq_loop_advance(ctx);
     if (bbq_loop_index(ctx) < (int64_t)({{ o.count }})) {
+        {{ o.field }}.items = bbq_array_grow(ctx, {{ o.field }}.items, sizeof(*{{ o.field }}.items));
+        if (!{{ o.field }}.items) return bbq_fail(ctx, "{{ o.msg }}");
+        {{ o.field }}.count = (size_t)(bbq_loop_index(ctx) + 1);
         BBQ_MUSTTAIL return {{ fn.kpfx }}_k{{ o.body }}(ctx, out, _struct_start);
     }
     bbq_pop_loop(ctx);

@@ -254,11 +254,18 @@ static inline void bbq_pop_loop(bbq_ctx_t* ctx) {
 }
 
 // Counted-array loop: push with the iteration limit (the CEK's LoopFrame.limit).
+// The declared count bounds the LOOP; it is not a capacity. IPG builds an array by
+// accumulating element parse trees (Fig 8, A-Seq1/A-Seq2) and the count appears
+// nowhere else in the semantics — so `cap` is what has actually been allocated,
+// which starts at zero exactly as it does for an unbounded loop. Seeding it with
+// `limit` instead made bbq_array_grow a no-op for counted arrays, which is why they
+// had to reserve the whole count up front: a 4-byte count field bought a 625 MB
+// allocation inside a 6-byte interval, before a single element was read.
 static inline void bbq_push_loop_n(bbq_ctx_t* ctx, int64_t limit) {
     bbq__loop_ensure(ctx);
     ctx->loop_indices[ctx->loop_depth] = 0;
     ctx->loop_limits[ctx->loop_depth] = limit;
-    ctx->loop_caps[ctx->loop_depth] = (size_t)(limit > 0 ? limit : 0);
+    ctx->loop_caps[ctx->loop_depth] = 0;
     ctx->loop_depth++;
 }
 

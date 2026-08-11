@@ -783,6 +783,70 @@ int main(int argc, char** argv) {
 
 // ── Error: truncated input ──
 
+// ── A counted array must not size an allocation from its count ──
+//
+// IPG semantics builds an array by ACCUMULATION: Fig 8's A-Seq1/A-Seq2 thread the
+// element parse trees one at a time into Array(Tr⃗), and the declared count appears
+// nowhere but the loop bound. The interval is what says how much input a term may
+// consume — T-Ter carries `r - l >= |s1|` as a PREMISE, checked before the match —
+// and a repetition count is not a width. So a count the input cannot possibly
+// justify must be discovered by the element that runs off the interval, and must
+// cost nothing before then.
+//
+// The address-space limit is what makes "did it allocate?" observable: a declared
+// 2^30 elements is well under what a 64-bit allocator will hand out, so without the
+// limit the over-allocation succeeds silently and the parse fails identically either
+// way. Under the limit, allocating from the count fails in the ALLOCATOR and reports
+// that; accumulating fails at the second element's read, which is the answer the
+// semantics prescribes. The assertion is on which one reported.
+TEST(CBackendE2E, CountedArrayDoesNotAllocateFromCount) {
+    const char* spec =
+        "@endian big\n"
+        "Item = struct { v: uint8 }\n"
+        "List = struct { count: uint32be, items: array<Item>[count] }";
+
+    const char* harness = R"(
+#include "testReader.h"
+#include <stdio.h>
+#include <string.h>
+#include <assert.h>
+#include <sys/resource.h>
+
+int main(int argc, char** argv) {
+    (void)argc; (void)argv;
+    // 2^30 declared elements; one byte of input left to hold them.
+    uint8_t buf[] = { 0x40, 0x00, 0x00, 0x00, 0xAA };
+
+    struct rlimit rl = { 256u * 1024u * 1024u, 256u * 1024u * 1024u };
+    assert(setrlimit(RLIMIT_AS, &rl) == 0);
+
+    bbq_ctx_t ctx;
+    bbq_ctx_init(&ctx, buf, sizeof(buf));
+    list_t list;
+    assert(!list_read(&ctx, &list));
+    assert(ctx.has_error);
+    // Two things together are the claim. The allocator did not report — had the store
+    // been sized from the count, calloc would have failed under the limit and said so.
+    // And the position is the interval's end: element 0 consumed the one byte that was
+    // really there and element 1 ran off, which is where the semantics puts the failure.
+    if (strstr(ctx.error, "alloc failed")) {
+        printf("FAIL: the allocator reported, so the count sized the store: %s\n", ctx.error);
+        return 1;
+    }
+    if (!strstr(ctx.error, "offset 5:")) {
+        printf("FAIL: expected the failure at the interval end (offset 5), got: %s\n", ctx.error);
+        return 1;
+    }
+    printf("OK: counted array accumulates; the interval reported (%s)\n", ctx.error);
+    return 0;
+}
+)";
+
+    uint8_t data[] = {0};
+    std::string err;
+    ASSERT_TRUE(run_c_e2e(spec, harness, data, 0, &err)) << err;
+}
+
 TEST(CBackendE2E, TruncatedInput) {
     const char* spec =
         "@endian big\n"

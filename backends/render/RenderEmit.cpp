@@ -334,7 +334,12 @@ void Emitter::fold_owning_paths(json& functions) const {
                 kept.push_back(op);
                 continue;
             }
-            if (k == "array_next_grow") { op["field"] = array_stack.back(); kept.push_back(op); continue; }
+            // Every loop-back op names the array it grows, so it needs the same fully
+            // qualified field the begin op got — counted and uncounted alike, now that
+            // the counted store accumulates instead of being sized from the count.
+            if (k == "array_next_grow" || k == "array_next" || k == "array_next_count") {
+                op["field"] = array_stack.back(); kept.push_back(op); continue;
+            }
             if (k == "invoke") {
                 op["target"] = container(prefix);
                 op["scope"] = fn.value("scope", true);

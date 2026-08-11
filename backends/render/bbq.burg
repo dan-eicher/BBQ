@@ -394,7 +394,8 @@ spine: ArrayNextNode      = 1 (. ArrayNextNode* an = (ArrayNextNode*)node;
             // element body as a sub-unit; reaching here means it parsed → return true.
             E.node(node, "array_elem_done");
         } else if (an->mode == bbq::cek::ArrayMode::FixedCount) {
-            E.node(node, "array_next", {{"body", body}, {"end", end}});
+            E.node(node, "array_next", {{"field", E.array_fields.back()},
+                    {"body", body}, {"end", end}, {"msg", "array: grow failed"}});
         } else if (an->mode == bbq::cek::ArrayMode::EOF_) {
             // grow-while `pos < end`, as a neutral bin node over two builtins.
             json cond = {{"e","bin"},{"op","<"},
@@ -421,7 +422,8 @@ spine: ArrayNextNode      = 1 (. ArrayNextNode* an = (ArrayNextNode*)node;
             BurgState* cs = burg_label_tree((bbq::cek::KontNode*)an->count_expr);
             burg_reduce((bbq::cek::KontNode*)an->count_expr, cs, expr_NT);
             json cnt = E.epop();
-            E.node(node, "array_next_count", {{"count", cnt}, {"body", body}, {"end", end}});
+            E.node(node, "array_next_count", {{"field", E.array_fields.back()}, {"count", cnt},
+                    {"body", body}, {"end", end}, {"msg", "array: grow failed"}});
         } .);
 spine: EndArrayNode       = 1 (. if (!E.absorbed.count(node)) {
         // ALWAYS emit a neutral end_array (owning folds + drops it, view keeps it).

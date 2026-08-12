@@ -108,7 +108,6 @@ static int run(int argc, char** argv) {
     rc |= write_file(out_dir, (std::string(prefix) + "_jit_symbols.h").c_str(), [&](FILE* o){ vm.emit_jit_symbols(o); });
     rc |= write_file(out_dir, (std::string(prefix) + "_sigtab.h").c_str(),     [&](FILE* o){ sig.emit_sigtab_h(o); });
     rc |= write_file(out_dir, (std::string(prefix) + "_ttree.asdl").c_str(),   [&](FILE* o){ sig.emit_ttree_asdl(o); });
-    rc |= write_file(out_dir, (std::string(prefix) + "_tile.burg").c_str(),    [&](FILE* o){ sig.emit_tile_burg(o); });
 
     return rc;
 }

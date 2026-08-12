@@ -65,7 +65,9 @@ public:
 
     void emit_sigtab_h(FILE* o);     // <prefix>_sigtab.h
     void emit_ttree_asdl(FILE* o);   // <prefix>_ttree.asdl
-    void emit_tile_burg(FILE* o);    // <prefix>_tile.burg
+    // The tiling grammar is NOT emitted here. A rule's cost is the size of the
+    // code it stamps, and that is measured downstream of this tool — so the
+    // consumer generates the grammar from the stencil table it ends up with.
 
 private:
     // One addrtype ATOM: a module entry whose declared addrtype an ADDR slot

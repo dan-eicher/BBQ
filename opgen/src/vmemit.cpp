@@ -360,48 +360,137 @@ int VmEmitter::operand_slot(const Opcode* op, int k, int state) {
     return (d < state) ? d : -1;
 }
 
-// What the machine is in after this instruction: it consumed its operands, and
-// its result (if any) is the new top, so the result is the one thing cached.
-int VmEmitter::follow_state(const Opcode* op, int state, int nslots) {
+// Do this state's results ride the cache? All of them or none: a pushed result
+// sitting above a cached one is not a state the minimal organization can name
+// (§2.3), since a state is a COUNT of cached items and says the top ones are the
+// cached ones. Three ways to fail it, and each is a real opcode:
+//   - the result would not fit alongside what survived (Ertl's OVERFLOW),
+//   - it is `word`/`any`, which has no storage class until a tile resolves one,
+//     so no stencil can know which CACHE_PUT_ to use — `local.get` and every
+//     other polymorphic mover lands here,
+//   - it is variadic, and already sits at the frame base where a callee left it.
+// This is the ONE place the question is answered, because the answer is what the
+// tiling grammar prices and what the stitcher has to stamp against.
+bool VmEmitter::results_cached(const Opcode* op, int state) const {
+    if (state < 0 || op->stack_out.empty()) return false;
     int a = (int)op->stack_in.size();
-    int left = state >= a ? state - a : 0;
-    int out = left + (int)op->stack_out.size();
-    return out > nslots ? nslots : out;
+    int left = state > a ? state - a : 0;
+    if (left + (int)op->stack_out.size() > tier2_n_) return false;
+    for (auto* so : op->stack_out)
+        if (out_count(so) || !(cacheable(so->ty) || poly_slot(so->ty))) return false;
+    return true;
+}
+
+// A `word`/`any` slot: no storage class in the SIGNATURE, because the class is a
+// property of the tile rather than of the opcode. That does not keep it out of a
+// register — the value is a slot either way, and a slot is what a cache register
+// holds. What the class decides is which spill re-tags it on the way back to
+// memory, and the tiler knows that before the stitcher stamps anything.
+//
+// The one class that must never reach a slot is `ref`, and the grammar is what
+// keeps it out: there are no `ref_reg0` rules, so a ref-resolved tile can only
+// reduce at `ref_mem`, which asks for the result in memory. The form that puts it
+// there already exists and is the PLAIN stencil — the uncached form at every
+// cache size — so this needs no second family, only for the grammar to offer that
+// stencil as the memory-result candidate and for the walk to stamp it when the
+// tile asks for one.
+// Both carriers the spec's value model has for "the class is not in the
+// signature": `word` (a slot whose class the tile resolves) and `any` (the
+// runtime-TYPED carrier, `{bits, hi, kind}`, whose tag the interpreter reads from
+// an RTT). Neither keeps its value out of a register.
+//
+// For `any` the tag looks like a reason it must — but it is not, because the two
+// fields beside `bits` are exactly what the class determines: `hi` is the second
+// half of a v128 and `kind` is the class itself. A cached value has no tag and
+// needs none; the spill that returns it to memory is the class-specific stencil,
+// and re-tagging is what that stencil is for.
+//
+// Either carrier can still be wider than a register — slot_t's union includes
+// v128 — but the grammar decides that, not this: v128 and ref are absent from
+// jav_class_cacheable, so no `*_reg0` rule exists for them and a tile that
+// resolves one reduces at `*_mem`, which asks for the plain stencil. The cached
+// form therefore only ever runs for the four classes that fit, where `bits` is
+// the whole value and `hi` is dead.
+bool VmEmitter::poly_slot(ValueType t) {
+    return t == ValueType::TyWord || t == ValueType::TyAny;
+}
+
+// D3s / §2.5: "The implementation of the same instruction in many states can be
+// the same." Two states emit the same BODY when they read the same operands from
+// the same slots, place their results the same way, and move the same survivors
+// — everything the state can change. An instruction that touches no register at
+// all is the common case: `nop` in state 0 and in state 1 differ only in a number
+// nothing in the body reads.
+//
+// Emitting both anyway is not wrong, it is a duplicate: two stencil-table entries
+// with identical code, and the table is what the JIT carries in memory. So the
+// later state points at the earlier one's stencil instead.
+int VmEmitter::same_state_as(const Opcode* op, int state) const {
+    for (int prev = 0; prev < state; prev++) {
+        if (!(prev == 0 || emits_variant(op, prev))) continue;
+        if (results_cached(op, prev) != results_cached(op, state)) continue;
+        int a = (int)op->stack_in.size(), same = 1;
+        for (int k = 0; k < a && same; k++)
+            if (operand_slot(op, k, prev) != operand_slot(op, k, state)) same = 0;
+        if (!same) continue;
+        // The survivor shift is (left, nout): same pair, same moves.
+        int lp = prev  > a ? prev  - a : 0;
+        int ls = state > a ? state - a : 0;
+        if (lp != ls) continue;
+        return prev;
+    }
+    return -1;
 }
 
 // Does the family carry this opcode in this entry state? The emission loop and
 // the variant table both ask, and a disagreement between them would have the
 // stitcher stamp a stencil that was never generated.
 bool VmEmitter::emits_variant(const Opcode* op, int state) const {
-    // What survives this instruction, plus what it produces, has to fit: a push
-    // that would shift a value past the last slot is Ertl's OVERFLOW, and rather
-    // than teach every stencil to spill, the family simply has no variant there
-    // and the tiler reaches the state through a transition (§2.5 / C5).
     int a = (int)op->stack_in.size();
     int left = state > a ? state - a : 0;
+    // Anything still cached on exit means the results had to be cached too, by
+    // the argument above; a state that cannot place them has no variant and the
+    // tiler reaches it through a transition instead (§2.5 / C5).
     if (left + (int)op->stack_out.size() > tier2_n_) return false;
+    if (!op->stack_out.empty() && !results_cached(op, state)) return false;
     for (int k = 0; k < a; k++)
         if (operand_slot(op, k, state) >= 0 &&
             (!cacheable(op->stack_in[k]->ty) || op->stack_in[k]->count.has_value()))
             return false;
-    // A state that leaves a value cached needs every result cacheable — an
-    // uncached result would be pushed while cached values sit below it, which is
-    // not a state this organization can name.
-    for (auto* so : op->stack_out)
-        if (!cacheable(so->ty)) return false;
     return true;
+}
+
+// What the machine is in after the variant for (op, state) runs: what survived
+// keeps its depth, and the results are on top of it if this state cached them.
+//
+// This CANNOT be recovered from the arity, which is what it used to be: a `word`
+// result pops and pushes exactly like an `i32` one and yet leaves the cache
+// empty, because it went to memory. Publishing the arity instead had the grammar
+// promise `local.get` a register the stencil never wrote, and the stitcher then
+// spilled a slot that was never loaded — the value read as zero. So the emitted
+// variant reports its own exit state, and there is nothing left to disagree with.
+int VmEmitter::variant_fs(const Opcode* op, int state) const {
+    if (state < 0) return -1;
+    if (state > 0 && !emits_variant(op, state)) return -1;
+    int a = (int)op->stack_in.size();
+    int left = state > a ? state - a : 0;
+    return left + (results_cached(op, state) ? (int)op->stack_out.size() : 0);
 }
 
 void VmEmitter::emit_one_opcode(SemLowerer& low, const Opcode* op, int state) {
     FILE* o = low.out();
     int stencil = (low.mode() == Mode::Stencil);
-    if (stencil && state >= 1) {
+    if (stencil && state >= 0) {
         fprintf(o, "void STENCIL gen_st_%s__s%d(CACHE_ARGS) {\n", op->mnemonic, state);
         fputs("    frame_t* f = &vm->frame; (void)f;\n", o);
         fputs("    STENCIL_TRAP_PC(_HOLE_pc);\n", o);
     } else if (stencil) {
-        // State 0 keeps the plain name: it is what the driver stamps by default,
-        // and with no cache at all it is the only form there is.
+        // The plain name is the NO-CACHE form at every n — tier-1's stencil, and
+        // the one a driver stamps when it has no tiling to go on. State 0 is a
+        // different thing: it says nothing is cached ON ENTRY, and its result
+        // still lands in a register. Naming them alike made the tier-2 build's
+        // fallback stamp tier-2 stencils with no transitions between them, so a
+        // declined body computed with a cache nothing ever read or spilled.
         fprintf(o, "void STENCIL gen_st_%s(CACHE_ARGS) {\n", op->mnemonic);
         fputs("    frame_t* f = &vm->frame; (void)f;\n", o);
         fputs("    STENCIL_TRAP_PC(_HOLE_pc);   /* per-stencil source byte offset: the default discards it (no trap-frame); a backend that records a trap site (e.g. §7.1.8) #defines STENCIL_TRAP_PC to bake _HOLE_pc into its frame */\n", o);
@@ -553,8 +642,16 @@ void VmEmitter::emit_one_opcode(SemLowerer& low, const Opcode* op, int state) {
         // A VARIADIC result names a count, not a value: the slots are already on the
         // stack and exposing them is an sp raise, so there is nothing to declare.
         if (!out_sem_expr(so) && !out_count(so)) {
-            if (so->ty == ValueType::TyWord)
+            if (so->ty == ValueType::TyWord) {
                 fprintf(o, "    slot_t %s; u1 %s_wt;\n", so->name, so->name);
+                // A cached result carries no tag: it is not in memory, so nothing
+                // scans it, and the spill that puts it back re-tags it from the
+                // class the tile resolved. The body still ASSIGNS the tag (its
+                // source is unchanged, D1s), so say the value is deliberately
+                // unused rather than let -Wunused-but-set-variable fail the build.
+                if (results_cached(op, state))
+                    fprintf(o, "    (void)%s_wt;\n", so->name);
+            }
             else
                 fprintf(o, "    %s %s;\n", low.c_scalar(so->ty), so->name);
         }
@@ -605,7 +702,10 @@ void VmEmitter::emit_one_opcode(SemLowerer& low, const Opcode* op, int state) {
     if (state >= 0) {
         int a = (int)op->stack_in.size();
         int left = state > a ? state - a : 0;
-        int nout = (int)op->stack_out.size();
+        // Where the survivors end up is where the results DIDN'T go: a result
+        // that went to memory occupies no slot, so the survivors close all the
+        // way up to slot 0.
+        int nout = results_cached(op, state) ? (int)op->stack_out.size() : 0;
         if (left && nout > a)
             for (int j = left - 1; j >= 0; j--)
                 fprintf(o, "    CACHE_R%d = CACHE_R%d;\n", nout + j, a + j);
@@ -630,7 +730,7 @@ void VmEmitter::emit_one_opcode(SemLowerer& low, const Opcode* op, int state) {
         // The result is the new top of stack, so in a cached state it lands in
         // slot 0 rather than being pushed. The values that SURVIVED this
         // instruction were moved into place above.
-        if (state >= 0 && cacheable(so->ty)) {
+        if (results_cached(op, state)) {
             fprintf(o, "    CACHE_R0 = CACHE_PUT_%s(%s);\n",
                     SemLowerer::slot_class(so->ty), val);
             continue;
@@ -751,6 +851,18 @@ void VmEmitter::emit_stencil_c(FILE* o) {
                     "#define CACHE_PUT_%s(x)  ((cache_slot_t)(uintptr_t)(%s)(x))\n",
                     cls, r.scalar, cls, r.uscalar);
         }
+        // A `word` has no class here — the tile resolved one, and the spill that
+        // returns the value to memory is the class-specific stencil that re-tags
+        // it. So this moves the SLOT: its low 8 bytes, which is the whole value
+        // for every class a rule can put in a register (v128 and ref have no
+        // *_reg0 rule, so they never reach this).
+        fputs("#define CACHE_GET_WORD(sl) (__extension__({ slot_t _s;"
+              " _s.l = (s8)(uintptr_t)(sl); _s; }))\n"
+              "#define CACHE_PUT_WORD(x)  ((cache_slot_t)(uintptr_t)(x).l)\n"
+              // …and the typed carrier, which is the same move: `bits` is the
+              // value, `hi` is the half only a v128 has, and `kind` is the class
+              // — so for anything a rule can cache, `bits` is all of it.
+              "#define CACHE_PUT_ANY(x)   ((cache_slot_t)(uintptr_t)(x).bits)\n", o);
     }
     fputs("\n", o);
     emit_slot_macros(low);
@@ -829,12 +941,19 @@ void VmEmitter::emit_stencil_c(FILE* o) {
 
     for (auto* op : mod_->opcodes) {
         if (!is_emittable(op) || SemLowerer::stencil_excluded(op)) continue;
-        emit_one_opcode(low, op, tier2_n_ ? 0 : -1);
-        // The variant family: the same body again per entry state. A state whose
-        // operands are not all cacheable gets no variant — §2.5's omission rule,
+        // Always the no-cache form first: it is tier-1's stencil, and the tier-2
+        // build needs it too as the form to stamp where there is no tiling.
+        emit_one_opcode(low, op, -1);
+        // The variant family: the same body again per entry state. State 0 always
+        // gets one — it is where a cover starts — while a HIGHER state whose
+        // operands are not all cacheable gets none, which is §2.5's omission rule,
         // and the tiler reaches it through a transition instead.
-        for (int st = 1; st <= tier2_n_; st++)
-            if (emits_variant(op, st)) emit_one_opcode(low, op, st);
+        // …and only when there IS a cache: at n=0 an `__s0` would be the no-cache
+        // form under a second name, and that table has to stay byte-identical.
+        if (tier2_n_)
+            for (int st = 0; st <= tier2_n_; st++)
+                if ((st == 0 || emits_variant(op, st)) && same_state_as(op, st) < 0)
+                    emit_one_opcode(low, op, st);   // D3s: a duplicate body is not emitted
     }
 
     // Machinery stencils — the machine boundary + control continuations, the
@@ -1024,33 +1143,47 @@ void VmEmitter::emit_jit_meta(FILE* o) {
     // opcode's meta. -1 is "no variant for this state", which the grammar never
     // asks for, because a rule only exists where the stencil does.
     fprintf(o, "\n#define %s_TIER2_N %d\n", uprefix_.c_str(), tier2_n_);
-    // The state an instruction leaves behind. ONE formula with two readers — the
-    // tiling grammar prices the transitions its state choices imply, and the
-    // stitcher derives which transitions to stamp from the same arithmetic. Two
-    // readings of it would have the cost model pay for spills nobody emits.
-    fprintf(o,
-        "/* The cache state after an instruction that pops `pop` and pushes `push`\n"
-        " * from entry state `entry`. What survives keeps its depth; what it\n"
-        " * produces becomes the new top; anything past the last slot is memory. */\n"
-        "static inline int %s_follow_state(int entry, int pop, int push) {\n"
-        "    int left = entry > pop ? entry - pop : 0;\n"
-        "    int out = left + push;\n"
-        "    return out > %s_TIER2_N ? %s_TIER2_N : out;\n"
-        "}\n", prefix_.c_str(), uprefix_.c_str(), uprefix_.c_str());
     fprintf(o, "static const int %s_variant[][%s_TIER2_N + 1] = {\n",
             prefix_.c_str(), uprefix_.c_str());
     for (auto* op : mod_->opcodes) {
         if (!is_emittable(op) || SemLowerer::stencil_excluded(op)) continue;
-        fputs("    [STENCIL_GEN_ST_", o); put_upper(o, op->mnemonic); fputs("] = { STENCIL_GEN_ST_", o);
-        put_upper(o, op->mnemonic);
-        for (int st = 1; st <= tier2_n_; st++) {
-            if (emits_variant(op, st)) {
-                fputs(", STENCIL_GEN_ST_", o); put_upper(o, op->mnemonic);
-                fprintf(o, "__S%d", st);
+        fputs("    [STENCIL_GEN_ST_", o); put_upper(o, op->mnemonic); fputs("] = {", o);
+        for (int st = 0; st <= tier2_n_; st++) {
+            // Indexed by ENTRY state, so slot 0 is the state-0 variant and NOT the
+            // plain stencil — that one is tier-1's, reachable through the meta.
+            if (st == 0 && !tier2_n_) {
+                fputs(" STENCIL_GEN_ST_", o); put_upper(o, op->mnemonic);
+            } else if (st == 0 || emits_variant(op, st)) {
+                // D3s: a state sharing an earlier state's body names that stencil.
+                int share = same_state_as(op, st);
+                fputs(st ? ", STENCIL_GEN_ST_" : " STENCIL_GEN_ST_", o);
+                put_upper(o, op->mnemonic);
+                fprintf(o, "__S%d", share >= 0 ? share : st);
             } else {
                 fputs(", -1", o);
             }
         }
+        fputs(" },\n", o);
+    }
+    fputs("};\n", o);
+
+    // The state each variant leaves behind, in step with the table above. ONE
+    // fact with two readers — the tiling grammar prices the transitions its
+    // state choices imply, and the stitcher stamps transitions against the same
+    // numbers — and it is REPORTED BY THE EMISSION rather than recomputed from
+    // the arity, because the arity cannot see a result that went to memory.
+    fprintf(o,
+        "/* The cache state after the variant above, or -1 where there is none.\n"
+        " * Not derivable from pop/push: a `word` result moves the stack exactly\n"
+        " * like an `i32` one and yet leaves nothing cached, having no class to\n"
+        " * cache AS. Read this; do not recompute it. */\n");
+    fprintf(o, "static const int %s_variant_fs[][%s_TIER2_N + 1] = {\n",
+            prefix_.c_str(), uprefix_.c_str());
+    for (auto* op : mod_->opcodes) {
+        if (!is_emittable(op) || SemLowerer::stencil_excluded(op)) continue;
+        fputs("    [STENCIL_GEN_ST_", o); put_upper(o, op->mnemonic); fputs("] = {", o);
+        for (int st = 0; st <= tier2_n_; st++)
+            fprintf(o, "%s %d", st ? "," : "", variant_fs(op, st));
         fputs(" },\n", o);
     }
     fputs("};\n", o);

@@ -42,6 +42,14 @@ static inline int jcb_init(jit_codebuf_t* b, size_t initial_cap) {
     return 0;
 }
 
+/* Drop everything stamped so far and stamp again from the start, keeping the
+ * mapping. For a driver that has to RE-emit a body — a second pass under
+ * different assumptions — rather than compile a different one. */
+static inline void jcb_reset(jit_codebuf_t* b) {
+    b->size = 0;
+    b->finalized = 0;
+}
+
 static inline void jcb_free(jit_codebuf_t* b) {
     if (b->base) munmap(b->base, b->cap);
     b->base = NULL; b->cap = b->size = 0;

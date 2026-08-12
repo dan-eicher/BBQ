@@ -52,16 +52,25 @@ private:
     // per-state signature is rejected outright by clang. The state is therefore
     // which slots are LIVE, which the tiler tracks; the signature never varies.
     int  cache_slots() const { return tier2_n_; }
-    static int follow_state(const Opcode* op, int state, int nslots);
     // Is operand k (counted from the bottom of this instruction's operands) in a
     // register in this state, and if so which one?
     static int operand_slot(const Opcode* op, int k, int state);
     // A class that never enters a slot: a managed reference belongs on the stack,
     // where the collector expects to find it and to be able to relocate it.
     static bool cacheable(ValueType t);
+    // A slot whose storage class the signature does not carry — the tile resolves
+    // one. Cacheable as a raw slot; see the note on the definition.
+    static bool poly_slot(ValueType t);
+    // Where this state's results go: all into the cache, or all pushed. Asked by
+    // the emission itself and by everything that has to know what it did.
+    bool results_cached(const Opcode* op, int state) const;
     // Does the family carry this opcode in this entry state? Asked by both the
     // emission loop and the variant table, so they cannot disagree.
     bool emits_variant(const Opcode* op, int state) const;
+    // The state the emitted variant LEAVES BEHIND, or -1 where there is none.
+    int  variant_fs(const Opcode* op, int state) const;
+    // An earlier state whose variant body is identical to this one's, or -1.
+    int  same_state_as(const Opcode* op, int state) const;
 
     // Handler emission (the interp/stencil body wrapper around the lowering).
     // `state` is the entry cache state; -1 is "no cache" (the interp, and every

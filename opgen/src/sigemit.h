@@ -41,6 +41,19 @@ inline bool sclass_cacheable(SClass c) {
            c == SClass::F32 || c == SClass::F64;
 }
 
+// The spelling a class contributes to a transition stencil's symbol, or null
+// when it does not cache. One place, so the emitted stencil and the table that
+// names it cannot drift.
+inline const char* sclass_stencil_name(SClass c) {
+    switch (c) {
+    case SClass::I32: return "I32";
+    case SClass::I64: return "I64";
+    case SClass::F32: return "F32";
+    case SClass::F64: return "F64";
+    default:          return nullptr;
+    }
+}
+
 // What a node stands for. Almost every node is an instruction, but a region does
 // not begin with an empty stack: whatever the previous region left behind is
 // sitting on the memory stack, and the first instruction that consumes one needs
@@ -82,6 +95,11 @@ public:
     // code it stamps, and that is measured downstream of this tool — so the
     // consumer generates the grammar from the stencil table it ends up with.
 
+    // The class a value type is HELD in. Public because it is the mapping, not an
+    // implementation detail: anything asking "can this cache" or "which
+    // transition stencil" has to reach a class the same way this walk does.
+    static SClass classify_final(ValueType ty, const char* mnemonic, const char* param);
+
 private:
     // One addrtype ATOM: a module entry whose declared addrtype an ADDR slot
     // reads, named by the predicate the spec wrote, the identifier it indexes
@@ -117,7 +135,6 @@ private:
     int  intern(const Sig& s);
     OpInfo describe(const Opcode* op) const;
     void resolve(OpInfo& oi);
-    static SClass classify_final(ValueType ty, const char* mnemonic, const char* param);
     static void collect_atoms(const SemExpr* e, std::vector<Atom>& out,
                               const Opcode* op);
     static unsigned atom_mask(const SemExpr* e, const std::vector<Atom>& atoms,

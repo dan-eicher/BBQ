@@ -844,6 +844,36 @@ void VmEmitter::emit_stencil_c(FILE* o) {
     // successor through the driver-built offmap; `gen_st_halt` is the off-the-
     // end terminator (a guarded result stash — works whether the function
     // returns implicitly off the end or via an explicit return opcode).
+    // The transitions. A spill moves the DEEPEST cached item to memory and a fill
+    // takes the top of memory into the first free slot, so neither renumbers
+    // anything: reg0 is the top either way, and only the count changes. That is
+    // what makes them one stencil per (class, slot) rather than per state.
+    //
+    // They are what a chain rule in the tiling grammar costs, and what the
+    // stitcher stamps in the gap between two instructions whose states disagree.
+    if (tier2_n_) {
+        fputs("\n/* ── Cache transitions (generated), per class and slot ── */\n", o);
+        for (auto* td : mod_->types) {
+            if (!cacheable(td->ty)) continue;
+            const char* cls = SemLowerer::slot_class(td->ty);
+            const char* nm = sclass_stencil_name(
+                SigEmitter::classify_final(td->ty, "type row", "cache slot"));
+            for (int s = 0; s < tier2_n_; s++) {
+                fprintf(o,
+                    "void STENCIL gen_st_spill_%s_%d(CACHE_ARGS) {\n"
+                    "    frame_t* f = &vm->frame; (void)f;\n"
+                    "    GPUSH_%s(CACHE_GET_%s(CACHE_R%d));\n"
+                    "    TAIL return _HOLE_cont(CACHE_PASS);\n}\n", nm, s, cls, cls, s);
+                fprintf(o,
+                    "void STENCIL gen_st_fill_%s_%d(CACHE_ARGS) {\n"
+                    "    frame_t* f = &vm->frame; (void)f;\n"
+                    "    GPOP_%s(_v);\n"
+                    "    CACHE_R%d = CACHE_PUT_%s(_v);\n"
+                    "    TAIL return _HOLE_cont(CACHE_PASS);\n}\n", nm, s, cls, s, cls);
+            }
+        }
+    }
+
     fputs(
 "\n/* ── Machinery stencils (generated): the machine boundary + control\n"
 " * continuations, identical for every opgen VM (the JIT requires a bbq_ctx\n"
@@ -994,6 +1024,19 @@ void VmEmitter::emit_jit_meta(FILE* o) {
     // opcode's meta. -1 is "no variant for this state", which the grammar never
     // asks for, because a rule only exists where the stencil does.
     fprintf(o, "\n#define %s_TIER2_N %d\n", uprefix_.c_str(), tier2_n_);
+    // The state an instruction leaves behind. ONE formula with two readers — the
+    // tiling grammar prices the transitions its state choices imply, and the
+    // stitcher derives which transitions to stamp from the same arithmetic. Two
+    // readings of it would have the cost model pay for spills nobody emits.
+    fprintf(o,
+        "/* The cache state after an instruction that pops `pop` and pushes `push`\n"
+        " * from entry state `entry`. What survives keeps its depth; what it\n"
+        " * produces becomes the new top; anything past the last slot is memory. */\n"
+        "static inline int %s_follow_state(int entry, int pop, int push) {\n"
+        "    int left = entry > pop ? entry - pop : 0;\n"
+        "    int out = left + push;\n"
+        "    return out > %s_TIER2_N ? %s_TIER2_N : out;\n"
+        "}\n", prefix_.c_str(), uprefix_.c_str(), uprefix_.c_str());
     fprintf(o, "static const int %s_variant[][%s_TIER2_N + 1] = {\n",
             prefix_.c_str(), uprefix_.c_str());
     for (auto* op : mod_->opcodes) {
@@ -1011,6 +1054,25 @@ void VmEmitter::emit_jit_meta(FILE* o) {
         fputs(" },\n", o);
     }
     fputs("};\n", o);
+
+    // The transitions, per storage class and slot. A chain rule in the tiling
+    // grammar is costed from these, and the stitcher stamps one when two adjacent
+    // instructions disagree about the state. -1 where the class does not cache.
+    for (int pass = 0; pass < 2; pass++) {
+        const char* what = pass ? "fill" : "spill";
+        fprintf(o, "\nstatic const int %s_%s[%u][%s_TIER2_N ? %s_TIER2_N : 1] = {\n",
+                prefix_.c_str(), what, SCLASS_FINAL - 1, uprefix_.c_str(), uprefix_.c_str());
+        for (unsigned c = 0; c + 1 < SCLASS_FINAL; c++) {
+            fputs("    {", o);
+            for (int s = 0; s < (tier2_n_ ? tier2_n_ : 1); s++) {
+                const char* nm = sclass_stencil_name((SClass)c);
+                if (!tier2_n_ || !nm) { fputs(" -1,", o); continue; }
+                fprintf(o, " STENCIL_GEN_ST_%s_%s_%d,", pass ? "FILL" : "SPILL", nm, s);
+            }
+            fputs(" },\n", o);
+        }
+        fputs("};\n", o);
+    }
     put_p(o, "#endif /* WASM_JIT_META_H */\n");
 }
 

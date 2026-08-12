@@ -362,14 +362,20 @@ void CBurgBackend::emit_rewrite_body(std::ostream& out, int indent) {
     pad(out, indent); out << "arena_reset(ctx);\n\n";
 
     pad(out, indent); out << "if (BURG_NODE_SUCC_COUNT(root) == 0) {\n";
+    // Whether the start nonterminal covers the root is a fact about the GRAMMAR,
+    // not about whether anyone wrote a semantic action. Gating the check on
+    // has_actions made an action-free grammar report success for every tree,
+    // including ones it cannot cover — the silent skip this error channel exists
+    // to close. A grammar with no actions is a coverage QUERY, which is exactly
+    // the case that needs the answer.
     pad(out, indent + 1); out << "burg_state_t* state = burg_label_tree(root, ctx);\n";
+    pad(out, indent + 1); out << "if (!state->rule[" << start_idx << "])\n";
+    pad(out, indent + 2);
+    out << "burg_set_error(\"burg: start nonterminal has no rule at root\", "
+           "(int)BURG_NODE_OP(root), ctx);\n";
     if (a_->has_actions) {
-        pad(out, indent + 1); out << "if (state->rule[" << start_idx << "])\n";
-        pad(out, indent + 2); out << ns_prefix_ << "burg_reduce(root, state, " << start_idx << ", ctx);\n";
         pad(out, indent + 1); out << "else\n";
-        pad(out, indent + 2);
-        out << "burg_set_error(\"burg: start nonterminal has no rule at root\", "
-               "(int)BURG_NODE_OP(root), ctx);\n";
+        pad(out, indent + 2); out << ns_prefix_ << "burg_reduce(root, state, " << start_idx << ", ctx);\n";
     }
     pad(out, indent + 1); out << "return;\n";
     pad(out, indent); out << "}\n\n";
@@ -385,24 +391,26 @@ void CBurgBackend::emit_rewrite_body(std::ostream& out, int indent) {
     pad(out, indent + 2); out << "burg_label(rpo[_i], ctx);\n";
     pad(out, indent); out << "}\n\n";
 
+    // Same on the graph path, and for the same reason: the cover is checked
+    // whether or not there is anything to reduce.
+    pad(out, indent); out << "/* Cover every node with the start nonterminal */\n";
+    pad(out, indent); out << "{\n";
+    pad(out, indent + 1); out << "int _i, _n = bbq_vec_len(rpo);\n";
+    pad(out, indent + 1); out << "for (_i = 0; _i < _n; _i++) {\n";
+    pad(out, indent + 2); out << "burg_state_t* s = burg_cache_lookup((uint32_t)(uintptr_t)BURG_NODE_ID(rpo[_i]), ctx);\n";
+    pad(out, indent + 2); out << "if (!s || !s->rule[" << start_idx << "])\n";
+    // No break: burg_reduce already opens with an error check, so once this fires
+    // every later node is a no-op call, and burg_set_error keeps the first message.
+    // The loop running to the end is what makes reduction stop, not a jump out of it.
+    pad(out, indent + 3);
+    out << "burg_set_error(\"burg: start nonterminal does not cover graph node\", "
+           "(int)BURG_NODE_OP(rpo[_i]), ctx);\n";
     if (a_->has_actions) {
-        pad(out, indent); out << "/* Reduce every node with the start nonterminal */\n";
-        pad(out, indent); out << "{\n";
-        pad(out, indent + 1); out << "int _i, _n = bbq_vec_len(rpo);\n";
-        pad(out, indent + 1); out << "for (_i = 0; _i < _n; _i++) {\n";
-        pad(out, indent + 2); out << "burg_state_t* s = burg_cache_lookup((uint32_t)(uintptr_t)BURG_NODE_ID(rpo[_i]), ctx);\n";
-        pad(out, indent + 2); out << "if (s && s->rule[" << start_idx << "])\n";
-        pad(out, indent + 3); out << ns_prefix_ << "burg_reduce(rpo[_i], s, " << start_idx << ", ctx);\n";
         pad(out, indent + 2); out << "else\n";
-        // No break: burg_reduce already opens with an error check, so once this fires
-        // every later node is a no-op call, and burg_set_error keeps the first message.
-        // The loop running to the end is what makes reduction stop, not a jump out of it.
-        pad(out, indent + 3);
-        out << "burg_set_error(\"burg: start nonterminal does not cover graph node\", "
-               "(int)BURG_NODE_OP(rpo[_i]), ctx);\n";
-        pad(out, indent + 1); out << "}\n";
-        pad(out, indent); out << "}\n";
+        pad(out, indent + 3); out << ns_prefix_ << "burg_reduce(rpo[_i], s, " << start_idx << ", ctx);\n";
     }
+    pad(out, indent + 1); out << "}\n";
+    pad(out, indent); out << "}\n";
 
     pad(out, indent); out << "bbq_vec_free(rpo);\n";
 }

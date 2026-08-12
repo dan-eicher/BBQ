@@ -354,10 +354,32 @@ bool VmEmitter::cacheable(ValueType t) {
 
 // In state k the top k operands are cached, so operand `k` of an arity-`a`
 // instruction is cached iff its distance from the top is under the state.
+// How many slots a value occupies. A v128 is twice a register wide, so it takes
+// two — which is why the state counts SLOTS and not items (§2.3's organization is
+// over the cache's capacity, and the plan's measurement puts a v128 at 111 -> 47
+// bytes across two integer slots, better than a native vector slot at 51).
+//
+// A `word`/`any` slot answers 1 even though the value it carries could be a v128.
+// The width has to be known HERE, at emission, because the register file is a
+// fixed shape in every stencil signature — musttail rejects a per-state parameter
+// list, which is the constraint that made the signature fixed in the first place.
+// A poly slot's width is a property of the tile, not of the opcode, so it cannot
+// be known here. The consequence, stated rather than discovered later: a
+// `local.get` resolving to v128 is never cached; it reduces at `v128_mem` like
+// any other class with no register form. Only an opcode whose signature SAYS
+// v128 can take two slots.
+int VmEmitter::slot_width(ValueType t) {
+    return t == ValueType::TyV128 ? 2 : 1;
+}
+
+// Where operand k sits, counted in SLOTS from the top: everything above it has
+// already spent its own width. Cached only if the whole value fits inside the
+// state — half a v128 in a register is not a value.
 int VmEmitter::operand_slot(const Opcode* op, int k, int state) {
     int a = (int)op->stack_in.size();
-    int d = a - 1 - k;
-    return (d < state) ? d : -1;
+    int base = 0;
+    for (int j = a - 1; j > k; j--) base += slot_width(op->stack_in[j]->ty);
+    return (base + slot_width(op->stack_in[k]->ty) <= state) ? base : -1;
 }
 
 // Do this state's results ride the cache? All of them or none: a pushed result
@@ -371,11 +393,23 @@ int VmEmitter::operand_slot(const Opcode* op, int k, int state) {
 //   - it is variadic, and already sits at the frame base where a callee left it.
 // This is the ONE place the question is answered, because the answer is what the
 // tiling grammar prices and what the stitcher has to stamp against.
+// Slots, not items: everything below counts capacity, and a v128 spends two of it.
+int VmEmitter::operand_slots(const Opcode* op) const {
+    int n = 0;
+    for (auto* si : op->stack_in) n += slot_width(si->ty);
+    return n;
+}
+int VmEmitter::result_slots(const Opcode* op) const {
+    int n = 0;
+    for (auto* so : op->stack_out) n += slot_width(so->ty);
+    return n;
+}
+
 bool VmEmitter::results_cached(const Opcode* op, int state) const {
     if (state < 0 || op->stack_out.empty()) return false;
-    int a = (int)op->stack_in.size();
+    int a = operand_slots(op);
     int left = state > a ? state - a : 0;
-    if (left + (int)op->stack_out.size() > tier2_n_) return false;
+    if (left + result_slots(op) > tier2_n_) return false;
     for (auto* so : op->stack_out)
         if (out_count(so) || !(cacheable(so->ty) || poly_slot(so->ty))) return false;
     return true;
@@ -429,11 +463,11 @@ int VmEmitter::same_state_as(const Opcode* op, int state) const {
     for (int prev = 0; prev < state; prev++) {
         if (!(prev == 0 || emits_variant(op, prev))) continue;
         if (results_cached(op, prev) != results_cached(op, state)) continue;
-        int a = (int)op->stack_in.size(), same = 1;
-        for (int k = 0; k < a && same; k++)
-            if (operand_slot(op, k, prev) != operand_slot(op, k, state)) same = 0;
+        int a = operand_slots(op), same = 1;
+        for (size_t k = 0; k < op->stack_in.size() && same; k++)
+            if (operand_slot(op, (int)k, prev) != operand_slot(op, (int)k, state)) same = 0;
         if (!same) continue;
-        // The survivor shift is (left, nout): same pair, same moves.
+        // The survivor shift is (left, nout) in SLOTS: same pair, same moves.
         int lp = prev  > a ? prev  - a : 0;
         int ls = state > a ? state - a : 0;
         if (lp != ls) continue;
@@ -446,15 +480,15 @@ int VmEmitter::same_state_as(const Opcode* op, int state) const {
 // the variant table both ask, and a disagreement between them would have the
 // stitcher stamp a stencil that was never generated.
 bool VmEmitter::emits_variant(const Opcode* op, int state) const {
-    int a = (int)op->stack_in.size();
+    int a = operand_slots(op);
     int left = state > a ? state - a : 0;
     // Anything still cached on exit means the results had to be cached too, by
     // the argument above; a state that cannot place them has no variant and the
     // tiler reaches it through a transition instead (§2.5 / C5).
-    if (left + (int)op->stack_out.size() > tier2_n_) return false;
+    if (left + result_slots(op) > tier2_n_) return false;
     if (!op->stack_out.empty() && !results_cached(op, state)) return false;
-    for (int k = 0; k < a; k++)
-        if (operand_slot(op, k, state) >= 0 &&
+    for (size_t k = 0; k < op->stack_in.size(); k++)
+        if (operand_slot(op, (int)k, state) >= 0 &&
             (!cacheable(op->stack_in[k]->ty) || op->stack_in[k]->count.has_value()))
             return false;
     return true;
@@ -472,9 +506,9 @@ bool VmEmitter::emits_variant(const Opcode* op, int state) const {
 int VmEmitter::variant_fs(const Opcode* op, int state) const {
     if (state < 0) return -1;
     if (state > 0 && !emits_variant(op, state)) return -1;
-    int a = (int)op->stack_in.size();
+    int a = operand_slots(op);
     int left = state > a ? state - a : 0;
-    return left + (results_cached(op, state) ? (int)op->stack_out.size() : 0);
+    return left + (results_cached(op, state) ? result_slots(op) : 0);
 }
 
 void VmEmitter::emit_one_opcode(SemLowerer& low, const Opcode* op, int state) {
@@ -609,9 +643,13 @@ void VmEmitter::emit_one_opcode(SemLowerer& low, const Opcode* op, int state) {
             // items in registers"). The slot is an opaque word; the cast back to
             // the operand's own type is what names it.
             jrow r = low.jtype(si->ty);
-            fprintf(o, "    %s %s = CACHE_GET_%s(CACHE_R%d);\n",
-                    r.scalar, si->name, SemLowerer::slot_class(si->ty),
-                    operand_slot(op, k, state));
+            int sl = operand_slot(op, k, state);
+            if (slot_width(si->ty) == 2)      // a v128 spans this slot and the next
+                fprintf(o, "    %s %s = CACHE_GET_V128(CACHE_R%d, CACHE_R%d);\n",
+                        r.scalar, si->name, sl, sl + 1);
+            else
+                fprintf(o, "    %s %s = CACHE_GET_%s(CACHE_R%d);\n",
+                        r.scalar, si->name, SemLowerer::slot_class(si->ty), sl);
         } else if (stack_in_live(op, k)) {
             if (si->ty == ValueType::TyAddr) {
                 /* §2.3.11: the width is the DECLARED addrtype of the module entry this operand
@@ -700,12 +738,12 @@ void VmEmitter::emit_one_opcode(SemLowerer& low, const Opcode* op, int state) {
     // Direction matters: moving up, walk down; moving down, walk up. Either way
     // no slot is read after it has been written. nout == a renumbers nothing.
     if (state >= 0) {
-        int a = (int)op->stack_in.size();
+        int a = operand_slots(op);
         int left = state > a ? state - a : 0;
         // Where the survivors end up is where the results DIDN'T go: a result
         // that went to memory occupies no slot, so the survivors close all the
-        // way up to slot 0.
-        int nout = results_cached(op, state) ? (int)op->stack_out.size() : 0;
+        // way up to slot 0. Counted in SLOTS — a v128 result vacates two.
+        int nout = results_cached(op, state) ? result_slots(op) : 0;
         if (left && nout > a)
             for (int j = left - 1; j >= 0; j--)
                 fprintf(o, "    CACHE_R%d = CACHE_R%d;\n", nout + j, a + j);
@@ -730,6 +768,15 @@ void VmEmitter::emit_one_opcode(SemLowerer& low, const Opcode* op, int state) {
         // The result is the new top of stack, so in a cached state it lands in
         // slot 0 rather than being pushed. The values that SURVIVED this
         // instruction were moved into place above.
+        if (results_cached(op, state) && slot_width(so->ty) == 2) {
+            // A v128 is two registers wide, so it lands in the top TWO slots —
+            // low half in reg0, high half in reg1, which is the same order the
+            // memory stack holds it in and therefore the order the spill and fill
+            // stencils move it back in.
+            fprintf(o, "    CACHE_R0 = CACHE_PUT_V128_LO(%s);\n", val);
+            fprintf(o, "    CACHE_R1 = CACHE_PUT_V128_HI(%s);\n", val);
+            continue;
+        }
         if (results_cached(op, state)) {
             fprintf(o, "    CACHE_R0 = CACHE_PUT_%s(%s);\n",
                     SemLowerer::slot_class(so->ty), val);
@@ -838,6 +885,9 @@ void VmEmitter::emit_stencil_c(FILE* o) {
             jrow r = low.jtype(td->ty);
             const char* cls = SemLowerer::slot_class(td->ty);
             if (!cacheable(td->ty)) continue;
+            // A two-slot class gets bespoke macros below — one slot cannot hold
+            // it, so there is no single-slot get/put to emit here.
+            if (slot_width(td->ty) == 2) continue;
             if (r.scalar[0] == 'f')
                 fprintf(o,
                     "#define CACHE_GET_%s(sl) (__extension__({ union { uintptr_t p; %s v; } _u;"
@@ -862,7 +912,17 @@ void VmEmitter::emit_stencil_c(FILE* o) {
               // …and the typed carrier, which is the same move: `bits` is the
               // value, `hi` is the half only a v128 has, and `kind` is the class
               // — so for anything a rule can cache, `bits` is all of it.
-              "#define CACHE_PUT_ANY(x)   ((cache_slot_t)(uintptr_t)(x).bits)\n", o);
+              "#define CACHE_PUT_ANY(x)   ((cache_slot_t)(uintptr_t)(x).bits)\n"
+              // …and the two-slot value. A v128 is twice a register wide, so it
+              // rides two slots — low half then high, the order the memory stack
+              // holds it in, so the spill and fill move it back unchanged. The
+              // stencils are built -fno-vectorize/-fno-slp-vectorize, so the lane
+              // arithmetic is already in GPRs and two integer slots are where it
+              // wanted to be anyway.
+              "#define CACHE_GET_V128(lo, hi) (__extension__({ v128_t _v;"
+              " _v.u64[0] = (u8)(uintptr_t)(lo); _v.u64[1] = (u8)(uintptr_t)(hi); _v; }))\n"
+              "#define CACHE_PUT_V128_LO(x)  ((cache_slot_t)(uintptr_t)(x).u64[0])\n"
+              "#define CACHE_PUT_V128_HI(x)  ((cache_slot_t)(uintptr_t)(x).u64[1])\n", o);
     }
     fputs("\n", o);
     emit_slot_macros(low);
@@ -977,7 +1037,26 @@ void VmEmitter::emit_stencil_c(FILE* o) {
             const char* cls = SemLowerer::slot_class(td->ty);
             const char* nm = sclass_stencil_name(
                 SigEmitter::classify_final(td->ty, "type row", "cache slot"));
-            for (int s = 0; s < tier2_n_; s++) {
+            int w = slot_width(td->ty);
+            for (int s = 0; s + w <= tier2_n_; s++) {
+                if (w == 2) {
+                    // A v128 crosses as one value in two slots. `s` names the slot
+                    // it STARTS at, so the pair is (s, s+1) and the memory form is
+                    // the single stack slot the whole value already occupies.
+                    fprintf(o,
+                        "void STENCIL gen_st_spill_%s_%d(CACHE_ARGS) {\n"
+                        "    frame_t* f = &vm->frame; (void)f;\n"
+                        "    GPUSH_V128(CACHE_GET_V128(CACHE_R%d, CACHE_R%d));\n"
+                        "    TAIL return _HOLE_cont(CACHE_PASS);\n}\n", nm, s, s, s + 1);
+                    fprintf(o,
+                        "void STENCIL gen_st_fill_%s_%d(CACHE_ARGS) {\n"
+                        "    frame_t* f = &vm->frame; (void)f;\n"
+                        "    GPOP_V128(_v);\n"
+                        "    CACHE_R%d = CACHE_PUT_V128_LO(_v);\n"
+                        "    CACHE_R%d = CACHE_PUT_V128_HI(_v);\n"
+                        "    TAIL return _HOLE_cont(CACHE_PASS);\n}\n", nm, s, s, s + 1);
+                    continue;
+                }
                 fprintf(o,
                     "void STENCIL gen_st_spill_%s_%d(CACHE_ARGS) {\n"
                     "    frame_t* f = &vm->frame; (void)f;\n"
@@ -1199,7 +1278,12 @@ void VmEmitter::emit_jit_meta(FILE* o) {
             fputs("    {", o);
             for (int s = 0; s < (tier2_n_ ? tier2_n_ : 1); s++) {
                 const char* nm = sclass_stencil_name((SClass)c);
-                if (!tier2_n_ || !nm) { fputs(" -1,", o); continue; }
+                // A value STARTING at slot s needs its whole width to fit, so a
+                // two-slot class has no transition at the last slot — there is no
+                // half of a v128 to move.
+                if (!tier2_n_ || !nm || s + sclass_width((SClass)c) > tier2_n_) {
+                    fputs(" -1,", o); continue;
+                }
                 fprintf(o, " STENCIL_GEN_ST_%s_%s_%d,", pass ? "FILL" : "SPILL", nm, s);
             }
             fputs(" },\n", o);

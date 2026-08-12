@@ -36,10 +36,22 @@ constexpr unsigned SCLASS_FINAL = 7;   // I32..Stk need no resolution
 // THE answer, for the variant family and for anything that reasons about cache
 // states. Two readings of it put rules in a grammar for registers no stencil
 // ever fills.
+// `ref` is the only class that never enters a slot: a managed reference belongs
+// on the operand stack, where the collector looks for roots and, because it
+// evacuates, where it rewrites them. A register has no address to rewrite.
+//
+// v128 DOES, across two slots — measured at 111 -> 47 bytes, and better than a
+// native vector-class slot at 51, because the stencils are built
+// -fno-vectorize/-fno-slp-vectorize so the lane arithmetic is already in GPRs.
+// It is why a cache state counts SLOTS and not items.
 inline bool sclass_cacheable(SClass c) {
     return c == SClass::I32 || c == SClass::I64 ||
-           c == SClass::F32 || c == SClass::F64;
+           c == SClass::F32 || c == SClass::F64 ||
+           c == SClass::V128;
 }
+
+// Slots a class occupies. Two for a v128, one for everything else.
+inline int sclass_width(SClass c) { return c == SClass::V128 ? 2 : 1; }
 
 // The spelling a class contributes to a transition stencil's symbol, or null
 // when it does not cache. One place, so the emitted stencil and the table that
@@ -50,6 +62,7 @@ inline const char* sclass_stencil_name(SClass c) {
     case SClass::I64: return "I64";
     case SClass::F32: return "F32";
     case SClass::F64: return "F64";
+    case SClass::V128: return "V128";
     default:          return nullptr;
     }
 }

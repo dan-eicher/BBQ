@@ -523,6 +523,18 @@ void SigEmitter::emit_sigtab_h(FILE* o) {
         fprintf(o, " %d,", sclass_cacheable((SClass)c) ? 1 : 0);
     fputs(" };\n", o);
 
+    // …and how many slots one occupies, which is why a cache state counts SLOTS
+    // and not items. A v128 is twice a register wide and takes two. Published
+    // beside cacheability because both are the same kind of fact and a second
+    // copy of either is how the grammar and the stencil family come to disagree.
+    fprintf(o,
+        "\n/* Slots a value of this class occupies. Two for a v128 — the state is\n"
+        " * a count of SLOTS, so an item may spend one or two of them. */\n"
+        "static const uint8_t %s_class_width[%u] = {", prefix_.c_str(), SCLASS_FINAL);
+    for (unsigned c = 0; c < SCLASS_FINAL; c++)
+        fprintf(o, " %d,", sclass_width((SClass)c));
+    fputs(" };\n", o);
+
     // valtype -> storage class, in the one place that owns the class vocabulary.
     // A consumer projecting a module's types into the tree builder's view reads
     // it here rather than writing the switch again.

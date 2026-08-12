@@ -61,6 +61,12 @@ private:
     // A slot whose storage class the signature does not carry — the tile resolves
     // one. Cacheable as a raw slot; see the note on the definition.
     static bool poly_slot(ValueType t);
+    // Slots a value occupies: 2 for a v128, 1 for everything else. See the note
+    // on the definition for why a poly slot answers 1.
+    static int  slot_width(ValueType t);
+    // Slots this instruction's operands occupy in total, and its results.
+    int  operand_slots(const Opcode* op) const;
+    int  result_slots(const Opcode* op) const;
     // Where this state's results go: all into the cache, or all pushed. Asked by
     // the emission itself and by everything that has to know what it did.
     bool results_cached(const Opcode* op, int state) const;

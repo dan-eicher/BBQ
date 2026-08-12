@@ -248,6 +248,41 @@ TEST(BurgAnalysis, ReportsUncoverableTreeShapeWithCoverage) {
     }
 }
 
+TEST(BurgAnalysis, TerminalWithNoRuleIsReported) {
+    // A terminal no rule names is invisible to the shape enumeration: arities
+    // are collected FROM the rules, so it contributes no (terminal, arity) pair
+    // and produces no witness. Without its own check the grammar passes
+    // --coverage --strict while the matcher cannot reduce the node at all —
+    // the failure mode of a GENERATED grammar, where the TERM block and the
+    // rule set come from separate walks.
+    Parser parser;
+    const char* input =
+        "TERM A=1 TERM B=2 TERM Orphan=3\n"
+        "RULES "
+        "reg: A = 1; "
+        "reg: B(reg) = 1;";
+    parser.init(input, (int)strlen(input));
+    ASSERT_TRUE(parser.parse());
+
+    BurgGenerator gen;
+    AnalysisConfig cfg;
+    cfg.emit_coverage_warnings = true;
+    cfg.skip_dead_rule_analysis = false;
+    gen.set_completeness_config(cfg);
+    EXPECT_TRUE(gen.analyze(parser.ast));
+
+    bool found = false;
+    for (auto& w : gen.warnings())
+        if (w.find("Orphan") != std::string::npos &&
+            w.find("named by no rule") != std::string::npos) found = true;
+    EXPECT_TRUE(found) << "expected the unreduced-terminal warning for Orphan";
+
+    // A terminal named only as a CHILD is reduced in context, so it is not a gap.
+    for (auto& w : gen.warnings())
+        EXPECT_EQ(w.find("- A"), std::string::npos)
+            << "a terminal some rule names must not be reported";
+}
+
 TEST(BurgAnalysis, AsdlSchemaTightensDemandFilter) {
     // For an AST-shaped IR (where BURG arity matches ASDL node-field
     // count), the schema-aware filter enumerates child states based

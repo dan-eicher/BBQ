@@ -12,6 +12,7 @@
 #include <string>
 
 #include "Parser.h"
+#include "sigemit.h"
 #include "spec.h"
 #include "vmemit.h"
 #include "tablesemit.h"
@@ -92,6 +93,7 @@ static int run(int argc, char** argv) {
     Spec spec(m);
     VmEmitter vm(m, prefix);
     TablesEmitter tables(spec);
+    SigEmitter sig(m, prefix);
 
     int rc = 0;
     rc |= write_file(out_dir, "opcodes.h",            [&](FILE* o){ tables.emit_opcodes_h(o); });
@@ -104,6 +106,9 @@ static int run(int argc, char** argv) {
     rc |= write_file(out_dir, (std::string(prefix) + "_valtype.h").c_str(),     [&](FILE* o){ vm.emit_valtype_h(o); });
     rc |= write_file(out_dir, (std::string(prefix) + "_type_meta.h").c_str(),   [&](FILE* o){ vm.emit_type_meta(o); });
     rc |= write_file(out_dir, (std::string(prefix) + "_jit_symbols.h").c_str(), [&](FILE* o){ vm.emit_jit_symbols(o); });
+    rc |= write_file(out_dir, (std::string(prefix) + "_sigtab.h").c_str(),     [&](FILE* o){ sig.emit_sigtab_h(o); });
+    rc |= write_file(out_dir, (std::string(prefix) + "_ttree.asdl").c_str(),   [&](FILE* o){ sig.emit_ttree_asdl(o); });
+    rc |= write_file(out_dir, (std::string(prefix) + "_tile.burg").c_str(),    [&](FILE* o){ sig.emit_tile_burg(o); });
 
     return rc;
 }

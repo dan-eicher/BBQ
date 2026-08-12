@@ -1,0 +1,102 @@
+#ifndef OPGEN_SIGEMIT_H
+#define OPGEN_SIGEMIT_H
+
+#include "opgen_ast.h"
+#include <cstdio>
+#include <map>
+#include <string>
+#include <vector>
+
+namespace opgen {
+
+// The STORAGE-CLASS signature vocabulary: what each stack slot of each opcode
+// needs to be held in once it leaves the type-agnostic operand slot and lives in
+// a register. The operand stack is one uniform slot per value, so an in-memory
+// value has no class to speak of; a register-resident one must pick one.
+//
+// Three of the classes are not final. An ADDR slot's width is the addrtype the
+// addressed memory/table DECLARES (spec §2.3.11), a POLY slot's class is the
+// type of the local/global/field/element/operand the instruction names, and
+// neither is knowable from the opcode alone. Resolving them is what turns a
+// declared signature into the burg terminals it can become.
+enum class SClass : unsigned char {
+    I32 = 0, I64, F32, F64, V128, Ref,
+    Stk,        // the variadic operand group: one signature slot, no tree child
+    Addr,       // non-final: i32 | i64, from the addressed entry's addrtype
+    Poly,       // non-final: the declared local/global/field/element/operand type
+    Count
+};
+constexpr unsigned SCLASS_FINAL = 7;   // I32..Stk need no resolution
+
+// One signature — a parameter class vector and a result class vector. Final
+// signatures (no Addr/Poly slot) are the burg terminals; the rest exist only as
+// the declared form an opcode carries and the resolution list it expands to.
+struct Sig {
+    std::vector<SClass> params, results;
+    bool operator<(const Sig& o) const {
+        if (params != o.params) return params < o.params;
+        return results < o.results;
+    }
+    bool is_final() const;
+    int  nkids() const;          // burg arity: the params that ARE tree children
+    std::string name() const;    // "Sig_i32_i32_to_i32" — TERM + ASDL constructor
+};
+
+// Emits the tier-2 signature vocabulary: the signature table + opcode map
+// (jav_sigtab.h), the tree IR schema burgc reads for coverage
+// (jav_ttree.asdl), and the tiling grammar's terminals and memory-form rules
+// (jav_tile.burg). One walk over Module.opcodes feeds all three, so they cannot
+// disagree about an opcode's arity unless the spec changes under all of them.
+class SigEmitter {
+public:
+    SigEmitter(const Module* mod, std::string prefix);
+
+    void emit_sigtab_h(FILE* o);     // <prefix>_sigtab.h
+    void emit_ttree_asdl(FILE* o);   // <prefix>_ttree.asdl
+    void emit_tile_burg(FILE* o);    // <prefix>_tile.burg
+
+private:
+    // One addrtype ATOM: a module entry whose declared addrtype an ADDR slot
+    // reads, named by the predicate the spec wrote, the identifier it indexes
+    // by, and the operand that identifier is decoded from. The two can differ:
+    // a memarg binds `memidx` out of its own flag bit rather than carrying an
+    // operand of its own (vmemit.cpp:389).
+    struct Atom { std::string pred, ident; int operand; };
+
+    // Everything one opcode contributes: its declared signature, the atoms its
+    // ADDR slots read, and the per-slot atom masks (a slot is i64 when EVERY
+    // atom it names is — memory.copy's length operand reads both memories).
+    struct OpInfo {
+        const Opcode* op = nullptr;
+        Sig           decl;
+        std::vector<Atom> atoms;
+        std::vector<unsigned> param_atoms;   // per param: bitmask of atoms, 0 if not ADDR
+        std::vector<int>  poly_group;        // per slot (params then results): tie group, -1 if not POLY
+        int               npoly_groups = 0;
+        int               variadic_param = -1;   // param index of the variadic group, or -1
+        std::vector<int>  resolved;          // signature ids this opcode can become
+    };
+
+    const Module* mod_;
+    std::string   prefix_, uprefix_;
+
+    std::vector<Sig>   sigs_;        // id -> signature
+    std::map<Sig, int> sig_ids_;
+    std::vector<OpInfo> ops_;
+    std::vector<int>    final_ids_;  // the burg terminal set, in id order
+
+    void build();
+    int  intern(const Sig& s);
+    OpInfo describe(const Opcode* op) const;
+    void resolve(OpInfo& oi);
+    static SClass classify_final(ValueType ty, const char* mnemonic, const char* param);
+    static void collect_atoms(const SemExpr* e, std::vector<Atom>& out,
+                              const Opcode* op);
+    static unsigned atom_mask(const SemExpr* e, const std::vector<Atom>& atoms,
+                              const Opcode* op);
+    void put_guard(FILE* o, const char* what) const;
+};
+
+} // namespace opgen
+
+#endif

@@ -20,6 +20,7 @@
 
 #include <cstdint>
 #include <fstream>
+#include <functional>
 #include <map>
 #include <set>
 #include <sstream>
@@ -596,6 +597,38 @@ void report_missing_witnesses(const BurgAnalysis& a,
     }
 }
 
+// A declared terminal that no rule names anywhere — not at a pattern root, not
+// at a child position. The shape enumeration structurally cannot see it: arities
+// are collected FROM the rules (collect_terminal_arities), so a terminal with no
+// rule contributes no (terminal, arity) pair, gets no transitions, and produces
+// no witness. It drops out of the analysis and the grammar passes.
+//
+// It is still a node the consumer's IR can build and the matcher has nothing to
+// reduce, which is the plainest coverage gap there is — and the one most likely
+// to appear in a GENERATED grammar, where the terminal set and the rule set come
+// from separate walks and only a check like this one holds them together.
+void report_unreduced_terminals(const BurgAnalysis& a,
+                                std::vector<std::string>& warnings) {
+    std::set<std::string> named;
+    std::function<void(const burg_ast::TreePattern*)> walk =
+        [&](const burg_ast::TreePattern* p) {
+            if (a.term_names.count(p->name)) named.insert(p->name);
+            for (auto* c : p->children) walk(c);
+        };
+    for (auto* rule : a.spec->rules) walk(rule->pattern);
+
+    std::set<std::string> unreduced;
+    for (auto& t : a.term_names)
+        if (!named.count(t)) unreduced.insert(t);
+    if (unreduced.empty()) return;
+
+    std::ostringstream os;
+    os << unreduced.size() << " declared terminal(s) named by no rule "
+       << "(the IR can build these nodes; nothing reduces them):";
+    for (auto& t : unreduced) os << "\n    - " << t;
+    warnings.push_back(os.str());
+}
+
 // Same-state demand closure: a demand for nt implies a demand for
 // every chain-rule predecessor of nt at the same state. (When
 // bit(nt) was produced via a chain rule X→nt at this state, the
@@ -842,8 +875,10 @@ AnalysisReport run_completeness_analysis(const BurgAnalysis& a,
     // ASDL schema (zany-painting-spark.md), enumeration produces
     // false positives on shapes the consumer's IR could never
     // construct. Off by default; --coverage opts in.
-    if (cfg.emit_coverage_warnings)
+    if (cfg.emit_coverage_warnings) {
         report_missing_witnesses(a, aut, report.warnings);
+        report_unreduced_terminals(a, report.warnings);
+    }
 
     // Dead-rule warnings are precise (they only require the
     // contributors map, no shape-enumeration noise) and useful even

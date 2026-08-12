@@ -51,7 +51,8 @@ add_library(opgen_core STATIC
     src/spec.cpp
     src/semlower.cpp
     src/vmemit.cpp
-    src/tablesemit.cpp)
+    src/tablesemit.cpp
+    src/sigemit.cpp)
 target_include_directories(opgen_core PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(opgen_core PUBLIC opgen_frontend)

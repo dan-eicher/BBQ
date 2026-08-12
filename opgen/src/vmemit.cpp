@@ -338,14 +338,11 @@ void VmEmitter::emit_prologue(SemLowerer& low) {
 // roots and, because Immix evacuates, where it rewrites them. A register has no
 // address to rewrite.
 //
-// Asked of the STORAGE CLASS, through the one routine that assigns it. Answering
-// it from the declared ValueType instead needs a second copy of that mapping,
-// and a copy is a thing that can be missing a case: this one was missing the
-// lane views, so every SIMD opcode — declared `i32x4`, `f64x2` and the rest, and
-// only `v128` in a handful of loads — reported uncacheable. The grammar resolves
-// through the signature table, where the lane views ALREADY collapse to v128, so
-// the two sides disagreed and every SIMD rule with a register in it was dropped
-// for want of a variant. No v128 reached a register at any n.
+// Asked of the STORAGE CLASS, through the one routine that assigns it. The
+// declared ValueType is the wrong vocabulary for the question: the SIMD lane
+// views (`i32x4`, `f64x2`, …) are all held in a v128, and only classify_final
+// knows that. The grammar resolves through the same routine, so asking here in
+// any other way is a second copy of one mapping.
 bool VmEmitter::cacheable(ValueType t) {
     return sclass_cacheable(SigEmitter::classify_final(t, "vmemit", "cache slot"));
 }
@@ -483,9 +480,8 @@ bool VmEmitter::emits_variant(const Opcode* op, int state) const {
     int left = state > a ? state - a : 0;
     // A state is a COUNT OF SLOTS cached from the top, and a value rides the
     // cache whole or not at all — so a state whose count ends INSIDE a value
-    // names no machine. With one-slot classes every count is a boundary and this
-    // is vacuous; a v128 operand makes state 1 land mid-value, and the form
-    // emitted for it claimed a cached slot holding half of something.
+    // names no machine and has no variant. With one-slot classes every count is
+    // a boundary; a v128 operand is what puts a state mid-value.
     if (state < a) {
         int base = 0, boundary = (state == 0);
         for (int k = (int)op->stack_in.size() - 1; k >= 0 && !boundary; k--) {
@@ -1200,9 +1196,8 @@ void VmEmitter::emit_jit_meta(FILE* o) {
           "typedef struct { const char* hole; jit_operand_kind_t kind; uint64_t value; } jit_operand_t;\n"
           "/* `pop`/`push` are ITEMS — the operand stack's own unit, one entry per value.\n"
           " * `pop_slots`/`push_slots` are the same effect in CACHE SLOTS, where a v128\n"
-          " * spends two. The two units coincide for every other class, which is why one\n"
-          " * number stood in for both until a v128 reached a register. Height arithmetic\n"
-          " * wants items; anything indexing the cache wants slots. */\n"
+          " * spends two and every other class spends one. Height arithmetic wants items;\n"
+          " * anything indexing the cache wants slots. */\n"
           "typedef struct { int stencil; const jit_operand_t* operands;\n"
           "                 unsigned char operand_count, pop, push, tail,\n"
           "                               pop_slots, push_slots; } wasm_jit_meta_t;\n\n");

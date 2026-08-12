@@ -50,6 +50,9 @@ std::string Sig::name() const {
     s += "_to";
     if (results.empty()) s += "_void";
     for (auto c : results) { s += '_'; s += cname(c); }
+    /* A polymorphic slot that resolved to v128 is not the same terminal as a
+     * declared one — see SigKind::PolyWide. */
+    if (kind == SigKind::PolyWide) s += "_pw";
     return s;
 }
 
@@ -295,6 +298,12 @@ void SigEmitter::resolve(OpInfo& oi) {
             for (size_t i = 0; i < s.results.size(); i++)
                 if (s.results[i] == SClass::Poly)
                     s.results[i] = pick[oi.poly_group[nin + i]];
+            /* A POLY group that landed on V128 makes this a DIFFERENT terminal
+             * from the identically-classed declared signature: the opcode is
+             * `word` and moves one slot, the class is two slots wide, and no
+             * single rule can be right for both. See SigKind::PolyWide. */
+            for (int g = 0; g < oi.npoly_groups; g++)
+                if (pick[g] == SClass::V128) { s.kind = SigKind::PolyWide; break; }
             got.insert(intern(s));
         }
     }

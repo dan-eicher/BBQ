@@ -75,6 +75,12 @@ inline const char* sclass_stencil_name(SClass c) {
 enum class SigKind : unsigned char {
     Op = 0,      // an opcode's storage-class signature
     Carried,     // a value carried across a cut, already in the canonical state
+    // …and the same classes reached through a POLY slot that resolved to V128.
+    // A separate terminal because the two need different rules: a v128 occupies
+    // two cache slots, while a polymorphic opcode is declared `word` and its
+    // stencil family moves one. A rule written for one is wrong for the other,
+    // and a terminal they share can only carry rules valid for both.
+    PolyWide,
 };
 
 // One signature — a parameter class vector and a result class vector. Final

@@ -564,6 +564,27 @@ void VmEmitter::emit_one_opcode(SemLowerer& low, const Opcode* op, int state) {
         for (auto* si : op->stack_in)
             if (out_count(si)) fprintf(o, "    JV_SP -= _vc_%s;\n", si->name);
 
+    // A slot holds the value at that DEPTH from the top, so an instruction that
+    // consumes `a` items and produces `nout` renumbers everything under them:
+    // a value that was at depth a+j is at depth nout+j afterwards. Ertl's minimal
+    // organization pays for its small state count in exactly these moves (§2.3),
+    // and they are not optional — leaving them out either strands a live value in
+    // a slot the next instruction will not look at, or writes over it.
+    //
+    // Direction matters: moving up, walk down; moving down, walk up. Either way
+    // no slot is read after it has been written. nout == a renumbers nothing.
+    if (state >= 0) {
+        int a = (int)op->stack_in.size();
+        int left = state > a ? state - a : 0;
+        int nout = (int)op->stack_out.size();
+        if (left && nout > a)
+            for (int j = left - 1; j >= 0; j--)
+                fprintf(o, "    CACHE_R%d = CACHE_R%d;\n", nout + j, a + j);
+        else if (left && nout < a)
+            for (int j = 0; j < left; j++)
+                fprintf(o, "    CACHE_R%d = CACHE_R%d;\n", nout + j, a + j);
+    }
+
     for (auto* so : op->stack_out) {
         // §3b VARIADIC RESULT: an immediate-/type-driven result count. The values are
         // already at the frame base (a nested callee left them there), so exposing them
@@ -578,20 +599,9 @@ void VmEmitter::emit_one_opcode(SemLowerer& low, const Opcode* op, int state) {
         std::string src = Spec::forwarded_name(so);
         const char* val = src.empty() ? so->name : src.c_str();
         // The result is the new top of stack, so in a cached state it lands in
-        // slot 0 rather than being pushed, and whatever was cached SHIFTS DOWN to
-        // make room — r0 becomes r1, and so on. Ertl's minimal organization pays
-        // for its small state count in exactly these moves (§2.3); leaving them
-        // out would write over a live value. The shift runs descending so no slot
-        // is read after it has been overwritten, and only once for the whole
-        // result list.
+        // slot 0 rather than being pushed. The values that SURVIVED this
+        // instruction were moved into place above.
         if (state >= 0 && cacheable(so->ty)) {
-            if (so == op->stack_out.front()) {
-                int a = (int)op->stack_in.size();
-                int left = state > a ? state - a : 0;
-                int nout = (int)op->stack_out.size();
-                for (int i = left + nout - 1; i >= nout; i--)
-                    fprintf(o, "    CACHE_R%d = CACHE_R%d;\n", i, i - nout);
-            }
             fprintf(o, "    CACHE_R0 = CACHE_PUT_%s(%s);\n",
                     SemLowerer::slot_class(so->ty), val);
             continue;

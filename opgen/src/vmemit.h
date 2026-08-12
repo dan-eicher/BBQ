@@ -59,6 +59,9 @@ private:
     // A class that never enters a slot: a managed reference belongs on the stack,
     // where the collector expects to find it and to be able to relocate it.
     static bool cacheable(ValueType t);
+    // Does the family carry this opcode in this entry state? Asked by both the
+    // emission loop and the variant table, so they cannot disagree.
+    bool emits_variant(const Opcode* op, int state) const;
 
     // Handler emission (the interp/stencil body wrapper around the lowering).
     // `state` is the entry cache state; -1 is "no cache" (the interp, and every

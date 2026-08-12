@@ -509,6 +509,20 @@ void SigEmitter::emit_sigtab_h(FILE* o) {
     for (int id : carried_ids_) fprintf(o, " %d,", id);
     fputs(" };\n", o);
 
+    // Which classes can ride a cache slot. The variant family is generated from
+    // this, so anything that reasons about cache states — a tiling grammar above
+    // all — has to read the same answer or it will write rules for registers that
+    // no stencil ever fills.
+    fprintf(o,
+        "\n/* Can a value of this class live in a cache slot? A managed reference\n"
+        " * cannot: it belongs on the operand stack, where the collector looks for\n"
+        " * roots and, because the collector moves objects, where it rewrites them.\n"
+        " * A register has no address to rewrite. */\n"
+        "static const uint8_t %s_class_cacheable[%u] = {", prefix_.c_str(), SCLASS_FINAL);
+    for (unsigned c = 0; c < SCLASS_FINAL; c++)
+        fprintf(o, " %d,", sclass_cacheable((SClass)c) ? 1 : 0);
+    fputs(" };\n", o);
+
     // valtype -> storage class, in the one place that owns the class vocabulary.
     // A consumer projecting a module's types into the tree builder's view reads
     // it here rather than writing the switch again.

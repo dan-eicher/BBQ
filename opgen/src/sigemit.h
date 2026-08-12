@@ -28,6 +28,19 @@ enum class SClass : unsigned char {
 };
 constexpr unsigned SCLASS_FINAL = 7;   // I32..Stk need no resolution
 
+// Can a value of this class ride a cache register? A managed reference cannot:
+// it belongs on the operand stack, where the collector looks for roots and,
+// because the collector moves objects, where it rewrites them — a register has
+// no address to rewrite. v128 needs two slots and does not have them yet.
+//
+// THE answer, for the variant family and for anything that reasons about cache
+// states. Two readings of it put rules in a grammar for registers no stencil
+// ever fills.
+inline bool sclass_cacheable(SClass c) {
+    return c == SClass::I32 || c == SClass::I64 ||
+           c == SClass::F32 || c == SClass::F64;
+}
+
 // What a node stands for. Almost every node is an instruction, but a region does
 // not begin with an empty stack: whatever the previous region left behind is
 // sitting on the memory stack, and the first instruction that consumes one needs

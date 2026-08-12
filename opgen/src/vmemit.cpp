@@ -3,6 +3,7 @@
 // emitted byte matches the reference VM; g_mod/g_mode/g_lane are gone — the
 // Module is a member, the mode/lane live in the SemLowerer.
 #include "vmemit.h"
+#include "sigemit.h"  /* sclass_cacheable — which classes can ride a cache slot */
 #include "spec.h"     /* Spec::forwarded_name — which stack slots the spec says are one value */
 #include <cstring>
 #include <cctype>
@@ -338,11 +339,16 @@ void VmEmitter::emit_prologue(SemLowerer& low) {
 // address to rewrite.
 bool VmEmitter::cacheable(ValueType t) {
     switch (t) {
-    case ValueType::TyI32: case ValueType::TyI64:
-    case ValueType::TyF32: case ValueType::TyF64:
-        return true;
-    default:
-        return false;   // ref forms, v128 (two slots — later), word/any, addr
+    case ValueType::TyI32:  return sclass_cacheable(SClass::I32);
+    case ValueType::TyI64:  return sclass_cacheable(SClass::I64);
+    case ValueType::TyF32:  return sclass_cacheable(SClass::F32);
+    case ValueType::TyF64:  return sclass_cacheable(SClass::F64);
+    case ValueType::TyV128: return sclass_cacheable(SClass::V128);
+    case ValueType::TyRef:
+    case ValueType::TyFuncRef:
+    case ValueType::TyExternRef:
+    case ValueType::TyI31Ref: return sclass_cacheable(SClass::Ref);
+    default: return false;      // word/any (no class yet), addr, lane views
     }
 }
 
@@ -361,6 +367,29 @@ int VmEmitter::follow_state(const Opcode* op, int state, int nslots) {
     int left = state >= a ? state - a : 0;
     int out = left + (int)op->stack_out.size();
     return out > nslots ? nslots : out;
+}
+
+// Does the family carry this opcode in this entry state? The emission loop and
+// the variant table both ask, and a disagreement between them would have the
+// stitcher stamp a stencil that was never generated.
+bool VmEmitter::emits_variant(const Opcode* op, int state) const {
+    // What survives this instruction, plus what it produces, has to fit: a push
+    // that would shift a value past the last slot is Ertl's OVERFLOW, and rather
+    // than teach every stencil to spill, the family simply has no variant there
+    // and the tiler reaches the state through a transition (§2.5 / C5).
+    int a = (int)op->stack_in.size();
+    int left = state > a ? state - a : 0;
+    if (left + (int)op->stack_out.size() > tier2_n_) return false;
+    for (int k = 0; k < a; k++)
+        if (operand_slot(op, k, state) >= 0 &&
+            (!cacheable(op->stack_in[k]->ty) || op->stack_in[k]->count.has_value()))
+            return false;
+    // A state that leaves a value cached needs every result cacheable — an
+    // uncached result would be pushed while cached values sit below it, which is
+    // not a state this organization can name.
+    for (auto* so : op->stack_out)
+        if (!cacheable(so->ty)) return false;
+    return true;
 }
 
 void VmEmitter::emit_one_opcode(SemLowerer& low, const Opcode* op, int state) {
@@ -804,27 +833,8 @@ void VmEmitter::emit_stencil_c(FILE* o) {
         // The variant family: the same body again per entry state. A state whose
         // operands are not all cacheable gets no variant — §2.5's omission rule,
         // and the tiler reaches it through a transition instead.
-        for (int st = 1; st <= tier2_n_; st++) {
-            // What survives this instruction, plus what it produces, has to fit:
-            // a push that would shift a value past the last slot is Ertl's
-            // OVERFLOW, and rather than teach every stencil to spill, the family
-            // simply has no variant there and the tiler reaches the state through
-            // a transition (§2.5 / C5).
-            int a = (int)op->stack_in.size();
-            int left = st > a ? st - a : 0;
-            if (left + (int)op->stack_out.size() > tier2_n_) continue;
-            bool ok = true;
-            for (int k = 0; k < (int)op->stack_in.size(); k++)
-                if (operand_slot(op, k, st) >= 0 &&
-                    (!cacheable(op->stack_in[k]->ty) || op->stack_in[k]->count.has_value()))
-                    ok = false;
-            // A state that would leave a value cached needs every result cacheable
-            // — an uncached result would be pushed while cached values sit below
-            // it, which is not a state this organization can name.
-            for (auto* so : op->stack_out)
-                if (!cacheable(so->ty)) ok = false;
-            if (ok) emit_one_opcode(low, op, st);
-        }
+        for (int st = 1; st <= tier2_n_; st++)
+            if (emits_variant(op, st)) emit_one_opcode(low, op, st);
     }
 
     // Machinery stencils — the machine boundary + control continuations, the
@@ -976,7 +986,32 @@ void VmEmitter::emit_jit_meta(FILE* o) {
     put_p(o, "\nstatic const wasm_jit_meta_t* const wasm_jit_meta_sub[256] = {\n");
     for (int p = 0; p < npfx; p++)
         fprintf(o, "    [0x%02x] = %s_jit_meta_sub_%02x,\n", prefixes[p], prefix_.c_str(), prefixes[p]);
-    put_p(o, "};\n#endif /* WASM_JIT_META_H */\n");
+    fputs("};\n", o);
+
+    // The cache-state variant of each stencil: what the stitcher stamps once the
+    // tiling has said which state an instruction runs in. Indexed by the BASE
+    // stencil so the walk needs no second lookup — it already has that from the
+    // opcode's meta. -1 is "no variant for this state", which the grammar never
+    // asks for, because a rule only exists where the stencil does.
+    fprintf(o, "\n#define %s_TIER2_N %d\n", uprefix_.c_str(), tier2_n_);
+    fprintf(o, "static const int %s_variant[][%s_TIER2_N + 1] = {\n",
+            prefix_.c_str(), uprefix_.c_str());
+    for (auto* op : mod_->opcodes) {
+        if (!is_emittable(op) || SemLowerer::stencil_excluded(op)) continue;
+        fputs("    [STENCIL_GEN_ST_", o); put_upper(o, op->mnemonic); fputs("] = { STENCIL_GEN_ST_", o);
+        put_upper(o, op->mnemonic);
+        for (int st = 1; st <= tier2_n_; st++) {
+            if (emits_variant(op, st)) {
+                fputs(", STENCIL_GEN_ST_", o); put_upper(o, op->mnemonic);
+                fprintf(o, "__S%d", st);
+            } else {
+                fputs(", -1", o);
+            }
+        }
+        fputs(" },\n", o);
+    }
+    fputs("};\n", o);
+    put_p(o, "#endif /* WASM_JIT_META_H */\n");
 }
 
 const char* VmEmitter::wvt_name(ValueType t) {

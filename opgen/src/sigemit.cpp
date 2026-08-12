@@ -43,6 +43,7 @@ int Sig::nkids() const {
 }
 
 std::string Sig::name() const {
+    if (kind == SigKind::Carried) return std::string("Carried_") + cname(results[0]);
     std::string s = "Sig";
     for (auto c : params) { s += '_'; s += cname(c); }
     s += "_to";
@@ -312,6 +313,15 @@ void SigEmitter::build() {
         resolve(oi);
         ops_.push_back(std::move(oi));
     }
+    // One canonical-state leaf per register class: the value a previous region
+    // left on the memory stack, which the next region's first consumer needs a
+    // child for. A leaf, so no params; its own terminal, so the stitcher can
+    // tell "already there" from "materialise a constant".
+    for (unsigned c = 0; c < SCLASS_FINAL; c++) {
+        if ((SClass)c == SClass::Stk) continue;   // the variadic group is not a value
+        Sig s; s.kind = SigKind::Carried; s.results.push_back((SClass)c);
+        carried_ids_.push_back(intern(s));
+    }
     for (size_t i = 0; i < sigs_.size(); i++)
         if (sigs_[i].is_final()) final_ids_.push_back((int)i);
 }
@@ -338,7 +348,7 @@ void SigEmitter::emit_sigtab_h(FILE* o) {
     put_guard(o, "Tier-2 storage-class signatures.");
     fprintf(o,
         "#ifndef %s_SIGTAB_H\n#define %s_SIGTAB_H\n"
-        "#include <stddef.h>\n#include <stdint.h>\n\n"
+        "#include <stddef.h>\n#include <stdint.h>\n#include \"%s_valtype.h\"\n\n"
         "/* What a value has to be HELD in. The operand stack is one uniform slot per\n"
         " * value, so a stack-resident value needs no class; a REGISTER-resident one\n"
         " * does, which is why tier-1 never had to answer this and tier-2 does. */\n"
@@ -349,7 +359,8 @@ void SigEmitter::emit_sigtab_h(FILE* o) {
         "    JSC_POLY,   /* non-final: the declared local/global/field/element/operand type */\n"
         "    JSC_COUNT\n} %s_sclass_t;\n"
         "#define %s_SCLASS_FINAL   %u   /* JSC_I32..JSC_STK need no resolution */\n\n",
-        uprefix_.c_str(), uprefix_.c_str(), prefix_.c_str(), uprefix_.c_str(), SCLASS_FINAL);
+        uprefix_.c_str(), uprefix_.c_str(), prefix_.c_str(), prefix_.c_str(),
+        uprefix_.c_str(), SCLASS_FINAL);
     fprintf(o,
         "#define %s_SIG_COUNT        %zu\n"
         "#define %s_SIG_MAX_PARAMS   %d\n"
@@ -415,10 +426,16 @@ void SigEmitter::emit_sigtab_h(FILE* o) {
         "    uint8_t                 natoms;\n"
         "    const %s_addr_atom_t*   atoms;\n"
         "    uint8_t                 param_atoms[%s_SIG_MAX_PARAMS];  /* atom bitmask per param */\n"
+        "    /* Slots the spec types alike, params then results: same group, same class.\n"
+        "     * A POLY result in a group an input also belongs to takes that input's\n"
+        "     * class — which is how select's three §3.4.1 `t` slots stay one type. -1\n"
+        "     * for a slot that is not polymorphic. */\n"
+        "    int8_t                  poly_group[%s_SIG_MAX_PARAMS + %s_SIG_MAX_RESULTS];\n"
         "    int8_t                  variadic;   /* param index of the variadic group, -1 if none */\n"
         "    uint8_t                 present;\n"
-        "} %s_opsig_t;\n\n",
-        prefix_.c_str(), prefix_.c_str(), uprefix_.c_str(), prefix_.c_str());
+        "} %s_opcode_sig_t;\n\n",
+        prefix_.c_str(), prefix_.c_str(), uprefix_.c_str(),
+        uprefix_.c_str(), uprefix_.c_str(), prefix_.c_str());
 
     for (auto& oi : ops_) {
         if (oi.atoms.empty()) continue;
@@ -434,6 +451,8 @@ void SigEmitter::emit_sigtab_h(FILE* o) {
         if (oi.atoms.empty()) fputs("NULL, {", o);
         else fprintf(o, "%s_atoms_%s, {", prefix_.c_str(), oi.op->mnemonic);
         for (unsigned m : oi.param_atoms) fprintf(o, " %u,", m);
+        fputs(" }, {", o);
+        for (int g : oi.poly_group) fprintf(o, " %d,", g);
         fprintf(o, " }, %d, 1 },\n", oi.variadic_param);
     };
 
@@ -448,7 +467,7 @@ void SigEmitter::emit_sigtab_h(FILE* o) {
         int pv = prefixes[p], maxsub = 0;
         for (auto& oi : ops_)
             if (oi.op->subop > maxsub && oi.op->opcode_val == pv) maxsub = oi.op->subop;
-        fprintf(o, "\nstatic const %s_opsig_t %s_opcode_sig_sub_%02x[%d] = {\n",
+        fprintf(o, "\nstatic const %s_opcode_sig_t %s_opcode_sig_sub_%02x[%d] = {\n",
                 prefix_.c_str(), prefix_.c_str(), pv, maxsub + 1);
         for (auto& oi : ops_) {
             if (oi.op->subop < 0 || oi.op->opcode_val != pv) continue;
@@ -456,14 +475,14 @@ void SigEmitter::emit_sigtab_h(FILE* o) {
         }
         fputs("};\n", o);
     }
-    fprintf(o, "\nstatic const %s_opsig_t %s_opcode_sig[256] = {\n",
+    fprintf(o, "\nstatic const %s_opcode_sig_t %s_opcode_sig[256] = {\n",
             prefix_.c_str(), prefix_.c_str());
     for (auto& oi : ops_) {
         if (oi.op->subop >= 0) continue;
         fprintf(o, "    [0x%02x] = ", oi.op->opcode_val); row(oi);
     }
     fputs("};\n", o);
-    fprintf(o, "\nstatic const %s_opsig_t* const %s_opcode_sig_sub[256] = {\n",
+    fprintf(o, "\nstatic const %s_opcode_sig_t* const %s_opcode_sig_sub[256] = {\n",
             prefix_.c_str(), prefix_.c_str());
     for (int p = 0; p < npfx; p++)
         fprintf(o, "    [0x%02x] = %s_opcode_sig_sub_%02x,\n",
@@ -480,6 +499,31 @@ void SigEmitter::emit_sigtab_h(FILE* o) {
         fprintf(o, "    [0x%02x] = %d,\n", pv, maxsub + 1);
     }
     fputs("};\n", o);
+
+    // §3.3's canonical-state leaf, per register class.
+    fprintf(o,
+        "\n/* The value a previous region left on the memory stack, per storage class:\n"
+        " * the leaf the next region's first consumer takes as its child. */\n"
+        "static const uint16_t %s_carried_sig[%u] = {", prefix_.c_str(), SCLASS_FINAL - 1);
+    for (int id : carried_ids_) fprintf(o, " %d,", id);
+    fputs(" };\n", o);
+
+    // valtype -> storage class, in the one place that owns the class vocabulary.
+    // A consumer projecting a module's types into the tree builder's view reads
+    // it here rather than writing the switch again.
+    fprintf(o,
+        "\n/* The class a §7.6 value type is HELD in. WVT_BOT has none — it is the\n"
+        " * validator's \"any type\" and no register answers it. */\n"
+        "static inline uint8_t %s_sclass_of_valtype(%s_valtype_t t) {\n"
+        "    switch (t) {\n"
+        "    case WVT_I32:  return JSC_I32;\n"
+        "    case WVT_I64:  return JSC_I64;\n"
+        "    case WVT_F32:  return JSC_F32;\n"
+        "    case WVT_F64:  return JSC_F64;\n"
+        "    case WVT_V128: return JSC_V128;\n"
+        "    case WVT_REF: case WVT_REF_NN: return JSC_REF;\n"
+        "    default:       return JSC_COUNT;\n"
+        "    }\n}\n", prefix_.c_str(), prefix_.c_str());
 
     // The census the pin reads back, so the numbers live where they are derived.
     size_t nmulti = 0;
@@ -562,9 +606,17 @@ void SigEmitter::emit_tile_burg(FILE* o) {
             if (!sigs_[id].results.empty() && (unsigned)sigs_[id].results[0] == c) used = true;
         if (used) fprintf(o, "stmt: %s_mem = 0;\n", kClassName[c]);
     }
+    fputs("\n// A value the previous region left behind: already where it needs to be,\n"
+          "// so the leaf costs nothing to \"produce\".\n", o);
+    for (int id : final_ids_)
+        if (sigs_[id].kind == SigKind::Carried)
+            fprintf(o, "%s_mem: %s = 0;\n", cname(sigs_[id].results[0]),
+                    sigs_[id].name().c_str());
+
     fputs("\n// One rule per terminal, all operands and the result on the memory stack.\n", o);
     for (int id : final_ids_) {
         const Sig& s = sigs_[id];
+        if (s.kind == SigKind::Carried) continue;
         const char* lhs = s.results.empty() ? "stmt" : nullptr;
         std::string lhs_s = lhs ? lhs : (std::string(cname(s.results[0])) + "_mem");
         fprintf(o, "%s: %s", lhs_s.c_str(), s.name().c_str());

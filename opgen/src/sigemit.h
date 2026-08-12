@@ -28,12 +28,24 @@ enum class SClass : unsigned char {
 };
 constexpr unsigned SCLASS_FINAL = 7;   // I32..Stk need no resolution
 
+// What a node stands for. Almost every node is an instruction, but a region does
+// not begin with an empty stack: whatever the previous region left behind is
+// sitting on the memory stack, and the first instruction that consumes one needs
+// a child to consume. That leaf is a node with no instruction behind it, and it
+// cannot borrow `()->(i32)` from i32.const — the stitcher would stamp a constant.
+enum class SigKind : unsigned char {
+    Op = 0,      // an opcode's storage-class signature
+    Carried,     // a value carried across a cut, already in the canonical state
+};
+
 // One signature — a parameter class vector and a result class vector. Final
 // signatures (no Addr/Poly slot) are the burg terminals; the rest exist only as
 // the declared form an opcode carries and the resolution list it expands to.
 struct Sig {
+    SigKind kind = SigKind::Op;
     std::vector<SClass> params, results;
     bool operator<(const Sig& o) const {
+        if (kind != o.kind) return kind < o.kind;
         if (params != o.params) return params < o.params;
         return results < o.results;
     }
@@ -83,7 +95,8 @@ private:
     std::vector<Sig>   sigs_;        // id -> signature
     std::map<Sig, int> sig_ids_;
     std::vector<OpInfo> ops_;
-    std::vector<int>    final_ids_;  // the burg terminal set, in id order
+    std::vector<int>    final_ids_;    // the burg terminal set, in id order
+    std::vector<int>    carried_ids_;  // class -> its canonical-state leaf
 
     void build();
     int  intern(const Sig& s);

@@ -486,7 +486,18 @@ bool VmEmitter::emits_variant(const Opcode* op, int state) const {
     // the argument above; a state that cannot place them has no variant and the
     // tiler reaches it through a transition instead (§2.5 / C5).
     if (left + result_slots(op) > tier2_n_) return false;
-    if (!op->stack_out.empty() && !results_cached(op, state)) return false;
+    // D7s. A result may go to MEMORY from a cached state, but only when nothing
+    // survives beneath it: a pushed value above cached ones is not a state a
+    // count of slots can name. With left == 0 the cached operands were all
+    // consumed, so pushing leaves the cache EMPTY — state 0, and nameable.
+    //
+    // Demanding a cached result in every state was the broad reading and it
+    // costs. An instruction whose operand is already in a register but whose
+    // result belongs in memory then has no form at all, so the tiler either
+    // takes the cached form and spills (2 + 5), or spills the operand first and
+    // takes the all-memory form (5 + 4) — where reading the register and pushing
+    // inline is 3.
+    if (!op->stack_out.empty() && !results_cached(op, state) && left > 0) return false;
     for (size_t k = 0; k < op->stack_in.size(); k++)
         if (operand_slot(op, (int)k, state) >= 0 &&
             (!cacheable(op->stack_in[k]->ty) || op->stack_in[k]->count.has_value()))
@@ -511,11 +522,33 @@ int VmEmitter::variant_fs(const Opcode* op, int state) const {
     return left + (results_cached(op, state) ? result_slots(op) : 0);
 }
 
-void VmEmitter::emit_one_opcode(SemLowerer& low, const Opcode* op, int state) {
+// D7s: worth a second stencil only when this state would otherwise cache the
+// result, and only when nothing survives beneath it — with survivors, a pushed
+// result sits above cached values and the state has no name. At state 0 the
+// memory form already exists under the plain name, so there is nothing to add.
+bool VmEmitter::has_mem_form(const Opcode* op, int state) const {
+    if (state <= 0 || op->stack_out.empty()) return false;
+    // The OPERAND side must be legal at this state, which is the whole of what
+    // emits_variant decides. Without asking, this emitted a memory-result form
+    // for states whose operands cannot be read from the cache at all — a `word`
+    // operand has no class to read AS, and it carries a tag a register does not.
+    if (!emits_variant(op, state)) return false;
+    if (!results_cached(op, state)) return false;      // it is already the mem form
+    int a = operand_slots(op);
+    return !(state > a);                                // left == 0
+}
+
+void VmEmitter::emit_one_opcode(SemLowerer& low, const Opcode* op, int state, int mem_result) {
     FILE* o = low.out();
     int stencil = (low.mode() == Mode::Stencil);
+    // D7s: the same entry state has two result placements. `__sK` caches what it
+    // produces; `__sKm` reads its operands from the same registers and pushes the
+    // result inline, which is what an instruction wants when its consumer is far
+    // enough away that the value belongs in memory anyway.
+    int cache_res = !mem_result && results_cached(op, state);
     if (stencil && state >= 0) {
-        fprintf(o, "void STENCIL gen_st_%s__s%d(CACHE_ARGS) {\n", op->mnemonic, state);
+        fprintf(o, "void STENCIL gen_st_%s__s%d%s(CACHE_ARGS) {\n", op->mnemonic, state,
+                mem_result ? "m" : "");
         fputs("    frame_t* f = &vm->frame; (void)f;\n", o);
         fputs("    STENCIL_TRAP_PC(_HOLE_pc);\n", o);
     } else if (stencil) {
@@ -687,7 +720,7 @@ void VmEmitter::emit_one_opcode(SemLowerer& low, const Opcode* op, int state) {
                 // class the tile resolved. The body still ASSIGNS the tag (its
                 // source is unchanged, D1s), so say the value is deliberately
                 // unused rather than let -Wunused-but-set-variable fail the build.
-                if (results_cached(op, state))
+                if (cache_res)
                     fprintf(o, "    (void)%s_wt;\n", so->name);
             }
             else
@@ -743,7 +776,7 @@ void VmEmitter::emit_one_opcode(SemLowerer& low, const Opcode* op, int state) {
         // Where the survivors end up is where the results DIDN'T go: a result
         // that went to memory occupies no slot, so the survivors close all the
         // way up to slot 0. Counted in SLOTS — a v128 result vacates two.
-        int nout = results_cached(op, state) ? result_slots(op) : 0;
+        int nout = cache_res ? result_slots(op) : 0;
         if (left && nout > a)
             for (int j = left - 1; j >= 0; j--)
                 fprintf(o, "    CACHE_R%d = CACHE_R%d;\n", nout + j, a + j);
@@ -768,7 +801,7 @@ void VmEmitter::emit_one_opcode(SemLowerer& low, const Opcode* op, int state) {
         // The result is the new top of stack, so in a cached state it lands in
         // slot 0 rather than being pushed. The values that SURVIVED this
         // instruction were moved into place above.
-        if (results_cached(op, state) && slot_width(so->ty) == 2) {
+        if (cache_res && slot_width(so->ty) == 2) {
             // A v128 is two registers wide, so it lands in the top TWO slots —
             // low half in reg0, high half in reg1, which is the same order the
             // memory stack holds it in and therefore the order the spill and fill
@@ -777,7 +810,7 @@ void VmEmitter::emit_one_opcode(SemLowerer& low, const Opcode* op, int state) {
             fprintf(o, "    CACHE_R1 = CACHE_PUT_V128_HI(%s);\n", val);
             continue;
         }
-        if (results_cached(op, state)) {
+        if (cache_res) {
             fprintf(o, "    CACHE_R0 = CACHE_PUT_%s(%s);\n",
                     SemLowerer::slot_class(so->ty), val);
             continue;
@@ -1011,9 +1044,12 @@ void VmEmitter::emit_stencil_c(FILE* o) {
         // …and only when there IS a cache: at n=0 an `__s0` would be the no-cache
         // form under a second name, and that table has to stay byte-identical.
         if (tier2_n_)
-            for (int st = 0; st <= tier2_n_; st++)
+            for (int st = 0; st <= tier2_n_; st++) {
                 if ((st == 0 || emits_variant(op, st)) && same_state_as(op, st) < 0)
                     emit_one_opcode(low, op, st);   // D3s: a duplicate body is not emitted
+                // …and D7s' second placement, where it exists.
+                if (has_mem_form(op, st)) emit_one_opcode(low, op, st, 1);
+            }
     }
 
     // Machinery stencils — the machine boundary + control continuations, the
@@ -1256,6 +1292,26 @@ void VmEmitter::emit_jit_meta(FILE* o) {
         " * Not derivable from pop/push: a `word` result moves the stack exactly\n"
         " * like an `i32` one and yet leaves nothing cached, having no class to\n"
         " * cache AS. Read this; do not recompute it. */\n");
+    // D7s' second placement, indexed the same way: the form that reads this
+    // state's cached operands and pushes its result inline, or -1 where the state
+    // has only one placement. At state 0 that form is the PLAIN stencil, which
+    // the meta already names, so the row is -1 there too.
+    fprintf(o, "static const int %s_variant_m[][%s_TIER2_N + 1] = {\n",
+            prefix_.c_str(), uprefix_.c_str());
+    for (auto* op : mod_->opcodes) {
+        if (!is_emittable(op) || SemLowerer::stencil_excluded(op)) continue;
+        fputs("    [STENCIL_GEN_ST_", o); put_upper(o, op->mnemonic); fputs("] = {", o);
+        for (int st = 0; st <= tier2_n_; st++) {
+            if (has_mem_form(op, st)) {
+                fputs(st ? ", STENCIL_GEN_ST_" : " STENCIL_GEN_ST_", o);
+                put_upper(o, op->mnemonic);
+                fprintf(o, "__S%dM", st);
+            } else fputs(st ? ", -1" : " -1", o);
+        }
+        fputs(" },\n", o);
+    }
+    fputs("};\n", o);
+
     fprintf(o, "static const int %s_variant_fs[][%s_TIER2_N + 1] = {\n",
             prefix_.c_str(), uprefix_.c_str());
     for (auto* op : mod_->opcodes) {

@@ -81,7 +81,12 @@ private:
     // Handler emission (the interp/stencil body wrapper around the lowering).
     // `state` is the entry cache state; -1 is "no cache" (the interp, and every
     // tier-1 stencil), which emits exactly what it always did.
-    void emit_one_opcode(SemLowerer& low, const Opcode* op, int state = -1);
+    // `mem_result` selects the D7s form: same entry state, same cached operands,
+    // but the result is pushed inline instead of held in a register.
+    void emit_one_opcode(SemLowerer& low, const Opcode* op, int state = -1,
+                         int mem_result = 0);
+    // Does this state have a distinct memory-result form worth emitting?
+    bool has_mem_form(const Opcode* op, int state) const;
     void emit_guards(SemLowerer& low, const Opcode* op);
     void emit_slot_macros(SemLowerer& low);
     void emit_prologue(SemLowerer& low);

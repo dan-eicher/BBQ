@@ -3,6 +3,7 @@
 // emitted byte matches the reference VM; g_mod/g_mode/g_lane are gone — the
 // Module is a member, the mode/lane live in the SemLowerer.
 #include "vmemit.h"
+#include "spec.h"     /* Spec::forwarded_name — which stack slots the spec says are one value */
 #include <cstring>
 #include <cctype>
 
@@ -128,12 +129,8 @@ int VmEmitter::stack_in_live(const Opcode* op, int k) {
     const char* name = op->stack_in[k]->name;
     for (auto* s : op->sem_body)
         if (stmt_refs_name(s, name)) return 1;
-    for (auto* so : op->stack_out) {
-        const char* se = out_sem_expr(so);
-        size_t l = se ? strlen(se) : 0;
-        if (se && se[0] == '"' && l >= 2 && strlen(name) == l - 2 &&
-            !strncmp(se + 1, name, l - 2)) return 1;
-    }
+    for (auto* so : op->stack_out)
+        if (Spec::forwarded_name(so) == name) return 1;   // `-- word r = "<name>"`
     // A guard reads its operands too. Without this an input named only by an
     // `error:` condition would be dropped with a bare `JV_SP -=` instead of
     // popped into a variable, and the emitted guard would not compile.

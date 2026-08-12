@@ -5,6 +5,14 @@
 
 namespace opgen {
 
+std::string Spec::forwarded_name(const StackParam* sp) {
+    if (!sp->sem_expr.has_value()) return std::string();
+    const char* se = *sp->sem_expr;
+    size_t n = std::strlen(se);
+    if (n >= 2 && se[0] == '"' && se[n - 1] == '"') return std::string(se + 1, n - 2);
+    return std::string(se);
+}
+
 int Spec::type_bytes(ValueType ty) {
     switch (ty) {
         case ValueType::TyI8:

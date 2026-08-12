@@ -31,6 +31,13 @@ static void usage() {
         "                     Requires -o; -name sets the entry point's prefix.\n"
         "  -name <prefix>     Entry-point prefix for --rewrite (default: burg).\n"
         "  --strict           Treat warnings as errors (CI gating).\n"
+        "  --asdl-strict      With -asdl: require every terminal to name a\n"
+        "                     constructor whose node-field count IS the pattern's\n"
+        "                     arity. Without it a mismatch silently demotes that\n"
+        "                     terminal to the heuristic demand filter, which is\n"
+        "                     right for a slot-based IR and a no-op check for an\n"
+        "                     AST-shaped one. Pass it when the schema and the\n"
+        "                     grammar are generated from the same walk.\n"
         "  --coverage         Run the full tree-automaton analysis: dead-rule\n"
         "                     warnings plus shape-enumeration warnings for\n"
         "                     uncovered tree shapes. Off by default — automaton\n"
@@ -49,6 +56,7 @@ int main(int argc, char** argv) {
     std::string asdl_file;
     bool strict = false;
     bool coverage = false;
+    bool asdl_strict = false;
     bool rule_table = false;
     bool rewrite_mode = false;
     std::string rewrite_name = "burg";
@@ -66,6 +74,8 @@ int main(int argc, char** argv) {
             asdl_file = argv[++i];
         } else if (strcmp(argv[i], "--strict") == 0) {
             strict = true;
+        } else if (strcmp(argv[i], "--asdl-strict") == 0) {
+            asdl_strict = true;
         } else if (strcmp(argv[i], "--coverage") == 0) {
             coverage = true;
         } else if (strcmp(argv[i], "--emit-rule-table") == 0) {
@@ -93,6 +103,7 @@ int main(int argc, char** argv) {
     AnalysisConfig acfg;
     acfg.emit_coverage_warnings = coverage;
     acfg.skip_dead_rule_analysis = !coverage;
+    acfg.asdl_strict = asdl_strict;
 
     AsdlSchema schema;
     if (!asdl_file.empty()) {

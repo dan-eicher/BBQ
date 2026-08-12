@@ -3,6 +3,7 @@
 
 #include "opgen_ast.h"
 #include <array>
+#include <string>
 
 namespace opgen {
 
@@ -46,6 +47,13 @@ public:
     const Module*                     module() const { return mod_; }
     const Derived&                    derived(unsigned idx) const { return derived_[idx & 0xff]; }
     const std::array<Derived, 256>&   table() const { return derived_; }
+
+    // The stack_in a stack_out is declared to BE — `( word v -- word r = "v" )`.
+    // Empty when the param carries no such declaration. The spec writes it as a
+    // string literal and the parser keeps the span, quotes and all, so unwrapping
+    // it lives here rather than in each emitter that wants to know which values
+    // the spec says are the same value.
+    static std::string forwarded_name(const StackParam* sp);
 
     // Byte width of a value type (the decoded carrier width for LEB/memarg).
     static int type_bytes(ValueType ty);

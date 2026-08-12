@@ -607,6 +607,29 @@ void report_missing_witnesses(const BurgAnalysis& a,
 // reduce, which is the plainest coverage gap there is — and the one most likely
 // to appear in a GENERATED grammar, where the terminal set and the rule set come
 // from separate walks and only a check like this one holds them together.
+// Under --asdl-strict, the schema and the grammar are claimed to describe the
+// same IR, so every terminal a rule uses must name a constructor and that
+// constructor's node fields must BE the pattern's children. Reported as errors:
+// a silently-demoted terminal is a coverage claim that checked nothing, which is
+// worse than no claim at all.
+void check_asdl_agreement(const BurgAnalysis& a, const AsdlSchema* schema,
+                          std::vector<std::string>& errors) {
+    if (!schema) return;
+    auto arities = collect_terminal_arities(a);
+    for (auto& [term, set] : arities) {
+        auto it = schema->constructor_node_fields.find(term);
+        if (it == schema->constructor_node_fields.end()) {
+            errors.push_back("terminal " + term + " has no constructor in the ASDL schema");
+            continue;
+        }
+        for (int arity : set)
+            if ((int)it->second.size() != arity)
+                errors.push_back("terminal " + term + " is matched at arity " +
+                                 std::to_string(arity) + " but its ASDL constructor has " +
+                                 std::to_string(it->second.size()) + " node field(s)");
+    }
+}
+
 void report_unreduced_terminals(const BurgAnalysis& a,
                                 std::vector<std::string>& warnings) {
     std::set<std::string> named;
@@ -846,6 +869,7 @@ AnalysisReport run_completeness_analysis(const BurgAnalysis& a,
 
     // 1. Duplicate rules — error. Cheap, no automaton needed.
     check_duplicate_rules(a, report.errors);
+    if (cfg.asdl_strict) check_asdl_agreement(a, cfg.asdl, report.errors);
 
     // Bail before the expensive automaton build if the caller has
     // explicitly opted out. Routine codegen-only runs use this; the

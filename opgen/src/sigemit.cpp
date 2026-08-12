@@ -9,6 +9,7 @@
 // result — `(i32)->(i32)` cannot stand for both i32.eqz and i32.trunc_f64_s —
 // so the signature IS the terminal.
 #include "sigemit.h"
+#include "spec.h"     /* Spec::forwarded_name — which stack slots the spec says are one value */
 
 #include <cstdlib>
 #include <cstring>
@@ -238,12 +239,12 @@ SigEmitter::OpInfo SigEmitter::describe(const Opcode* op) const {
     // The declared forward: a stack_out written `= "<in>"` IS that input value.
     auto find = [&](int x) { while (uf[x] != x) x = uf[x] = uf[uf[x]]; return x; };
     for (size_t k = 0; k < op->stack_out.size(); k++) {
-        if (!op->stack_out[k]->sem_expr.has_value()) continue;
+        std::string src = Spec::forwarded_name(op->stack_out[k]);
+        if (src.empty()) continue;
         size_t slot = nin + k;
         if (poly_slot[slot] < 0) continue;
         for (size_t i = 0; i < nin; i++)
-            if (poly_slot[i] > 0 &&
-                std::strcmp(*op->stack_out[k]->sem_expr, op->stack_in[i]->name) == 0)
+            if (poly_slot[i] > 0 && src == op->stack_in[i]->name)
                 uf[find((int)i)] = find((int)slot);
     }
     for (auto* s : op->sem_body) forwarding_ties(s, op, poly_slot, uf);

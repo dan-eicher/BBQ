@@ -248,6 +248,44 @@ TEST(BurgAnalysis, ReportsUncoverableTreeShapeWithCoverage) {
     }
 }
 
+TEST(BurgAnalysis, AsdlStrictRejectsAnArityDisagreement) {
+    // The schema says Add takes one node; the grammar matches it with two. Left
+    // alone burgc reads that as a slot-based IR and falls back to the heuristic
+    // demand filter — right for a consumer whose BURG operands are virtual, and a
+    // coverage claim that checks nothing for one whose IR really is AST-shaped.
+    AsdlSchema schema;
+    schema.constructor_node_fields["Const"] = {};
+    schema.constructor_node_fields["Add"] = {"expr"};
+    schema.sum_constructors["expr"] = {"Add", "Const"};
+
+    Parser parser;
+    const char* input =
+        "TERM Const=1 TERM Add=2\n"
+        "RULES expr: Const = 1; expr: Add(expr, expr) = 1;";
+    parser.init(input, (int)strlen(input));
+    ASSERT_TRUE(parser.parse());
+
+    {   // default: tolerated, because a slot-based IR looks exactly like this
+        BurgGenerator gen;
+        AnalysisConfig cfg;
+        cfg.asdl = &schema;
+        EXPECT_TRUE(gen.analyze(parser.ast));
+    }
+    {   // --asdl-strict: the consumer says both come from one walk, so it is a bug
+        BurgGenerator gen;
+        AnalysisConfig cfg;
+        cfg.asdl = &schema;
+        cfg.asdl_strict = true;
+        gen.set_completeness_config(cfg);
+        gen.analyze(parser.ast);
+        bool found = false;
+        for (auto& e : gen.errors())
+            if (e.find("Add") != std::string::npos &&
+                e.find("node field") != std::string::npos) found = true;
+        EXPECT_TRUE(found) << "expected an arity-disagreement error for Add";
+    }
+}
+
 TEST(BurgAnalysis, TerminalWithNoRuleIsReported) {
     // A terminal no rule names is invisible to the shape enumeration: arities
     // are collected FROM the rules, so it contributes no (terminal, arity) pair

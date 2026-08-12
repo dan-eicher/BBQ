@@ -66,6 +66,16 @@ struct AnalysisConfig {
     // constructed.
     bool emit_coverage_warnings = false;
 
+    // Hold the grammar to the ASDL schema instead of quietly working around it.
+    // Without this, a TERM whose constructor's node-field count disagrees with
+    // the burg arity is treated as a slot-based IR and demoted to the heuristic
+    // demand filter — correct for a consumer whose BURG operands are virtual,
+    // and a silent no-op for one whose IR really is AST-shaped. A consumer that
+    // KNOWS its schema and grammar come from the same walk asks for the
+    // disagreement to be an error, which is the only way `-asdl` coverage means
+    // what it says.
+    bool asdl_strict = false;
+
     // Skip the tree-automaton build and the dead-rule analysis.
     // Duplicate-rule detection still runs (cheap, no automaton).
     // The automaton's worklist re-enumeration is `|states|^arity` per

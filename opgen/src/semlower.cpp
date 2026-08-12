@@ -685,7 +685,7 @@ void SemLowerer::lower_void_call(const SemExpr* e, const Opcode* op) {
     if (mode_ == Mode::Stencil && !md->inl) fputs("));\n", out_);   // close the extra `(` of the _HOLE_ fn-ptr cast; a direct inline-native call has one less
     else                                    fputs(");\n", out_);
     if (ctrl) {
-        if (mode_ == Mode::Stencil) fputs("    TAIL return _HOLE_resync(vm);\n", out_);
+        if (mode_ == Mode::Stencil) fputs("    TAIL return _HOLE_resync(CACHE_PASS);\n", out_);
         else                        fprintf(out_, "    TAIL return %s_next(vm);\n", prefix_.c_str());
     }
 }
@@ -929,7 +929,7 @@ void SemLowerer::lower_stmt(const Opcode* op, const SemStmt* s) {
         break;
     }
     case SemStmtTag::STrap:
-        if (mode_ == Mode::Stencil) fputs("    TAIL return _HOLE_trap(vm);\n", out_);
+        if (mode_ == Mode::Stencil) fputs("    TAIL return _HOLE_trap(CACHE_PASS);\n", out_);
         else                        fprintf(out_, "    TAIL return %s_trap(vm);\n", prefix_.c_str());
         break;
     }
@@ -1057,7 +1057,7 @@ int SemLowerer::stencil_excluded(const Opcode* op) {
 // causes (wasm's "integer divide by zero" vs "integer overflow") overrides it.
 void SemLowerer::guard_trap(const char* error_name) {
     fprintf(out_, " { OPGEN_GUARD_TRAP(vm, OPGEN_ERR_%s);", error_name);
-    if (mode_ == Mode::Stencil) fputs(" TAIL return _HOLE_trap(vm); }\n", out_);
+    if (mode_ == Mode::Stencil) fputs(" TAIL return _HOLE_trap(CACHE_PASS); }\n", out_);
     else fprintf(out_, " TAIL return %s_trap(vm); }\n", prefix_.c_str());
 }
 

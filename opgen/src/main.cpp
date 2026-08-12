@@ -70,10 +70,12 @@ static int run(int argc, char** argv) {
     const char* in_path = nullptr;
     const char* out_dir = nullptr;
     const char* prefix = nullptr;
+    int tier2_n = 0;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-i") == 0 && i + 1 < argc) in_path = argv[++i];
         else if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) out_dir = argv[++i];
         else if (strcmp(argv[i], "-prefix") == 0 && i + 1 < argc) prefix = argv[++i];
+        else if (strcmp(argv[i], "-tier2") == 0 && i + 1 < argc) tier2_n = atoi(argv[++i]);
         else { usage(argv[0]); return 2; }
     }
     if (!in_path || !out_dir || !prefix) { usage(argv[0]); return 2; }
@@ -91,7 +93,7 @@ static int run(int argc, char** argv) {
 
     Module* m = p.ast;
     Spec spec(m);
-    VmEmitter vm(m, prefix);
+    VmEmitter vm(m, prefix, tier2_n);
     TablesEmitter tables(spec);
     SigEmitter sig(m, prefix);
 

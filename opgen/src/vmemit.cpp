@@ -331,11 +331,49 @@ void VmEmitter::emit_prologue(SemLowerer& low) {
 
 // ── One opcode (interp handler / stencil) ───────────────────
 
-void VmEmitter::emit_one_opcode(SemLowerer& low, const Opcode* op) {
+// A managed reference is the one class that never rides a slot. Stack caching
+// removes push/pop traffic on computational temporaries; a GC reference is not
+// one — it belongs on the operand stack, which is where the collector looks for
+// roots and, because Immix evacuates, where it rewrites them. A register has no
+// address to rewrite.
+bool VmEmitter::cacheable(ValueType t) {
+    switch (t) {
+    case ValueType::TyI32: case ValueType::TyI64:
+    case ValueType::TyF32: case ValueType::TyF64:
+        return true;
+    default:
+        return false;   // ref forms, v128 (two slots — later), word/any, addr
+    }
+}
+
+// In state k the top k operands are cached, so operand `k` of an arity-`a`
+// instruction is cached iff its distance from the top is under the state.
+int VmEmitter::operand_slot(const Opcode* op, int k, int state) {
+    int a = (int)op->stack_in.size();
+    int d = a - 1 - k;
+    return (d < state) ? d : -1;
+}
+
+// What the machine is in after this instruction: it consumed its operands, and
+// its result (if any) is the new top, so the result is the one thing cached.
+int VmEmitter::follow_state(const Opcode* op, int state, int nslots) {
+    int a = (int)op->stack_in.size();
+    int left = state >= a ? state - a : 0;
+    int out = left + (int)op->stack_out.size();
+    return out > nslots ? nslots : out;
+}
+
+void VmEmitter::emit_one_opcode(SemLowerer& low, const Opcode* op, int state) {
     FILE* o = low.out();
     int stencil = (low.mode() == Mode::Stencil);
-    if (stencil) {
-        fprintf(o, "void STENCIL gen_st_%s(vm_t* vm) {\n", op->mnemonic);
+    if (stencil && state >= 1) {
+        fprintf(o, "void STENCIL gen_st_%s__s%d(CACHE_ARGS) {\n", op->mnemonic, state);
+        fputs("    frame_t* f = &vm->frame; (void)f;\n", o);
+        fputs("    STENCIL_TRAP_PC(_HOLE_pc);\n", o);
+    } else if (stencil) {
+        // State 0 keeps the plain name: it is what the driver stamps by default,
+        // and with no cache at all it is the only form there is.
+        fprintf(o, "void STENCIL gen_st_%s(CACHE_ARGS) {\n", op->mnemonic);
         fputs("    frame_t* f = &vm->frame; (void)f;\n", o);
         fputs("    STENCIL_TRAP_PC(_HOLE_pc);   /* per-stencil source byte offset: the default discards it (no trap-frame); a backend that records a trap site (e.g. §7.1.8) #defines STENCIL_TRAP_PC to bake _HOLE_pc into its frame */\n", o);
     } else {
@@ -446,6 +484,16 @@ void VmEmitter::emit_one_opcode(SemLowerer& low, const Opcode* op) {
             // keeps struct.new/array.new_fixed safe, whose bodies DO allocate.
             if (SemLowerer::op_has_flag(op, "pops_first"))
                 fprintf(o, "    JV_SP -= _vc_%s;\n", si->name);
+        } else if (state >= 0 && operand_slot(op, k, state) >= 0) {
+            // Cached: the value is already in a slot, so there is no pop and no
+            // sp movement for it at all (§2.3 — "the stack pointer need not be
+            // updated in instruction implementations that can access all stack
+            // items in registers"). The slot is an opaque word; the cast back to
+            // the operand's own type is what names it.
+            jrow r = low.jtype(si->ty);
+            fprintf(o, "    %s %s = CACHE_GET_%s(CACHE_R%d);\n",
+                    r.scalar, si->name, SemLowerer::slot_class(si->ty),
+                    operand_slot(op, k, state));
         } else if (stack_in_live(op, k)) {
             if (si->ty == ValueType::TyAddr) {
                 /* §2.3.11: the width is the DECLARED addrtype of the module entry this operand
@@ -527,14 +575,16 @@ void VmEmitter::emit_one_opcode(SemLowerer& low, const Opcode* op) {
             fprintf(o, "); JV_SP += _vr_%s; }\n", so->name);
             continue;
         }
-        const char* se = out_sem_expr(so);
-        fprintf(o, "    GPUSH_%s(", SemLowerer::slot_class(so->ty));
-        if (se && se[0] == '"') {
-            fprintf(o, "%.*s", (int)strlen(se) - 2, se + 1);
-        } else {
-            fputs(se ? se : so->name, o);
+        std::string src = Spec::forwarded_name(so);
+        const char* val = src.empty() ? so->name : src.c_str();
+        // The result is the new top of stack, so in a cached state it lands in
+        // slot 0 rather than being pushed. Nothing touches sp.
+        if (state >= 0 && follow_state(op, state, cache_slots()) > 0 && cacheable(so->ty)) {
+            fprintf(o, "    CACHE_R0 = CACHE_PUT_%s(%s);\n",
+                    SemLowerer::slot_class(so->ty), val);
+            continue;
         }
-        fputs(");\n", o);
+        fprintf(o, "    GPUSH_%s(%s);\n", SemLowerer::slot_class(so->ty), val);
     }
 
     if (!low.body_tail_returns(op)) {
@@ -545,8 +595,8 @@ void VmEmitter::emit_one_opcode(SemLowerer& low, const Opcode* op) {
             // (a store after a trapped load) or underflowing the stack (a value-less trap like
             // table.get followed by a consumer). Status/control natives already bail via _HOLE_resync.
             if (low.native_called())
-                fputs("    if (vm->trapped) TAIL return _HOLE_trap(vm);\n", o);
-            fputs("    TAIL return _HOLE_cont(vm);\n", o);
+                fputs("    if (vm->trapped) TAIL return _HOLE_trap(CACHE_PASS);\n", o);
+            fputs("    TAIL return _HOLE_cont(CACHE_PASS);\n", o);
         } else {
             put_p(o, "    TAIL return wasm_next(vm);\n");
         }
@@ -608,10 +658,54 @@ void VmEmitter::emit_stencil_c(FILE* o) {
     fputs("#include \"runtime_api.h\"\n\n", o);
     fputs("#define STENCIL __attribute__((preserve_none))\n"
           "#define TAIL    __attribute__((musttail))\n\n", o);
+    // The cache register file. It is the SAME slot list in every stencil's
+    // signature — musttail requires the caller's and callee's signatures to
+    // match, so a per-state signature is rejected by clang outright. Which slots
+    // are live is the cache STATE, which the tiler tracks; the signature is
+    // fixed. Pointer-typed like every other value a stencil carries, so clang
+    // cannot see through it (see the copy-and-patch discipline: WE patch, clang
+    // does not). n = 0 is the tier-1 shape and emits the same code as ever.
+    fprintf(o, "typedef void* cache_slot_t;\n#define CACHE_ARGS vm_t* vm");
+    for (int i = 0; i < tier2_n_; i++) fprintf(o, ", cache_slot_t _r%d", i);
+    fprintf(o, "\n#define CACHE_PASS vm");
+    for (int i = 0; i < tier2_n_; i++) fprintf(o, ", _r%d", i);
+    fputs("\n", o);
+    for (int i = 0; i < tier2_n_; i++) fprintf(o, "#define CACHE_R%d _r%d\n", i, i);
+    fprintf(o, "#define CACHE_ENTRY vm");
+    for (int i = 0; i < tier2_n_; i++) fputs(", 0", o);
+    fputs("\n", o);
+    if (tier2_n_) {
+        // A slot is an opaque word, so reading and writing one is a REINTERPRET,
+        // not a conversion: an integer round-trips through uintptr_t, and a float
+        // rides its bits the same way a float constant hole already does. Emitted
+        // per declared type row, so the set follows the spec's value model rather
+        // than a list here.
+        fputs("\n/* Slot access: the value's bits, reinterpreted. Never a numeric cast —\n"
+              " * a float has no meaning as a pointer, and an int narrower than a slot\n"
+              " * would sign-extend differently on the way back. */\n", o);
+        for (auto* td : mod_->types) {
+            jrow r = low.jtype(td->ty);
+            const char* cls = SemLowerer::slot_class(td->ty);
+            if (!cacheable(td->ty)) continue;
+            if (r.scalar[0] == 'f')
+                fprintf(o,
+                    "#define CACHE_GET_%s(sl) (__extension__({ union { uintptr_t p; %s v; } _u;"
+                    " _u.p = (uintptr_t)(sl); _u.v; }))\n"
+                    "#define CACHE_PUT_%s(x)  (__extension__({ union { uintptr_t p; %s v; } _u;"
+                    " _u.p = 0; _u.v = (x); (cache_slot_t)_u.p; }))\n",
+                    cls, r.scalar, cls, r.scalar);
+            else
+                fprintf(o,
+                    "#define CACHE_GET_%s(sl) ((%s)(uintptr_t)(sl))\n"
+                    "#define CACHE_PUT_%s(x)  ((cache_slot_t)(uintptr_t)(%s)(x))\n",
+                    cls, r.scalar, cls, r.uscalar);
+        }
+    }
+    fputs("\n", o);
     emit_slot_macros(low);
-    fputs("extern void STENCIL _HOLE_cont(vm_t* vm);\n"
-          "extern void STENCIL _HOLE_trap(vm_t* vm);\n"
-          "extern void STENCIL _HOLE_resync(vm_t* vm);  /* the in-buffer IP-dispatch stencil */\n"
+    fputs("extern void STENCIL _HOLE_cont(CACHE_ARGS);\n"
+          "extern void STENCIL _HOLE_trap(CACHE_ARGS);\n"
+          "extern void STENCIL _HOLE_resync(CACHE_ARGS);  /* the in-buffer IP-dispatch stencil */\n"
           "extern uint64_t _HOLE_ip;                    /* a control op's own post-operand position */\n"
           "extern uint64_t _HOLE_pc;                    /* this stencil's source byte offset (§7.1.8 trap-frame offset) */\n", o);
 
@@ -684,7 +778,21 @@ void VmEmitter::emit_stencil_c(FILE* o) {
 
     for (auto* op : mod_->opcodes) {
         if (!is_emittable(op) || SemLowerer::stencil_excluded(op)) continue;
-        emit_one_opcode(low, op);
+        emit_one_opcode(low, op, tier2_n_ ? 0 : -1);
+        // The variant family: the same body again per entry state. A state whose
+        // operands are not all cacheable gets no variant — §2.5's omission rule,
+        // and the tiler reaches it through a transition instead.
+        for (int st = 1; st <= tier2_n_; st++) {
+            if (st > (int)op->stack_in.size()) break;
+            bool ok = true;
+            for (int k = 0; k < (int)op->stack_in.size(); k++)
+                if (operand_slot(op, k, st) >= 0 &&
+                    (!cacheable(op->stack_in[k]->ty) || op->stack_in[k]->count.has_value()))
+                    ok = false;
+            for (auto* so : op->stack_out)
+                if (follow_state(op, st, tier2_n_) > 0 && !cacheable(so->ty)) ok = false;
+            if (ok) emit_one_opcode(low, op, st);
+        }
     }
 
     // Machinery stencils — the machine boundary + control continuations, the
@@ -700,21 +808,24 @@ void VmEmitter::emit_stencil_c(FILE* o) {
 " * code cursor in the backend frame). ── */\n"
 "/* Run off the function end. The results ARE the top of the frame stack, where the\n"
 " * caller reads them — there is nothing to stash into a side channel. */\n"
-"void STENCIL gen_st_halt(vm_t* vm) { (void)vm; }\n"
-"typedef void STENCIL (*opgen_kont_t)(vm_t*);\n"
+"void STENCIL gen_st_halt(CACHE_ARGS) { (void)vm; }\n"
+"typedef void STENCIL (*opgen_kont_t)(CACHE_ARGS);\n"
 "extern uint64_t _HOLE_offmap;\n"
 "extern uint64_t _HOLE_codelen;\n"
-"void STENCIL resync(vm_t* vm) {\n"
+"void STENCIL resync(CACHE_ARGS) {\n"
 "    size_t _p = vm->frame.code.pos;\n"
 "    size_t _len = (size_t)_HOLE_codelen;\n"
 "    opgen_kont_t* _map = (opgen_kont_t*)(uintptr_t)_HOLE_offmap;\n"
 "    opgen_kont_t _fn = (_p <= _len) ? _map[_p] : _map[_len];\n"
 "    if (!_fn) _fn = _map[_len];\n"
-"    TAIL return _fn(vm);\n"
+"    TAIL return _fn(CACHE_PASS);\n"
 "}\n"
-"void STENCIL trap(vm_t* vm) { vm->trapped = 1; }\n"
+"void STENCIL trap(CACHE_ARGS) { vm->trapped = 1; }\n"
+/* The machine boundary: ordinary C in, preserve_none out. The cache file starts
+ * empty, so the entry passes null slots — a value is only in one because a
+ * stencil put it there. */
 "void entry(vm_t* vm) {\n"
-"    return ((void STENCIL (*)(vm_t*))_HOLE_cont)(vm);\n"
+"    return ((void STENCIL (*)(CACHE_ARGS))_HOLE_cont)(CACHE_ENTRY);\n"
 "}\n", o);
 }
 

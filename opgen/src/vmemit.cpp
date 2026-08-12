@@ -337,19 +337,17 @@ void VmEmitter::emit_prologue(SemLowerer& low) {
 // one — it belongs on the operand stack, which is where the collector looks for
 // roots and, because Immix evacuates, where it rewrites them. A register has no
 // address to rewrite.
+//
+// Asked of the STORAGE CLASS, through the one routine that assigns it. Answering
+// it from the declared ValueType instead needs a second copy of that mapping,
+// and a copy is a thing that can be missing a case: this one was missing the
+// lane views, so every SIMD opcode — declared `i32x4`, `f64x2` and the rest, and
+// only `v128` in a handful of loads — reported uncacheable. The grammar resolves
+// through the signature table, where the lane views ALREADY collapse to v128, so
+// the two sides disagreed and every SIMD rule with a register in it was dropped
+// for want of a variant. No v128 reached a register at any n.
 bool VmEmitter::cacheable(ValueType t) {
-    switch (t) {
-    case ValueType::TyI32:  return sclass_cacheable(SClass::I32);
-    case ValueType::TyI64:  return sclass_cacheable(SClass::I64);
-    case ValueType::TyF32:  return sclass_cacheable(SClass::F32);
-    case ValueType::TyF64:  return sclass_cacheable(SClass::F64);
-    case ValueType::TyV128: return sclass_cacheable(SClass::V128);
-    case ValueType::TyRef:
-    case ValueType::TyFuncRef:
-    case ValueType::TyExternRef:
-    case ValueType::TyI31Ref: return sclass_cacheable(SClass::Ref);
-    default: return false;      // word/any (no class yet), addr, lane views
-    }
+    return sclass_cacheable(SigEmitter::classify_final(t, "vmemit", "cache slot"));
 }
 
 // In state k the top k operands are cached, so operand `k` of an arity-`a`
@@ -366,10 +364,11 @@ bool VmEmitter::cacheable(ValueType t) {
 // A poly slot's width is a property of the tile, not of the opcode, so it cannot
 // be known here. The consequence, stated rather than discovered later: a
 // `local.get` resolving to v128 is never cached; it reduces at `v128_mem` like
-// any other class with no register form. Only an opcode whose signature SAYS
-// v128 can take two slots.
+// any other class with no register form. An opcode whose slot classifies as V128
+// takes two — which is every SIMD opcode, the lane views included, because the
+// class is what the width is a property of.
 int VmEmitter::slot_width(ValueType t) {
-    return t == ValueType::TyV128 ? 2 : 1;
+    return sclass_width(SigEmitter::classify_final(t, "vmemit", "cache slot"));
 }
 
 // Where operand k sits, counted in SLOTS from the top: everything above it has
@@ -482,6 +481,19 @@ int VmEmitter::same_state_as(const Opcode* op, int state) const {
 bool VmEmitter::emits_variant(const Opcode* op, int state) const {
     int a = operand_slots(op);
     int left = state > a ? state - a : 0;
+    // A state is a COUNT OF SLOTS cached from the top, and a value rides the
+    // cache whole or not at all — so a state whose count ends INSIDE a value
+    // names no machine. With one-slot classes every count is a boundary and this
+    // is vacuous; a v128 operand makes state 1 land mid-value, and the form
+    // emitted for it claimed a cached slot holding half of something.
+    if (state < a) {
+        int base = 0, boundary = (state == 0);
+        for (int k = (int)op->stack_in.size() - 1; k >= 0 && !boundary; k--) {
+            base += slot_width(op->stack_in[k]->ty);
+            if (base >= state) { boundary = (base == state); break; }
+        }
+        if (!boundary) return false;
+    }
     // Anything still cached on exit means the results had to be cached too, by
     // the argument above; a state that cannot place them has no variant and the
     // tiler reaches it through a transition instead (§2.5 / C5).
@@ -1186,8 +1198,14 @@ void VmEmitter::emit_jit_meta(FILE* o) {
           " * compile-walk skips it (by kind) after capturing _HOLE_ip, to place the next stencil. */\n"
           "typedef enum { JTAIL_NONE, JTAIL_BRTABLE, JTAIL_TRYTABLE, JTAIL_SELECTVEC } jit_tail_kind_t;\n"
           "typedef struct { const char* hole; jit_operand_kind_t kind; uint64_t value; } jit_operand_t;\n"
+          "/* `pop`/`push` are ITEMS — the operand stack's own unit, one entry per value.\n"
+          " * `pop_slots`/`push_slots` are the same effect in CACHE SLOTS, where a v128\n"
+          " * spends two. The two units coincide for every other class, which is why one\n"
+          " * number stood in for both until a v128 reached a register. Height arithmetic\n"
+          " * wants items; anything indexing the cache wants slots. */\n"
           "typedef struct { int stencil; const jit_operand_t* operands;\n"
-          "                 unsigned char operand_count, pop, push, tail; } wasm_jit_meta_t;\n\n");
+          "                 unsigned char operand_count, pop, push, tail,\n"
+          "                               pop_slots, push_slots; } wasm_jit_meta_t;\n\n");
 
     for (auto* op : mod_->opcodes) {
         if (!is_emittable(op)) continue;
@@ -1217,8 +1235,10 @@ void VmEmitter::emit_jit_meta(FILE* o) {
         const char* tail = tail_kind_name(op);
         if (SemLowerer::stencil_excluded(op)) fputs("-1", o);
         else { fputs("STENCIL_GEN_ST_", o); put_upper(o, op->mnemonic); }
-        if (nops) fprintf(o, ", jitops_%s, %d, %d, %d, %s },\n", op->mnemonic, nops, pop, push, tail);
-        else      fprintf(o, ", NULL, 0, %d, %d, %s },\n", pop, push, tail);
+        int pops = operand_slots(op), pushs = result_slots(op);
+        if (nops) fprintf(o, ", jitops_%s, %d, %d, %d, %s, %d, %d },\n",
+                          op->mnemonic, nops, pop, push, tail, pops, pushs);
+        else      fprintf(o, ", NULL, 0, %d, %d, %s, %d, %d },\n", pop, push, tail, pops, pushs);
     };
 
     int prefixes[8]; int npfx = 0;

@@ -578,8 +578,20 @@ void VmEmitter::emit_one_opcode(SemLowerer& low, const Opcode* op, int state) {
         std::string src = Spec::forwarded_name(so);
         const char* val = src.empty() ? so->name : src.c_str();
         // The result is the new top of stack, so in a cached state it lands in
-        // slot 0 rather than being pushed. Nothing touches sp.
-        if (state >= 0 && follow_state(op, state, cache_slots()) > 0 && cacheable(so->ty)) {
+        // slot 0 rather than being pushed, and whatever was cached SHIFTS DOWN to
+        // make room — r0 becomes r1, and so on. Ertl's minimal organization pays
+        // for its small state count in exactly these moves (§2.3); leaving them
+        // out would write over a live value. The shift runs descending so no slot
+        // is read after it has been overwritten, and only once for the whole
+        // result list.
+        if (state >= 0 && cacheable(so->ty)) {
+            if (so == op->stack_out.front()) {
+                int a = (int)op->stack_in.size();
+                int left = state > a ? state - a : 0;
+                int nout = (int)op->stack_out.size();
+                for (int i = left + nout - 1; i >= nout; i--)
+                    fprintf(o, "    CACHE_R%d = CACHE_R%d;\n", i, i - nout);
+            }
             fprintf(o, "    CACHE_R0 = CACHE_PUT_%s(%s);\n",
                     SemLowerer::slot_class(so->ty), val);
             continue;
@@ -783,14 +795,24 @@ void VmEmitter::emit_stencil_c(FILE* o) {
         // operands are not all cacheable gets no variant — §2.5's omission rule,
         // and the tiler reaches it through a transition instead.
         for (int st = 1; st <= tier2_n_; st++) {
-            if (st > (int)op->stack_in.size()) break;
+            // What survives this instruction, plus what it produces, has to fit:
+            // a push that would shift a value past the last slot is Ertl's
+            // OVERFLOW, and rather than teach every stencil to spill, the family
+            // simply has no variant there and the tiler reaches the state through
+            // a transition (§2.5 / C5).
+            int a = (int)op->stack_in.size();
+            int left = st > a ? st - a : 0;
+            if (left + (int)op->stack_out.size() > tier2_n_) continue;
             bool ok = true;
             for (int k = 0; k < (int)op->stack_in.size(); k++)
                 if (operand_slot(op, k, st) >= 0 &&
                     (!cacheable(op->stack_in[k]->ty) || op->stack_in[k]->count.has_value()))
                     ok = false;
+            // A state that would leave a value cached needs every result cacheable
+            // — an uncached result would be pushed while cached values sit below
+            // it, which is not a state this organization can name.
             for (auto* so : op->stack_out)
-                if (follow_state(op, st, tier2_n_) > 0 && !cacheable(so->ty)) ok = false;
+                if (!cacheable(so->ty)) ok = false;
             if (ok) emit_one_opcode(low, op, st);
         }
     }

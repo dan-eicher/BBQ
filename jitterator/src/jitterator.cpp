@@ -369,6 +369,12 @@ static std::string render_stencil_table(const std::vector<Stencil>& stencils) {
     out += "    uint16_t hole_count;\n";
     out += "    uint16_t data_hole_count;  // holes needing constant pool (8 bytes each)\n";
     out += "    const char **hole_names;\n";
+    // The holes a stitcher resolves by NAME on every instruction it stamps. The
+    // mapping is fixed when this table is generated, so it is emitted rather than
+    // searched for: a driver asking `find_hole(def, \"_HOLE_ip\")` per instruction
+    // is a string comparison per instruction, per function, per module load.
+    // -1 means this stencil has no such hole.
+    out += "    int16_t h_cont, h_ip, h_pc, h_trap, h_resync, h_memidx, h_offmap, h_codelen;\n";
     out += "} StencilDef;\n\n";
 
     // Per-stencil code bytes and patch arrays
@@ -410,18 +416,27 @@ static std::string render_stencil_table(const std::vector<Stencil>& stencils) {
     }
 
     // Stencil table
+    auto hole_index = [](const Stencil& s, const char* want) -> int {
+        for (size_t i = 0; i < s.hole_names.size(); i++)
+            if (s.hole_names[i] == want) return (int)i;
+        return -1;
+    };
     out += "static const StencilDef stencil_table[STENCIL_COUNT] = {\n";
     for (auto& s : stencils) {
         std::string upper = to_upper(s.name);
-        char buf[512];
+        char buf[640];
         snprintf(buf, sizeof(buf),
-                 "    [STENCIL_%s] = {code_%s, %zu, %s, %zu, %zu, %u, %s},\n",
+                 "    [STENCIL_%s] = {code_%s, %zu, %s, %zu, %zu, %u, %s, %d,%d,%d,%d,%d,%d,%d,%d},\n",
                  upper.c_str(), s.name.c_str(), s.code.size(),
                  s.patches.empty() ? "NULL" : ("patches_" + s.name).c_str(),
                  s.patches.size(),
                  s.hole_names.size(),
                  s.data_hole_count,
-                 s.hole_names.empty() ? "NULL" : ("holes_" + s.name).c_str());
+                 s.hole_names.empty() ? "NULL" : ("holes_" + s.name).c_str(),
+                 hole_index(s, "_HOLE_cont"),   hole_index(s, "_HOLE_ip"),
+                 hole_index(s, "_HOLE_pc"),     hole_index(s, "_HOLE_trap"),
+                 hole_index(s, "_HOLE_resync"), hole_index(s, "_HOLE_memidx"),
+                 hole_index(s, "_HOLE_offmap"), hole_index(s, "_HOLE_codelen"));
         out += buf;
     }
     out += "};\n";

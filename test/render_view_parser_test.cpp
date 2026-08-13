@@ -94,6 +94,7 @@ const char* kSpec =
     "Bytes = struct { n: uint8, data: bytes[n] }\n"
     "Str = struct { s: string[3] }\n"
     "Wh = struct { ver: uint8 where ver == 1, x: uint8 }\n"
+    "WhTwice = struct { lo: uint8, v: uint8 where v >= lo && v <= lo + 8, hi: uint8 }\n"
     "Comp = struct { raw: uint8, hi: compute((raw >> 4) & 0x0F : uint8), lo: compute(raw & 0x0F : uint8) }\n"
     "Iv = struct { off: uint8, val: uint8 [off, off + 1] }\n"
     "Pos = struct { a: uint8, b: uint8 where @pos == 2 }\n"
@@ -998,6 +999,7 @@ std::vector<RuleCase> all_rule_cases() {
         {"RArr", zr::RArr_read, {0x02,1,2,3,4}},
         {"Bytes", zr::Bytes_read, {0x03,0xAA,0xBB,0xCC}},
         {"Str", zr::Str_read, {0x61,0x62,0x63}},
+        {"WhTwice", zr::WhTwice_read, {0x05,0x0A,0x2A}},
         {"Wh", zr::Wh_read, {0x01,0x2A}},
         {"Comp", zr::Comp_read, {0xA5}},
         {"Iv", zr::Iv_read, {0x02,0xFF,0x2A}},

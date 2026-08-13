@@ -27,7 +27,7 @@
 // we call here (resolved at link) to avoid multiply-defining them.
 namespace zr {
 #define ZR(R) bbq::CaptureMetadata R##_read(const uint8_t*, size_t, bbq::ParseArena&);
-ZR(Flat) ZR(Nest) ZR(Arr) ZR(Pair) ZR(Outer) ZR(RArr) ZR(Bytes) ZR(Str) ZR(Wh)
+ZR(Flat) ZR(Nest) ZR(Arr) ZR(Pair) ZR(Outer) ZR(RArr) ZR(Bytes) ZR(Str) ZR(Wh) ZR(WhTwice)
 ZR(Comp) ZR(Iv) ZR(Pos) ZR(Op) ZR(Bare) ZR(Sw) ZR(VA) ZR(VB) ZR(U) ZR(Alts)
 ZR(Bf) ZR(InlineBf) ZR(Eof) ZR(Unt) ZR(Es) ZR(RsItem) ZR(Resync) ZR(Ext)
 ZR(SwRange) ZR(Tern) ZR(Bstart) ZR(Rest) ZR(RestEof) ZR(Cnt) ZR(TopSw) ZR(Np) ZR(OScope)
@@ -317,6 +317,7 @@ std::vector<XCase> xcases() {
         {"Bytes", zr::Bytes_read, {0x03,0xAA,0xBB,0xCC}},
         {"Str", zr::Str_read, {0x61,0x62,0x63}},
         {"Wh", zr::Wh_read, {0x01,0x2A}},
+        {"WhTwice", zr::WhTwice_read, {0x05,0x0A,0x2A}},   // lo=5, v=10 (5..13), hi=42
         {"Comp", zr::Comp_read, {0xA5}},
         {"Iv", zr::Iv_read, {0x02,0xFF,0x2A}},
         {"Pos", zr::Pos_read, {0x0A,0x0B}},
@@ -367,7 +368,7 @@ using ViewWriteFn = std::vector<uint8_t> (*)(const bbq::FieldCapture*, const uin
 ViewWriteFn wfn_for(const std::string& r) {
     static const std::unordered_map<std::string, ViewWriteFn> m = {
 #define ZW(R) {#R, zr::R##_write},
-        ZW(Flat) ZW(Nest) ZW(Arr) ZW(Pair) ZW(Outer) ZW(RArr) ZW(Bytes) ZW(Str) ZW(Wh)
+        ZW(Flat) ZW(Nest) ZW(Arr) ZW(Pair) ZW(Outer) ZW(RArr) ZW(Bytes) ZW(Str) ZW(Wh) ZW(WhTwice)
         ZW(Comp) ZW(Iv) ZW(Pos) ZW(Op) ZW(Bare) ZW(Sw) ZW(VA) ZW(VB) ZW(U) ZW(Alts)
         ZW(Bf) ZW(InlineBf) ZW(Eof) ZW(Unt) ZW(Es) ZW(RsItem) ZW(Resync) ZW(Ext)
         ZW(SwRange) ZW(Tern) ZW(Bstart) ZW(Rest) ZW(RestEof) ZW(Cnt) ZW(TopSw) ZW(Np) ZW(OScope)
@@ -827,6 +828,49 @@ TEST(CrossBackend, ViewCReaderMatchesCek) {
         EXPECT_EQ(cl_d, cek_d) << c.rule << ": c-lite index dump diverges from the CEK\n"
                                << "  c-lite:\n" << cl_d << "  cek:\n" << cek_d;
     }
+}
+
+// ── c-lite: a field named k times in one predicate is SEARCHED ONCE. ─────────────
+// The c-lite field_ref is bbq_view_i64(ctx, "<name>") — a by-name search of the capture
+// index, not a struct member. Spelling it per occurrence makes a k-term predicate pay k
+// searches for an answer that cannot differ between them, and the index-vs-CEK gates above
+// stay green either way: the cost is invisible to behaviour. WhTwice names `v` twice and
+// `lo` twice, so its stencil must hold one search apiece, with the predicate reading the
+// locals. Rules that name a field once keep the direct call — nothing to hoist.
+TEST(CrossBackend, ViewCReaderSearchesARepeatedFieldOnce) {
+    std::string spec = fixture_for_c();
+    auto* parser = new Parser();
+    parser->init(spec.c_str(), (int)spec.size());
+    ASSERT_TRUE(parser->parse());
+    auto* errs = new ErrorReporter();
+    auto* sema = new Sema(*errs);
+    ASSERT_TRUE(sema->analyze(parser->ast));
+    bbq::render::CompilerCtx ctx{parser->ast, sema, nullptr, ""};
+    auto* g = new bbq::Compiler();
+    ctx.ir = g->compile_grammar(parser->ast);
+    std::string src = bbq::render::render_reader_view_c(
+        ctx, std::string(SOURCE_DIR) + "/backends/render/templates");
+
+    auto count = [&src](const std::string& needle) {
+        size_t n = 0;
+        for (size_t p = src.find(needle); p != std::string::npos; p = src.find(needle, p + 1)) n++;
+        return n;
+    };
+    // Exactly one search apiece, and it is the hoist. (A whole-file count of the CALL would
+    // be answering a different question: other rules have their own `v`, named once, which
+    // correctly keeps its direct call.)
+    EXPECT_EQ(count("const int64_t _fr_v = bbq_view_i64(ctx, \"v\");"), 1u);
+    EXPECT_EQ(count("const int64_t _fr_lo = bbq_view_i64(ctx, \"lo\");"), 1u);
+
+    // ...and WhTwice's predicate itself searches for nothing: every occurrence reads a local.
+    size_t at = src.find("WhTwice.constraint failed");
+    ASSERT_NE(at, std::string::npos) << "fixture rule WhTwice lost its predicate";
+    size_t bol = src.rfind('\n', at) + 1;
+    std::string stmt = src.substr(bol, src.find('\n', at) - bol);
+    EXPECT_EQ(stmt.find("bbq_view_i64"), std::string::npos)
+        << "WhTwice's predicate still searches the index:\n" << stmt;
+    EXPECT_NE(stmt.find("_fr_v"), std::string::npos) << stmt;
+    EXPECT_NE(stmt.find("_fr_lo"), std::string::npos) << stmt;
 }
 
 // ── c-lite NEGATIVE (the gatekeeper, ASan/UBSan): for every rule, every truncation +

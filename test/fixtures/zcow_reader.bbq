@@ -35,6 +35,10 @@ RArr  = struct { n: uint8, items: array<Pair>[n] }
 Bytes = struct { n: uint8, data: bytes[n] }
 Str   = struct { s: string[3] }
 Wh    = struct { ver: uint8 where ver == 1, x: uint8 }
+# A predicate naming ONE field several times (a range test). Every other `where` here
+# names its field once, so this is the only rule that exercises a backend whose
+# field_ref costs a search: the reference must be spelled once and reused.
+WhTwice = struct { lo: uint8, v: uint8 where v >= lo && v <= lo + 8, hi: uint8 }
 
 # computed field — evaluated on parse (decode-on-access operands), stored as a
 # Computed capture, read via node_computed_int.

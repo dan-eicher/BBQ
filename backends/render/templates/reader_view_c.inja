@@ -44,6 +44,12 @@ bbq_capture_metadata {{ fn.name }}(const uint8_t* data, size_t len, bbq_arena* a
 {% for o in fn.ops %}
 static bool {{ fn.kpfx }}_k{{ o.id }}(bbq_view_ctx_t* ctx) {
     (void)ctx;
+{# a field this op names more than once: searched here, once, into a local #}
+{% if existsIn(o, "hoist") %}
+{% for h in o.hoist %}
+    {{ h }}
+{% endfor %}
+{% endif %}
 {% if o.op == "read" %}
 {% if o.prim.enc == "uleb" %}
     if (!bbq_view_uleb_capture(ctx, "{{ o.target }}", {{ o.prim.w }})) return false;   /* variable-length varint */

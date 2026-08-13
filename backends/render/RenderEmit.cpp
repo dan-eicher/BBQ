@@ -11,6 +11,7 @@
 
 #include <fstream>
 #include <functional>
+#include <map>
 #include <sstream>
 #include <string>
 #include <set>
@@ -116,6 +117,14 @@ struct Emitter {
     // A field_ref to a NON-SCALAR (Bytes/String) capture: the owning backend's
     // out->name is already the right type; only the views need a span recovery.
     virtual std::string field_ref_bytes(const std::string& name) const { return field_ref(name); }
+    // An owning backend's field_ref is a struct member — naming it twice costs nothing, so
+    // the default declines to hoist. A VIEW's field_ref is a by-name search of the capture
+    // index, and an expression naming the same field k times pays for k searches of an
+    // answer that cannot differ between them. A backend that returns a declaration here
+    // gets the field searched once into that local, and every reference spelled as the
+    // local. Empty = this backend has nothing to gain.
+    virtual std::string field_ref_decl(const std::string& /*var*/,
+                                       const std::string& /*name*/) const { return ""; }
     virtual std::string path_start(const std::string& name) const { return "out->" + name; }
     virtual std::string path_field(const std::string& base, const std::string& field) const {
         return base + "." + field;
@@ -489,35 +498,42 @@ void Emitter::derive_write_prefixes(json& functions) const {
 }
 
 
+// field name → the local its search was hoisted into, for the op being spelled.
+using FieldLocals = std::map<std::string, std::string>;
+
 // Spell a neutral expr record (`{"e": kind, ...}`, built backend-blind by burg) into a
 // C/C++ expr string. The combinators (bin/un/tern/call/literals) are backend-neutral;
 // only the LEAVES (builtins/refs/path-nav) dispatch to the Emitter — so a backend swap
 // is a speller swap, the lowering never re-runs.
-std::string render_expr(const json& e, const Emitter& em) {
+std::string render_expr(const json& e, const Emitter& em, const FieldLocals* hoisted) {
     const std::string k = e.value("e", std::string());
     if (k == "int")        return std::to_string(e["v"].get<int64_t>());
     if (k == "bool")       return e["v"].get<bool>() ? "1" : "0";
     if (k == "float")      return std::to_string(e["v"].get<double>());
     if (k == "str")        return "\"" + e["v"].get<std::string>() + "\"";
     if (k == "builtin")    return em.builtin(e["name"].get<std::string>());
-    if (k == "field_ref")  return e.value("bytes", false)
-                                  ? em.field_ref_bytes(e["name"].get<std::string>())
-                                  : em.field_ref(e["name"].get<std::string>());
+    if (k == "field_ref") {
+        const std::string n = e["name"].get<std::string>();
+        if (e.value("bytes", false)) return em.field_ref_bytes(n);
+        if (hoisted) { auto it = hoisted->find(n); if (it != hoisted->end()) return it->second; }
+        return em.field_ref(n);
+    }
     if (k == "cross_ref")  return em.cross_ref(e["parent"].get<std::string>(),
                                                e["depth"].get<int>(), e["path"].get<std::string>());
     if (k == "path_start") return em.path_start(e["name"].get<std::string>());
-    if (k == "path_field") return em.path_field(render_expr(e["base"], em), e["field"].get<std::string>());
-    if (k == "path_index") return em.path_index(render_expr(e["base"], em), render_expr(e["idx"], em));
-    if (k == "path_value") return em.path_value(render_expr(e["x"], em));
+    if (k == "path_field") return em.path_field(render_expr(e["base"], em, hoisted), e["field"].get<std::string>());
+    if (k == "path_index") return em.path_index(render_expr(e["base"], em, hoisted),
+                                                render_expr(e["idx"], em, hoisted));
+    if (k == "path_value") return em.path_value(render_expr(e["x"], em, hoisted));
     if (k == "bin") return em.bin_expr(e["op"].get<std::string>(),
-                                       render_expr(e["l"], em), render_expr(e["r"], em));
-    if (k == "un")  return em.un_expr(e["op"].get<std::string>(), render_expr(e["x"], em));
-    if (k == "tern") return "(" + render_expr(e["c"], em) + " ? " + render_expr(e["t"], em) +
-                            " : " + render_expr(e["e2"], em) + ")";
+                                       render_expr(e["l"], em, hoisted), render_expr(e["r"], em, hoisted));
+    if (k == "un")  return em.un_expr(e["op"].get<std::string>(), render_expr(e["x"], em, hoisted));
+    if (k == "tern") return "(" + render_expr(e["c"], em, hoisted) + " ? " + render_expr(e["t"], em, hoisted) +
+                            " : " + render_expr(e["e2"], em, hoisted) + ")";
     if (k == "call") {
         std::string s = e["func"].get<std::string>() + "(";
         const json& args = e["args"];
-        for (size_t i = 0; i < args.size(); i++) { if (i) s += ", "; s += render_expr(args[i], em); }
+        for (size_t i = 0; i < args.size(); i++) { if (i) s += ", "; s += render_expr(args[i], em, hoisted); }
         return s + ")";
     }
     return "/*?expr*/";
@@ -525,13 +541,62 @@ std::string render_expr(const json& e, const Emitter& em) {
 
 // Replace every neutral expr node ({"e":...}) anywhere in an op record with its spelled
 // string. Walks the op generically (expr-bearing keys vary: expr/cond/disc/len/count).
-void render_exprs_in(json& v, const Emitter& em) {
+void render_exprs_in(json& v, const Emitter& em, const FieldLocals* hoisted) {
     if (v.is_object()) {
-        if (v.contains("e")) { v = render_expr(v, em); return; }
-        for (auto& [k, child] : v.items()) render_exprs_in(child, em);
+        if (v.contains("e")) { v = render_expr(v, em, hoisted); return; }
+        for (auto& [k, child] : v.items()) render_exprs_in(child, em, hoisted);
     } else if (v.is_array()) {
-        for (auto& child : v) render_exprs_in(child, em);
+        for (auto& child : v) render_exprs_in(child, em, hoisted);
     }
+}
+
+// ── the field_ref hoist (the counting half of render_exprs_in) ──
+// Tally the scalar field_refs an op's expressions make, by name.
+static void count_field_refs(const json& v, std::map<std::string, int>& n) {
+    if (v.is_object()) {
+        if (v.value("e", std::string()) == "field_ref") {
+            if (!v.value("bytes", false)) n[v["name"].get<std::string>()]++;
+            return;
+        }
+        for (auto& [k, child] : v.items()) count_field_refs(child, n);
+    } else if (v.is_array()) {
+        for (auto& child : v) count_field_refs(child, n);
+    }
+}
+
+// The fields an op WRITES. A hoist lifts the search to the head of the op's stencil, so a
+// field the op itself records must never be hoisted: a bitfield's members are added one at
+// a time and a member's `where` names the member just added, which at the head of the
+// stencil has not been recorded yet (and, on a re-entered stencil, still holds the previous
+// iteration's value). Those keep the in-place search.
+static void op_writes(const json& op, std::set<std::string>& w) {
+    for (const char* key : { "target", "tag_target", "field" })
+        if (op.contains(key) && op[key].is_string()) w.insert(op[key].get<std::string>());
+    if (op.contains("members"))
+        for (const auto& m : op["members"])
+            if (m.contains("target") && m["target"].is_string()) w.insert(m["target"].get<std::string>());
+}
+
+// Give an op's repeated field_refs a local apiece, and record the declarations for the
+// template to emit at the head of the op's stencil. A backend that declines (field_ref_decl
+// returns empty) renders exactly as before.
+static void hoist_field_refs(json& op, const Emitter& em) {
+    std::map<std::string, int> uses;
+    count_field_refs(op, uses);
+    std::set<std::string> writes;
+    op_writes(op, writes);
+    FieldLocals locals;
+    json decls = json::array();
+    for (const auto& [name, n] : uses) {
+        if (n < 2 || writes.count(name)) continue;
+        std::string var = "_fr_" + name;
+        std::string decl = em.field_ref_decl(var, name);
+        if (decl.empty()) continue;
+        locals[name] = var;
+        decls.push_back(decl);
+    }
+    if (!decls.empty()) op["hoist"] = decls;
+    render_exprs_in(op, em, locals.empty() ? nullptr : &locals);
 }
 
 // burg lowers each rule's kont graph to ONE backend-neutral op-list — a pure function
@@ -657,7 +722,7 @@ std::string render_emit(const CompilerCtx& ctx, const Emitter& em, json function
     // Emitter spells the leaves (builtins/refs/path-nav) here.
     for (auto& fn : functions)
         for (auto& op : fn["ops"])
-            render_exprs_in(op, em);
+            hoist_field_refs(op, em);
     // The Emitter supplies the target root: burg emits rootless paths; prepend the root
     // (out->/in->) here so the SAME records serve reader and writer. The view's root is
     // empty (rooted_target is identity); the writer derefs the whole-value root.
@@ -969,6 +1034,9 @@ struct ViewCReader : Emitter {
     }
     std::string field_ref_bytes(const std::string& name) const override {
         return "bbq_view_bytes(ctx, \"" + name + "\")";
+    }
+    std::string field_ref_decl(const std::string& var, const std::string& name) const override {
+        return "const int64_t " + var + " = " + field_ref(name) + ";";
     }
     std::string path_start(const std::string& name) const override {
         return "bbq_cap_find_field_str(&ctx->builder, \"" + name + "\")";

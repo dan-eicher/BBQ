@@ -78,12 +78,15 @@ class CBurgBackend : public BurgBackend {
         out << "   the context arena — valid until the next burg_label_root/burg_rewrite. */\n";
         out << "burg_state_t* " << ns_prefix_ << "burg_label_root(BURG_NODE_TYPE root, " << ctx_type_ << "* ctx);\n";
         if (emit_rule_table_) emit_rule_table_decls(out);
-        out << "/* Error API — check after burg_rewrite() */\n";
-        out << "bool burg_has_error(const " << ctx_type_ << "* ctx);\n";
-        out << "const char* burg_get_error(const " << ctx_type_ << "* ctx);\n";
-        out << "int burg_get_error_arg(const " << ctx_type_ << "* ctx);\n";
-        out << "void burg_clear_error(" << ctx_type_ << "* ctx);\n";
-        out << "void burg_set_error(const char* msg, int arg, " << ctx_type_ << "* ctx);\n";
+        // COMPILER's prefix has to reach EVERY external this file defines, or the
+        // namespace is decorative: two matchers in one program still collide, just on
+        // a shorter list. These five were the list.
+        out << "/* Error API — check after " << ns_prefix_ << "burg_rewrite() */\n";
+        out << "bool " << ns_prefix_ << "burg_has_error(const " << ctx_type_ << "* ctx);\n";
+        out << "const char* " << ns_prefix_ << "burg_get_error(const " << ctx_type_ << "* ctx);\n";
+        out << "int " << ns_prefix_ << "burg_get_error_arg(const " << ctx_type_ << "* ctx);\n";
+        out << "void " << ns_prefix_ << "burg_clear_error(" << ctx_type_ << "* ctx);\n";
+        out << "void " << ns_prefix_ << "burg_set_error(const char* msg, int arg, " << ctx_type_ << "* ctx);\n";
         if (a_->has_actions) {
             out << "void " << ns_prefix_ << "burg_reduce(BURG_NODE_TYPE node, burg_state_t* state, int goalnt, " << ctx_type_ << "* ctx);\n";
         }
@@ -103,20 +106,20 @@ class CBurgBackend : public BurgBackend {
         out << "    ctx->state_cache = NULL;\n";
         out << "}\n\n";
 
-        out << "bool burg_has_error(const " << ctx_type_ << "* ctx) {\n";
+        out << "bool " << ns_prefix_ << "burg_has_error(const " << ctx_type_ << "* ctx) {\n";
         out << "    return ctx->burg_error_msg != NULL;\n";
         out << "}\n\n";
-        out << "const char* burg_get_error(const " << ctx_type_ << "* ctx) {\n";
+        out << "const char* " << ns_prefix_ << "burg_get_error(const " << ctx_type_ << "* ctx) {\n";
         out << "    return ctx->burg_error_msg;\n";
         out << "}\n\n";
-        out << "int burg_get_error_arg(const " << ctx_type_ << "* ctx) {\n";
+        out << "int " << ns_prefix_ << "burg_get_error_arg(const " << ctx_type_ << "* ctx) {\n";
         out << "    return ctx->burg_error_arg;\n";
         out << "}\n\n";
-        out << "void burg_clear_error(" << ctx_type_ << "* ctx) {\n";
+        out << "void " << ns_prefix_ << "burg_clear_error(" << ctx_type_ << "* ctx) {\n";
         out << "    ctx->burg_error_msg = NULL;\n";
         out << "    ctx->burg_error_arg = 0;\n";
         out << "}\n\n";
-        out << "void burg_set_error(const char* msg, int arg, " << ctx_type_ << "* ctx) {\n";
+        out << "void " << ns_prefix_ << "burg_set_error(const char* msg, int arg, " << ctx_type_ << "* ctx) {\n";
         out << "    if (ctx->burg_error_msg == NULL) {\n";
         out << "        ctx->burg_error_msg = msg;\n";
         out << "        ctx->burg_error_arg = arg;\n";
@@ -358,7 +361,7 @@ void CBurgBackend::emit_rewrite_body(std::ostream& out, int indent) {
     // (Clear-on-entry let a mid-body no-cover be swallowed by the next statement's
     // rewrite — the truncated body then SHIPPED with its check green.) A caller
     // wanting per-call isolation clears explicitly (burg_ctx_init starts clear).
-    pad(out, indent); out << "if (burg_has_error(ctx)) return;\n";
+    pad(out, indent); out << "if (" << ns_prefix_ << "burg_has_error(ctx)) return;\n";
     pad(out, indent); out << "arena_reset(ctx);\n\n";
 
     pad(out, indent); out << "if (BURG_NODE_SUCC_COUNT(root) == 0) {\n";
@@ -371,7 +374,7 @@ void CBurgBackend::emit_rewrite_body(std::ostream& out, int indent) {
     pad(out, indent + 1); out << "burg_state_t* state = burg_label_tree(root, ctx);\n";
     pad(out, indent + 1); out << "if (!state->rule[" << start_idx << "])\n";
     pad(out, indent + 2);
-    out << "burg_set_error(\"burg: start nonterminal has no rule at root\", "
+    out << ns_prefix_ << "burg_set_error(\"burg: start nonterminal has no rule at root\", "
            "(int)BURG_NODE_OP(root), ctx);\n";
     if (a_->has_actions) {
         pad(out, indent + 1); out << "else\n";
@@ -403,7 +406,7 @@ void CBurgBackend::emit_rewrite_body(std::ostream& out, int indent) {
     // every later node is a no-op call, and burg_set_error keeps the first message.
     // The loop running to the end is what makes reduction stop, not a jump out of it.
     pad(out, indent + 3);
-    out << "burg_set_error(\"burg: start nonterminal does not cover graph node\", "
+    out << ns_prefix_ << "burg_set_error(\"burg: start nonterminal does not cover graph node\", "
            "(int)BURG_NODE_OP(rpo[_i]), ctx);\n";
     if (a_->has_actions) {
         pad(out, indent + 2); out << "else\n";

@@ -670,7 +670,7 @@ void BurgBackend::emit_label_dp_switch(std::ostream& out, int indent) {
     // this default arm prevents).
     pad(out, indent); out << "default:\n";
     pad(out, indent + 1);
-    out << "burg_set_error(\"burg: unknown opcode in match\", op" << ctx_arg() << ");\n";
+    out << sym_prefix() << "burg_set_error(\"burg: unknown opcode in match\", op" << ctx_arg() << ");\n";
     pad(out, indent + 1); out << "break;\n";
     pad(out, indent); out << "}\n";
 }
@@ -756,7 +756,7 @@ void BurgBackend::emit_cost_func_body(std::ostream& out, int indent) {
 // and stays valid until the next labeling or rewrite call.
 void BurgBackend::emit_label_root_body(std::ostream& out, int indent) {
     if (needs_error_polling()) {
-        pad(out, indent); out << "if (burg_has_error(" << ctx_solo() << ")) return NULL;\n";
+        pad(out, indent); out << "if (" << sym_prefix() << "burg_has_error(" << ctx_solo() << ")) return NULL;\n";
     }
     pad(out, indent); out << "arena_reset(" << ctx_solo() << ");\n";
     pad(out, indent); out << "return burg_label_tree(root" << ctx_arg() << ");\n";
@@ -898,7 +898,7 @@ void BurgBackend::emit_child_reductions(std::ostream& out,
         if (child->is_leaf() && !is_terminal(child->name)) {
             int64_t nt_idx = a_->nonterm_index.at(child->name);
             pad(out, indent);
-            out << "burg_reduce(BURG_NODE_CHILD(node, " << idx << "), "
+            out << sym_prefix() << "burg_reduce(BURG_NODE_CHILD(node, " << idx << "), "
                 << "state->children[" << idx << "], " << nt_idx << ctx_arg() << ");\n";
         } else if (!child->is_leaf()) {
             for (size_t j = 0; j < child->children.size(); j++) {
@@ -906,7 +906,7 @@ void BurgBackend::emit_child_reductions(std::ostream& out,
                 if (gc->is_leaf() && !is_terminal(gc->name)) {
                     int64_t nt_idx = a_->nonterm_index.at(gc->name);
                     pad(out, indent);
-                    out << "burg_reduce(BURG_NODE_CHILD(BURG_NODE_CHILD(node, " << idx
+                    out << sym_prefix() << "burg_reduce(BURG_NODE_CHILD(BURG_NODE_CHILD(node, " << idx
                         << "), " << j << "), state->children[" << idx
                         << "]->children[" << j << "], " << nt_idx << ctx_arg() << ");\n";
                 }
@@ -921,7 +921,7 @@ void BurgBackend::emit_child_reductions(std::ostream& out,
     out << "for (int _ci = " << pat->children.size()
         << "; _ci < state->child_count; _ci++) {\n";
     pad(out, indent + 1);
-    out << "burg_reduce(BURG_NODE_CHILD(node, _ci), "
+    out << sym_prefix() << "burg_reduce(BURG_NODE_CHILD(node, _ci), "
         << "state->children[_ci], " << start_nt << ctx_arg() << ");\n";
     pad(out, indent);
     out << "}\n";
@@ -934,9 +934,9 @@ void BurgBackend::emit_reduce_body(std::ostream& out, int indent) {
     // failed. C++ uses exceptions, so this check is unnecessary there
     // (the throw unwinds the whole stack naturally).
     if (needs_error_polling()) {
-        pad(out, indent); out << "if (burg_has_error(" << ctx_solo() << ")) return;\n";
+        pad(out, indent); out << "if (" << sym_prefix() << "burg_has_error(" << ctx_solo() << ")) return;\n";
     }
-    pad(out, indent); out << "int rule = burg_rule(state, goalnt);\n";
+    pad(out, indent); out << "int rule = " << sym_prefix() << "burg_rule(state, goalnt);\n";
     pad(out, indent); out << "switch (rule) {\n";
 
     for (auto* rule : a_->spec->rules) {
@@ -946,7 +946,7 @@ void BurgBackend::emit_reduce_body(std::ostream& out, int indent) {
         if (rule->pattern->is_leaf() && !is_terminal(rule->pattern->name)) {
             int64_t src_idx = a_->nonterm_index.at(rule->pattern->name);
             pad(out, indent + 1);
-            out << "burg_reduce(node, state, " << src_idx << ctx_arg() << ");\n";
+            out << sym_prefix() << "burg_reduce(node, state, " << src_idx << ctx_arg() << ");\n";
         } else {
             emit_child_reductions(out, rule->pattern, indent + 1);
         }
@@ -968,7 +968,7 @@ void BurgBackend::emit_reduce_body(std::ostream& out, int indent) {
     // modes.
     pad(out, indent); out << "default:\n";
     pad(out, indent + 1);
-    out << "burg_set_error(\"burg: no rule for goal nonterminal\", goalnt"
+    out << sym_prefix() << "burg_set_error(\"burg: no rule for goal nonterminal\", goalnt"
         << ctx_arg() << ");\n";
     pad(out, indent + 1); out << "break;\n";
     pad(out, indent); out << "}\n";
@@ -1006,7 +1006,7 @@ void BurgBackend::emit_rewrite_body(std::ostream& out, int indent) {
     int64_t start_idx = a_->nonterm_index.at(a_->start_nonterm);
 
     if (needs_error_polling()) {
-        pad(out, indent); out << "burg_clear_error(" << ctx_solo() << ");\n";
+        pad(out, indent); out << sym_prefix() << "burg_clear_error(" << ctx_solo() << ");\n";
     }
     pad(out, indent); out << "arena_reset(" << ctx_solo() << ");\n\n";
 
@@ -1014,14 +1014,14 @@ void BurgBackend::emit_rewrite_body(std::ostream& out, int indent) {
     pad(out, indent); out << "if (BURG_NODE_SUCC_COUNT(root) == 0) {\n";
     pad(out, indent + 1); out << state_type() << "* state = burg_label_tree(root" << ctx_arg() << ");\n";
     if (needs_error_polling()) {
-        pad(out, indent + 1); out << "if (burg_has_error(" << ctx_solo() << ")) return;\n";
+        pad(out, indent + 1); out << "if (" << sym_prefix() << "burg_has_error(" << ctx_solo() << ")) return;\n";
     }
     if (a_->has_actions) {
         pad(out, indent + 1); out << "if (state->rule[" << start_idx << "])\n";
-        pad(out, indent + 2); out << "burg_reduce(root, state, " << start_idx << ctx_arg() << ");\n";
+        pad(out, indent + 2); out << sym_prefix() << "burg_reduce(root, state, " << start_idx << ctx_arg() << ");\n";
         pad(out, indent + 1); out << "else\n";
         pad(out, indent + 2);
-        out << "burg_set_error(\"burg: start nonterminal has no rule at root\", "
+        out << sym_prefix() << "burg_set_error(\"burg: start nonterminal has no rule at root\", "
                "(int)BURG_NODE_OP(root)" << ctx_arg() << ");\n";
     }
     pad(out, indent + 1); out << "return;\n";
@@ -1046,10 +1046,10 @@ void BurgBackend::emit_rewrite_body(std::ostream& out, int indent) {
         pad(out, indent); out << "for (auto* n : rpo) {\n";
         pad(out, indent + 1); out << state_type() << "* s = burg_cache_lookup(BURG_NODE_ID(n)" << ctx_arg() << ");\n";
         pad(out, indent + 1); out << "if (s && s->rule[" << start_idx << "])\n";
-        pad(out, indent + 2); out << "burg_reduce(n, s, " << start_idx << ctx_arg() << ");\n";
+        pad(out, indent + 2); out << sym_prefix() << "burg_reduce(n, s, " << start_idx << ctx_arg() << ");\n";
         pad(out, indent + 1); out << "else\n";
         pad(out, indent + 2);
-        out << "burg_set_error(\"burg: start nonterminal does not cover graph node\", "
+        out << sym_prefix() << "burg_set_error(\"burg: start nonterminal does not cover graph node\", "
                "(int)BURG_NODE_OP(n)" << ctx_arg() << ");\n";
         pad(out, indent); out << "}\n";
     }

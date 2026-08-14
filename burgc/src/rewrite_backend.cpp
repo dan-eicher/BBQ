@@ -16,9 +16,15 @@
 
 namespace {
 
+// The C variable a binder is bound to. PREFIXED, not the bare name: the
+// matcher's own scaffolding (`c` the class iterator, `g` the graph,
+// `changed`, the `nK`/`bK` temporaries) lives in the same scopes, and a
+// binder named `$c` bound to a bare `c` shadowed the iterator inside its
+// own initializer — a matcher that compiled uninitialized. The rule
+// author's namespace and the emitter's must not share spelling.
+std::string binder_var(const std::string& name) { return "bv_" + name; }
+
 // Substitute `$name` with the C variable holding that binder's class.
-// `$name` names a binder, which the matcher bound to an identically
-// named C variable, so substitution is just dropping the sigil.
 //
 // `$$` names the class the rule MATCHED. A guard often has to compare
 // the replacement against the thing being replaced rather than against
@@ -38,10 +44,12 @@ std::string subst_binders(const std::string& src, const std::string& root) {
         if (src[i] == '$' && i + 1 < src.size() &&
             (isalpha((unsigned char)src[i + 1]) || src[i + 1] == '_')) {
             i++;
+            std::string name;
             while (i < src.size() &&
                    (isalnum((unsigned char)src[i]) || src[i] == '_'))
-                out += src[i++];
+                name += src[i++];
             i--;
+            out += binder_var(name);
         } else {
             out += src[i];
         }
@@ -71,10 +79,11 @@ int emit_match(std::ostream& o, const burg_ast::RewritePat* p,
     // every iteration and indented as though it were not nested.
     std::vector<std::string> kid_names;
     for (size_t k = 0; k < p->children.size(); k++) {
-        // A binder child takes the kid's own name, so the body reads the
-        // class directly; a nested pattern gets a temporary to descend into.
+        // A binder child takes the kid's PREFIXED name, so the body reads
+        // the class directly; a nested pattern gets a temporary to descend
+        // into.
         const burg_ast::RewritePat* c = p->children[k];
-        std::string kid = c->is_binder ? c->name
+        std::string kid = c->is_binder ? binder_var(c->name)
                                        : ("k" + std::to_string(tmp++));
         kid_names.push_back(kid);
         o << ind << "    eg_id " << kid << " = eg_class_node_kid(g, " << cls
@@ -100,7 +109,7 @@ std::string emit_build(std::ostream& o, const burg_ast::RewriteTmpl* t,
     /* A binder names the C variable the matcher bound; `$$` names the
      * class the rule matched, which is the loop's own variable. */
     if (t->kind == burg_ast::RewriteTmpl::Binder)
-        return t->name == "$" ? std::string("c") : t->name;
+        return t->name == "$" ? std::string("c") : binder_var(t->name);
 
     std::vector<std::string> kids;
     for (auto* c : t->children)

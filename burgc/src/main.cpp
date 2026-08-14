@@ -104,6 +104,7 @@ int main(int argc, char** argv) {
     acfg.emit_coverage_warnings = coverage;
     acfg.skip_dead_rule_analysis = !coverage;
     acfg.asdl_strict = asdl_strict;
+    acfg.rewrite_only = rewrite_mode;
 
     AsdlSchema schema;
     if (!asdl_file.empty()) {
@@ -148,7 +149,12 @@ int main(int argc, char** argv) {
     // the spec's terminals and nothing else, so it does not go through a
     // BurgBackend.
     if (rewrite_mode) {
-        if (spec->rewrites.empty()) {
+        // A REWRITE section with ZERO rules is a valid input: the emitted
+        // round matches nothing and saturation is vacuous, which is exactly
+        // the harness a consumer proves its pipeline with before the first
+        // axiom lands. What this rejects is a plain tiling file — no rules
+        // AND no ANALYSIS means there was no REWRITE section to emit.
+        if (spec->rewrites.empty() && spec->analyses.empty()) {
             fprintf(stderr, "error: --rewrite but the spec has no REWRITE section\n");
             return 1;
         }

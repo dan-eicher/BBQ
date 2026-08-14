@@ -268,10 +268,10 @@ bool BurgGenerator::analyze(burg_ast::Spec* spec) {
                               "' is not a nonterminal defined by any rule");
     }
 
-    if (a.nonterms.empty())
+    if (a.nonterms.empty() && !completeness_cfg_.rewrite_only)
         errors_.push_back("no rules defined");
 
-    if (errors_.empty()) {
+    if (errors_.empty() && !completeness_cfg_.rewrite_only) {
         check_coverage();
         AnalysisReport report = run_completeness_analysis(a, completeness_cfg_);
         for (auto& e : report.errors)   errors_.push_back(e);

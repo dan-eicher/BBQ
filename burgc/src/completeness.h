@@ -84,6 +84,14 @@ struct AnalysisConfig {
     // gate.
     bool skip_dead_rule_analysis = true;
 
+    // --rewrite: the invocation consumes the REWRITE section and emits no
+    // tiling matcher, so a file with no tiling rules is a complete input —
+    // "no rules defined" and the tiling analyses (coverage, completeness)
+    // are about the matcher this run does not produce. A REWRITE-carrying
+    // file used for BOTH halves runs twice, and its tiling invocation still
+    // gets the full validation.
+    bool rewrite_only = false;
+
     // Optional ASDL schema. When present and a TERM's pattern arity
     // matches its constructor's node-field count, the position-demand
     // filter uses the constructor's node-typed field types; otherwise

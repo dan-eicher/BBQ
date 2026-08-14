@@ -507,10 +507,21 @@ bool VmEmitter::emits_variant(const Opcode* op, int state) const {
     // takes the all-memory form (5 + 4) — where reading the register and pushing
     // inline is 3.
     if (!op->stack_out.empty() && !results_cached(op, state) && left > 0) return false;
-    for (size_t k = 0; k < op->stack_in.size(); k++)
-        if (operand_slot(op, (int)k, state) >= 0 &&
-            (!cacheable(op->stack_in[k]->ty) || op->stack_in[k]->count.has_value()))
-            return false;
+    for (size_t k = 0; k < op->stack_in.size(); k++) {
+        if (operand_slot(op, (int)k, state) < 0) continue;
+        const StackParam* si = op->stack_in[k];
+        if (si->count.has_value()) return false;
+        // An `addr` operand's VALUE is an i32 or i64 — one slot at either width,
+        // and both resolutions are cacheable classes — so the declared Addr rides
+        // a slot exactly like the value it resolves to. Gating on the DECLARED
+        // type here was the family refusing every load and store in the ISA a
+        // register while the grammar, which resolves Addr per module, offered
+        // them cached rules: the resolved vocabulary is the one both ends of the
+        // pipeline must answer. Poly stays refused — a `word` can be a v128 (two
+        // slots) or a ref, and one stencil body per (op, state) cannot vary its
+        // width by instance.
+        if (si->ty != ValueType::TyAddr && !cacheable(si->ty)) return false;
+    }
     return true;
 }
 
@@ -684,14 +695,32 @@ void VmEmitter::emit_one_opcode(SemLowerer& low, const Opcode* op, int state, in
             // updated in instruction implementations that can access all stack
             // items in registers"). The slot is an opaque word; the cast back to
             // the operand's own type is what names it.
-            jrow r = low.jtype(si->ty);
             int sl = operand_slot(op, k, state);
-            if (slot_width(si->ty) == 2)      // a v128 spans this slot and the next
+            if (si->ty == ValueType::TyAddr) {
+                /* §2.3.11: same width selection as the GPOP_ADDR path below — the
+                 * DECLARED addrtype of the addressed entry, read from the
+                 * signature's `addr(expr)` source. The slot's producer PUT the
+                 * value zero-extended at its own class width, so reading either
+                 * width back off the carrier is exact. */
+                if (!si->at_src) {
+                    fprintf(stderr, "opgen: %s: `addr` operand '%s' has no addrtype source — write "
+                                    "`addr(<is64-expr>) %s` (WASM §2.3.11: addrtype is declared "
+                                    "by the memtype/tabletype, not carried by the value)\n",
+                            op->mnemonic, si->name, si->name);
+                    exit(1);
+                }
+                fprintf(o, "    CACHE_GET_ADDR(%s, CACHE_R%d, ", si->name, sl);
+                low.lower_expr(*si->at_src, op, ValueType::TyI32);
+                fputs(");\n", o);
+            } else if (slot_width(si->ty) == 2) { // a v128 spans this slot and the next
+                jrow r = low.jtype(si->ty);
                 fprintf(o, "    %s %s = CACHE_GET_V128(CACHE_R%d, CACHE_R%d);\n",
                         r.scalar, si->name, sl, sl + 1);
-            else
+            } else {
+                jrow r = low.jtype(si->ty);
                 fprintf(o, "    %s %s = CACHE_GET_%s(CACHE_R%d);\n",
                         r.scalar, si->name, SemLowerer::slot_class(si->ty), sl);
+            }
         } else if (stack_in_live(op, k)) {
             if (si->ty == ValueType::TyAddr) {
                 /* §2.3.11: the width is the DECLARED addrtype of the module entry this operand
@@ -948,6 +977,8 @@ void VmEmitter::emit_stencil_c(FILE* o) {
         // it. So this moves the SLOT: its low 8 bytes, which is the whole value
         // for every class a rule can put in a register (v128 and ref have no
         // *_reg0 rule, so they never reach this).
+        fputs("#define CACHE_GET_ADDR(name, sl, is64) u8 name; do { if (is64)"
+              " name = (u8)(uintptr_t)(sl); else name = (u8)(u4)(uintptr_t)(sl); } while (0)\n", o);
         fputs("#define CACHE_GET_WORD(sl) (__extension__({ slot_t _s;"
               " _s.l = (s8)(uintptr_t)(sl); _s; }))\n"
               "#define CACHE_PUT_WORD(x)  ((cache_slot_t)(uintptr_t)(x).l)\n"

@@ -419,13 +419,18 @@ void SigEmitter::emit_sigtab_h(FILE* o) {
     fprintf(o,
         "/* One signature. `final` ones are the burg terminals and the %s_ttree.asdl\n"
         " * constructors; the rest are the declared form an opcode carries, and\n"
-        " * `resolves_to` lists every terminal it can become. */\n"
+        " * `resolves_to` lists every terminal it can become. `pw` marks a POLY slot\n"
+        " * resolved to v128 (SigKind::PolyWide): the value is TWO slots wide where\n"
+        " * the declaring opcode's stencil family moves one, so a consumer matching\n"
+        " * per-opcode forms against per-signature rules reads this to keep the two\n"
+        " * width vocabularies apart. */\n"
         "typedef struct {\n"
         "    const char*     name;\n"
         "    uint8_t         nparams;    /* signature slots, JSC_STK included */\n"
         "    uint8_t         nkids;      /* burg arity: the slots that are tree children */\n"
         "    uint8_t         nresults;\n"
         "    uint8_t         final;\n"
+        "    uint8_t         pw;\n"
         "    uint8_t         params[%s_SIG_MAX_PARAMS];\n"
         "    uint8_t         results[%s_SIG_MAX_RESULTS];\n"
         "    uint16_t        nresolve;\n"
@@ -450,8 +455,9 @@ void SigEmitter::emit_sigtab_h(FILE* o) {
             prefix_.c_str(), prefix_.c_str(), uprefix_.c_str());
     for (size_t i = 0; i < sigs_.size(); i++) {
         const Sig& s = sigs_[i];
-        fprintf(o, "    [%zu] = { \"%s\", %zu, %d, %zu, %d, {", i, s.name().c_str(),
-                s.params.size(), s.nkids(), s.results.size(), s.is_final() ? 1 : 0);
+        fprintf(o, "    [%zu] = { \"%s\", %zu, %d, %zu, %d, %d, {", i, s.name().c_str(),
+                s.params.size(), s.nkids(), s.results.size(), s.is_final() ? 1 : 0,
+                s.kind == SigKind::PolyWide ? 1 : 0);
         for (auto c : s.params) fprintf(o, " %s,", kClassEnum[(unsigned)c]);
         fputs(" }, {", o);
         for (auto c : s.results) fprintf(o, " %s,", kClassEnum[(unsigned)c]);

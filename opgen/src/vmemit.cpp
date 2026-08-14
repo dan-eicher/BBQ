@@ -384,10 +384,11 @@ int VmEmitter::operand_slot(const Opcode* op, int k, int state) {
 // (§2.3), since a state is a COUNT of cached items and says the top ones are the
 // cached ones. Three ways to fail it, and each is a real opcode:
 //   - the result would not fit alongside what survived (Ertl's OVERFLOW),
-//   - it is `word`/`any`, which has no storage class until a tile resolves one,
-//     so no stencil can know which CACHE_PUT_ to use — `local.get` and every
-//     other polymorphic mover lands here,
-//   - it is variadic, and already sits at the frame base where a callee left it.
+//   - it is variadic, and already sits at the frame base where a callee left it,
+//   - its class is one no slot holds (ref) — but `word`/`any` pass: CACHE_PUT
+//     needs no class because a scalar rides `bits` whole, and the instances
+//     wider than that (v128) or unslottable (ref) never reduce at a
+//     cached-result rule (the grammar's pw fence / jav_class_cacheable).
 // This is the ONE place the question is answered, because the answer is what the
 // tiling grammar prices and what the stitcher has to stamp against.
 // Slots, not items: everything below counts capacity, and a v128 spends two of it.
@@ -437,11 +438,14 @@ bool VmEmitter::results_cached(const Opcode* op, int state) const {
 // and re-tagging is what that stencil is for.
 //
 // Either carrier can still be wider than a register — slot_t's union includes
-// v128 — but the grammar decides that, not this: v128 and ref are absent from
-// jav_class_cacheable, so no `*_reg0` rule exists for them and a tile that
-// resolves one reduces at `*_mem`, which asks for the plain stencil. The cached
-// form therefore only ever runs for the four classes that fit, where `bits` is
-// the whole value and `hi` is dead.
+// v128 — but the grammar decides that, not this. Ref is absent from
+// jav_class_cacheable, so no `ref_reg*` location exists at all; a DECLARED v128
+// is two slots on both sides of the pipeline and caches whole; and a POLY slot
+// that RESOLVED to v128 is fenced by the terminal's `pw` flag — its two-register
+// resolution does not match the one declared word this family moves, so
+// gen_tile_burg refuses it any rule whose state window touches the slot. The
+// cached form therefore only ever runs for the four scalar classes, where
+// `bits` is the whole value and `hi` is dead.
 bool VmEmitter::poly_slot(ValueType t) {
     return t == ValueType::TyWord || t == ValueType::TyAny;
 }
@@ -517,10 +521,19 @@ bool VmEmitter::emits_variant(const Opcode* op, int state) const {
         // type here was the family refusing every load and store in the ISA a
         // register while the grammar, which resolves Addr per module, offered
         // them cached rules: the resolved vocabulary is the one both ends of the
-        // pipeline must answer. Poly stays refused — a `word` can be a v128 (two
-        // slots) or a ref, and one stencil body per (op, state) cannot vary its
-        // width by instance.
-        if (si->ty != ValueType::TyAddr && !cacheable(si->ty)) return false;
+        // pipeline must answer.
+        //
+        // A `word` operand is admitted on the same argument with the fence moved
+        // to the grammar: the instances that DON'T fit one register — v128 (two
+        // slots) and ref (no register form at all) — never reduce at a
+        // cached-operand rule, because gen_tile_burg refuses any state whose
+        // window touches a pw terminal's v128 slot or a non-cacheable class. So
+        // every instance that can reach this body is one of the four scalars,
+        // for which one register is the whole value. `any` stays refused: its
+        // instances are refs, which the same fence keeps in memory, so a variant
+        // here would be code no rule ever stamps.
+        if (si->ty != ValueType::TyAddr && si->ty != ValueType::TyWord
+            && !cacheable(si->ty)) return false;
     }
     return true;
 }
@@ -716,6 +729,21 @@ void VmEmitter::emit_one_opcode(SemLowerer& low, const Opcode* op, int state, in
                 jrow r = low.jtype(si->ty);
                 fprintf(o, "    %s %s = CACHE_GET_V128(CACHE_R%d, CACHE_R%d);\n",
                         r.scalar, si->name, sl, sl + 1);
+            } else if (si->ty == ValueType::TyWord) {
+                /* A cached `word` is one of the four scalar classes — the
+                 * grammar's fence (jav_sig_t.pw + jav_class_cacheable) keeps
+                 * v128- and ref-resolved instances out of cached-operand rules
+                 * — so one register holds the whole value. The tag GPOP_WORD
+                 * carries beside it is the one thing a register does not: a
+                 * scalar's tag gates nothing (tags exist for the GC's ref
+                 * detection, and refs never reach a slot), so the rebuilt value
+                 * takes tag 0 exactly as a zero-initialised local does, and the
+                 * class-specific spill re-tags anything returning to memory.
+                 * `slot_t` verbatim: it is GPOP_WORD's own declared type — the
+                 * word carrier is the slot, not jtype's scalar row. */
+                fprintf(o, "    slot_t %s = CACHE_GET_WORD(CACHE_R%d); u1 %s_wt = 0;"
+                           " (void)%s; (void)%s_wt;\n",
+                        si->name, sl, si->name, si->name, si->name);
             } else {
                 jrow r = low.jtype(si->ty);
                 fprintf(o, "    %s %s = CACHE_GET_%s(CACHE_R%d);\n",

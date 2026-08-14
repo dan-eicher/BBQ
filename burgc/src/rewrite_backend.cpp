@@ -235,12 +235,29 @@ void emit_rewriter(std::ostream& o, const BurgAnalysis& a,
              "}\n\n";
     }
 
+    o << "/* Which rules did work, by name — a saturating pass that reports\n"
+         " * only \"changed\" hides which axiom earned its place, and a rule\n"
+         " * that never fires on any corpus is dead weight nobody can see.\n"
+         " * A fire is one round in which the rule added information. */\n"
+         "enum { " << name << "_NRULES = " << a.spec->rewrites.size() << " };\n"
+         "const char* const " << name << "_rule_names[" << name << "_NRULES"
+      << " ? " << name << "_NRULES : 1] = {\n";
+    for (auto* rw : a.spec->rewrites)
+        o << "    \"" << rw->name << "\",\n";
+    o << "};\n"
+         "unsigned long long " << name << "_rule_fires[" << name << "_NRULES"
+      << " ? " << name << "_NRULES : 1];\n\n";
+
     o << "/* One pass over the rule set. */\n"
          "static bool " << name << "_round(egraph* g, void* user) {\n"
          "    (void)user;\n"
          "    bool changed = false;\n";
-    for (auto* rw : a.spec->rewrites)
-        o << "    if (rw_" << rw->name << "(g)) changed = true;\n";
+    {
+        size_t ri = 0;
+        for (auto* rw : a.spec->rewrites)
+            o << "    if (rw_" << rw->name << "(g)) { changed = true; "
+              << name << "_rule_fires[" << ri++ << "]++; }\n";
+    }
     o << "    return changed;\n"
          "}\n\n";
 

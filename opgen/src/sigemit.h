@@ -151,6 +151,19 @@ private:
     std::vector<int>    carried_ids_;  // class -> its canonical-state leaf
 
     void build();
+    // The schema's constructor declaration order: finals bucketed by RESULT class
+    // (the sum each constructor belongs to), ascending id within a bucket. ONE
+    // function, consumed by the renumbering below and by emit_ttree_asdl, which is
+    // what makes "generated tag value == signature id" a construction rather than
+    // a coincidence two emitters happen to share.
+    std::vector<int> schema_final_order() const;
+    // Renumber so final ids ARE the schema order, 0..n-1, declared-only forms
+    // after. The ids are the coupling point — the burg TERMs, the node's `sig`
+    // field and the tag enum a template emits from the schema all carry them —
+    // and an enum generated from the schema is dense in declaration order with no
+    // way to say otherwise. So the ids move to the schema, not the schema to the
+    // ids, and every downstream consumer reads regenerated tables.
+    void renumber_to_schema_order();
     int  intern(const Sig& s);
     OpInfo describe(const Opcode* op) const;
     void resolve(OpInfo& oi);

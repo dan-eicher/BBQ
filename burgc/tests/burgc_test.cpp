@@ -1889,8 +1889,10 @@ TEST(BurgRewriteEmit, GuardCanNameTheMatchedClass) {
         "RULES r: Add(r, r) = 1;");
     ASSERT_FALSE(code.empty());
     // `$$` becomes the loop's class variable, and `$x` its binder — the
-    // guard reaches both without either being described to it.
-    EXPECT_NE(code.find("same_repr(g, c, x)"), std::string::npos) << code;
+    // guard reaches both without either being described to it. Binders are
+    // bv_-prefixed in the emitted C so a binder named like the matcher's own
+    // iterator cannot shadow it (the capture bug the prefix fixed).
+    EXPECT_NE(code.find("same_repr(g, c, bv_x)"), std::string::npos) << code;
     // The sigil never survives into the emitted C.
     EXPECT_EQ(code.find("$"), std::string::npos) << code;
 }

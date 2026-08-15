@@ -448,15 +448,19 @@ static long long node_cost(egraph* g, const ext_state* st,
     return c;
 }
 
-bool eg_extract_excluding(egraph* g, eg_id root, eg_cost_fn cost, void* user,
-                          int excl_op, int64_t excl_data,
-                          eg_extract_result* out) {
-    memset(out, 0, sizeof *out);
+bool eg_extract_prepare(egraph* g, eg_cost_fn cost, void* user,
+                        int excl_op, int64_t excl_data,
+                        eg_extract_plan* plan) {
     size_t nc = (size_t)bbq_vec_len(g->classes);
+    plan->nclasses = (int)nc;
+    plan->cost = (long long*)malloc((nc ? nc : 1) * sizeof *plan->cost);
+    plan->best = (int*)malloc((nc ? nc : 1) * sizeof *plan->best);
+    if (!plan->cost || !plan->best) { eg_extract_plan_free(plan); return false; }
+    for (size_t i = 0; i < nc; i++) { plan->cost[i] = -1; plan->best[i] = -1; }
+
     ext_state st;
-    st.cost = (long long*)malloc(nc * sizeof *st.cost);
-    st.best = (int*)malloc(nc * sizeof *st.best);
-    for (size_t i = 0; i < nc; i++) { st.cost[i] = -1; st.best[i] = -1; }
+    st.cost = plan->cost;
+    st.best = plan->best;
 
     bool improved = true;
     while (improved) {
@@ -478,9 +482,24 @@ bool eg_extract_excluding(egraph* g, eg_id root, eg_cost_fn cost, void* user,
             }
         }
     }
+    return true;
+}
+
+void eg_extract_plan_free(eg_extract_plan* plan) {
+    free(plan->cost); free(plan->best);
+    plan->cost = NULL; plan->best = NULL; plan->nclasses = 0;
+}
+
+bool eg_extract_from(egraph* g, const eg_extract_plan* plan, eg_id root,
+                     eg_extract_result* out) {
+    memset(out, 0, sizeof *out);
+    size_t nc = (size_t)plan->nclasses;
+    ext_state st;
+    st.cost = plan->cost;
+    st.best = plan->best;
 
     root = eg_find(g, root);
-    if (st.cost[root] < 0) { free(st.cost); free(st.best); return false; }
+    if (st.cost[root] < 0) return false;
 
     /* Size the output: one node per class on the chosen term. */
     int* memo = (int*)malloc(nc * sizeof *memo);
@@ -495,10 +514,12 @@ bool eg_extract_excluding(egraph* g, eg_id root, eg_cost_fn cost, void* user,
     out->kids    = (int*)malloc(((size_t)bbq_vec_len(g->kids) + 1) * sizeof(int));
 
     /* Emit children-first so every kid already has an index, filling the
-     * kid array as we go. */
+     * kid array as we go. The walk stack is a bbq_vec: the fixed 256-slot
+     * array it replaces overflowed silently on any term deeper than that,
+     * and a library never smashes its host's stack over input shape. */
     int nkids_total = 0;
-    int stack[256]; int sp = 0;
-    stack[sp++] = root;
+    eg_id* stack = NULL; int sp = 0;
+    bbq_vec_push(stack, root); sp = 1;
     /* iterative post-order over the chosen nodes */
     while (sp > 0) {
         eg_id c = eg_find(g, stack[sp - 1]);
@@ -507,7 +528,11 @@ bool eg_extract_excluding(egraph* g, eg_id root, eg_cost_fn cost, void* user,
         bool pending = false;
         for (int i = 0; i < n->nkids; i++) {
             eg_id kc = eg_find(g, node_kids(g, n)[i]);
-            if (memo[kc] < 0) { stack[sp++] = kc; pending = true; }
+            if (memo[kc] < 0) {
+                if (sp >= (int)bbq_vec_len(stack)) bbq_vec_push(stack, kc);
+                else stack[sp] = kc;
+                sp++; pending = true;
+            }
         }
         if (pending) continue;
         sp--;
@@ -522,8 +547,21 @@ bool eg_extract_excluding(egraph* g, eg_id root, eg_cost_fn cost, void* user,
     }
     out->root = memo[root];
 
-    free(memo); free(st.cost); free(st.best);
+    free(memo); bbq_vec_free(stack);
     return true;
+}
+
+bool eg_extract_excluding(egraph* g, eg_id root, eg_cost_fn cost, void* user,
+                          int excl_op, int64_t excl_data,
+                          eg_extract_result* out) {
+    eg_extract_plan plan;
+    if (!eg_extract_prepare(g, cost, user, excl_op, excl_data, &plan)) {
+        memset(out, 0, sizeof *out);
+        return false;
+    }
+    bool ok = eg_extract_from(g, &plan, root, out);
+    eg_extract_plan_free(&plan);
+    return ok;
 }
 
 bool eg_extract(egraph* g, eg_id root, eg_cost_fn cost, void* user,

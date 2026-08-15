@@ -358,7 +358,11 @@ TEST(OpgenEmit, StencilDeclaresANativeNamedOnlyByAVariadicCount) {
 TEST(OpgenEmit, HaltStencilStashesNothing) {
     std::string s = stencil(std::string(kI32).append(
         "add 0x10 (i32 a, i32 b -- i32 r)  (.  r = a + b;  .)\n").c_str());
-    HAS(s, "void STENCIL gen_st_halt(vm_t* vm) { (void)vm; }");
+    /* Every stencil shares the ONE musttail signature (CACHE_ARGS), halt
+     * included — a per-stencil signature is rejected by clang's musttail,
+     * which is the constraint that made the signature uniform. The claim
+     * this test holds is the body: empty but for silencing the parameter. */
+    HAS(s, "void STENCIL gen_st_halt(CACHE_ARGS) { (void)vm; }");
     // `result`/`result_type` were the BACKEND's field names in one consumer's vm_t —
     // a baked-in target identifier in a generator that promises to have none. The
     // results are the top of the frame stack, where the caller reads them.

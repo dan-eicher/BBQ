@@ -222,6 +222,31 @@ bool eg_extract_excluding(egraph* g, eg_id root,
                           int excl_op, int64_t excl_data,
                           eg_extract_result* out);
 
+/* The two halves of extraction, split for a caller with MANY roots in one
+ * graph. eg_extract runs a fixpoint DP over every class and then walks one
+ * root's chosen term; the DP is a function of the GRAPH and the cost model
+ * alone, so a per-root call recomputes an identical table per root —
+ * O(roots x classes) where O(classes) suffices. Prepare once after the
+ * last mutation, extract each root from the plan, free the plan.
+ *
+ * The plan is a SNAPSHOT: any mutation (eg_add, eg_merge, eg_rebuild)
+ * invalidates it, and extracting from a stale plan is the caller's bug.
+ * eg_extract_prepare returns false only when allocation fails.
+ * eg_extract_from returns false when the root's class has no finite-cost
+ * term under the plan (same meaning as eg_extract's false). */
+typedef struct {
+    long long* cost;    /* per class: cheapest term cost, -1 = none      */
+    int*       best;    /* per class: the chosen e-node index, -1 = none */
+    int        nclasses;
+} eg_extract_plan;
+
+bool eg_extract_prepare(egraph* g, eg_cost_fn cost, void* user,
+                        int excl_op, int64_t excl_data,
+                        eg_extract_plan* plan);
+bool eg_extract_from(egraph* g, const eg_extract_plan* plan, eg_id root,
+                     eg_extract_result* out);
+void eg_extract_plan_free(eg_extract_plan* plan);
+
 int  eg_extracted_op(const eg_extract_result* r, int node);
 void eg_extract_free(eg_extract_result* r);
 

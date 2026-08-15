@@ -44,6 +44,21 @@ static int op_body_refs_count(const Opcode* op, const char* name) {
     return 0;
 }
 
+// Does this opcode carry a `word` stack slot a tile can resolve to v128 —
+// i.e. does the poly-wide stencil family exist for it? A variadic group is
+// its own class (Stk) and an `addr` slot resolves i32/i64 only, so neither
+// counts; `any` instances are runtime-tagged and its v128 form crosses on
+// the memory stack, so it keeps the scalar family's fence.
+static bool op_has_pw_slot(const Opcode* op) {
+    for (auto* si : op->stack_in)
+        if (si->ty == ValueType::TyWord && !si->count.has_value() && !si->at_src.has_value())
+            return true;
+    for (auto* so : op->stack_out)
+        if (so->ty == ValueType::TyWord && !so->count.has_value())
+            return true;
+    return false;
+}
+
 static int n_fixed_operands(const Opcode* op) {
     int n = 0;
     for (auto* od : op->operands) {
@@ -359,24 +374,28 @@ bool VmEmitter::cacheable(ValueType t) {
 // The width has to be known HERE, at emission, because the register file is a
 // fixed shape in every stencil signature — musttail rejects a per-state parameter
 // list, which is the constraint that made the signature fixed in the first place.
-// A poly slot's width is a property of the tile, not of the opcode, so it cannot
-// be known here. The consequence, stated rather than discovered later: a
-// `local.get` resolving to v128 is never cached; it reduces at `v128_mem` like
-// any other class with no register form. An opcode whose slot classifies as V128
-// takes two — which is every SIMD opcode, the lane views included, because the
-// class is what the width is a property of.
+// A poly slot's width is a property of the tile, not of the opcode, so ONE
+// family cannot serve both answers — which is why there are two: the scalar
+// family prices a `word` at one slot, the poly-wide family (pw_) at two, and a
+// tile that resolved v128 selects the second. This function is the DECLARED
+// width; swidth() is the flavored one every emission-path question goes
+// through. An opcode whose slot classifies as V128 takes two in both families —
+// every SIMD opcode, the lane views included, because the class is what the
+// width is a property of.
 int VmEmitter::slot_width(ValueType t) {
     return sclass_width(SigEmitter::classify_final(t, "vmemit", "cache slot"));
 }
 
 // Where operand k sits, counted in SLOTS from the top: everything above it has
 // already spent its own width. Cached only if the whole value fits inside the
-// state — half a v128 in a register is not a value.
-int VmEmitter::operand_slot(const Opcode* op, int k, int state) {
+// state — half a v128 in a register is not a value. Widths go through
+// swidth(), so the poly-wide flavor prices a `word` at two here and
+// everywhere else with one switch.
+int VmEmitter::operand_slot(const Opcode* op, int k, int state) const {
     int a = (int)op->stack_in.size();
     int base = 0;
-    for (int j = a - 1; j > k; j--) base += slot_width(op->stack_in[j]->ty);
-    return (base + slot_width(op->stack_in[k]->ty) <= state) ? base : -1;
+    for (int j = a - 1; j > k; j--) base += swidth(op->stack_in[j]->ty);
+    return (base + swidth(op->stack_in[k]->ty) <= state) ? base : -1;
 }
 
 // Do this state's results ride the cache? All of them or none: a pushed result
@@ -394,12 +413,12 @@ int VmEmitter::operand_slot(const Opcode* op, int k, int state) {
 // Slots, not items: everything below counts capacity, and a v128 spends two of it.
 int VmEmitter::operand_slots(const Opcode* op) const {
     int n = 0;
-    for (auto* si : op->stack_in) n += slot_width(si->ty);
+    for (auto* si : op->stack_in) n += swidth(si->ty);
     return n;
 }
 int VmEmitter::result_slots(const Opcode* op) const {
     int n = 0;
-    for (auto* so : op->stack_out) n += slot_width(so->ty);
+    for (auto* so : op->stack_out) n += swidth(so->ty);
     return n;
 }
 
@@ -440,17 +459,19 @@ bool VmEmitter::results_cached(const Opcode* op, int state) const {
 // Either carrier can still be wider than a register — slot_t's union includes
 // v128 — but the grammar decides that, not this. Ref is absent from
 // jav_class_cacheable, so no `ref_reg*` location exists at all; a DECLARED v128
-// is two slots on both sides of the pipeline and caches whole; and a POLY slot
-// that RESOLVED to v128 is fenced by the terminal's `pw` flag — its two-register
-// resolution does not match the one declared word this family moves, so
-// gen_tile_burg refuses it any rule whose state window touches the slot. The
-// cached form therefore only ever runs for the four scalar classes, where
-// `bits` is the whole value and `hi` is dead.
+// is two slots on both sides of the pipeline and caches whole. A `word` that
+// RESOLVED to v128 is the poly-wide family's case: the grammar's `pw`
+// terminals name `__sK_pw` forms that move it as a pair, so the SCALAR family
+// never meets it — its rules and this family's are different terminals. An
+// `any` that resolved to v128 has no widened family at all (`hi` rides inside
+// the carrier), so the grammar's `aw` terminals keep it fenced to memory. The
+// scalar cached form therefore only ever runs for the four scalar classes,
+// where `bits` is the whole value and `hi` is dead.
 bool VmEmitter::poly_slot(ValueType t) {
     return t == ValueType::TyWord || t == ValueType::TyAny;
 }
 
-// D3s / §2.5: "The implementation of the same instruction in many states can be
+// §2.5: "The implementation of the same instruction in many states can be
 // the same." Two states emit the same BODY when they read the same operands from
 // the same slots, place their results the same way, and move the same survivors
 // — everything the state can change. An instruction that touches no register at
@@ -490,16 +511,17 @@ bool VmEmitter::emits_variant(const Opcode* op, int state) const {
     if (state < a) {
         int base = 0, boundary = (state == 0);
         for (int k = (int)op->stack_in.size() - 1; k >= 0 && !boundary; k--) {
-            base += slot_width(op->stack_in[k]->ty);
+            base += swidth(op->stack_in[k]->ty);
             if (base >= state) { boundary = (base == state); break; }
         }
         if (!boundary) return false;
     }
     // Anything still cached on exit means the results had to be cached too, by
     // the argument above; a state that cannot place them has no variant and the
-    // tiler reaches it through a transition instead (§2.5 / C5).
+    // tiler reaches it through a transition instead (§2.5).
     if (left + result_slots(op) > tier2_n_) return false;
-    // D7s. A result may go to MEMORY from a cached state, but only when nothing
+    // The memory-result placement. A result may go to MEMORY from a cached
+    // state, but only when nothing
     // survives beneath it: a pushed value above cached ones is not a state a
     // count of slots can name. With left == 0 the cached operands were all
     // consumed, so pushing leaves the cache EMPTY — state 0, and nameable.
@@ -523,15 +545,16 @@ bool VmEmitter::emits_variant(const Opcode* op, int state) const {
         // them cached rules: the resolved vocabulary is the one both ends of the
         // pipeline must answer.
         //
-        // A `word` operand is admitted on the same argument with the fence moved
-        // to the grammar: the instances that DON'T fit one register — v128 (two
-        // slots) and ref (no register form at all) — never reduce at a
-        // cached-operand rule, because gen_tile_burg refuses any state whose
-        // window touches a pw terminal's v128 slot or a non-cacheable class. So
-        // every instance that can reach this body is one of the four scalars,
-        // for which one register is the whole value. `any` stays refused: its
-        // instances are refs, which the same fence keeps in memory, so a variant
-        // here would be code no rule ever stamps.
+        // A `word` operand is admitted on the same argument, with the routing in
+        // the grammar: a scalar instance reduces at THIS family's rules (one
+        // register is the whole value), a v128 instance at the poly-wide
+        // family's (`pw` terminals name only `__sK_pw` forms), and a ref
+        // instance at no cached rule at all (jav_class_cacheable). So every
+        // instance that can reach this body is one of the four scalars. `any`
+        // stays refused: its scalar-and-ref traffic is ref-dominated and its
+        // v128 instances have no widened family (`hi` rides inside the
+        // carrier), so the grammar's `aw` terminals keep every wide one in
+        // memory and a variant here would be code no rule ever stamps.
         if (si->ty != ValueType::TyAddr && si->ty != ValueType::TyWord
             && !cacheable(si->ty)) return false;
     }
@@ -555,7 +578,7 @@ int VmEmitter::variant_fs(const Opcode* op, int state) const {
     return left + (results_cached(op, state) ? result_slots(op) : 0);
 }
 
-// D7s: worth a second stencil only when this state would otherwise cache the
+// The memory-result form: worth a second stencil only when this state would otherwise cache the
 // result, and only when nothing survives beneath it — with survivors, a pushed
 // result sits above cached values and the state has no name. At state 0 the
 // memory form already exists under the plain name, so there is nothing to add.
@@ -574,14 +597,14 @@ bool VmEmitter::has_mem_form(const Opcode* op, int state) const {
 void VmEmitter::emit_one_opcode(SemLowerer& low, const Opcode* op, int state, int mem_result) {
     FILE* o = low.out();
     int stencil = (low.mode() == Mode::Stencil);
-    // D7s: the same entry state has two result placements. `__sK` caches what it
+    // The same entry state has two result placements. `__sK` caches what it
     // produces; `__sKm` reads its operands from the same registers and pushes the
     // result inline, which is what an instruction wants when its consumer is far
     // enough away that the value belongs in memory anyway.
     int cache_res = !mem_result && results_cached(op, state);
     if (stencil && state >= 0) {
-        fprintf(o, "void STENCIL gen_st_%s__s%d%s(CACHE_ARGS) {\n", op->mnemonic, state,
-                mem_result ? "m" : "");
+        fprintf(o, "void STENCIL gen_st_%s__s%d%s%s(CACHE_ARGS) {\n", op->mnemonic, state,
+                pw_ ? "_pw" : "", mem_result ? "m" : "");
         fputs("    frame_t* f = &vm->frame; (void)f;\n", o);
         fputs("    STENCIL_TRAP_PC(_HOLE_pc);\n", o);
     } else if (stencil) {
@@ -725,15 +748,25 @@ void VmEmitter::emit_one_opcode(SemLowerer& low, const Opcode* op, int state, in
                 fprintf(o, "    CACHE_GET_ADDR(%s, CACHE_R%d, ", si->name, sl);
                 low.lower_expr(*si->at_src, op, ValueType::TyI32);
                 fputs(");\n", o);
-            } else if (slot_width(si->ty) == 2) { // a v128 spans this slot and the next
+            } else if (pw_ && si->ty == ValueType::TyWord) {
+                /* The poly-wide flavor: this instance's `word` IS a v128, two
+                 * registers wide, rebuilt into the slot's own vector half —
+                 * and its tag is knowable here, unlike the scalar flavor's:
+                 * this whole family exists only for the v128 instances. */
+                fprintf(o, "    slot_t %s; %s.v = CACHE_GET_V128(CACHE_R%d, CACHE_R%d);"
+                           " u1 %s_wt = T_V128; (void)%s; (void)%s_wt;\n",
+                        si->name, si->name, sl, sl + 1,
+                        si->name, si->name, si->name);
+            } else if (swidth(si->ty) == 2) { // a v128 spans this slot and the next
                 jrow r = low.jtype(si->ty);
                 fprintf(o, "    %s %s = CACHE_GET_V128(CACHE_R%d, CACHE_R%d);\n",
                         r.scalar, si->name, sl, sl + 1);
             } else if (si->ty == ValueType::TyWord) {
-                /* A cached `word` is one of the four scalar classes — the
-                 * grammar's fence (jav_sig_t.pw + jav_class_cacheable) keeps
-                 * v128- and ref-resolved instances out of cached-operand rules
-                 * — so one register holds the whole value. The tag GPOP_WORD
+                /* A cached `word` in the SCALAR family is one of the four
+                 * scalar classes — a v128 instance reduces at the poly-wide
+                 * family's own terminals and a ref at no cached rule at all
+                 * (jav_class_cacheable) — so one register holds the whole
+                 * value. The tag GPOP_WORD
                  * carries beside it is the one thing a register does not: a
                  * scalar's tag gates nothing (tags exist for the GC's ref
                  * detection, and refs never reach a slot), so the rebuilt value
@@ -784,7 +817,7 @@ void VmEmitter::emit_one_opcode(SemLowerer& low, const Opcode* op, int state, in
                 // A cached result carries no tag: it is not in memory, so nothing
                 // scans it, and the spill that puts it back re-tags it from the
                 // class the tile resolved. The body still ASSIGNS the tag (its
-                // source is unchanged, D1s), so say the value is deliberately
+                // source is unchanged), so say the value is deliberately
                 // unused rather than let -Wunused-but-set-variable fail the build.
                 if (cache_res)
                     fprintf(o, "    (void)%s_wt;\n", so->name);
@@ -867,7 +900,14 @@ void VmEmitter::emit_one_opcode(SemLowerer& low, const Opcode* op, int state, in
         // The result is the new top of stack, so in a cached state it lands in
         // slot 0 rather than being pushed. The values that SURVIVED this
         // instruction were moved into place above.
-        if (cache_res && slot_width(so->ty) == 2) {
+        if (cache_res && pw_ && so->ty == ValueType::TyWord) {
+            // The poly-wide flavor's result is a v128 riding a slot_t
+            // carrier, so the pair comes off its vector view.
+            fprintf(o, "    CACHE_R0 = CACHE_PUT_V128_LO(%s.v);\n", val);
+            fprintf(o, "    CACHE_R1 = CACHE_PUT_V128_HI(%s.v);\n", val);
+            continue;
+        }
+        if (cache_res && swidth(so->ty) == 2) {
             // A v128 is two registers wide, so it lands in the top TWO slots —
             // low half in reg0, high half in reg1, which is the same order the
             // memory stack holds it in and therefore the order the spill and fill
@@ -1114,10 +1154,26 @@ void VmEmitter::emit_stencil_c(FILE* o) {
         if (tier2_n_)
             for (int st = 0; st <= tier2_n_; st++) {
                 if ((st == 0 || emits_variant(op, st)) && same_state_as(op, st) < 0)
-                    emit_one_opcode(low, op, st);   // D3s: a duplicate body is not emitted
-                // …and D7s' second placement, where it exists.
+                    emit_one_opcode(low, op, st);   // a duplicate body is not emitted
+                // …and the memory-result placement, where it exists.
                 if (has_mem_form(op, st)) emit_one_opcode(low, op, st, 1);
             }
+        // The POLY-WIDE family (`__sK_pw`): the same states again with every
+        // `word` slot priced at TWO registers, for the instances whose value
+        // resolved to v128. The scalar family cannot serve them — its word
+        // moves one slot — and fencing them to memory rules made every SIMD
+        // value crossing a local/select/drop spill both halves. One flavor
+        // bit; every width answer routes through swidth(), so the two
+        // families disagree about nothing else.
+        if (tier2_n_ && op_has_pw_slot(op)) {
+            pw_ = 1;
+            for (int st = 0; st <= tier2_n_; st++) {
+                if ((st == 0 || emits_variant(op, st)) && same_state_as(op, st) < 0)
+                    emit_one_opcode(low, op, st);
+                if (has_mem_form(op, st)) emit_one_opcode(low, op, st, 1);
+            }
+            pw_ = 0;
+        }
     }
 
     // Machinery stencils — the machine boundary + control continuations, the
@@ -1367,7 +1423,7 @@ void VmEmitter::emit_jit_meta(FILE* o) {
             if (st == 0 && !tier2_n_) {
                 fputs(" STENCIL_GEN_ST_", o); put_upper(o, op->mnemonic);
             } else if (st == 0 || emits_variant(op, st)) {
-                // D3s: a state sharing an earlier state's body names that stencil.
+                // A state sharing an earlier state's body names that stencil.
                 int share = same_state_as(op, st);
                 fputs(st ? ", STENCIL_GEN_ST_" : " STENCIL_GEN_ST_", o);
                 put_upper(o, op->mnemonic);
@@ -1390,7 +1446,7 @@ void VmEmitter::emit_jit_meta(FILE* o) {
         " * Not derivable from pop/push: a `word` result moves the stack exactly\n"
         " * like an `i32` one and yet leaves nothing cached, having no class to\n"
         " * cache AS. Read this; do not recompute it. */\n");
-    // D7s' second placement, indexed the same way: the form that reads this
+    // The memory-result placement, indexed the same way: the form that reads this
     // state's cached operands and pushes its result inline, or -1 where the state
     // has only one placement. At state 0 that form is the PLAIN stencil, which
     // the meta already names, so the row is -1 there too.
@@ -1420,6 +1476,70 @@ void VmEmitter::emit_jit_meta(FILE* o) {
         fputs(" },\n", o);
     }
     fputs("};\n", o);
+
+    // The POLY-WIDE flavor, in step with the three tables above: the same rows
+    // priced with every `word` slot TWO registers wide, naming the `__sK_pw`
+    // family. A consumer reads these INSTEAD of the tables above when the tile
+    // resolved a pw signature (jav_sigtab[].pw) — same index, same entry-state
+    // axis, so the switch is which table, never which arithmetic. An opcode
+    // with no word slot has no pw signature to arrive through; its row is -1
+    // so a misrouted lookup declines instead of stamping stencil 0.
+    pw_ = 1;
+    fprintf(o, "static const int %s_variant_pw[][%s_TIER2_N + 1] = {\n",
+            prefix_.c_str(), uprefix_.c_str());
+    for (auto* op : mod_->opcodes) {
+        if (!is_emittable(op) || SemLowerer::stencil_excluded(op)) continue;
+        int pw_op = op_has_pw_slot(op);
+        fputs("    [STENCIL_GEN_ST_", o); put_upper(o, op->mnemonic); fputs("] = {", o);
+        for (int st = 0; st <= tier2_n_; st++) {
+            if (!pw_op) {
+                fputs(st ? ", -1" : " -1", o);
+            } else if (st == 0 && !tier2_n_) {
+                // No cache, so no flavors either: the plain stencil moves the
+                // memory stack's uniform slots and serves every instance.
+                fputs(" STENCIL_GEN_ST_", o); put_upper(o, op->mnemonic);
+            } else if (st == 0 || emits_variant(op, st)) {
+                int share = same_state_as(op, st);
+                fputs(st ? ", STENCIL_GEN_ST_" : " STENCIL_GEN_ST_", o);
+                put_upper(o, op->mnemonic);
+                fprintf(o, "__S%d_PW", share >= 0 ? share : st);
+            } else {
+                fputs(", -1", o);
+            }
+        }
+        fputs(" },\n", o);
+    }
+    fputs("};\n", o);
+
+    fprintf(o, "static const int %s_variant_pw_m[][%s_TIER2_N + 1] = {\n",
+            prefix_.c_str(), uprefix_.c_str());
+    for (auto* op : mod_->opcodes) {
+        if (!is_emittable(op) || SemLowerer::stencil_excluded(op)) continue;
+        int pw_op = op_has_pw_slot(op);
+        fputs("    [STENCIL_GEN_ST_", o); put_upper(o, op->mnemonic); fputs("] = {", o);
+        for (int st = 0; st <= tier2_n_; st++) {
+            if (pw_op && has_mem_form(op, st)) {
+                fputs(st ? ", STENCIL_GEN_ST_" : " STENCIL_GEN_ST_", o);
+                put_upper(o, op->mnemonic);
+                fprintf(o, "__S%d_PWM", st);
+            } else fputs(st ? ", -1" : " -1", o);
+        }
+        fputs(" },\n", o);
+    }
+    fputs("};\n", o);
+
+    fprintf(o, "static const int %s_variant_pw_fs[][%s_TIER2_N + 1] = {\n",
+            prefix_.c_str(), uprefix_.c_str());
+    for (auto* op : mod_->opcodes) {
+        if (!is_emittable(op) || SemLowerer::stencil_excluded(op)) continue;
+        int pw_op = op_has_pw_slot(op);
+        fputs("    [STENCIL_GEN_ST_", o); put_upper(o, op->mnemonic); fputs("] = {", o);
+        for (int st = 0; st <= tier2_n_; st++)
+            fprintf(o, "%s %d", st ? "," : "", pw_op ? variant_fs(op, st) : -1);
+        fputs(" },\n", o);
+    }
+    fputs("};\n", o);
+    pw_ = 0;
 
     // The transitions, per storage class and slot. A chain rule in the tiling
     // grammar is costed from these, and the stitcher stamps one when two adjacent

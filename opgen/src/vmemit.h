@@ -52,9 +52,18 @@ private:
     // per-state signature is rejected outright by clang. The state is therefore
     // which slots are LIVE, which the tiler tracks; the signature never varies.
     int  cache_slots() const { return tier2_n_; }
+    // The POLY-WIDE flavor switch: while set, a `word` slot is priced and
+    // moved as TWO register slots — the second stencil family (`__sK_pw`)
+    // for the instances whose value is a v128. One emitter object, one
+    // flavor at a time; every slot-arithmetic helper below reads it through
+    // swidth(), so the two families cannot disagree about a width.
+    int pw_ = 0;
+    int swidth(ValueType t) const {
+        return (pw_ && t == ValueType::TyWord) ? 2 : slot_width(t);
+    }
     // Is operand k (counted from the bottom of this instruction's operands) in a
     // register in this state, and if so which one?
-    static int operand_slot(const Opcode* op, int k, int state);
+    int operand_slot(const Opcode* op, int k, int state) const;
     // A class that never enters a slot: a managed reference belongs on the stack,
     // where the collector expects to find it and to be able to relocate it.
     static bool cacheable(ValueType t);

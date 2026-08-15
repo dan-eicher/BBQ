@@ -88,9 +88,17 @@ enum class SigKind : unsigned char {
 // the declared form an opcode carries and the resolution list it expands to.
 struct Sig {
     SigKind kind = SigKind::Op;
+    // An `any` slot that resolved to v128 — the OTHER wide resolution, and a
+    // separate identity axis because it can co-occur with PolyWide (an opcode
+    // with both a `word` and an `any` slot). PolyWide slots are served by the
+    // poly-wide stencil family; `aw` slots are not — the any_t carrier moves
+    // its second half in `hi` wherever the value goes, one slot at every
+    // width, so the consumer FENCES them from the register file instead.
+    bool aw = false;
     std::vector<SClass> params, results;
     bool operator<(const Sig& o) const {
         if (kind != o.kind) return kind < o.kind;
+        if (aw != o.aw) return aw < o.aw;
         if (params != o.params) return params < o.params;
         return results < o.results;
     }

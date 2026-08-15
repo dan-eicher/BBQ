@@ -51,8 +51,12 @@ std::string Sig::name() const {
     if (results.empty()) s += "_void";
     for (auto c : results) { s += '_'; s += cname(c); }
     /* A polymorphic slot that resolved to v128 is not the same terminal as a
-     * declared one — see SigKind::PolyWide. */
+     * declared one — see SigKind::PolyWide — and a `word`'s wide resolution is
+     * not the same terminal as an `any`'s: the pw stencil family serves one and
+     * the fence keeps the other in memory, so a shape they shared would hand
+     * one family's rules to the other's movement. */
     if (kind == SigKind::PolyWide) s += "_pw";
+    if (aw) s += "_aw";
     return s;
 }
 
@@ -298,12 +302,34 @@ void SigEmitter::resolve(OpInfo& oi) {
             for (size_t i = 0; i < s.results.size(); i++)
                 if (s.results[i] == SClass::Poly)
                     s.results[i] = pick[oi.poly_group[nin + i]];
-            /* A POLY group that landed on V128 makes this a DIFFERENT terminal
-             * from the identically-classed declared signature: the opcode is
-             * `word` and moves one slot, the class is two slots wide, and no
-             * single rule can be right for both. See SigKind::PolyWide. */
-            for (int g = 0; g < oi.npoly_groups; g++)
-                if (pick[g] == SClass::V128) { s.kind = SigKind::PolyWide; break; }
+            /* A poly slot that landed on V128 makes this a DIFFERENT terminal
+             * from the identically-classed declared signature: the opcode
+             * moves one slot there, the class is two slots wide, and no single
+             * rule can be right for both. PER SLOT, and split by which
+             * carrier: a `word` slot's wide resolution raises PolyWide — the
+             * `__sK_pw` stencil flavor widens exactly the word slots, so that
+             * family serves it — while an `any` slot's raises `aw`, which no
+             * flavor serves (the any_t carrier moves its second half in `hi`,
+             * one slot at every width) and the grammar fences instead. Both
+             * are identity: drop's (v128)→() and throw_ref's are different
+             * terminals, or one family's rules would price the other's moves. */
+            auto wide = [&](const std::vector<SClass>& decl, size_t i, size_t gbase,
+                            const std::vector<StackParam*>& sps, ValueType which) {
+                return decl[i] == SClass::Poly && sps[i]->ty == which
+                       && pick[(size_t)oi.poly_group[gbase + i]] == SClass::V128;
+            };
+            for (size_t i = 0; i < oi.decl.params.size(); i++) {
+                if (wide(oi.decl.params, i, 0, oi.op->stack_in, ValueType::TyWord))
+                    s.kind = SigKind::PolyWide;
+                if (wide(oi.decl.params, i, 0, oi.op->stack_in, ValueType::TyAny))
+                    s.aw = true;
+            }
+            for (size_t i = 0; i < oi.decl.results.size(); i++) {
+                if (wide(oi.decl.results, i, nin, oi.op->stack_out, ValueType::TyWord))
+                    s.kind = SigKind::PolyWide;
+                if (wide(oi.decl.results, i, nin, oi.op->stack_out, ValueType::TyAny))
+                    s.aw = true;
+            }
             got.insert(intern(s));
         }
     }
@@ -419,11 +445,13 @@ void SigEmitter::emit_sigtab_h(FILE* o) {
     fprintf(o,
         "/* One signature. `final` ones are the burg terminals and the %s_ttree.asdl\n"
         " * constructors; the rest are the declared form an opcode carries, and\n"
-        " * `resolves_to` lists every terminal it can become. `pw` marks a POLY slot\n"
+        " * `resolves_to` lists every terminal it can become. `pw` marks a WORD slot\n"
         " * resolved to v128 (SigKind::PolyWide): the value is TWO slots wide where\n"
-        " * the declaring opcode's stencil family moves one, so a consumer matching\n"
-        " * per-opcode forms against per-signature rules reads this to keep the two\n"
-        " * width vocabularies apart. */\n"
+        " * the declaring opcode's plain stencil family moves one, and the poly-wide\n"
+        " * family (`__sK_pw`) is the one that moves it two — a consumer selects\n"
+        " * variant tables by this bit. `aw` marks an ANY slot resolved to v128: no\n"
+        " * flavor widens it (the any_t carrier moves its second half in `hi`, one\n"
+        " * slot at every width), so a consumer FENCES it from the register file. */\n"
         "typedef struct {\n"
         "    const char*     name;\n"
         "    uint8_t         nparams;    /* signature slots, JSC_STK included */\n"
@@ -431,6 +459,7 @@ void SigEmitter::emit_sigtab_h(FILE* o) {
         "    uint8_t         nresults;\n"
         "    uint8_t         final;\n"
         "    uint8_t         pw;\n"
+        "    uint8_t         aw;\n"
         "    uint8_t         params[%s_SIG_MAX_PARAMS];\n"
         "    uint8_t         results[%s_SIG_MAX_RESULTS];\n"
         "    uint16_t        nresolve;\n"
@@ -455,9 +484,9 @@ void SigEmitter::emit_sigtab_h(FILE* o) {
             prefix_.c_str(), prefix_.c_str(), uprefix_.c_str());
     for (size_t i = 0; i < sigs_.size(); i++) {
         const Sig& s = sigs_[i];
-        fprintf(o, "    [%zu] = { \"%s\", %zu, %d, %zu, %d, %d, {", i, s.name().c_str(),
+        fprintf(o, "    [%zu] = { \"%s\", %zu, %d, %zu, %d, %d, %d, {", i, s.name().c_str(),
                 s.params.size(), s.nkids(), s.results.size(), s.is_final() ? 1 : 0,
-                s.kind == SigKind::PolyWide ? 1 : 0);
+                s.kind == SigKind::PolyWide ? 1 : 0, s.aw ? 1 : 0);
         for (auto c : s.params) fprintf(o, " %s,", kClassEnum[(unsigned)c]);
         fputs(" }, {", o);
         for (auto c : s.results) fprintf(o, " %s,", kClassEnum[(unsigned)c]);

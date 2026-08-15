@@ -248,6 +248,19 @@ add_custom_command(
     VERBATIM
 )
 
+# The opcode name table is C — compile it as C once and link the object, so
+# the C++ test links below don't compile a .c input in C++ mode (clang 19
+# warns -Wdeprecated for that, and the C99 designators inside warn too).
+set(CALC_OPTAB_O ${CALC_VM_DIR}/opcode_tables.o)
+add_custom_command(
+    OUTPUT ${CALC_OPTAB_O}
+    COMMAND ${CLANG_C_COMPILER} -std=c11 -O2 ${CALC_VM_INCS}
+            -c ${CALC_VM_DIR}/opcode_tables.c -o ${CALC_OPTAB_O}
+    DEPENDS ${CALC_VM_GEN}
+    COMMENT "clang: calc opcode tables (opcode_tables.c)"
+    VERBATIM
+)
+
 # Tier 1 — the copy-and-patch stencils → jitterator → stencil table.
 set(CALC_VM_STENCILS_O ${CALC_VM_DIR}/calc_stencils.o)
 add_custom_command(
@@ -276,8 +289,8 @@ add_custom_command(
     COMMAND ${CLANG_CXX_COMPILER} -std=c++17 -DCALC_EQSAT ${CALC_VM_INCS}
             ${CMAKE_CURRENT_SOURCE_DIR}/example/test/calc_e2e_test.cpp
             $<TARGET_FILE:calc_runner> ${CALC_INTERP_O}
-            ${CALC_VM_DIR}/opcode_tables.c -lm -o ${CALC_VM_E2E}
-    DEPENDS ${CALC_INTERP_O} calc_runner ${CALC_REWRITE_H}
+            ${CALC_OPTAB_O} -lm -o ${CALC_VM_E2E}
+    DEPENDS ${CALC_INTERP_O} ${CALC_OPTAB_O} calc_runner ${CALC_REWRITE_H}
             ${CMAKE_CURRENT_SOURCE_DIR}/example/test/calc_e2e_test.cpp
     COMMENT "clang: calc VM e2e (parse -> ddcg -> IR -> bytecode -> interp)"
     VERBATIM
@@ -296,9 +309,9 @@ add_custom_command(
             ${CMAKE_CURRENT_SOURCE_DIR}/example/test/calc_e2e_test.cpp
             ${CMAKE_CURRENT_SOURCE_DIR}/example/calc_runner.cpp
             ${CMAKE_CURRENT_SOURCE_DIR}/example/frontend/Parser.cpp
-            ${CALC_INTERP_O} ${CALC_VM_DIR}/opcode_tables.c -lm
+            ${CALC_INTERP_O} ${CALC_OPTAB_O} -lm
             -o ${CALC_VM_E2E_NOREWRITE}
-    DEPENDS ${CALC_INTERP_O} calc_runner ${CALC_REWRITE_H}
+    DEPENDS ${CALC_INTERP_O} ${CALC_OPTAB_O} calc_runner ${CALC_REWRITE_H}
             ${CMAKE_CURRENT_SOURCE_DIR}/example/test/calc_e2e_test.cpp
             ${CMAKE_CURRENT_SOURCE_DIR}/example/calc_runner.cpp
     COMMENT "clang: calc e2e with the rewrite pass compiled out (falsifier)"

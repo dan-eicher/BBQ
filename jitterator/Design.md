@@ -264,7 +264,6 @@ typedef struct {
     uint32_t offset;        // byte offset within stencil code
     PatchType type;         // how to patch
     uint16_t hole_index;    // index into the stencil's hole array
-    const char *hole_name;  // original symbol name (e.g., "_HOLE_cont")
 } PatchEntry;
 
 typedef struct {

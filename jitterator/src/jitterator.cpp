@@ -61,7 +61,6 @@ struct PatchInfo {
     uint32_t offset;       // byte offset within stencil
     PatchType type;
     uint16_t hole_index;   // index into per-stencil hole list
-    std::string hole_name; // _HOLE_xxx symbol name
 };
 
 struct Stencil {
@@ -292,7 +291,6 @@ static std::vector<Stencil> extract_stencils(const uint8_t* data, const ElfInfo&
             p.offset = static_cast<uint32_t>(rela.offset - si.offset);
             p.type = reloc_to_patch_type(rela.type);
             p.hole_index = hole_idx;
-            p.hole_name = rela.sym_name;
             s.patches.push_back(p);
         }
 
@@ -353,11 +351,14 @@ static std::string render_stencil_table(const std::vector<Stencil>& stencils) {
     out += "} PatchType;\n\n";
 
     // Patch entry struct
+    // A patch names its hole by INDEX; the hole's name lives once in the
+    // stencil's hole_names[]. A per-patch string here would be a pointer and
+    // a load-time relocation per entry that no consumer reads — patching goes
+    // by hole_index, and the name lookups go through hole_names[].
     out += "typedef struct {\n";
     out += "    uint32_t offset;\n";
     out += "    PatchType type;\n";
     out += "    uint16_t hole_index;\n";
-    out += "    const char *hole_name;\n";
     out += "} PatchEntry;\n\n";
 
     // Stencil def struct
@@ -397,9 +398,9 @@ static std::string render_stencil_table(const std::vector<Stencil>& stencils) {
             for (auto& p : s.patches) {
                 char buf[256];
                 snprintf(buf, sizeof(buf),
-                         "    {%u, %s, %u, \"%s\"},\n",
+                         "    {%u, %s, %u},\n",
                          p.offset, patch_type_name(p.type),
-                         p.hole_index, p.hole_name.c_str());
+                         p.hole_index);
                 out += buf;
             }
             out += "};\n\n";

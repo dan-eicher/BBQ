@@ -19,7 +19,10 @@ asdl reads an ASDL specification, validates it, and either generates
 typed AST source via a Jinja-style template (Inja), writes a
 processed JSON sidecar for downstream tools, or both.
 
-ASDL describes algebraic data types: sum types (tagged unions),
+ASDL is the Zephyr Abstract Syntax Description Language (Daniel C.
+Wang, Andrew W. Appel, Jeff L. Korn, Christopher S. Serra, *The
+Zephyr Abstract Syntax Description Language*, DSL'97, USENIX). It
+describes algebraic data types: sum types (tagged unions),
 product types (records), and primitive aliases. The processor
 validates type references, registers C/C++ type names, and produces
 a normalized JSON object suitable for codegen via Inja templates or

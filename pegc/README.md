@@ -16,7 +16,8 @@ pegc [options] grammar.peg
 
 pegc compiles `.peg` grammar specifications into standalone C++ parsers.
 The generated parsers implement PEG (Parsing Expression Grammar) semantics
-via recursive descent: each production becomes a `parse_X()` method, ordered
+(Bryan Ford, *Parsing Expression Grammars: A Recognition-Based Syntactic
+Foundation*, POPL 2004) via recursive descent: each production becomes a `parse_X()` method, ordered
 choice backtracks via `save()`/`restore()`, and `&`/`!` predicates provide
 unlimited lookahead. There is no separate lexer stage (scanner-less).
 Generated parsers inherit from `peg::PegCursor`, which provides cursor-based

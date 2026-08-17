@@ -10,6 +10,7 @@ add_library(bbq_crt STATIC
     crt/bbq_buf.c
     crt/bbq_htree.c
     crt/bbq_hmap.c
+    crt/bbq_dict.c
 )
 set_target_properties(bbq_crt PROPERTIES
     C_STANDARD 11

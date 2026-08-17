@@ -8,6 +8,7 @@ extern "C" {
 #include "bbq_buf.h"
 #include "bbq_htree.h"
 #include "bbq_hmap.h"
+#include "bbq_dict.h"
 }
 
 // ── Arena tests ────────────────────────────────────────────
@@ -473,4 +474,134 @@ TEST(BbqHmap, ClusteredAlignedKeys) {
     for (uint64_t i = 0; i < 2000; i++)
         EXPECT_EQ(bbq_hmap_get(&m, base + i * 64), (void*)(uintptr_t)(i + 1));
     bbq_hmap_free(&m);
+}
+
+// ── Dict tests ─────────────────────────────────────────────
+//
+// The reason this container exists is the collision case, so that is the first
+// test rather than an afterthought. djb2-33 collides structurally on short keys
+// — any pair whose character deltas satisfy d1*33 + d2 == 0 — so these fixtures
+// are constructed, not lucky, and the test cannot silently stop exercising the
+// path it is here for.
+
+TEST(BbqDict, CollidingKeysAreDistinctEntries) {
+    // 'c'-'a' == 2, 2*33 == 66, 'r'-'0' == 66  =>  same digest, different keys.
+    ASSERT_EQ(bbq_dict_hash("ar", 2), bbq_dict_hash("c0", 2));
+
+    bbq_dict* d = bbq_dict_create();
+    ASSERT_NE(d, nullptr);
+    ASSERT_TRUE(bbq_dict_puts(d, "ar", (void*)(uintptr_t)1));
+    ASSERT_TRUE(bbq_dict_puts(d, "c0", (void*)(uintptr_t)2));
+
+    EXPECT_EQ(bbq_dict_gets(d, "ar"), (void*)(uintptr_t)1);
+    EXPECT_EQ(bbq_dict_gets(d, "c0"), (void*)(uintptr_t)2);
+    EXPECT_EQ(bbq_dict_len(d), 2u);
+    bbq_dict_destroy(d);
+}
+
+// A key that collides with a stored one but was never inserted is a MISS. This
+// is the half that a hash-and-trust table gets wrong in the other direction:
+// it would answer with the resident key's value.
+TEST(BbqDict, CollidingAbsentKeyIsAMiss) {
+    bbq_dict* d = bbq_dict_create();
+    ASSERT_TRUE(bbq_dict_puts(d, "ar", (void*)(uintptr_t)1));
+    EXPECT_EQ(bbq_dict_gets(d, "c0"), nullptr);
+    EXPECT_FALSE(bbq_dict_contains(d, "c0", 2));
+    bbq_dict_destroy(d);
+}
+
+TEST(BbqDict, DeleteUnlinksFromTheMiddleOfAChain) {
+    // Three keys on one digest: 33x + y is constant along the collision line.
+    const char* k[3] = { "ar", "c0", "bQ" };
+    ASSERT_EQ(bbq_dict_hash(k[0], 2), bbq_dict_hash(k[1], 2));
+    ASSERT_EQ(bbq_dict_hash(k[0], 2), bbq_dict_hash(k[2], 2));
+
+    bbq_dict* d = bbq_dict_create();
+    for (int i = 0; i < 3; i++) ASSERT_TRUE(bbq_dict_puts(d, k[i], (void*)(uintptr_t)(i + 1)));
+    EXPECT_EQ(bbq_dict_delete(d, k[1], 2), (void*)(uintptr_t)2);
+    EXPECT_EQ(bbq_dict_gets(d, k[0]), (void*)(uintptr_t)1);
+    EXPECT_EQ(bbq_dict_gets(d, k[1]), nullptr);
+    EXPECT_EQ(bbq_dict_gets(d, k[2]), (void*)(uintptr_t)3);
+    EXPECT_EQ(bbq_dict_len(d), 2u);
+    // ...and emptying the chain removes the tree entry without stranding it.
+    EXPECT_EQ(bbq_dict_delete(d, k[0], 2), (void*)(uintptr_t)1);
+    EXPECT_EQ(bbq_dict_delete(d, k[2], 2), (void*)(uintptr_t)3);
+    EXPECT_EQ(bbq_dict_len(d), 0u);
+    EXPECT_EQ(bbq_dict_gets(d, k[0]), nullptr);
+    bbq_dict_destroy(d);
+}
+
+// Keys are bytes, not C strings: pooled UTF-16LE runs carry a 0x00 every other
+// byte, which is why bytes_hash had to exist beside str_hash in the first place.
+TEST(BbqDict, KeysWithEmbeddedNulAreDistinct) {
+    bbq_dict* d = bbq_dict_create();
+    const unsigned char a[4] = { 'A', 0, 'B', 0 };
+    const unsigned char b[4] = { 'A', 0, 'C', 0 };
+    ASSERT_TRUE(bbq_dict_put(d, a, 4, (void*)(uintptr_t)1));
+    ASSERT_TRUE(bbq_dict_put(d, b, 4, (void*)(uintptr_t)2));
+    EXPECT_EQ(bbq_dict_get(d, a, 4), (void*)(uintptr_t)1);
+    EXPECT_EQ(bbq_dict_get(d, b, 4), (void*)(uintptr_t)2);
+    // A prefix is not the key.
+    EXPECT_EQ(bbq_dict_get(d, a, 2), nullptr);
+    bbq_dict_destroy(d);
+}
+
+// The dict owns its keys, so a caller may key on a buffer it then overwrites.
+TEST(BbqDict, KeyIsCopiedNotBorrowed) {
+    bbq_dict* d = bbq_dict_create();
+    char scratch[8];
+    memcpy(scratch, "volatile", 8);
+    ASSERT_TRUE(bbq_dict_put(d, scratch, 8, (void*)(uintptr_t)42));
+    memset(scratch, 'X', sizeof scratch);
+    EXPECT_EQ(bbq_dict_get(d, "volatile", 8), (void*)(uintptr_t)42);
+    bbq_dict_destroy(d);
+}
+
+TEST(BbqDict, PutOverwritesAndDoesNotGrow) {
+    bbq_dict* d = bbq_dict_create();
+    ASSERT_TRUE(bbq_dict_puts(d, "k", (void*)(uintptr_t)1));
+    ASSERT_TRUE(bbq_dict_puts(d, "k", (void*)(uintptr_t)2));
+    EXPECT_EQ(bbq_dict_gets(d, "k"), (void*)(uintptr_t)2);
+    EXPECT_EQ(bbq_dict_len(d), 1u);
+    bbq_dict_destroy(d);
+}
+
+TEST(BbqDict, EmptyKeyIsAKey) {
+    bbq_dict* d = bbq_dict_create();
+    ASSERT_TRUE(bbq_dict_put(d, "", 0, nullptr));
+    EXPECT_TRUE(bbq_dict_contains(d, "", 0));
+    EXPECT_FALSE(bbq_dict_contains(d, "x", 1));
+    EXPECT_EQ(bbq_dict_len(d), 1u);
+    bbq_dict_destroy(d);
+}
+
+TEST(BbqDict, ManyKeysNoCrossTalk) {
+    bbq_dict* d = bbq_dict_create();
+    char buf[32];
+    for (int i = 0; i < 5000; i++) {
+        int n = snprintf(buf, sizeof buf, "sym_%d_%d", i, i * 7);
+        ASSERT_TRUE(bbq_dict_put(d, buf, (size_t)n, (void*)(uintptr_t)(i + 1)));
+    }
+    EXPECT_EQ(bbq_dict_len(d), 5000u);
+    for (int i = 0; i < 5000; i++) {
+        int n = snprintf(buf, sizeof buf, "sym_%d_%d", i, i * 7);
+        EXPECT_EQ(bbq_dict_get(d, buf, (size_t)n), (void*)(uintptr_t)(i + 1));
+    }
+    EXPECT_EQ(bbq_dict_gets(d, "sym_5000_35000"), nullptr);
+    bbq_dict_destroy(d);
+}
+
+TEST(BbqDict, IterationVisitsEveryEntryOnce) {
+    bbq_dict* d = bbq_dict_create();
+    ASSERT_TRUE(bbq_dict_puts(d, "ar", (void*)(uintptr_t)1));   // colliding pair,
+    ASSERT_TRUE(bbq_dict_puts(d, "c0", (void*)(uintptr_t)2));   // so a chain is walked
+    ASSERT_TRUE(bbq_dict_puts(d, "solo", (void*)(uintptr_t)3));
+
+    bbq_dict_iter it; bbq_dict_entry e;
+    uintptr_t sum = 0; int n = 0;
+    bbq_dict_iter_init(d, &it);
+    while (bbq_dict_next(&it, &e)) { sum += (uintptr_t)e.value; n++; }
+    EXPECT_EQ(n, 3);
+    EXPECT_EQ(sum, 6u);
+    bbq_dict_destroy(d);
 }

@@ -88,6 +88,7 @@ target_link_libraries(bbq_shapegen PUBLIC bbq_frontend bbq_ctypes)
 add_library(bbq_render STATIC
     backends/render/RenderEmit.cpp
     backends/render/CompilerCtx.cpp
+    backends/render/WriterInterp.cpp
     ${CMAKE_CURRENT_BINARY_DIR}/BbqMatcher.h
 )
 target_include_directories(bbq_render PUBLIC
@@ -193,12 +194,15 @@ set_tests_properties(crt_hmap_oom_tests PROPERTIES TIMEOUT 30)
 # --- Python extension module (optional) ---
 find_package(Python3 COMPONENTS Development)
 if(Python3_FOUND)
-    # Static libs linked into the .so need PIC
-    set_target_properties(bbq_frontend bbq_cek_backend bbq_index_runtime PROPERTIES
+    # Static libs linked into the .so need PIC. bbq_render (and the libs it pulls in) is
+    # here because the module WRITES as well as reads: emit() runs the writer op-list
+    # through WriterInterp, and that list comes from the shared lowering.
+    set_target_properties(bbq_frontend bbq_cek_backend bbq_index_runtime
+                          bbq_render bbq_ctypes bbq_shapegen PROPERTIES
         POSITION_INDEPENDENT_CODE ON)
 
     add_library(bbq_python MODULE bindings/python/bbq_python.cpp bindings/python/bbq_build.cpp)
-    target_link_libraries(bbq_python PRIVATE bbq_frontend bbq_cek_backend Python3::Python)
+    target_link_libraries(bbq_python PRIVATE bbq_frontend bbq_cek_backend bbq_render Python3::Python)
     set_target_properties(bbq_python PROPERTIES
         PREFIX ""
         OUTPUT_NAME "bbq"

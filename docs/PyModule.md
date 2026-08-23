@@ -3,15 +3,17 @@
 CPython C API extension wrapping the CEK VM. The workflow is **parse · explore ·
 edit · emit** for prototyping grammars and exploring binary formats: parse a real
 binary, get a zero-copy Python container, poke and edit it, and serialize back to
-bytes. There is **no write-verification** — `emit()` serializes the overlay exactly
-as poked; matching a format's derived fields (counts, lengths) to your edits is your
-job. For grammar-verified output, compile the spec to a C/C++ parser via `bbqc`.
+bytes. `parse`/`emit` are the `get`/`put` of a well-behaved lens: an unedited
+`emit()` returns the input byte for byte, and an edited one re-parses to the edit
+that was made — so **dependent fields** (array counts, `@rest` window sizes) are
+recomputed for you, never maintained by hand. See [Bidirectional.md](Bidirectional.md)
+for the laws and what they do and do not claim.
 
 A separate `bbq.build` submodule constructs binary content from scratch (a typed
 byte-emitter — the struct-tier analogue of Python's `struct`).
 
 **Source:** `bindings/python/bbq_python.cpp` (parse/edit) + `bindings/python/bbq_build.cpp` (construction)
-**Tests:** `test/test_bbq_python.py` (205 tests)
+**Tests:** `test/test_bbq_python.py` (214 tests)
 
 ## Architecture
 
@@ -30,14 +32,19 @@ byte-emitter — the struct-tier analogue of Python's `struct`).
 │  bbq_build.cpp  : grammar-free byte construction (knows only │
 │                   bytes; meets the parse side at bytes only) │
 ├──────────────────────────────────────────────────────────────┤
-│  CEK VM (parse)  ·  bbq::zcow / bbq::emit (overlay + bytes)  │
+│  CEK VM (parse)  ·  WriterInterp (grammar enforcement)       │
+│                  ·  bbq::zcow / bbq::emit (overlay + bytes)  │
 └──────────────────────────────────────────────────────────────┘
 ```
 
 The parse produces a `FieldCapture` index over the input buffer (zero-copy reads).
-Edits go through the `bbq::zcow` copy-on-write overlay; `emit()` blits unchanged
-(Borrowed) ranges and re-serializes changed (Owned) ones. ZCow knows only bytes — it
-has no concept of grammar, counts, or validity.
+Edits go through the `bbq::zcow` copy-on-write overlay. ZCow itself knows only bytes —
+it has no concept of grammar, counts, or validity — so `emit()` first walks the
+grammar over the edited overlay and recomputes the dependent fields the edits
+invalidated, then hands off to ZCow, which blits unchanged (Borrowed) ranges and
+re-serializes changed (Owned) ones. The walk is the shared writer lowering
+(`lower_writer_ops`), executed rather than rendered: the same op-list `bbqc` turns
+into the generated C++ ZCow writer.
 
 ## Types
 
@@ -72,7 +79,7 @@ Container protocols: `result.field`, `result["field"]`, `result[i]`, slices, `le
 
 | Method | Description |
 |--------|-------------|
-| `emit() -> bytes` | Serialize the overlay exactly as it stands (byte-identical to the input if unedited). No grammar derivation. |
+| `emit() -> bytes` | Enforce the grammar over the edited overlay (dependent fields recomputed), then serialize. Byte-identical to the input if unedited; re-parses to the edit if not. |
 | `deltas() -> list[dict]` | The structured diff since parse: `{path, offset, old, new}` per changed field. |
 
 ### `bbq.Node`
@@ -101,8 +108,10 @@ The core lazy, zero-copy type over a single `FieldCapture`.
 
 `len(array_node)` is **live** — it reflects appends/deletes immediately, like a
 Python list. Structural *contents* (the new elements) are read back after
-`emit()` → re-parse. A format's count/length field is an ordinary byte; ZCow never
-derives it, so set it yourself if the format needs it (or re-parse to check).
+`emit()` → re-parse. The array's count field is a **dependent field**: `emit()`
+derives it from the array's effective length, so do not set it yourself — the
+array wins. The same holds for a count reached by a path (`array<uint8>[h.n]`),
+a count nested inside an array element, and an `@rest` window's size.
 
 ## `bbq.build` — construction from scratch
 

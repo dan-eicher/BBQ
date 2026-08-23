@@ -29,6 +29,14 @@
 #include "CaptureDecode.h"
 #include "CaptureCow.h"
 
+// The WRITE half: emit() is the lens's `put`, so it runs the grammar-enforcement walk
+// (dependent fields recomputed into the overlay) before ZCow serializes. The op-list is
+// the shared writer lowering; WriterInterp executes it, as the generated C++ writer's
+// stencils render it.
+#include "CompilerCtx.h"
+#include "RenderEmit.h"
+#include "WriterInterp.h"
+
 // bbq.build — the grammar-free byte-construction submodule (its own translation unit)
 #include "bbq_build.h"
 
@@ -58,6 +66,16 @@ static PyBBQNode* PyBBQNode_New(const FieldCapture* cap, PyBBQResult* result);
 struct PyBBQSpec {
     PyObject_HEAD
     CompiledGrammar* grammar;
+    // The frontend artifacts, kept alive for the WRITE side: the writer lowering reads the
+    // AST (which the Parser owns) alongside the kont IR. Reads need none of this.
+    Parser* parser;
+    bbqgen::ErrorReporter* errors;
+    bbqgen::Sema* sema;
+    // The writer op-list, lowered on the first emit() and cached (see spec_wops). Lowering
+    // it costs ~7x what compiling the grammar does — an 87-rule spec is 15 ms to compile and
+    // 100 ms to lower — and a session that only reads never needs it. The module never
+    // releases the GIL, so this cache cannot be raced; `parse` still touches none of it.
+    nlohmann::json* wops;
 
     // Extern parser support
     PyObject** ext_callables;               // Array of strong refs (INCREFed)
@@ -75,6 +93,7 @@ struct PyBBQResult {
     PyBBQSpec* spec;
     bool view_valid;
     bbq::zcow* zcow;   // copy-on-write overlay, lazily created on first mutation
+    const char* rule;  // the rule this was parsed with — emit() enforces THAT rule's grammar
 };
 
 struct PyBBQNode {
@@ -1247,15 +1266,47 @@ static PyObject* PyBBQResult_dir(PyBBQResult* self, PyObject*) {
     return list;
 }
 
+// The spec's writer op-list, lowered on first use. Null + a Python error on failure.
+static const nlohmann::json* spec_wops(PyBBQSpec* spec) {
+    if (spec->wops) return spec->wops;
+    bbq::render::CompilerCtx ctx{spec->parser->ast, spec->sema, spec->grammar, ""};
+    try {
+        spec->wops = new nlohmann::json(bbq::render::lower_writer_ops(ctx));
+    } catch (const std::exception& e) {
+        PyErr_Format(PyBBQParseError, "writer lowering failed: %s", e.what());
+        return nullptr;
+    }
+    return spec->wops;
+}
+
+// `put` — the write half of the lens. ZCow (bbq::emit) is the byte serializer; it knows
+// bytes, not the format. So the grammar walk runs first over the edited overlay and
+// recomputes the DEPENDENT fields the edits invalidated (array counts, @rest window
+// sizes), then ZCow serializes the now-consistent document. Unedited, that is the
+// identity — GetPut, byte for byte; edited, the result re-parses to the edit — PutGet.
 static PyObject* PyBBQResult_emit(PyBBQResult* self, PyObject*) {
-    // Serialize the overlay exactly as it stands — ZCow knows only bytes. Format
-    // fields (counts/lengths) are ordinary scalar bytes; matching them to the
-    // edited container is the caller's job (reparse to check). No grammar here.
-    bbq::zcow empty;
-    const bbq::zcow& z = self->zcow ? *self->zcow : empty;
     const uint8_t* b = self->view_valid ? (const uint8_t*)self->view.buf : nullptr;
     size_t l = self->view_valid ? (size_t)self->view.len : 0;
-    std::vector<uint8_t> out = bbq::emit(b, l, z);
+
+    if (!self->meta.success || !self->meta.root) {
+        // A failed parse has no document to enforce a grammar over; the overlay is
+        // whatever it was, so this is the raw serialization by definition.
+        bbq::zcow empty;
+        std::vector<uint8_t> raw = bbq::emit(b, l, self->zcow ? *self->zcow : empty);
+        return PyBytes_FromStringAndSize((const char*)raw.data(), (Py_ssize_t)raw.size());
+    }
+
+    const nlohmann::json* wops = spec_wops(self->spec);
+    if (!wops) return NULL;
+
+    if (!self->zcow) self->zcow = new bbq::zcow();
+    std::string err;
+    std::vector<uint8_t> out = bbq::render::run_writer(
+        *wops, self->rule, self->meta.root, b, l, self->zcow, &err);
+    if (out.empty() && !err.empty()) {
+        PyErr_Format(PyBBQParseError, "emit: %s", err.c_str());
+        return NULL;
+    }
     return PyBytes_FromStringAndSize((const char*)out.data(), (Py_ssize_t)out.size());
 }
 
@@ -1286,8 +1337,10 @@ static PyMethodDef PyBBQResult_methods[] = {
     {"__dir__", (PyCFunction)PyBBQResult_dir, METH_NOARGS,
      "List attributes including parsed field names."},
     {"emit", (PyCFunction)PyBBQResult_emit, METH_NOARGS,
-     "Serialize back to bytes: blit the input, patch any mutated fields "
-     "(byte-identical to the input if nothing was changed)."},
+     "Serialize back to bytes: enforce the grammar over the edited document "
+     "(dependent fields — array counts, @rest sizes — recomputed), then blit the "
+     "input and patch what changed. Byte-identical to the input if nothing was "
+     "changed; re-parses to the edit if something was."},
     {"deltas", (PyCFunction)PyBBQResult_deltas, METH_NOARGS,
      "The structured diff since parse: list of {path, offset, old, new}."},
     {NULL, NULL, 0, NULL}
@@ -1454,7 +1507,11 @@ static void PyBBQSpec_dealloc(PyBBQSpec* self) {
         Py_XDECREF(self->ext_callables[i]);
     PyMem_Free(self->ext_callables);
     PyMem_Free(self->ext_entries);
+    delete self->wops;
     delete self->grammar;
+    delete self->sema;      // holds a reference to *errors, so it goes first
+    delete self->errors;
+    delete self->parser;    // owns the AST the lowering read
     Py_TYPE(self)->tp_free((PyObject*)self);
 }
 
@@ -1547,8 +1604,16 @@ static PyObject* PyBBQSpec_register_extern(PyBBQSpec* self, PyObject* args) {
 // Core parse logic — takes ownership of view on success
 static PyObject* do_parse(PyBBQSpec* self, Py_buffer* view, const char* rule_name) {
     KontNode* entry = nullptr;
+    // The RESOLVED rule name (the grammar's own interned copy, so it outlives the call):
+    // emit() enforces this rule's grammar, so the result has to remember which one it is.
+    const char* resolved = nullptr;
     if (rule_name) {
-        entry = self->grammar->lookup(std::string(rule_name));
+        for (int i = 0; i < self->grammar->rule_count; i++)
+            if (std::strcmp(self->grammar->rules[i].name, rule_name) == 0) {
+                entry = self->grammar->rules[i].entry;
+                resolved = self->grammar->rules[i].name;
+                break;
+            }
         if (!entry) {
             PyErr_Format(PyBBQParseError, "unknown rule: '%s'", rule_name);
             return NULL;
@@ -1559,6 +1624,7 @@ static PyObject* do_parse(PyBBQSpec* self, Py_buffer* view, const char* rule_nam
             return NULL;
         }
         entry = self->grammar->rules[0].entry;
+        resolved = self->grammar->rules[0].name;
     }
 
     ParseArena* arena = new ParseArena();
@@ -1584,6 +1650,7 @@ static PyObject* do_parse(PyBBQSpec* self, Py_buffer* view, const char* rule_nam
     result->view = *view;       // transfer buffer ownership
     result->view_valid = true;
     result->zcow = nullptr;     // created on first mutation
+    result->rule = resolved;
     Py_INCREF(self);
     result->spec = self;
     PyObject_GC_Track((PyObject*)result);
@@ -1752,33 +1819,42 @@ PyTypeObject PyBBQSpec_Type = {
 // ── Module functions ────────────────────────────────────────────────────────
 
 static PyObject* compile_source(const char* source, Py_ssize_t length) {
-    Parser parser;
-    parser.init(source, (int)length);
-    if (!parser.parse()) {
+    // The Parser owns the AST and the Sema its resolved facts; both outlive this call
+    // because the writer lowering consumes them (the Spec frees them in dealloc).
+    Parser* parser = new Parser();
+    parser->init(source, (int)length);
+    if (!parser->parse()) {
         PyErr_Format(PyBBQParseError, "parse error at line %d, col %d",
-                     parser.line(), parser.col());
+                     parser->line(), parser->col());
+        delete parser;
         return NULL;
     }
 
-    bbqgen::ErrorReporter errors;
-    bbqgen::Sema sema(errors);
-    if (!sema.analyze(parser.ast)) {
+    bbqgen::ErrorReporter* errors = new bbqgen::ErrorReporter();
+    bbqgen::Sema* sema = new bbqgen::Sema(*errors);
+    if (!sema->analyze(parser->ast)) {
         std::ostringstream oss;
-        errors.print_all(oss);
+        errors->print_all(oss);
         PyErr_SetString(PyBBQParseError, oss.str().c_str());
+        delete sema; delete errors; delete parser;
         return NULL;
     }
 
     ::bbq::Compiler compiler;
-    CompiledGrammar* grammar = compiler.compile_grammar(parser.ast);
+    CompiledGrammar* grammar = compiler.compile_grammar(parser->ast);
     if (!grammar) {
         PyErr_SetString(PyBBQParseError, "compilation failed");
+        delete sema; delete errors; delete parser;
         return NULL;
     }
 
     PyBBQSpec* spec = PyObject_New(PyBBQSpec, &PyBBQSpec_Type);
-    if (!spec) { delete grammar; return NULL; }
+    if (!spec) { delete grammar; delete sema; delete errors; delete parser; return NULL; }
     spec->grammar = grammar;
+    spec->parser = parser;
+    spec->errors = errors;
+    spec->sema = sema;
+    spec->wops = nullptr;
     spec->ext_callables = nullptr;
     spec->ext_entries = nullptr;
     spec->ext_count = 0;

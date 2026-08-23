@@ -1118,6 +1118,22 @@ std::string render_writer_view(const CompilerCtx& ctx, const std::string& templa
     return render_emit(ctx, ZCowWriter(ns, templates_dir), lower_grammar(ctx));
 }
 
+// The writer op-list, for a consumer that EXECUTES it rather than rendering it (the CEK
+// face compiles at runtime, so there is no generated <Rule>_write to call). The same two
+// passes render_emit runs ahead of the writer template — the structural fold, then
+// ZCowWriter's post_lower (= derive_write_prefixes) — over the same lower_grammar output.
+// The spelling passes render_emit does after this (expr hoisting, the target-root prepend)
+// are identities for ZCowWriter: its target_root is empty and the enforcement template
+// spells no expressions, so the op-list here is exactly the one the template consumes.
+// `fn["rule"]` is left in place (render_emit erases it once a header is merged) — the
+// interpreter resolves `invoke`/`choice` targets by rule name.
+json lower_writer_ops(const CompilerCtx& ctx) {
+    json functions = lower_grammar(ctx);
+    fold_bitfield_constraints(functions);
+    ZCowWriter("", "").post_lower(functions);
+    return functions;
+}
+
 // c-lite (C view) reader — the C emission of the view lowering; ViewCReader over the same
 // loop. Reader only (no writer / no types header); C uses the name prefix, so no `ns`.
 std::string render_reader_view_c(const CompilerCtx& ctx, const std::string& templates_dir) {

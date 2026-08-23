@@ -16,6 +16,8 @@
 //
 #include <string>
 
+#include <nlohmann/json.hpp>
+
 namespace bbq::render {
 
 struct CompilerCtx;
@@ -61,5 +63,12 @@ std::string render_reader_view_c(const CompilerCtx& ctx, const std::string& temp
 // Forward declarations for every rule's c-lite reader — `bbq_capture_metadata
 // <pfx>_<rule>_read(const uint8_t*, size_t, bbq_arena*);` (for the generated header).
 std::string render_reader_view_c_decls(const CompilerCtx& ctx);
+
+// The ZCow WRITER op-list: the neutral lowering plus the writer's derive pass (the
+// count-field↔array and @rest linkage), with `fn["rule"]` intact. This is the one producer
+// behind both writer consumers — `writer_view_cpp.inja` RENDERS it into per-rule stencils,
+// and `bbq::render::run_writer` (WriterInterp.h) EXECUTES it for a grammar compiled at
+// runtime. A dynamic backend that lowered the kont graph itself would be a second grammar.
+nlohmann::json lower_writer_ops(const CompilerCtx& ctx);
 
 }  // namespace bbq::render

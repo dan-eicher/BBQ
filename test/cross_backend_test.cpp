@@ -19,6 +19,7 @@
 #include "CompilerCtx.h"
 #include "RenderTypes.h"
 #include "RenderEmit.h"
+#include "WriterInterp.h"
 #include "CTypeMapper.h"
 #include "bbq_node.h"
 
@@ -102,6 +103,9 @@ struct CRoundtrip {
     bool ok = false;
     bool sanitized = false;   // built with a working ASan/UBSan runtime (OOB → abort)
     std::string err;
+    // The writer op-list the cpp-zcow writer template was rendered from — the SAME list the
+    // dynamic writer (WriterInterp) executes. Kept so the two consumers can be compared.
+    nlohmann::json wops;
 };
 
 // A sanitizer-capable C compiler invocation, probed once. clang ships its own sanitizer
@@ -140,6 +144,7 @@ CRoundtrip build_c_roundtrip(const std::vector<std::string>& rules) {
     auto* cg = g->compile_grammar(parser->ast);
     ctx.ir = cg;
     rt.cek_cg = cg;
+    rt.wops = bbq::render::lower_writer_ops(ctx);
 
     std::string dir = "/tmp/bbq_cross_" + std::to_string(getpid());
     system(("mkdir -p " + dir).c_str());
@@ -299,6 +304,16 @@ NegRun run_bin_neg(const std::string& bin, const char* rule, const std::vector<u
     // exits non-zero (clang), and a raw segfault signals — all of which are "crashed".
     r.crashed = WIFSIGNALED(st) || !WIFEXITED(st) || WEXITSTATUS(st) != 0;
     return r;
+}
+
+// Byte string for a failure message — a GetPut/byte-equality mismatch is only readable
+// as the two byte strings side by side.
+std::string hexdump(const std::vector<uint8_t>& b) {
+    std::string s;
+    char hex[8];
+    for (uint8_t x : b) { snprintf(hex, sizeof hex, "%02x ", x); s += hex; }
+    if (!s.empty()) s.pop_back();
+    return s;
 }
 
 using ViewReadFn = bbq::CaptureMetadata (*)(const uint8_t*, size_t, bbq::ParseArena&);
@@ -627,6 +642,25 @@ TEST(CrossBackend, CppWriterToCReaderFullFixture) {
         ASSERT_FALSE(wb.empty()) << c.rule << ": ZCow writer produced no bytes";
         auto* wbuf = new uint8_t[wb.size()]; std::copy(wb.begin(), wb.end(), wbuf);
 
+        // (0) GetPut — put(get(c), c) = c. With no edit the lens must return the input
+        // BYTE for byte, not merely something that decodes to the same values: the whole
+        // point of keeping the baseline (the Borrowed spans emit() blits) is that the
+        // information `get` discarded survives `put`. cmp_node below cannot see a lost
+        // constant/padding byte, so the law needs its own assertion.
+        EXPECT_EQ(wb, c.valid) << c.rule << ": GetPut violated — unedited re-emit is not byte-identical\n"
+                               << "  in : " << hexdump(c.valid) << "\n  out: " << hexdump(wb);
+
+        // (0b) The DYNAMIC writer (WriterInterp) EXECUTES the same op-list these stencils
+        // were RENDERED from. Byte-equality on every fixture rule, so every construct's
+        // enforcement path — switch, choice, optional, resync, bitfield, intervals — is
+        // held to the generated writer, not just the rules the mutate table edits.
+        std::string ierr;
+        std::vector<uint8_t> ib = bbq::render::run_writer(rt.wops, c.rule, vm.root,
+                                                          c.valid.data(), c.valid.size(), nullptr, &ierr);
+        ASSERT_FALSE(ib.empty()) << c.rule << ": dynamic writer produced no bytes: " << ierr;
+        EXPECT_EQ(ib, wb) << c.rule << ": dynamic writer diverges from the generated stencils\n"
+                          << "  gen: " << hexdump(wb) << "\n  dyn: " << hexdump(ib);
+
         // (1) Fidelity: the ZCow writer's bytes decode (oracle) to the authored value tree.
         bbq::CaptureMetadata ck_out = cek_meta_x(rt.cek_cg, c.rule, wbuf, wb.size());
         ASSERT_TRUE(ck_out.success) << c.rule << ": CEK rejected ZCow-writer bytes";
@@ -683,6 +717,20 @@ TEST(CrossBackend, CppWriterMutateRoundTrip) {
         bbq::zcow zc; mut(vm.root, zc);
         std::vector<uint8_t> wb = wr(vm.root, v.data(), v.size(), &zc);
         ASSERT_FALSE(wb.empty()) << rule << ": writer produced no bytes";
+
+        // The dynamic writer, given the SAME edit from an independent parse + overlay (the
+        // first writer already wrote its recomputed counts into `zc`, so reusing it would
+        // hand the interpreter an answer instead of asking for one).
+        bbq::ParseArena ar2; bbq::CaptureMetadata vm2 = rd(v.data(), v.size(), ar2);
+        ASSERT_TRUE(vm2.success) << rule << ": reader rejected authored (dynamic pass)";
+        bbq::zcow zc2; mut(vm2.root, zc2);
+        std::string ierr;
+        std::vector<uint8_t> ib = bbq::render::run_writer(rt.wops, rule, vm2.root,
+                                                          v.data(), v.size(), &zc2, &ierr);
+        ASSERT_FALSE(ib.empty()) << rule << ": dynamic writer produced no bytes: " << ierr;
+        EXPECT_EQ(ib, wb) << rule << ": dynamic writer diverges from the generated stencils\n"
+                          << "  gen: " << hexdump(wb) << "\n  dyn: " << hexdump(ib);
+
         auto* b = new uint8_t[wb.size()]; std::copy(wb.begin(), wb.end(), b);
         bbq::CaptureMetadata ck = cek_meta_x(rt.cek_cg, rule, b, wb.size());
         ASSERT_TRUE(ck.success) << rule << ": CEK rejected the re-emitted (edited) bytes";

@@ -324,7 +324,8 @@ class TestNodeProperties:
 # ── ZCow mutation (copy-on-write through the Python face) ─────────────────────
 # `result.field = v` / `node.field = v` detaches that field to Owned in the
 # shared overlay (the same one the C++ handles use); reads see the override,
-# siblings stay borrowed.
+# siblings stay borrowed. emit() then enforces the grammar over the edited
+# overlay before serializing — see TestLensLaws for the laws that pin that down.
 
 class TestZCowMutation:
     def test_scalar_set(self):
@@ -387,39 +388,35 @@ class TestZCowMutation:
         assert [int(x) for x in r2.items] == [0x0102, 0x0304]
 
     def test_delete_element(self):
-        # del removes the element; the container's len updates live (like a list).
-        # ZCow knows only bytes — the format's count field is a separate byte the
-        # caller owns and sets to match.
+        # del removes the element; the container's len updates live (like a list). `n` is a
+        # DEPENDENT field — derived from the array, not maintained by the caller — so emit()
+        # recomputes it.
         spec = bbq.compile_string("Tab = struct { n: uint8, items: array<uint8>[n] }")
         r = spec.parse(bytes([3, 10, 20, 30]))
         del r.items[1]
         assert len(r.items) == 2                            # len is live, like a list
-        r.n = 2                                             # caller maintains the count byte
         r2 = spec.parse(r.emit())                           # structure is read back after reparse
         assert int(r2.n) == 2 and [int(x) for x in r2.items] == [10, 30]
 
     def test_append_scalar_from_sibling_type(self):
         # a scalar append takes the array's existing element type (pure data, no grammar);
-        # len updates live; the count byte is the caller's to set.
+        # len updates live, and the dependent count follows the array.
         spec = bbq.compile_string("Tab = struct { n: uint8, items: array<uint8>[n] }")
         r = spec.parse(bytes([1, 10]))
         r.items.append(20)
         r.items.append(30)
         assert len(r.items) == 3
-        r.n = 3
         r2 = spec.parse(r.emit())
         assert int(r2.n) == 3 and [int(x) for x in r2.items] == [10, 20, 30]
 
     def test_append_bytes_element(self):
         # variable-width (LEB) and composite elements have no by-value form — ZCow is
         # byte-level, so the caller supplies the bytes. (300 as uleb128 = b"\xac\x02".)
-        # The count field is fixed-width here so the caller can set it; editing a
-        # variable-width (uleb) leaf in place is a separate concern (see notes).
+        # The count is dependent either way and is recomputed on emit.
         sl = bbq.compile_string("T = struct { n: uint8, xs: array<uleb128>[n] }")
         rl = sl.parse(bytes([1, 5]))
         rl.xs.append(b"\xac\x02")
         assert len(rl.xs) == 2
-        rl.n = 2
         r2 = sl.parse(rl.emit())
         assert int(r2.n) == 2 and [int(x) for x in r2.xs] == [5, 300]
         # a struct element, appended as raw bytes
@@ -427,7 +424,6 @@ class TestZCowMutation:
             "It = struct { v: uint8, w: uint8 }\nT = struct { n: uint8, items: array<It>[n] }")
         rs = ss.parse(bytes([1, 1, 2]), rule="T")
         rs.items.append(b"\x03\x04")
-        rs.n = 2
         r3 = ss.parse(rs.emit(), rule="T")
         assert int(r3.n) == 2 and int(r3.items[1].v) == 3 and int(r3.items[1].w) == 4
 
@@ -453,7 +449,6 @@ class TestZCowMutation:
         del r.items[0]                       # remove the first (drops its subtree)
         r.items.append(b"\x07\x08")          # grow -> (7, 8)
         assert len(r.items) == 3
-        r.n = 3
         r2 = ss.parse(r.emit(), rule="T")
         got = [(int(it.v), int(it.w)) for it in r2.items]
         assert int(r2.n) == 3 and got == [(30, 40), (5, 6), (7, 8)]
@@ -469,6 +464,108 @@ class TestZCowMutation:
         assert out != data
         r2 = spec.parse(out)               # mutation survives the round-trip
         assert int(r2.x) == 42 and int(r2.y) == 2 and int(r2.z) == 0x11223344
+
+
+# ── Lens laws ────────────────────────────────────────────────────────────────
+# parse/emit is a lens (Foster et al., TOPLAS 2007): get = parse (bytes -> capture
+# view), put = emit (edited view x ORIGINAL bytes -> new bytes). `put` takes the
+# original because `get` discards information — which is exactly what the ZCow
+# overlay retains. Two laws:
+#
+#   GetPut   put(get(c), c) = c      an unedited re-emit is byte-identical
+#   PutGet   get(put(a, c)) = a      re-parsing an edit yields the edit you made
+#
+# PutGet is what forces dependent fields (Nail's term: length/count/offset fields,
+# "not exposed in the data model, but instead transparently computed"). An append
+# that leaves the count field stale fails it. These mirror the C++ ZCow writer's
+# CppWriterMutateRoundTrip suite case for case — the same fixture, the same edits.
+
+class TestLensLaws:
+    """get/put must be well behaved: GetPut byte-exact, PutGet through a re-parse."""
+
+    @classmethod
+    def setup_class(cls):
+        cls.spec = bbq.compile(ZCOW_READER_BBQ)
+
+    def _lens(self, rule, data, edit):
+        """GetPut on `data`, then apply `edit` and return the re-parsed result (PutGet)."""
+        assert self.spec.parse(data, rule=rule).emit() == data, "GetPut: re-emit not byte-identical"
+        r = self.spec.parse(data, rule=rule)
+        assert r.success
+        edit(r)
+        out = r.emit()
+        r2 = self.spec.parse(out, rule=rule)
+        assert r2.success, f"re-parse of the edited document failed: {r2.error_message}"
+        assert r2.bytes_consumed == len(out), (
+            f"edited document not fully consumed: {r2.bytes_consumed} of {len(out)}")
+        return r2
+
+    def test_scalar_value_edit(self):
+        # (1) same-width scalar edit: no dependent field involved.
+        data = bytes([0x12, 0x56, 0x34, 0x00, 0x01, 0x00, 0x00, 0x01, 0x02, 0xFC, 0xFF, 0xFF, 0xFF])
+        def edit(r):
+            r.u8 = 0x99
+        r2 = self._lens("Flat", data, edit)
+        assert int(r2.u8) == 0x99 and int(r2.u16) == 0x3456
+
+    def test_array_element_value_edit(self):
+        # (2) element value edit — structure unchanged, count untouched.
+        data = bytes([0x03, 0x10, 0x00, 0x20, 0x00, 0x30, 0x00])
+        def edit(r):
+            r.xs[1] = 0x0099
+        r2 = self._lens("Arr", data, edit)
+        assert len(r2.xs) == 3 and int(r2.xs[1]) == 0x0099
+
+    def test_array_remove_recomputes_count(self):
+        # (3) remove: the count field is derived, so `n` must fall to 2 on its own.
+        data = bytes([0x03, 0x10, 0x00, 0x20, 0x00, 0x30, 0x00])
+        def edit(r):
+            del r.xs[0]
+        r2 = self._lens("Arr", data, edit)
+        assert int(r2.n) == 2
+        assert [int(x) for x in r2.xs] == [0x0020, 0x0030]
+
+    def test_array_append_recomputes_count(self):
+        # (4) append: `n` must rise to 4 without the caller touching it.
+        data = bytes([0x03, 0x10, 0x00, 0x20, 0x00, 0x30, 0x00])
+        def edit(r):
+            r.xs.append(0x0040)
+        r2 = self._lens("Arr", data, edit)
+        assert int(r2.n) == 4
+        assert len(r2.xs) == 4 and int(r2.xs[3]) == 0x0040
+
+    def test_path_count_recomputed(self):
+        # (5) the count lives in a sub-struct — `array<uint8>[h.n]`, so the enforcement
+        # has to resolve the path, not just a sibling name.
+        data = bytes([0x03, 0xAA, 0xBB, 0xCC])
+        def edit(r):
+            r.xs.append(0xDD)
+        r2 = self._lens("Np", data, edit)
+        assert int(r2.h.n) == 4
+        assert len(r2.xs) == 4 and int(r2.xs[3]) == 0xDD
+
+    def test_rest_size_recomputed(self):
+        # (6) @rest: `sz` is the byte length of the window that follows it, so growing
+        # the window's content must grow `sz` (3 -> 4).
+        data = bytes([0x03, 10, 20, 30])
+        def edit(r):
+            r.xs.append(40)
+        r2 = self._lens("RestEof", data, edit)
+        assert int(r2.sz) == 4
+        assert [int(x) for x in r2.xs] == [10, 20, 30, 40]
+
+    def test_nested_per_element_count_recomputed(self):
+        # (7) the walk must DESCEND into array element bodies: editing gs[0].xs fixes
+        # gs[0].n, leaves the outer count and the sibling element alone.
+        data = bytes([0x02, 0x01, 0x11, 0x02, 0x22, 0x33])
+        def edit(r):
+            r.gs[0].xs.append(0x99)
+        r2 = self._lens("NestArr", data, edit)
+        assert int(r2.m) == 2                                  # outer count unchanged
+        assert int(r2.gs[0].n) == 2                            # inner count fixed
+        assert [int(x) for x in r2.gs[0].xs] == [0x11, 0x99]
+        assert int(r2.gs[1].n) == 2                            # sibling intact
+        assert [int(x) for x in r2.gs[1].xs] == [0x22, 0x33]
 
 
 # ── Union backtracking ───────────────────────────────────────────────────────
@@ -1218,6 +1315,15 @@ class TestFailedResult:
         if not result.root:
             with pytest.raises(AttributeError):
                 result.tag
+
+    def test_emit_on_failure(self):
+        # A failed parse produced no document, so there is no grammar to enforce over
+        # it — emit() is the raw serialization of the (untouched) overlay: the input.
+        spec = bbq.compile_string(MULTI_FIELD_SPEC)
+        data = b"\x01"
+        result = spec.parse(data)
+        assert not result.success
+        assert result.emit() == data
 
 
 # ── keys/values/items on non-struct ──────────────────────────────────────────

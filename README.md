@@ -102,7 +102,10 @@ python -c "import bbq; print('ok')"
 
 `import bbq` — compile specs and parse binary data interactively. Zero-copy
 mmap for large files, lazy materialization, full Python protocols for
-navigating parsed structures.
+navigating parsed structures. Parsed documents are editable: `parse`/`emit` form
+a well-behaved lens, so an unedited `emit()` returns the input byte for byte and
+an edited one re-parses to the edit, with dependent fields (array counts, `@rest`
+sizes) recomputed — see [The Write Side](docs/Bidirectional.md).
 
 See [Getting Started](docs/GettingStarted.md) for a walkthrough, and
 [PyModule.md](docs/PyModule.md) for the full API reference.
@@ -156,11 +159,12 @@ jitterator/         Copy-and-patch JIT stencil extractor and runtime
 | [Getting Started](docs/GettingStarted.md) | End-to-end tutorial: writing specs, Python workflow, C++ codegen |
 | [Grammar Reference](docs/Grammar.md) | Complete BBQ language syntax and semantics |
 | [Python Module](docs/PyModule.md) | Python API reference (Spec, ParseResult, Node) |
+| [The Write Side](docs/Bidirectional.md) | Lens laws, dependent fields, and what the parser/serializer pair does not claim |
 | [CEK Machine Design](docs/CEK%20Machine%20Design.md) | Internals of the interpretive VM backend |
 
 ## Running Tests
 
 ```sh
-# Full suite (C++ via ctest, Python via pytest hook): 642 + 146 tests
+# Full suite (C++ via ctest, Python via pytest hook): 866 + 214 tests
 ctest --test-dir build --output-on-failure
 ```

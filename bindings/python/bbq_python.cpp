@@ -73,8 +73,12 @@ struct PyBBQSpec {
     bbqgen::Sema* sema;
     // The writer op-list, lowered on the first emit() and cached (see spec_wops). Lowering
     // it costs ~7x what compiling the grammar does — an 87-rule spec is 15 ms to compile and
-    // 100 ms to lower — and a session that only reads never needs it. The module never
-    // releases the GIL, so this cache cannot be raced; `parse` still touches none of it.
+    // 100 ms to lower — and a session that only reads never needs it. `parse` touches none
+    // of it. The cache is unlocked because this module runs under a GIL either way: it
+    // never releases one, and it declares no free-threading support (no Py_mod_gil slot /
+    // PyUnstable_Module_SetGIL), so importing it into a free-threaded build re-enables the
+    // GIL. Declaring that support means locking this — and the extern registry, and the
+    // per-result overlay — first.
     nlohmann::json* wops;
 
     // Extern parser support

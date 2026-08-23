@@ -61,6 +61,41 @@ static PyObject* PyBBQParseError;
 static PyBBQNode* PyBBQNode_New(const FieldCapture* cap, PyBBQResult* result);
 
 
+// ── Locking ─────────────────────────────────────────────────────────────────
+//
+// The module declares Py_MOD_GIL_NOT_USED (see PyInit_bbq), so it must serialize its own
+// shared state. Everything guarded here is plain C++ — an unordered_map, a node tree, two
+// parallel arrays — which the interpreter knows nothing about and cannot protect.
+//
+// PyMutex, not Py_BEGIN_CRITICAL_SECTION: a critical section is *suspended* when the
+// holding thread blocks, which is right for locking a Python object and wrong for a C++
+// container mid-rehash. The rule that makes a plain mutex safe here is that a lock is only
+// ever held over C++ — every PyObject conversion happens before it is taken, so nothing can
+// re-enter the interpreter (and thus this module) while one is held.
+//
+// Below 3.13 there is no PyMutex and no free-threaded build, so the GIL already serializes
+// all of this and the shim compiles to nothing.
+#if PY_VERSION_HEX >= 0x030D0000
+using BBQMutex = PyMutex;
+#  define BBQ_MUTEX_INIT PyMutex()
+static inline void bbq_mutex_lock(BBQMutex* m)   { PyMutex_Lock(m); }
+static inline void bbq_mutex_unlock(BBQMutex* m) { PyMutex_Unlock(m); }
+#else
+struct BBQMutex { char unused; };
+#  define BBQ_MUTEX_INIT BBQMutex{0}
+static inline void bbq_mutex_lock(BBQMutex*)   {}
+static inline void bbq_mutex_unlock(BBQMutex*) {}
+#endif
+
+struct BBQLock {
+    BBQMutex* m;
+    explicit BBQLock(BBQMutex* mu) : m(mu) { bbq_mutex_lock(m); }
+    ~BBQLock() { bbq_mutex_unlock(m); }
+    BBQLock(const BBQLock&) = delete;
+    BBQLock& operator=(const BBQLock&) = delete;
+};
+
+
 // ── Structs ─────────────────────────────────────────────────────────────────
 
 struct PyBBQSpec {
@@ -74,11 +109,7 @@ struct PyBBQSpec {
     // The writer op-list, lowered on the first emit() and cached (see spec_wops). Lowering
     // it costs ~7x what compiling the grammar does — an 87-rule spec is 15 ms to compile and
     // 100 ms to lower — and a session that only reads never needs it. `parse` touches none
-    // of it. The cache is unlocked because this module runs under a GIL either way: it
-    // never releases one, and it declares no free-threading support (no Py_mod_gil slot /
-    // PyUnstable_Module_SetGIL), so importing it into a free-threaded build re-enables the
-    // GIL. Declaring that support means locking this — and the extern registry, and the
-    // per-result overlay — first.
+    // of it.
     nlohmann::json* wops;
 
     // Extern parser support
@@ -87,6 +118,10 @@ struct PyBBQSpec {
     int ext_count;
     int ext_capacity;
     ExternalParserTable ext_table;
+
+    // Guards `wops` and the extern registry. register_extern REALLOCS both arrays, so a
+    // parse cannot read them directly — it takes a snapshot under this lock (do_parse).
+    BBQMutex lock;
 };
 
 struct PyBBQResult {
@@ -98,6 +133,11 @@ struct PyBBQResult {
     bool view_valid;
     bbq::zcow* zcow;   // copy-on-write overlay, lazily created on first mutation
     const char* rule;  // the rule this was parsed with — emit() enforces THAT rule's grammar
+    // Guards `zcow` — its creation and every read/write of it. bbq::zcow is an
+    // unordered_map plus a node tree; two threads editing one document corrupt it
+    // (node_for() inserts while another rehashes). Reads of the BASELINE index need no
+    // lock: FieldCapture is immutable after the parse.
+    BBQMutex lock;
 };
 
 struct PyBBQNode {
@@ -179,21 +219,35 @@ static PyObject* decode_float(const FieldCapture* cap, const uint8_t* data) {
 // A ZCow integer override for `cap` as a PyLong, or null if the field is
 // unmutated. The dynamic face of the same overlay the C++ handles use.
 static PyObject* zcow_int_override(const FieldCapture* cap, PyBBQResult* result) {
-    if (result->zcow)
-        if (auto* o = result->zcow->get_int(cap))
-            return PyLong_FromLongLong(*o);
-    return nullptr;
+    int64_t v = 0;
+    bool found = false;
+    {
+        BBQLock g(&result->lock);
+        if (result->zcow)
+            if (auto* o = result->zcow->get_int(cap)) { v = *o; found = true; }
+    }
+    return found ? PyLong_FromLongLong(v) : nullptr;
+}
+
+// The overlay, created on demand. Caller holds the result's lock.
+static bbq::zcow* zcow_of(PyBBQResult* result) {
+    if (!result->zcow) result->zcow = new bbq::zcow();
+    return result->zcow;
 }
 
 // Write `value` into leaf node `cap` via the ZCow overlay, dispatched on the
 // field's grammar type so every leaf kind round-trips (not just integers).
+//
+// Every PyObject→C conversion happens BEFORE the lock: PyFloat_AsDouble, PyObject_IsTrue
+// and PyLong_AsLongLong can all run arbitrary Python (__float__ / __bool__ / __index__),
+// and re-entering this module while holding the overlay lock would deadlock.
 static int zcow_set_capture(const FieldCapture* cap, PyBBQResult* result, PyObject* value) {
-    if (!result->zcow) result->zcow = new bbq::zcow();
     CaptureType t = cap->type;
     if (is_float_type(t)) {
         double d = PyFloat_AsDouble(value);
         if (d == -1.0 && PyErr_Occurred()) return -1;
-        result->zcow->set_float(cap, d);
+        BBQLock g(&result->lock);
+        zcow_of(result)->set_float(cap, d);
         return 0;
     }
     if (t == CaptureType::Bytes || t == CaptureType::External) {
@@ -201,25 +255,31 @@ static int zcow_set_capture(const FieldCapture* cap, PyBBQResult* result, PyObje
             PyErr_SetString(PyExc_TypeError, "expected bytes for a bytes field"); return -1;
         }
         const char* p = PyBytes_AS_STRING(value);
-        result->zcow->set_bytes(cap, std::vector<uint8_t>(p, p + PyBytes_GET_SIZE(value)));
+        std::vector<uint8_t> bytes(p, p + PyBytes_GET_SIZE(value));
+        BBQLock g(&result->lock);
+        zcow_of(result)->set_bytes(cap, std::move(bytes));
         return 0;
     }
     if (t == CaptureType::String) {
+        std::vector<uint8_t> bytes;
         if (PyBytes_Check(value)) {
             const char* p = PyBytes_AS_STRING(value);
-            result->zcow->set_bytes(cap, std::vector<uint8_t>(p, p + PyBytes_GET_SIZE(value)));
+            bytes.assign(p, p + PyBytes_GET_SIZE(value));
         } else {
             Py_ssize_t n = 0;
             const char* s = PyUnicode_AsUTF8AndSize(value, &n);
             if (!s) return -1;
-            result->zcow->set_bytes(cap, std::vector<uint8_t>(s, s + n));
+            bytes.assign(s, s + n);
         }
+        BBQLock g(&result->lock);
+        zcow_of(result)->set_bytes(cap, std::move(bytes));
         return 0;
     }
     if (t == CaptureType::Bool) {
         int b = PyObject_IsTrue(value);
         if (b < 0) return -1;
-        result->zcow->set_int(cap, b ? 1 : 0);
+        BBQLock g(&result->lock);
+        zcow_of(result)->set_int(cap, b ? 1 : 0);
         return 0;
     }
     if (t == CaptureType::Struct || t == CaptureType::Array || t == CaptureType::Computed) {
@@ -228,7 +288,8 @@ static int zcow_set_capture(const FieldCapture* cap, PyBBQResult* result, PyObje
     }
     int64_t v = PyLong_AsLongLong(value);   // integer leaf types
     if (v == -1 && PyErr_Occurred()) return -1;
-    result->zcow->set_int(cap, v);
+    BBQLock g(&result->lock);
+    zcow_of(result)->set_int(cap, v);
     return 0;
 }
 
@@ -508,7 +569,9 @@ static Py_ssize_t PyBBQNode_mp_length(PyBBQNode* self) {
     if (type == CaptureType::Struct || type == CaptureType::Array) {
         // Live like a Python list: reflect overlay appends/deletes when the container
         // was structurally edited, else the baseline child count.
-        int o = self->result->zcow ? self->result->zcow->overlay_child_count(self->capture) : -1;
+        int o;
+        { BBQLock g(&self->result->lock);
+          o = self->result->zcow ? self->result->zcow->overlay_child_count(self->capture) : -1; }
         return o >= 0 ? o : self->capture->child_count;
     }
     PyErr_Format(PyExc_TypeError,
@@ -622,10 +685,10 @@ static int PyBBQNode_mp_ass_subscript(PyBBQNode* self, PyObject* key, PyObject* 
         return -1;
     }
     if (value == NULL) {   // del node[index]
-        if (!self->result->zcow) self->result->zcow = new bbq::zcow();
-        if (!self->result->zcow->remove_index(cap, (size_t)index)) {
-            PyErr_SetString(PyExc_IndexError, "cannot delete"); return -1;
-        }
+        bool ok;
+        { BBQLock g(&self->result->lock);
+          ok = zcow_of(self->result)->remove_index(cap, (size_t)index); }
+        if (!ok) { PyErr_SetString(PyExc_IndexError, "cannot delete"); return -1; }
         return 0;
     }
     // Splice: replacing a composite array element (`arr[i] = b"..."`) sets a raw byte
@@ -637,8 +700,8 @@ static int PyBBQNode_mp_ass_subscript(PyBBQNode* self, PyObject* key, PyObject* 
         PyBBQResult* res = self->result;
         std::unique_ptr<bbq::znode> elem = znode_from_pyvalue(value, nullptr);
         if (!elem) return -1;
-        if (!res->zcow) res->zcow = new bbq::zcow();
-        res->zcow->set_node(child, std::move(elem));
+        BBQLock g(&res->lock);
+        zcow_of(res)->set_node(child, std::move(elem));
         return 0;
     }
     return zcow_set_capture(child, self->result, value);
@@ -918,7 +981,7 @@ static PyObject* PyBBQNode_items(PyBBQNode* self, PyObject*) {
 // node.append(value): add an element to an array. ZCow is byte-level — a number takes
 // the array's existing element type (a sibling, pure data); bytes/str append verbatim
 // (the form for a composite or variable-width element). The array's child count updates
-// live (like a Python list); any format count field is a separate byte the caller owns.
+// live (like a Python list); the format's count field is dependent and emit() derives it.
 static PyObject* PyBBQNode_append(PyBBQNode* self, PyObject* value) {
     const FieldCapture* cap = self->capture;
     if (cap->type != CaptureType::Array) {
@@ -929,8 +992,8 @@ static PyObject* PyBBQNode_append(PyBBQNode* self, PyObject* value) {
     const FieldCapture* sib = (cap->child_count > 0) ? &cap->children[0] : nullptr;
     std::unique_ptr<bbq::znode> elem = znode_from_pyvalue(value, sib);
     if (!elem) return NULL;
-    if (!res->zcow) res->zcow = new bbq::zcow();
-    res->zcow->append(cap, std::move(elem));
+    BBQLock g(&res->lock);
+    zcow_of(res)->append(cap, std::move(elem));
     Py_RETURN_NONE;
 }
 
@@ -1271,7 +1334,9 @@ static PyObject* PyBBQResult_dir(PyBBQResult* self, PyObject*) {
 }
 
 // The spec's writer op-list, lowered on first use. Null + a Python error on failure.
+// Once published it is immutable, so callers read it without the lock.
 static const nlohmann::json* spec_wops(PyBBQSpec* spec) {
+    BBQLock g(&spec->lock);
     if (spec->wops) return spec->wops;
     bbq::render::CompilerCtx ctx{spec->parser->ast, spec->sema, spec->grammar, ""};
     try {
@@ -1296,17 +1361,25 @@ static PyObject* PyBBQResult_emit(PyBBQResult* self, PyObject*) {
         // A failed parse has no document to enforce a grammar over; the overlay is
         // whatever it was, so this is the raw serialization by definition.
         bbq::zcow empty;
+        BBQLock g(&self->lock);
         std::vector<uint8_t> raw = bbq::emit(b, l, self->zcow ? *self->zcow : empty);
         return PyBytes_FromStringAndSize((const char*)raw.data(), (Py_ssize_t)raw.size());
     }
 
+    // Lowered before the overlay lock is taken: spec_wops takes the SPEC's lock, and
+    // holding two locks at once is how a lock order gets invented.
     const nlohmann::json* wops = spec_wops(self->spec);
     if (!wops) return NULL;
 
-    if (!self->zcow) self->zcow = new bbq::zcow();
     std::string err;
-    std::vector<uint8_t> out = bbq::render::run_writer(
-        *wops, self->rule, self->meta.root, b, l, self->zcow, &err);
+    std::vector<uint8_t> out;
+    {
+        // The walk both reads and WRITES the overlay (it recomputes dependent fields into
+        // it), so it takes the same lock every mutation does.
+        BBQLock g(&self->lock);
+        out = bbq::render::run_writer(*wops, self->rule, self->meta.root, b, l,
+                                      zcow_of(self), &err);
+    }
     if (out.empty() && !err.empty()) {
         PyErr_Format(PyBBQParseError, "emit: %s", err.c_str());
         return NULL;
@@ -1318,8 +1391,15 @@ static PyObject* PyBBQResult_emit(PyBBQResult* self, PyObject*) {
 // {path, offset:(start,end), old, new} — a typed, path-addressed diff.
 static PyObject* PyBBQResult_deltas(PyBBQResult* self, PyObject*) {
     PyObject* list = PyList_New(0);
-    if (!list || !self->zcow) return list;
-    auto ds = bbq::deltas((const uint8_t*)self->view.buf, *self->zcow);
+    if (!list) return list;
+    // Snapshot the diff under the lock, then build the Python objects outside it —
+    // PyBytes/PyLong construction must not run while the overlay lock is held.
+    std::vector<bbq::delta_info> ds;
+    {
+        BBQLock g(&self->lock);
+        if (!self->zcow) return list;
+        ds = bbq::deltas((const uint8_t*)self->view.buf, *self->zcow);
+    }
     for (const auto& d : ds) {
         PyObject* old_o = d.is_bytes
             ? PyBytes_FromStringAndSize((const char*)d.old_bytes.data(), (Py_ssize_t)d.old_bytes.size())
@@ -1566,42 +1646,46 @@ static PyObject* PyBBQSpec_register_extern(PyBBQSpec* self, PyObject* args) {
     // Intern name so pointer-equality lookup works in the VM
     const char* interned = self->grammar->strings.intern(name);
 
-    // Check if already registered — if so, replace
-    for (int i = 0; i < self->ext_count; i++) {
-        if (self->ext_entries[i].name == interned) {
-            Py_INCREF(callable);
-            Py_DECREF(self->ext_callables[i]);
-            self->ext_callables[i] = callable;
-            self->ext_entries[i].user_data = (void*)callable;
-            Py_RETURN_NONE;
+    Py_INCREF(callable);            // the registry's reference, taken before the lock
+    PyObject* displaced = nullptr;  // the old callable, released after it
+    bool oom = false;
+
+    {
+        BBQLock g(&self->lock);
+
+        int slot = -1;                                    // existing entry for this name
+        for (int i = 0; i < self->ext_count; i++)
+            if (self->ext_entries[i].name == interned) { slot = i; break; }
+
+        if (slot >= 0) {
+            displaced = self->ext_callables[slot];
+            self->ext_callables[slot] = callable;
+            self->ext_entries[slot].user_data = (void*)callable;
+        } else {
+            if (self->ext_count >= self->ext_capacity) {   // grow
+                int new_cap = self->ext_capacity ? self->ext_capacity * 2 : 4;
+                auto* new_callables = (PyObject**)PyMem_Realloc(
+                    self->ext_callables, sizeof(PyObject*) * new_cap);
+                auto* new_entries = new_callables ? (ExternalParserTable::Entry*)PyMem_Realloc(
+                    self->ext_entries, sizeof(ExternalParserTable::Entry) * new_cap) : nullptr;
+                if (new_callables) self->ext_callables = new_callables;
+                if (new_entries)   self->ext_entries = new_entries;
+                if (!new_callables || !new_entries) oom = true;
+                else self->ext_capacity = new_cap;
+            }
+            if (!oom) {
+                int idx = self->ext_count++;
+                self->ext_callables[idx] = callable;
+                self->ext_entries[idx] = {interned, py_extern_trampoline, (void*)callable};
+                self->ext_table.entries = self->ext_entries;
+                self->ext_table.count = self->ext_count;
+            }
         }
     }
 
-    // Grow arrays if needed
-    if (self->ext_count >= self->ext_capacity) {
-        int new_cap = self->ext_capacity ? self->ext_capacity * 2 : 4;
-        auto* new_callables = (PyObject**)PyMem_Realloc(
-            self->ext_callables, sizeof(PyObject*) * new_cap);
-        if (!new_callables) return PyErr_NoMemory();
-        self->ext_callables = new_callables;
-
-        auto* new_entries = (ExternalParserTable::Entry*)PyMem_Realloc(
-            self->ext_entries, sizeof(ExternalParserTable::Entry) * new_cap);
-        if (!new_entries) return PyErr_NoMemory();
-        self->ext_entries = new_entries;
-
-        self->ext_capacity = new_cap;
-    }
-
-    Py_INCREF(callable);
-    int idx = self->ext_count++;
-    self->ext_callables[idx] = callable;
-    self->ext_entries[idx] = {interned, py_extern_trampoline, (void*)callable};
-
-    // Update table pointer
-    self->ext_table.entries = self->ext_entries;
-    self->ext_table.count = self->ext_count;
-
+    // Outside the lock: a DECREF can run a __del__, which could re-enter this module.
+    if (oom) { Py_DECREF(callable); return PyErr_NoMemory(); }
+    Py_XDECREF(displaced);
     Py_RETURN_NONE;
 }
 
@@ -1631,18 +1715,35 @@ static PyObject* do_parse(PyBBQSpec* self, Py_buffer* view, const char* rule_nam
         resolved = self->grammar->rules[0].name;
     }
 
+    // The extern table, SNAPSHOT under the spec lock rather than pointed at: a concurrent
+    // register_extern PyMem_Reallocs both arrays (so `&self->ext_table` would dangle) and
+    // can DECREF a callable this parse is about to invoke. The snapshot holds a strong
+    // reference to each callable for the parse's duration, so a registration during a
+    // running parse does not affect that parse — the only coherent rule under concurrency.
+    std::vector<ExternalParserTable::Entry> ext_snapshot;
+    std::vector<PyObject*> ext_held;
+    {
+        BBQLock g(&self->lock);
+        ext_snapshot.assign(self->ext_entries, self->ext_entries + self->ext_count);
+        ext_held.assign(self->ext_callables, self->ext_callables + self->ext_count);
+        for (PyObject* c : ext_held) Py_INCREF(c);
+    }
+    ExternalParserTable ext_table{ext_snapshot.data(), (int)ext_snapshot.size()};
+
     ParseArena* arena = new ParseArena();
     CEKMachine machine;
     machine.arena = arena;
     machine.builtins = &self->grammar->builtins;
-    if (self->ext_count > 0)
-        machine.ext_parsers = &self->ext_table;
+    if (!ext_snapshot.empty())
+        machine.ext_parsers = &ext_table;
 
     CaptureMetadata meta = machine.execute_from(
         entry,
         (const uint8_t*)view->buf,
         (size_t)view->len,
         self->grammar->default_little_endian);
+
+    for (PyObject* c : ext_held) Py_DECREF(c);
 
     PyBBQResult* result = PyObject_GC_New(PyBBQResult, &PyBBQResult_Type);
     if (!result) {
@@ -1655,6 +1756,7 @@ static PyObject* do_parse(PyBBQSpec* self, Py_buffer* view, const char* rule_nam
     result->view_valid = true;
     result->zcow = nullptr;     // created on first mutation
     result->rule = resolved;
+    result->lock = BBQ_MUTEX_INIT;   // PyObject_GC_New does not zero
     Py_INCREF(self);
     result->spec = self;
     PyObject_GC_Track((PyObject*)result);
@@ -1864,6 +1966,7 @@ static PyObject* compile_source(const char* source, Py_ssize_t length) {
     spec->ext_count = 0;
     spec->ext_capacity = 0;
     spec->ext_table = {};
+    spec->lock = BBQ_MUTEX_INIT;    // PyObject_New does not zero
     return (PyObject*)spec;
 }
 
@@ -1942,6 +2045,16 @@ PyInit_bbq(void)
     if (m == NULL) {
         return NULL;
     }
+
+    /* Free-threaded builds: this module serializes its own shared state (the Spec's
+     * writer-op cache and extern registry, each Result's overlay — see the locking note
+     * near the top), so it does not need the interpreter to do it. Without this
+     * declaration importing bbq would re-enable the GIL for the whole process.
+     * PyUnstable_Module_SetGIL is the single-phase-init spelling and exists only in the
+     * free-threaded build. */
+#ifdef Py_GIL_DISABLED
+    PyUnstable_Module_SetGIL(m, Py_MOD_GIL_NOT_USED);
+#endif
 
     /* Register the 'bbq.Spec' class */
 

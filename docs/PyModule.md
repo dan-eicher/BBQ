@@ -13,7 +13,7 @@ A separate `bbq.build` submodule constructs binary content from scratch (a typed
 byte-emitter — the struct-tier analogue of Python's `struct`).
 
 **Source:** `bindings/python/bbq_python.cpp` (parse/edit) + `bindings/python/bbq_build.cpp` (construction)
-**Tests:** `test/test_bbq_python.py` (214 tests)
+**Tests:** `test/test_bbq_python.py` (215 tests) + `test/test_bbq_freethreaded.py` (free-threading stress)
 
 ## Architecture
 
@@ -192,6 +192,11 @@ The callable gets a read-only `memoryview` of the remaining input and returns th
 number of bytes consumed (or `None`/raise to fail). The `Spec` holds a strong
 reference to each registered callable.
 
+A parse runs against the registry **as it stood when the parse began**: it takes a
+snapshot holding a strong reference to each callable. So `register_extern` during a
+running parse (from the extern callback itself, or from another thread) affects the
+next parse, not that one.
+
 ## Error Handling
 
 | Condition | Exception |
@@ -204,6 +209,30 @@ reference to each registered callable.
 | Index out of range | `IndexError` |
 | `bbq.build` child that isn't a build value or bytes | `TypeError` |
 
+## Free-threaded Python
+
+The module declares `Py_MOD_GIL_NOT_USED`, so importing it into a free-threaded
+build (PEP 703; 3.13 experimental, 3.14 supported) leaves the GIL disabled — it
+does not silently re-enable it for the whole process.
+
+That means the module serializes its own shared state rather than leaning on the
+interpreter:
+
+| State | Guard |
+|---|---|
+| `Spec`'s writer op-list cache, extern registry | a `PyMutex` on the `Spec` |
+| each `ParseResult`'s ZCow overlay (creation, every edit, `emit`, `deltas`) | a `PyMutex` on the result |
+| `bbq.build` `Struct`'s parallel `names`/`children` lists | a critical section on the object |
+
+Locks are only ever held over C++ — every `PyObject` conversion happens before one
+is taken, so nothing can re-enter the interpreter while a lock is held.
+
+What this does **not** promise is that concurrent edits to *one* `ParseResult` are
+meaningful; they are merely safe. Which of two racing writes wins is up to the
+schedule, exactly as for a shared `list`. Separate results are fully parallel.
+
+Below 3.13 the locking compiles to nothing, since the GIL already provides it.
+
 ## Build
 
 Built only if `Python3::Development` is found.
@@ -212,4 +241,14 @@ Built only if `Python3::Development` is found.
 cmake -B build && cmake --build build -j4
 ctest --test-dir build -R bbq_python --output-on-failure
 PYTHONPATH=build python -m pytest test/test_bbq_python.py -v
+```
+
+For the free-threading stress suite (`test/test_bbq_freethreaded.py`), configure a
+second build dir against a free-threaded interpreter — `ctest` picks the test up
+automatically when the interpreter reports `Py_GIL_DISABLED`:
+
+```sh
+cmake -B build-ft -DPython3_FIND_ABI='ANY;ANY;ANY;ON' \
+                  -DPython3_EXECUTABLE=/usr/bin/python3.14t
+ctest --test-dir build-ft -R bbq_python_freethreaded --output-on-failure
 ```

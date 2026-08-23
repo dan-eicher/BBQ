@@ -13,6 +13,20 @@
 
 using bbq::CaptureType;
 
+// A Struct's `names` and `children` are two lists that must stay parallel, and every
+// accessor is a check-then-act across them: find the index in one, index into the other.
+// Each list op is individually atomic on a free-threaded build, which is exactly why the
+// pair is not — two threads interleave between the two PyList_Appends and the lists
+// desynchronize, after which the unchecked PyList_GET_ITEM reads out of bounds. Critical
+// sections (rather than the plain mutex bbq_python.cpp uses for its C++ state) are right
+// here: the invariant belongs to the Python object, and the guarded code calls back into
+// the interpreter (rich comparison, list resize), which a critical section tolerates.
+// Below 3.13 the macros do not exist and the GIL already provides this.
+#if PY_VERSION_HEX < 0x030D0000
+#  define Py_BEGIN_CRITICAL_SECTION(op) {
+#  define Py_END_CRITICAL_SECTION() }
+#endif
+
 namespace {
 
 enum LeafKind : uint8_t { BL_INT, BL_FLOAT, BL_ULEB, BL_SLEB, BL_BYTES };
@@ -93,16 +107,21 @@ bool bbq_build_serialize(PyObject* o, std::vector<uint8_t>& out) {
         }
         return false;
     }
-    if (PyObject_TypeCheck(o, &PyBuildStruct_Type)) {
-        PyObject* kids = reinterpret_cast<PyBuildStruct*>(o)->children;
+    // Containers snapshot their child list under the object's critical section and walk the
+    // COPY: indexing the live list while another thread appends would read a stale item
+    // array, and holding the section across the recursion would lock every level at once.
+    if (PyObject_TypeCheck(o, &PyBuildStruct_Type) || PyObject_TypeCheck(o, &PyBuildArray_Type)) {
+        PyObject* live = PyObject_TypeCheck(o, &PyBuildStruct_Type)
+                       ? reinterpret_cast<PyBuildStruct*>(o)->children
+                       : reinterpret_cast<PyBuildArray*>(o)->items;
+        PyObject* kids = nullptr;
+        Py_BEGIN_CRITICAL_SECTION(o);
+        kids = PyList_GetSlice(live, 0, PyList_GET_SIZE(live));
+        Py_END_CRITICAL_SECTION();
+        if (!kids) return false;
         for (Py_ssize_t i = 0, n = PyList_GET_SIZE(kids); i < n; i++)
-            if (!bbq_build_serialize(PyList_GET_ITEM(kids, i), out)) return false;
-        return true;
-    }
-    if (PyObject_TypeCheck(o, &PyBuildArray_Type)) {
-        PyObject* items = reinterpret_cast<PyBuildArray*>(o)->items;
-        for (Py_ssize_t i = 0, n = PyList_GET_SIZE(items); i < n; i++)
-            if (!bbq_build_serialize(PyList_GET_ITEM(items, i), out)) return false;
+            if (!bbq_build_serialize(PyList_GET_ITEM(kids, i), out)) { Py_DECREF(kids); return false; }
+        Py_DECREF(kids);
         return true;
     }
     if (PyBytes_Check(o)) {
@@ -318,18 +337,29 @@ Py_ssize_t struct_index(PyBuildStruct* self, PyObject* name) {
 }
 PyObject* Struct_subscript(PyBuildStruct* self, PyObject* key) {
     if (PyUnicode_Check(key)) {
+        PyObject* v = nullptr;
+        bool err = false, missing = false;
+        Py_BEGIN_CRITICAL_SECTION(self);
         Py_ssize_t i = struct_index(self, key);
-        if (i == -2) return nullptr;
-        if (i < 0) { PyErr_SetObject(PyExc_KeyError, key); return nullptr; }
-        PyObject* v = PyList_GET_ITEM(self->children, i); Py_INCREF(v); return v;
+        if (i == -2) err = true;
+        else if (i < 0) missing = true;
+        else { v = PyList_GET_ITEM(self->children, i); Py_INCREF(v); }
+        Py_END_CRITICAL_SECTION();
+        if (err) return nullptr;
+        if (missing) { PyErr_SetObject(PyExc_KeyError, key); return nullptr; }
+        return v;
     }
     if (PyIndex_Check(key)) {
         Py_ssize_t i = PyNumber_AsSsize_t(key, PyExc_IndexError);
         if (i == -1 && PyErr_Occurred()) return nullptr;
+        PyObject* v = nullptr;
+        Py_BEGIN_CRITICAL_SECTION(self);
         Py_ssize_t n = PyList_GET_SIZE(self->children);
-        if (i < 0) i += n;
-        if (i < 0 || i >= n) { PyErr_SetString(PyExc_IndexError, "struct index out of range"); return nullptr; }
-        PyObject* v = PyList_GET_ITEM(self->children, i); Py_INCREF(v); return v;
+        Py_ssize_t j = i < 0 ? i + n : i;
+        if (j >= 0 && j < n) { v = PyList_GET_ITEM(self->children, j); Py_INCREF(v); }
+        Py_END_CRITICAL_SECTION();
+        if (!v) { PyErr_SetString(PyExc_IndexError, "struct index out of range"); return nullptr; }
+        return v;
     }
     PyErr_SetString(PyExc_TypeError, "struct index must be str or int");
     return nullptr;
@@ -338,23 +368,33 @@ int Struct_ass_subscript(PyBuildStruct* self, PyObject* key, PyObject* value) {
     if (!value) { PyErr_SetString(PyExc_TypeError, "cannot delete a struct field"); return -1; }
     if (!check_child(value)) return -1;
     if (PyUnicode_Check(key)) {
+        int rc = 0;
+        Py_BEGIN_CRITICAL_SECTION(self);
         Py_ssize_t i = struct_index(self, key);
-        if (i == -2) return -1;
-        if (i < 0) {  // new field → append
-            if (PyList_Append(self->names, key) < 0) return -1;
-            return PyList_Append(self->children, value);
+        if (i == -2) rc = -1;
+        else if (i < 0) {  // new field → append; BOTH lists, or the pair desynchronizes
+            if (PyList_Append(self->names, key) < 0) rc = -1;
+            else rc = PyList_Append(self->children, value);
+        } else {
+            Py_INCREF(value);
+            rc = PyList_SetItem(self->children, i, value);  // steals the ref, drops the old
         }
-        Py_INCREF(value);
-        return PyList_SetItem(self->children, i, value);  // steals the ref, drops the old
+        Py_END_CRITICAL_SECTION();
+        return rc;
     }
     if (PyIndex_Check(key)) {
         Py_ssize_t i = PyNumber_AsSsize_t(key, PyExc_IndexError);
         if (i == -1 && PyErr_Occurred()) return -1;
+        int rc = 0;
+        bool oob = false;
+        Py_BEGIN_CRITICAL_SECTION(self);
         Py_ssize_t n = PyList_GET_SIZE(self->children);
-        if (i < 0) i += n;
-        if (i < 0 || i >= n) { PyErr_SetString(PyExc_IndexError, "struct index out of range"); return -1; }
-        Py_INCREF(value);
-        return PyList_SetItem(self->children, i, value);
+        Py_ssize_t j = i < 0 ? i + n : i;
+        if (j < 0 || j >= n) oob = true;
+        else { Py_INCREF(value); rc = PyList_SetItem(self->children, j, value); }
+        Py_END_CRITICAL_SECTION();
+        if (oob) { PyErr_SetString(PyExc_IndexError, "struct index out of range"); return -1; }
+        return rc;
     }
     PyErr_SetString(PyExc_TypeError, "struct index must be str or int");
     return -1;
@@ -363,12 +403,15 @@ PyObject* Struct_getattro(PyBuildStruct* self, PyObject* name) {
     PyObject* attr = PyObject_GenericGetAttr(reinterpret_cast<PyObject*>(self), name);
     if (attr) return attr;
     if (!PyErr_ExceptionMatches(PyExc_AttributeError)) return nullptr;
+    PyObject* v = nullptr;
+    bool err = false;
+    Py_BEGIN_CRITICAL_SECTION(self);
     Py_ssize_t i = struct_index(self, name);
-    if (i == -2) return nullptr;
-    if (i >= 0) {
-        PyErr_Clear();
-        PyObject* v = PyList_GET_ITEM(self->children, i); Py_INCREF(v); return v;
-    }
+    if (i == -2) err = true;
+    else if (i >= 0) { v = PyList_GET_ITEM(self->children, i); Py_INCREF(v); }
+    Py_END_CRITICAL_SECTION();
+    if (err) return nullptr;
+    if (v) { PyErr_Clear(); return v; }
     return nullptr;  // keep the AttributeError
 }
 int Struct_setattro(PyBuildStruct* self, PyObject* name, PyObject* value) {
@@ -376,25 +419,43 @@ int Struct_setattro(PyBuildStruct* self, PyObject* name, PyObject* value) {
 }
 int Struct_contains(PyBuildStruct* self, PyObject* value) {
     if (!PyUnicode_Check(value)) return 0;
-    Py_ssize_t i = struct_index(self, value);
+    Py_ssize_t i;
+    Py_BEGIN_CRITICAL_SECTION(self);
+    i = struct_index(self, value);
+    Py_END_CRITICAL_SECTION();
     if (i == -2) return -1;
     return i >= 0 ? 1 : 0;
 }
 PyObject* Struct_keys(PyBuildStruct* self, PyObject*) {
-    return PyList_GetSlice(self->names, 0, PyList_GET_SIZE(self->names));
+    PyObject* out;
+    Py_BEGIN_CRITICAL_SECTION(self);
+    out = PyList_GetSlice(self->names, 0, PyList_GET_SIZE(self->names));
+    Py_END_CRITICAL_SECTION();
+    return out;
 }
 PyObject* Struct_values(PyBuildStruct* self, PyObject*) {
-    return PyList_GetSlice(self->children, 0, PyList_GET_SIZE(self->children));
+    PyObject* out;
+    Py_BEGIN_CRITICAL_SECTION(self);
+    out = PyList_GetSlice(self->children, 0, PyList_GET_SIZE(self->children));
+    Py_END_CRITICAL_SECTION();
+    return out;
 }
+// Zips the two lists by index, so it must see them at one instant — the pair's whole
+// invariant is that names[i] goes with children[i].
 PyObject* Struct_items(PyBuildStruct* self, PyObject*) {
+    PyObject* out = nullptr;
+    Py_BEGIN_CRITICAL_SECTION(self);
     Py_ssize_t n = PyList_GET_SIZE(self->names);
-    PyObject* out = PyList_New(n);
-    if (!out) return nullptr;
-    for (Py_ssize_t i = 0; i < n; i++) {
-        PyObject* t = PyTuple_Pack(2, PyList_GET_ITEM(self->names, i), PyList_GET_ITEM(self->children, i));
-        if (!t) { Py_DECREF(out); return nullptr; }
-        PyList_SET_ITEM(out, i, t);
+    out = PyList_New(n);
+    if (out) {
+        for (Py_ssize_t i = 0; i < n; i++) {
+            PyObject* t = PyTuple_Pack(2, PyList_GET_ITEM(self->names, i),
+                                          PyList_GET_ITEM(self->children, i));
+            if (!t) { Py_CLEAR(out); break; }
+            PyList_SET_ITEM(out, i, t);
+        }
     }
+    Py_END_CRITICAL_SECTION();
     return out;
 }
 PyObject* Struct_iter(PyBuildStruct* self) {

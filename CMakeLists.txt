@@ -218,14 +218,44 @@ if(Python3_FOUND)
             COMMAND ${CMAKE_COMMAND} --build ${CMAKE_CURRENT_BINARY_DIR} --target bbq_python)
         set_tests_properties(bbq_python_build PROPERTIES FIXTURES_SETUP bbq_python_module)
 
-        add_test(NAME bbq_python_tests
-            COMMAND ${Python3_EXECUTABLE} -m pytest
-                ${CMAKE_CURRENT_SOURCE_DIR}/test/test_bbq_python.py
-                --tb=short
-            WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
-        set_tests_properties(bbq_python_tests PROPERTIES
-            FIXTURES_REQUIRED bbq_python_module
-            ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_BINARY_DIR}")
+        # pytest belongs to the interpreter, not the system — a second build dir aimed at
+        # another interpreter (the free-threaded one below) usually has none. Say so at
+        # configure time rather than registering a test that can only fail on "No module
+        # named pytest".
+        execute_process(COMMAND ${Python3_EXECUTABLE} -c "import pytest"
+            RESULT_VARIABLE _bbq_no_pytest OUTPUT_QUIET ERROR_QUIET)
+        if(_bbq_no_pytest)
+            message(STATUS "bbq: ${Python3_EXECUTABLE} has no pytest — skipping bbq_python_tests")
+        else()
+            add_test(NAME bbq_python_tests
+                COMMAND ${Python3_EXECUTABLE} -m pytest
+                    ${CMAKE_CURRENT_SOURCE_DIR}/test/test_bbq_python.py
+                    --tb=short
+                WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
+            set_tests_properties(bbq_python_tests PROPERTIES
+                FIXTURES_REQUIRED bbq_python_module
+                ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_BINARY_DIR}")
+        endif()
+
+        # Free-threading stress. The module declares Py_MOD_GIL_NOT_USED, so it must
+        # serialize its own shared state; this hammers each piece of it from many threads
+        # with no GIL to hide behind. Only meaningful on a free-threaded interpreter —
+        # configure a second build dir against one to get it:
+        #   cmake -B build-ft -DPython3_FIND_ABI='ANY;ANY;ANY;ON' \
+        #                     -DPython3_EXECUTABLE=/usr/bin/python3.14t
+        # (Python3_FREE_THREADED is not populated by CMake 3.31, so ask the interpreter.)
+        execute_process(COMMAND ${Python3_EXECUTABLE} -c
+            "import sysconfig,sys; sys.exit(0 if sysconfig.get_config_var('Py_GIL_DISABLED') else 1)"
+            RESULT_VARIABLE _bbq_not_freethreaded OUTPUT_QUIET ERROR_QUIET)
+        if(NOT _bbq_not_freethreaded)
+            add_test(NAME bbq_python_freethreaded
+                COMMAND ${Python3_EXECUTABLE}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/test/test_bbq_freethreaded.py)
+            set_tests_properties(bbq_python_freethreaded PROPERTIES
+                FIXTURES_REQUIRED bbq_python_module
+                TIMEOUT 300
+                ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_BINARY_DIR}")
+        endif()
     endif()
 endif()
 

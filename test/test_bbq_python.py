@@ -1424,6 +1424,35 @@ Msg = struct {
 
 
 class TestExtern:
+    def test_register_during_parse_does_not_disturb_it(self):
+        """A parse runs against the registry as it stood when the parse began.
+
+        The extern callback registering more externs used to grow the live arrays that
+        the running machine was pointed at — a PyMem_Realloc under the parse's feet, and
+        an override could free a callable the parse still held. The parse now takes a
+        snapshot with strong references, so registrations land for the NEXT parse.
+        """
+        spec = bbq.compile_string(EXTERN_SPEC)
+        seen = []
+
+        def validate(mv):
+            seen.append(bytes(mv))
+            # Reallocs the registry (past its capacity of 4) and replaces "validate"
+            # itself, all while this very parse is using it.
+            for i in range(8):
+                spec.register_extern(f"other{i}", lambda m: 0)
+            spec.register_extern("validate", lambda m: 1)
+            return 4
+
+        spec.register_extern("validate", validate)
+        data = b"\x01\x00\x00\x00\xAA\xBB\xCC\xDD"
+        r = spec.parse(data)
+        assert r.success and r.bytes_consumed == 8
+        assert seen == [b"\xAA\xBB\xCC\xDD"]
+        # The replacement takes effect from the next parse on.
+        r2 = spec.parse(data)
+        assert r2.success and r2.bytes_consumed == 5
+
     def test_success(self):
         """Extern callable returns 4 → consumes 4 bytes after header."""
         spec = bbq.compile_string(EXTERN_SPEC)

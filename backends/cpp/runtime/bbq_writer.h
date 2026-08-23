@@ -39,6 +39,12 @@ struct writer : machine {
     // array then sets it to the array's effective child count, so emit() writes a valid prefix).
     std::unordered_map<int, const FieldCapture*> count_field_;
     std::vector<const FieldCapture*> rest_stack_;   // open @rest windows: their size fields, LIFO
+    // Every node the grammar DERIVES — the counts and @rest sizes this walk overwrites.
+    // Nail calls these dependent fields: "not exposed in the data model, but instead
+    // transparently computed", so they are not the caller's to set. Recorded so a face
+    // that DOES expose them (the Python view) can refuse an assignment instead of taking
+    // it and then silently overwriting it.
+    std::vector<const FieldCapture*> derived;
     const char* error = nullptr;
 
     writer(const FieldCapture* root, const uint8_t* buf, size_t length, zcow* overlay)
@@ -80,7 +86,11 @@ struct writer : machine {
     void end_array() { scope.pop_back(); }
 
     // ── grammar enforcement (the only writes — into the overlay, not the byte stream) ──
-    void mark_count(int id, const char* field_name) { count_field_[id] = field(field_name); }
+    void mark_count(int id, const char* field_name) {
+        const FieldCapture* n = field(field_name);
+        count_field_[id] = n;
+        if (n) derived.push_back(n);
+    }
     void set_count(int id, int64_t v, znode::Enc enc) {
         auto it = count_field_.find(id);
         if (it != count_field_.end() && it->second) zc->set_scalar(it->second, v, enc);
@@ -93,7 +103,11 @@ struct writer : machine {
     // (window_len reserializes the post-size children) and written back, so a content edit that
     // changed the window's length yields a corrected size. SIZE_MAX = the container was never
     // touched → keep the stored size (an unmutated re-emit is byte-identity).
-    void mark_rest(const char* size_field) { rest_stack_.push_back(field(size_field)); }
+    void mark_rest(const char* size_field) {
+        const FieldCapture* n = field(size_field);
+        rest_stack_.push_back(n);
+        if (n) derived.push_back(n);
+    }
     void set_rest(znode::Enc enc) {
         if (rest_stack_.empty()) return;
         const FieldCapture* sz = rest_stack_.back(); rest_stack_.pop_back();

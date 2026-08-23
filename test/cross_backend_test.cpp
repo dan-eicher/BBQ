@@ -703,6 +703,61 @@ TEST(CrossBackend, CppWriterToCReaderFullFixture) {
     }
 }
 
+// ── (PUT): put(A × C) ⊆ C. Foster et al. Def 3.2 types a well-behaved lens with `put`
+// landing back in C, not just with GetPut/PutGet — and that typing is the one the walk
+// cannot establish, because it replays the shape the PARSE recorded. Change a switch
+// discriminant and the recorded arm no longer matches: the bytes are not a document this
+// grammar accepts. PutGet does NOT catch it (`⊑` is vacuous when its left side is
+// undefined), so the writer has to test membership itself and REFUSE.
+TEST(CrossBackend, WriterRefusesWhenTheEditLeavesTheGrammar) {
+    const CRoundtrip& rt = shared_rt();
+    ASSERT_TRUE(rt.ok) << rt.err;
+
+    // Sw = struct { tag: uint8, body: switch(tag) { 1: uint16le; 2: Pair; default: uint8; } }
+    // Authored with tag=1 (a 2-byte body). Retag to 2 and the body must be a Pair — which
+    // it still is by width, so the shape survives; retag to 9 takes the default arm, one
+    // byte, leaving a trailing byte the grammar cannot place.
+    const std::vector<uint8_t> v{0x01, 0x34, 0x12};
+    bbq::ParseArena ar;
+    bbq::CaptureMetadata vm = zr::Sw_read(v.data(), v.size(), ar);
+    ASSERT_TRUE(vm.success);
+
+    bbq::zcow zc;
+    zc.set_int(bbq::node_child(vm.root, "tag"), 9);        // now the default (1-byte) arm
+    std::vector<uint8_t> wb = zr::Sw_write(vm.root, v.data(), v.size(), &zc);
+    EXPECT_TRUE(wb.empty())
+        << "generated ZCow writer emitted a document outside the grammar: " << hexdump(wb);
+
+    // The dynamic writer must refuse for the same reason. Its membership test is a
+    // callback, since the parser differs per face — here, the CEK.
+    bbq::ParseArena ar2;
+    bbq::CaptureMetadata vm2 = zr::Sw_read(v.data(), v.size(), ar2);
+    ASSERT_TRUE(vm2.success);
+    bbq::zcow zc2;
+    zc2.set_int(bbq::node_child(vm2.root, "tag"), 9);
+    std::string ierr;
+    const size_t tail_before = v.size() > vm2.root->end_offset ? v.size() - vm2.root->end_offset : 0;
+    auto verify = [&](const uint8_t* d, size_t n, std::string* why) {
+        bbq::CaptureMetadata m = cek_meta_x(rt.cek_cg, "Sw", d, n);
+        if (!m.success) { if (why) *why = m.error_message ? m.error_message : "parse failed"; return false; }
+        size_t tail_after = n > m.bytes_consumed ? n - m.bytes_consumed : 0;
+        if (tail_after > tail_before) { if (why) *why = "trailing bytes"; return false; }
+        return true;
+    };
+    std::vector<uint8_t> ib = bbq::render::run_writer(rt.wops, "Sw", vm2.root, v.data(), v.size(),
+                                                      &zc2, &ierr, verify);
+    EXPECT_TRUE(ib.empty()) << "dynamic writer emitted a document outside the grammar: " << hexdump(ib);
+    EXPECT_NE(ierr.find("does not produce a document"), std::string::npos) << "unhelpful: " << ierr;
+
+    // And a legal edit still goes through both — the refusal is not a blanket veto.
+    bbq::ParseArena ar3;
+    bbq::CaptureMetadata vm3 = zr::Sw_read(v.data(), v.size(), ar3);
+    bbq::zcow zc3;
+    zc3.set_int(&bbq::node_child(vm3.root, "body")[0], 0x1234);
+    EXPECT_FALSE(zr::Sw_write(vm3.root, v.data(), v.size(), &zc3).empty())
+        << "generated writer refused a legal same-shape edit";
+}
+
 // ── The MUTATE axis — the whole point of ZCow. Parse → graph → CoW-edit via the zcow
 // overlay → ZCow writer re-emits → the bytes decode (CEK oracle) to the EDITED value tree,
 // derived fields (counts) consistent. Value edit, array remove, array append.

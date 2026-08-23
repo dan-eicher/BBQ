@@ -13,7 +13,7 @@ A separate `bbq.build` submodule constructs binary content from scratch (a typed
 byte-emitter — the struct-tier analogue of Python's `struct`).
 
 **Source:** `bindings/python/bbq_python.cpp` (parse/edit) + `bindings/python/bbq_build.cpp` (construction)
-**Tests:** `test/test_bbq_python.py` (215 tests) + `test/test_bbq_freethreaded.py` (free-threading stress)
+**Tests:** `test/test_bbq_python.py` (221 tests) + `test/test_bbq_freethreaded.py` (free-threading stress)
 
 ## Architecture
 
@@ -79,7 +79,7 @@ Container protocols: `result.field`, `result["field"]`, `result[i]`, slices, `le
 
 | Method | Description |
 |--------|-------------|
-| `emit() -> bytes` | Enforce the grammar over the edited overlay (dependent fields recomputed), then serialize. Byte-identical to the input if unedited; re-parses to the edit if not. |
+| `emit() -> bytes` | Enforce the grammar over the edited overlay (dependent fields recomputed), serialize, and verify the result parses. Byte-identical to the input if unedited; re-parses to the edit if not. Raises `bbq.ParseError` rather than returning a document the grammar would reject. |
 | `deltas() -> list[dict]` | The structured diff since parse: `{path, offset, old, new}` per changed field. |
 
 ### `bbq.Node`
@@ -108,10 +108,29 @@ The core lazy, zero-copy type over a single `FieldCapture`.
 
 `len(array_node)` is **live** — it reflects appends/deletes immediately, like a
 Python list. Structural *contents* (the new elements) are read back after
-`emit()` → re-parse. The array's count field is a **dependent field**: `emit()`
-derives it from the array's effective length, so do not set it yourself — the
-array wins. The same holds for a count reached by a path (`array<uint8>[h.n]`),
-a count nested inside an array element, and an `@rest` window's size.
+`emit()` → re-parse.
+
+The array's count field is a **dependent field**: `emit()` derives it from the
+array's effective length, so **assigning to it raises `TypeError`** — edit the
+array instead. The same holds for a count reached by a path
+(`array<uint8>[h.n]`), a count nested inside an array element, and an `@rest`
+window's size.
+
+`emit()` **refuses** rather than handing back a document the grammar would
+reject. Editing a value the *shape* depends on — a switch discriminant, a field a
+`where` constrains — leaves the writer replaying the shape the parse recorded, so
+the result would not re-parse; that raises `bbq.ParseError`:
+
+```python
+r = spec.parse(data)      # T = struct { kind: uint8, body: switch (kind) {...} }
+r.kind = 2                # the body is still the old arm's shape
+r.emit()                  # bbq.ParseError: the edit does not produce a document
+                          #                 this grammar accepts: ...
+```
+
+Content that enters as **raw bytes** (an appended composite element, a splice) is
+opaque: the count of elements is still derived for you, but lengths *inside* those
+bytes are yours. The verification above catches it if they are wrong.
 
 ## `bbq.build` — construction from scratch
 

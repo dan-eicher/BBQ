@@ -12,10 +12,23 @@
 #include <cstddef>
 #include <vector>
 #include "bbq_writer.h"
+#include "ParseArena.h"
 
 {% if has_ns %}
 namespace {{ namespace }} {
 {% endif %}
+
+{# The writer needs the READER: Foster et al. Def 3.2 types a well-behaved lens with
+   `put(A × C) ⊆ C` — put must land back in C — and the walk below cannot establish that,
+   because it replays the shape the PARSE recorded. An edit that changes which shape the
+   grammar selects (a switch discriminant, a value a `where` now rejects) would otherwise
+   be handed back as bytes that will not re-parse; PutGet does not catch it, since `⊑` is
+   vacuous when its left side is undefined. So <Rule>_write re-reads its own output and
+   returns nothing rather than a non-member. Declared, not #included, so header order does
+   not matter; the definitions come from the generated reader. #}
+{% for fn in functions %}
+bbq::CaptureMetadata {{ fn.kpfx }}_read(const uint8_t*, size_t, bbq::ParseArena&);
+{% endfor %}
 
 {% for fn in functions %}
 {% for o in fn.ops %}
@@ -32,7 +45,19 @@ static bool {{ fn.kpfx }}_w_entry(bbq::writer& w) { return {{ fn.kpfx }}_w{{ fn.
 std::vector<uint8_t> {{ fn.name }}(const bbq::FieldCapture* root, const uint8_t* buf, size_t len, bbq::zcow* zc) {
     bbq::writer w(root, buf, len, zc);
     if (!{{ fn.kpfx }}_w_entry(w)) return {};   // enforce derived fields into the overlay
-    return w.emit_bytes();                       // ZCow serializes the now-consistent overlay
+    std::vector<uint8_t> out = w.emit_bytes();   // ZCow serializes the now-consistent overlay
+    // (PUT): put(A x C) subset C. Membership in C is what `get` decides, so ask it.
+    // Not "consumes everything": a rule may legitimately stop early (an until-array with
+    // a trailing-context terminator leaves its reserve behind), and the input did too. The
+    // test is that the edit did not turn ACCOUNTED-FOR bytes into unaccounted-for ones, so
+    // compare the leftover against the leftover the original parse had.
+    size_t _tail_before = (root && len > root->end_offset) ? len - root->end_offset : 0;
+    bbq::ParseArena _a;
+    bbq::CaptureMetadata _m = {{ fn.kpfx }}_read(out.data(), out.size(), _a);
+    if (!_m.success) return {};
+    size_t _tail_after = out.size() > _m.bytes_consumed ? out.size() - _m.bytes_consumed : 0;
+    if (_tail_after > _tail_before) return {};
+    return out;
 }
 {% endfor %}
 

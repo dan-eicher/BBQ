@@ -116,7 +116,7 @@ See [Getting Started](docs/GettingStarted.md) for a walkthrough, and
 on BBQ, selected by `-backend`. **`-backend cpp`** (default) emits header-only C++
 zero-copy view types (`<prefix>Types.h`, `<prefix>Reader.h`, `<prefix>Writer.h`) —
 a parse records offsets and copies nothing, and `emit()` writes mutations back
-(copy-on-write). **`-backend c`** emits an owning C reader **and a writer** plus
+(copy-on-write), refusing rather than emitting a document the grammar would reject. **`-backend c`** emits an owning C reader **and a writer** plus
 generated free functions (`<prefix>_types.h`, `<prefix>_reader.h/.c`,
 `<prefix>_writer.h/.c`) — read∘write round-trips, and the writer recomputes `uleb`
 `@rest` sizes so programmatically-built trees serialize correctly. **`-backend
@@ -165,6 +165,6 @@ jitterator/         Copy-and-patch JIT stencil extractor and runtime
 ## Running Tests
 
 ```sh
-# Full suite (C++ via ctest, Python via pytest hook): 866 + 215 tests
+# Full suite (C++ via ctest, Python via pytest hook): 867 + 221 tests
 ctest --test-dir build --output-on-failure
 ```

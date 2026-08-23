@@ -13,7 +13,7 @@ A separate `bbq.build` submodule constructs binary content from scratch (a typed
 byte-emitter — the struct-tier analogue of Python's `struct`).
 
 **Source:** `bindings/python/bbq_python.cpp` (parse/edit) + `bindings/python/bbq_build.cpp` (construction)
-**Tests:** `test/test_bbq_python.py` (221 tests) + `test/test_bbq_freethreaded.py` (free-threading stress)
+**Tests:** `test/test_bbq_python.py` (225 tests) + `test/test_bbq_freethreaded.py` (free-threading stress)
 
 ## Architecture
 

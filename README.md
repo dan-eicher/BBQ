@@ -165,6 +165,6 @@ jitterator/         Copy-and-patch JIT stencil extractor and runtime
 ## Running Tests
 
 ```sh
-# Full suite (C++ via ctest, Python via pytest hook): 867 + 221 tests
+# Full suite (C++ via ctest, Python via pytest hook): 867 + 225 tests
 ctest --test-dir build --output-on-failure
 ```

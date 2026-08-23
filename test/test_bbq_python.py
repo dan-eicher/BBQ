@@ -585,6 +585,27 @@ class TestLensLaws:
         with pytest.raises(bbq.ParseError):
             r.emit()
 
+    @pytest.mark.parametrize("label,src,data,field,value", [
+        # The membership test is a re-parse, so it is not scoped to the shapes anyone
+        # thought to enumerate. These are the OTHER ways an edit can decide a shape;
+        # they are here so a cheaper approximation cannot quietly replace it.
+        ("interval offset", "T = struct { off: uint8, val: uint8 [off, off + 1] }",
+         bytes([1, 0xAA, 0xBB]), "off", 200),
+        ("optional predicate", "T = struct { has: uint8, v: optional<uint16le> where has == 1 }",
+         bytes([1, 0x34, 0x12]), "has", 0),
+        ("where on a plain field", "T = struct { n: uint8 where n == 1, w: uint16be }",
+         bytes([1, 0x12, 0x34]), "n", 2),
+        ("switch discriminant",
+         "T = struct { kind: uint8, body: switch (kind) { 1: uint8; 2: uint32le; } }",
+         bytes([1, 0xAA]), "kind", 2),
+    ])
+    def test_put_refuses_every_kind_of_shape_change(self, label, src, data, field, value):
+        spec = bbq.compile_string(src)
+        r = spec.parse(data)
+        setattr(r, field, value)
+        with pytest.raises(bbq.ParseError):
+            r.emit()
+
     def test_put_still_emits_for_a_legal_edit(self):
         # The refusal must not be a blanket "any edit is suspicious".
         spec = bbq.compile_string("T = struct { ver: uint8 where ver == 1, x: uint8 }")

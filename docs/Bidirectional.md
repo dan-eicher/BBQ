@@ -30,51 +30,25 @@ put : A × C ⇀ C        emit  — edited view AND THE ORIGINAL BYTES to new by
 entire reason `bbq::zcow` is an overlay over a retained baseline rather than a value tree:
 the Borrowed spans *are* the discarded information, kept so `put` can put them back.
 
-Def 3.2 is **two typing conditions and two laws**, and the typings do most of the work:
+Two laws [LENS, Def 3.2]:
 
-| | Statement | In BBQ | Anchored by |
+| Law | Statement | In BBQ | Anchored by |
 |---|---|---|---|
-| **(GET)** | `get(C) ⊆ A` | a parse yields a capture view | the reader; every parse test |
-| **(PUT)** | `put(A × C) ⊆ C` | emit must yield a document **the grammar accepts** | `CrossBackend.WriterRefusesWhenTheEditLeavesTheGrammar`, `TestLensLaws.test_put_refuses_*` |
-| **GetPut** | `put(get(c), c) ⊑ c` | an unedited re-emit is **byte-identical** | `CrossBackend.CppWriterToCReaderFullFixture` (all 49 rules), `TestLensLaws._lens` |
-| **PutGet** | `get(put(a, c)) ⊑ a` | re-parsing an edit yields **the edit that was made** | `CrossBackend.CppWriterMutateRoundTrip`, `TestLensLaws` |
-| Def 3.3 **Totality** | `C ⊆ dom(get)` and `A × C ⊆ dom(put)` | `get` is partial (a parse can reject); `put` is total — it always answers, with bytes or a refusal | — |
-| **PutPut** | `put(a', put(a, c)) ⊑ put(a', c)` | **not claimed** | — |
+| **GetPut** | `put(get(c), c) ⊑ c` | an unedited re-emit is **byte-identical** to the input | `CrossBackend.CppWriterToCReaderFullFixture` (all 49 fixture rules), `TestLensLaws._lens` |
+| **PutGet** | `get(put(a, c)) ⊑ a` | re-parsing an edited document yields **the edit that was made** | `CrossBackend.CppWriterMutateRoundTrip`, `TestLensLaws` |
 
-**(PUT) is the condition that forbids a broken write, and it is easy to miss.** `⊑` holds
-vacuously when its left side is undefined, so `get(put(a,c)) ⊑ a` is satisfied by emitting
-garbage that fails to parse — PutGet alone rules out nothing. Foster et al. make the point
-directly (§3.3, fn. 3): well-behavedness without totality is near-trivial, since a `put`
-undefined on all inputs satisfies both laws.
+GetPut is the property the whole zero-copy design exists to deliver, so it is asserted as
+byte equality, not as "decodes to the same values" — a value comparison cannot see a lost
+padding byte or a re-canonicalised varint.
 
-So the writer tests membership in `C` itself and **refuses** rather than returning a
-non-member. It has to: the walk replays the shape the *parse* recorded, so an edit that
-changes which shape the grammar selects — a switch discriminant, a value a `where` now
-rejects — leaves it emitting bytes that will not re-parse. Membership is what `get`
-decides, so `get` is what it asks:
-
-- **C++** — `<Rule>_write` re-reads its own output with `<Rule>_read` and returns an empty
-  vector if it is not a member. The generated writer therefore depends on the generated
-  reader.
-- **CEK/Python** — `emit()` re-parses with the CEK and raises `bbq.ParseError`. For a spec
-  with `extern`, that runs the registered callback once more, on the output.
-
-The test is *not* "consumes every byte". A rule may legitimately stop early — `Unt =
-struct { xs: array<uint8>(none, until(@remaining < 2)) }` accounts for 2 of 3 bytes by
-design, and the CEK does the same — which is EverParse's caveat about parsers that do not
-consume their whole input [EVERPARSE, §5]. What must not happen is an edit turning
-**accounted-for bytes into unaccounted-for ones**, so the check compares the leftover
-against the leftover the original parse had.
+PutGet is what forces the dependent-field machinery below. An append that leaves a count
+field stale fails it: the appended element is in the bytes but orphaned, so `get` of the
+result is not the edit that was made.
 
 **PutPut is not claimed.** `put(a', put(a, c)) ⊑ put(a', c)` — "very well behaved"
 [LENS, §3.2] — does not hold for BBQ's array edits, and Foster et al. note that their own
 `map`, `flatten`, `merge` and conditional combinators fail it "for reasons that seem
 pragmatically unavoidable". BBQ is well behaved. It is not very well behaved.
-
-**Creation is not modelled.** Foster et al. handle "make a new concrete view from an
-abstract one with no old concrete view" with a distinguished `Ω` ("missing") value
-[LENS, §3, *Dealing with Creation*]. BBQ has no `put(a, Ω)`: `bbq.build` constructs bytes
-with no grammar involved, and the two layers meet only at bytes.
 
 ## Dependent fields
 
@@ -86,11 +60,8 @@ Nail's rule is that such a field
 > developer from checking that these fields are correct (for input) or having to keep their
 > values in sync with the rest of the data structure (for output).
 
-BBQ follows this. A count is a *result* of the array, never an input the caller maintains,
-and **assigning to one is refused** (`TypeError` from the Python face). Accepting the
-assignment and then overwriting it would be a PutGet violation the caller could not see —
-the document parses, it just is not the view that was asked for. `bbq::writer::derived`
-records the nodes the walk writes, so the refusal is by node identity, not by name.
+BBQ follows this. A count is a *result* of the array, never an input the caller maintains.
+Setting `r.n` by hand is not required and not respected — the array's effective length wins.
 
 The algorithm is Nail's [NAIL, §4]: reserve the field, overwrite it when the construct that
 determines it is reached, and let anything downstream read the corrected value. In BBQ that
@@ -107,9 +78,8 @@ What is enforced: array counts, including a count reached by a path (`array<uint
 counts nested inside array element bodies (the walk descends into each element), and `@rest`
 window sizes. The encoding is respected — a `uleb128` count is rewritten as a varint.
 
-What is not derived: `compute` fields are not in the byte stream at all. A `where` constraint
-is not a dependent field either — nothing recomputes it — but an edit that violates one is
-caught by the (PUT) membership test above, which refuses rather than emitting.
+What is not: `where` constraints are not re-checked on write, and `compute` fields are not in
+the byte stream at all. Neither is a dependent field.
 
 The owning C writer solves the same problem in the serializer shape — `bbq_write_ctx_t`
 carries `count_holes` and `rest_holes` and back-patches the prefix once the content length is

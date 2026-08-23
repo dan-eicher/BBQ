@@ -8,7 +8,6 @@
 
 #include <cstring>
 #include <cstdio>
-#include <set>
 #include <string>
 #include <sstream>
 
@@ -60,8 +59,6 @@ extern PyTypeObject PyBBQNodeIter_Type;
 static PyObject* PyBBQParseError;
 
 static PyBBQNode* PyBBQNode_New(const FieldCapture* cap, PyBBQResult* result);
-static const nlohmann::json* spec_wops(PyBBQSpec* spec);
-static const std::set<const FieldCapture*>* result_derived(PyBBQResult* result);
 
 
 // ── Locking ─────────────────────────────────────────────────────────────────
@@ -136,10 +133,6 @@ struct PyBBQResult {
     bool view_valid;
     bbq::zcow* zcow;   // copy-on-write overlay, lazily created on first mutation
     const char* rule;  // the rule this was parsed with — emit() enforces THAT rule's grammar
-    // The nodes the grammar derives (counts, @rest sizes). Computed on the first
-    // assignment and cached; null until then. Assigning to one of these is refused —
-    // they are emit()'s to write, not the caller's.
-    std::set<const FieldCapture*>* derived;
     // Guards `zcow` — its creation and every read/write of it. bbq::zcow is an
     // unordered_map plus a node tree; two threads editing one document corrupt it
     // (node_for() inserts while another rehashes). Reads of the BASELINE index need no
@@ -249,19 +242,6 @@ static bbq::zcow* zcow_of(PyBBQResult* result) {
 // and PyLong_AsLongLong can all run arbitrary Python (__float__ / __bool__ / __index__),
 // and re-entering this module while holding the overlay lock would deadlock.
 static int zcow_set_capture(const FieldCapture* cap, PyBBQResult* result, PyObject* value) {
-    // A dependent field belongs to the grammar, not the caller: emit() derives it from the
-    // document. Taking the assignment and then overwriting it would be a PutGet violation
-    // the caller could not see, so refuse it instead.
-    if (const std::set<const FieldCapture*>* d = result_derived(result)) {
-        if (d->count(cap)) {
-            // ASCII only: PyErr_Format goes through PyUnicode_FromFormatV.
-            PyErr_Format(PyExc_TypeError,
-                         "'%s' is a derived field (a count or @rest size); emit() computes "
-                         "it from the document, so edit the array or window instead",
-                         cap->name ? cap->name : "?");
-            return -1;
-        }
-    }
     CaptureType t = cap->type;
     if (is_float_type(t)) {
         double d = PyFloat_AsDouble(value);
@@ -1209,7 +1189,6 @@ PyTypeObject PyBBQNodeIter_Type = {
 
 static void PyBBQResult_dealloc(PyBBQResult* self) {
     PyObject_GC_UnTrack((PyObject*)self);
-    delete self->derived;
     delete self->zcow;
     delete self->arena;
     if (self->view_valid)
@@ -1354,21 +1333,6 @@ static PyObject* PyBBQResult_dir(PyBBQResult* self, PyObject*) {
     return list;
 }
 
-// The nodes this document's grammar derives, computed on first use and cached. Null when
-// there is nothing to derive against (a failed parse) or the lowering is unavailable —
-// in which case nothing is refused, which is the pre-existing behaviour, not a new claim.
-static const std::set<const FieldCapture*>* result_derived(PyBBQResult* result) {
-    if (result->derived) return result->derived;
-    if (!result->meta.success || !result->meta.root || !result->view_valid) return nullptr;
-    const nlohmann::json* wops = spec_wops(result->spec);
-    if (!wops) { PyErr_Clear(); return nullptr; }
-    auto nodes = bbq::render::derived_fields(*wops, result->rule, result->meta.root,
-                                             (const uint8_t*)result->view.buf,
-                                             (size_t)result->view.len);
-    result->derived = new std::set<const FieldCapture*>(nodes.begin(), nodes.end());
-    return result->derived;
-}
-
 // The spec's writer op-list, lowered on first use. Null + a Python error on failure.
 // Once published it is immutable, so callers read it without the lock.
 static const nlohmann::json* spec_wops(PyBBQSpec* spec) {
@@ -1382,56 +1346,6 @@ static const nlohmann::json* spec_wops(PyBBQSpec* spec) {
         return nullptr;
     }
     return spec->wops;
-}
-
-// Does `bytes` parse as this result's rule, all of it? The membership test for C.
-// Runs the same machine `parse` does, with the same externs, over a throwaway arena.
-static bool verify_membership(PyBBQResult* self, const std::vector<uint8_t>& bytes,
-                              std::string* why) {
-    PyBBQSpec* spec = self->spec;
-    KontNode* entry = nullptr;
-    for (int i = 0; i < spec->grammar->rule_count; i++)
-        if (spec->grammar->rules[i].name == self->rule) { entry = spec->grammar->rules[i].entry; break; }
-    if (!entry) { if (why) *why = "rule vanished"; return false; }
-
-    std::vector<ExternalParserTable::Entry> snap;
-    std::vector<PyObject*> held;
-    {
-        BBQLock g(&spec->lock);
-        snap.assign(spec->ext_entries, spec->ext_entries + spec->ext_count);
-        held.assign(spec->ext_callables, spec->ext_callables + spec->ext_count);
-        for (PyObject* c : held) Py_INCREF(c);
-    }
-    ExternalParserTable table{snap.data(), (int)snap.size()};
-
-    ParseArena arena;
-    CEKMachine m;
-    m.arena = &arena;
-    m.builtins = &spec->grammar->builtins;
-    if (!snap.empty()) m.ext_parsers = &table;
-    CaptureMetadata meta = m.execute_from(entry, bytes.data(), bytes.size(),
-                                          spec->grammar->default_little_endian);
-    for (PyObject* c : held) Py_DECREF(c);
-
-    // An extern callback may have raised; that is a verification failure, not a parse result.
-    if (PyErr_Occurred()) { PyErr_Clear(); if (why) *why = "an extern parser raised"; return false; }
-    if (!meta.success) {
-        if (why) *why = meta.error_message ? meta.error_message : "parse failed";
-        return false;
-    }
-    // Not "consumes everything": a rule may legitimately stop early (an until-array whose
-    // terminator reserves trailing context), and the input did too. What must not happen is
-    // the edit turning ACCOUNTED-FOR bytes into unaccounted-for ones, so compare leftovers.
-    size_t tail_before = (size_t)self->view.len > self->meta.bytes_consumed
-                       ? (size_t)self->view.len - self->meta.bytes_consumed : 0;
-    size_t tail_after = bytes.size() > meta.bytes_consumed
-                      ? bytes.size() - meta.bytes_consumed : 0;
-    if (tail_after > tail_before) {
-        if (why) *why = "only " + std::to_string(meta.bytes_consumed) + " of " +
-                        std::to_string(bytes.size()) + " bytes are accounted for";
-        return false;
-    }
-    return true;
 }
 
 // `put` — the write half of the lens. ZCow (bbq::emit) is the byte serializer; it knows
@@ -1468,23 +1382,6 @@ static PyObject* PyBBQResult_emit(PyBBQResult* self, PyObject*) {
     }
     if (out.empty() && !err.empty()) {
         PyErr_Format(PyBBQParseError, "emit: %s", err.c_str());
-        return NULL;
-    }
-
-    // (PUT): put(A × C) ⊆ C — the result has to be a document this grammar accepts. The
-    // walk keeps derived fields consistent but replays the shape the PARSE recorded, so an
-    // edit that changes which shape the grammar selects (a discriminant, a value a `where`
-    // now rejects) would otherwise be handed back as bytes that will not re-parse. Asking
-    // `get` is the exact membership test.
-    //
-    // Deliberately NOT run through run_writer's `verify` hook and NOT under the overlay
-    // lock: this re-parse runs the grammar, which for a spec with `extern` calls back into
-    // Python. Holding a lock across that would deadlock — and it means an extern callback
-    // is invoked once more per emit(), on the output.
-    if (!verify_membership(self, out, &err)) {
-        PyErr_Format(PyBBQParseError,
-                     "emit: the edit does not produce a document this grammar accepts%s%s",
-                     err.empty() ? "" : ": ", err.c_str());
         return NULL;
     }
     return PyBytes_FromStringAndSize((const char*)out.data(), (Py_ssize_t)out.size());
@@ -1858,7 +1755,6 @@ static PyObject* do_parse(PyBBQSpec* self, Py_buffer* view, const char* rule_nam
     result->view = *view;       // transfer buffer ownership
     result->view_valid = true;
     result->zcow = nullptr;     // created on first mutation
-    result->derived = nullptr;  // computed on first assignment
     result->rule = resolved;
     result->lock = BBQ_MUTEX_INIT;   // PyObject_GC_New does not zero
     Py_INCREF(self);

@@ -184,7 +184,7 @@ struct Interp {
 
 std::vector<uint8_t> run_writer(const json& functions, const std::string& rule,
                                 const bbq::FieldCapture* root, const uint8_t* buf, size_t len,
-                                bbq::zcow* zc, std::string* error, const VerifyFn& verify) {
+                                bbq::zcow* zc, std::string* error) {
     // The op-list is our own lowering, so a missing key is a toolchain bug, not user input —
     // but this runs behind the Python C API, where an escaping exception is a hard crash.
     // Catch it here and report it as the failure it is.
@@ -199,35 +199,9 @@ std::vector<uint8_t> run_writer(const json& functions, const std::string& rule,
             if (error) *error = w.error;
             return {};
         }
-        std::vector<uint8_t> out = w.emit_bytes();
-        // (PUT): put(A × C) ⊆ C. The walk keeps the DERIVED fields consistent; it cannot
-        // know that the edit still selects the shape it just replayed. Ask `get`.
-        if (verify) {
-            std::string why;
-            if (!verify(out.data(), out.size(), &why)) {
-                if (error)
-                    *error = "the edit does not produce a document this grammar accepts"
-                             + (why.empty() ? std::string() : ": " + why);
-                return {};
-            }
-        }
-        return out;
+        return w.emit_bytes();
     } catch (const std::exception& e) {
         if (error) *error = std::string("malformed writer op-list: ") + e.what();
-        return {};
-    }
-}
-
-std::vector<const bbq::FieldCapture*> derived_fields(
-    const json& functions, const std::string& rule,
-    const bbq::FieldCapture* root, const uint8_t* buf, size_t len) {
-    try {
-        Interp in(functions);
-        bbq::zcow scratch;                 // thrown away — only the marks are wanted
-        bbq::writer w(root, buf, len, &scratch);
-        in.run_rule(rule, w);              // a partial walk still marks what it reached
-        return w.derived;
-    } catch (const std::exception&) {
         return {};
     }
 }

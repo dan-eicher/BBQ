@@ -467,27 +467,17 @@ class TestZCowMutation:
 
 
 # ── Lens laws ────────────────────────────────────────────────────────────────
-# parse/emit is a lens (Foster et al., TOPLAS 2007, Def 3.2): get = parse (bytes ->
-# capture view), put = emit (edited view x ORIGINAL bytes -> new bytes). `put` takes
-# the original because `get` discards information — which is exactly what the ZCow
-# overlay retains.
+# parse/emit is a lens (Foster et al., TOPLAS 2007): get = parse (bytes -> capture
+# view), put = emit (edited view x ORIGINAL bytes -> new bytes). `put` takes the
+# original because `get` discards information — which is exactly what the ZCow
+# overlay retains. Two laws:
 #
-# Def 3.2 is TWO typing conditions and TWO laws, and the typings do most of the work:
+#   GetPut   put(get(c), c) = c      an unedited re-emit is byte-identical
+#   PutGet   get(put(a, c)) = a      re-parsing an edit yields the edit you made
 #
-#   (GET)    get(C) ⊆ A
-#   (PUT)    put(A × C) ⊆ C     put must land back in C — a document that PARSES
-#   GetPut   put(get(c), c) ⊑ c  an unedited re-emit is byte-identical
-#   PutGet   get(put(a, c)) ⊑ a  re-parsing an edit yields the edit you made
-#
-# `⊑` holds vacuously when its left side is undefined, so PutGet is satisfied by
-# emitting garbage that fails to parse — which is why (PUT) is the condition that
-# actually forbids a broken write, and why `_lens` below asserts the re-parse
-# explicitly rather than trusting PutGet.
-#
-# PutGet also forces dependent fields (Nail's term: length/count/offset fields,
+# PutGet is what forces dependent fields (Nail's term: length/count/offset fields,
 # "not exposed in the data model, but instead transparently computed"). An append
-# that leaves the count field stale fails it; so does letting the caller set a count
-# that emit() then overwrites. These mirror the C++ ZCow writer's
+# that leaves the count field stale fails it. These mirror the C++ ZCow writer's
 # CppWriterMutateRoundTrip suite case for case — the same fixture, the same edits.
 
 class TestLensLaws:
@@ -563,59 +553,6 @@ class TestLensLaws:
         r2 = self._lens("RestEof", data, edit)
         assert int(r2.sz) == 4
         assert [int(x) for x in r2.xs] == [10, 20, 30, 40]
-
-    # ── (PUT): put(A × C) ⊆ C — emit() may not hand back a non-member ──────────
-    # An edit that changes what SHAPE follows it (a switch discriminant, a value a
-    # `where` rejects) leaves the writer replaying the shape the parse recorded. The
-    # result is bytes that do not parse. PutGet does not catch this — it is satisfied
-    # vacuously — so the typing condition is the one that has to be enforced.
-
-    def test_put_refuses_when_a_discriminant_changed(self):
-        spec = bbq.compile_string(
-            "T = struct { kind: uint8, body: switch (kind) { 1: uint8; 2: uint32le; } }")
-        r = spec.parse(bytes([1, 0xAA]))
-        r.kind = 2                              # now claims a 4-byte body over 1 byte
-        with pytest.raises(bbq.ParseError):
-            r.emit()
-
-    def test_put_refuses_when_an_edit_violates_a_where(self):
-        spec = bbq.compile_string("T = struct { ver: uint8 where ver == 1, x: uint8 }")
-        r = spec.parse(bytes([1, 42]))
-        r.ver = 9
-        with pytest.raises(bbq.ParseError):
-            r.emit()
-
-    def test_put_still_emits_for_a_legal_edit(self):
-        # The refusal must not be a blanket "any edit is suspicious".
-        spec = bbq.compile_string("T = struct { ver: uint8 where ver == 1, x: uint8 }")
-        r = spec.parse(bytes([1, 42]))
-        r.x = 43
-        assert r.emit() == bytes([1, 43])
-
-    # ── Dependent fields are derived, not settable ────────────────────────────
-    # Nail: a count/length field is "not exposed in the data model, but instead
-    # transparently computed". Accepting an assignment and then overwriting it is a
-    # non-vacuous PutGet violation — the document parses, it just is not the view
-    # that was asked for.
-
-    def test_setting_a_dependent_count_is_refused(self):
-        spec = bbq.compile_string("T = struct { n: uint8, xs: array<uint8>[n] }")
-        r = spec.parse(bytes([2, 10, 20]))
-        with pytest.raises(TypeError):
-            r.n = 99
-
-    def test_setting_a_rest_size_is_refused(self):
-        spec = bbq.compile_string(
-            "T = struct { sz: uint8 @rest, xs: array<uint8>(none, eof) }")
-        r = spec.parse(bytes([2, 10, 20]))
-        with pytest.raises(TypeError):
-            r.sz = 99
-
-    def test_a_free_field_beside_a_dependent_one_still_sets(self):
-        spec = bbq.compile_string("T = struct { tag: uint8, n: uint8, xs: array<uint8>[n] }")
-        r = spec.parse(bytes([7, 2, 10, 20]))
-        r.tag = 9                                # not dependent — must still work
-        assert spec.parse(r.emit()).tag == 9
 
     def test_nested_per_element_count_recomputed(self):
         # (7) the walk must DESCEND into array element bodies: editing gs[0].xs fixes
@@ -1920,7 +1857,8 @@ class TestBuild:
         r = spec.parse(bytes([1, 1, 2]), rule="T")
         r.items.append(B.Struct(v=B.u8(3), w=B.u8(4)))
         r.items[0] = B.Struct(v=B.u8(9), w=B.u8(8))
-        r2 = spec.parse(r.emit(), rule="T")     # `n` is derived; emit() writes it
+        r.n = 2
+        r2 = spec.parse(r.emit(), rule="T")
         got = [(int(it.v), int(it.w)) for it in r2.items]
         assert int(r2.n) == 2 and got == [(9, 8), (3, 4)]
 

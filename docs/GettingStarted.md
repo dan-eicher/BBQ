@@ -357,14 +357,8 @@ int main() {
     hdr::Header edit(vm.root, data, &zc);
     edit.set_version(2);
     std::vector<uint8_t> out = hdr::Header_write(vm.root, data, sizeof data, &zc);
-    if (out.empty()) return 1;   // the edit does not yield a document this grammar accepts
 }
 ```
-
-`<Rule>_write` recomputes the fields the grammar derives (array counts, `@rest`
-sizes), then **re-reads its own output** and returns an empty vector rather than
-bytes that would not parse — see [The Write Side](Bidirectional.md). That is why
-`headerWriter.h` needs `headerReader.h`'s definitions linked.
 
 ```sh
 g++ -std=c++17 -I gen -I backends/cpp/runtime \

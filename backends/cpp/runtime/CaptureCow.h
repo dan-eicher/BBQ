@@ -212,10 +212,16 @@ inline size_t leaf_width(CaptureType t) {
 }
 
 // LEB128 encoders — the inverse of the varint decoders the readers use.
-inline void encode_uleb128(std::vector<uint8_t>& out, uint64_t v) {
+// Templated on where the bytes go, because a varint's WIDTH is a property of its value:
+// the only honest way to ask how wide one is, is to encode it. A caller that wants the
+// width and not the bytes hands in something that counts (see `sink`), and gets the
+// answer from this encoder rather than from a second one that could disagree with it.
+template <class Out>
+inline void encode_uleb128(Out& out, uint64_t v) {
     do { uint8_t b = (uint8_t)(v & 0x7F); v >>= 7; if (v) b |= 0x80; out.push_back(b); } while (v);
 }
-inline void encode_sleb128(std::vector<uint8_t>& out, int64_t v) {
+template <class Out>
+inline void encode_sleb128(Out& out, int64_t v) {
     for (;;) {
         uint8_t b = (uint8_t)(v & 0x7F);
         v >>= 7;                                  // arithmetic (sign-propagating)
@@ -265,13 +271,46 @@ inline bool computed_int(const node* n, int64_t* out) {
 
 namespace detail {
 
-inline void emit_node(const node& n, const source& src, const std::string& at,
-                      std::vector<uint8_t>& out) {
+// Where emitted bytes go. With a buffer it collects them; without one it only counts
+// them. That is what lets an @rest window be MEASURED by the emitter itself: a separate
+// "how many bytes would this be" function would be a second case analysis over the same
+// nodes, and the day it disagreed with this one the size field would be quietly wrong.
+struct sink {
+    std::vector<uint8_t>* out;   // null: count only
+    size_t n = 0;
+
+    explicit sink(std::vector<uint8_t>* o) : out(o) { if (o) n = o->size(); }
+
+    void raw(const uint8_t* p, size_t len) {
+        if (out) out->insert(out->end(), p, p + len);
+        n += len;
+    }
+    // A fixed-width leaf, encoded where it lands. Counting needs no encoding at all,
+    // because a fixed width does not depend on the value.
+    void fixed(size_t w, const node& nd) {
+        if (!out) { n += w; return; }
+        size_t p = out->size();
+        out->resize(p + w);
+        if (is_float_type(nd.type)) encode_float(out->data(), p, nd.type, nd.fval);
+        else                        encode_int(out->data(), p, nd.type, nd.ival);
+        n += w;
+    }
+    // A varint, whose width IS its value — so both faces go through the one encoder.
+    void push_back(uint8_t) { n++; }             // the counting face of the encoders
+    void uleb(uint64_t v) { if (out) { size_t b = out->size(); encode_uleb128(*out, v);
+                                       n += out->size() - b; }
+                            else encode_uleb128(*this, v); }
+    void sleb(int64_t v)  { if (out) { size_t b = out->size(); encode_sleb128(*out, v);
+                                       n += out->size() - b; }
+                            else encode_sleb128(*this, v); }
+};
+
+inline void emit_node(const node& n, const source& src, const std::string& at, sink& out) {
     // Untouched: its bytes are still exactly what it was parsed from. One blit,
     // however large the subtree — this is the zero-copy payoff.
     if (n.parsed) {
         if (src.buf && n.end_offset > n.start_offset)
-            out.insert(out.end(), src.buf + n.start_offset, src.buf + n.end_offset);
+            out.raw(src.buf + n.start_offset, n.end_offset - n.start_offset);
         return;
     }
     if (n.type == CaptureType::Computed) {
@@ -280,14 +319,14 @@ inline void emit_node(const node& n, const source& src, const std::string& at,
         // — so writing one back has to re-encode it. Which of the two this is, is the
         // ENCODING and not the span: a varint built from nothing never had a span, and
         // reading that as "occupies no bytes" would emit it as nothing.
-        if (n.enc == Enc::Uleb) encode_uleb128(out, (uint64_t)n.ival);
-        else if (n.enc == Enc::Sleb) encode_sleb128(out, n.ival);
+        if (n.enc == Enc::Uleb) out.uleb((uint64_t)n.ival);
+        else if (n.enc == Enc::Sleb) out.sleb(n.ival);
         return;
     }
     if (is_container_type(n.type)) {
         // A bitfield run owns the bytes its entries are read out of; the entries
         // themselves contribute none, so concatenating them would emit nothing.
-        if (!n.bval.empty()) { out.insert(out.end(), n.bval.begin(), n.bval.end()); return; }
+        if (!n.bval.empty()) { out.raw(n.bval.data(), n.bval.size()); return; }
         for (size_t i = 0; i < n.kids.size(); i++) {
             const node& k = *n.kids[i];
             const char* nm = k.name;
@@ -299,20 +338,31 @@ inline void emit_node(const node& n, const source& src, const std::string& at,
         return;
     }
     if (n.type == CaptureType::Bytes || n.type == CaptureType::String) {
-        out.insert(out.end(), n.bval.begin(), n.bval.end());
+        out.raw(n.bval.data(), n.bval.size());
         return;
     }
-    if (n.enc == Enc::Uleb) { encode_uleb128(out, (uint64_t)n.ival); return; }
-    if (n.enc == Enc::Sleb) { encode_sleb128(out, n.ival); return; }
+    if (n.enc == Enc::Uleb) { out.uleb((uint64_t)n.ival); return; }
+    if (n.enc == Enc::Sleb) { out.sleb(n.ival); return; }
     size_t w = (n.end_offset > n.start_offset) ? (n.end_offset - n.start_offset)
                                                : leaf_width(n.type);
     if (w == 0)
         throw type_error("zcow emit: '" + (at.empty() ? std::string("<root>") : at) +
                          "' has no width for its type");
-    size_t p = out.size();
-    out.resize(p + w);
-    if (is_float_type(n.type)) encode_float(out.data(), p, n.type, n.fval);
-    else                      encode_int(out.data(), p, n.type, n.ival);
+    out.fixed(w, n);
+}
+
+// Collecting the bytes is the common case; measuring is the other one.
+inline void emit_node(const node& n, const source& src, const std::string& at,
+                      std::vector<uint8_t>& out) {
+    sink s(&out);
+    emit_node(n, src, at, s);
+}
+
+// How many bytes this subtree occupies — by the emitter, so it cannot disagree with it.
+inline size_t emitted_size(const node& n, const source& src) {
+    sink s(nullptr);
+    emit_node(n, src, std::string(), s);
+    return s.n;
 }
 
 // Does anything under here occupy a different number of bytes than it was parsed
@@ -642,10 +692,12 @@ private:
             for (size_t i = 0; i < n->kids.size(); i++) {
                 if (!n->kids[i]->name || !n->determines ||
                     std::strcmp(n->kids[i]->name, n->determines) != 0) continue;
-                std::vector<uint8_t> window;
+                // Measured by the emitter rather than by a second walk that knows how
+                // wide things are: nothing is collected, only counted.
+                size_t window = 0;
                 for (size_t j = i + 1; j < n->kids.size(); j++)
-                    detail::emit_node(*n->kids[j], src(), std::string(), window);
-                set_derived(n->kids[i], (int64_t)window.size());
+                    window += detail::emitted_size(*n->kids[j], src());
+                set_derived(n->kids[i], (int64_t)window);
                 break;
             }
         }

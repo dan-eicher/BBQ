@@ -270,6 +270,43 @@ TEST(ZCow, AnExistingSubtreeCanBeAppendedAndIsStillStructure) {
     EXPECT_EQ(v.serialize(), bytes_of({0xDE, 0xAD, 0xBE, 0xEF, 0x02, 0x0A, 0x14, 0x63, 0x64}));
 }
 
+// An @rest window's size is MEASURED by the emitter, not by a second walk that knows how
+// wide each shape is. This is what that buys: for every node, of every shape, measuring
+// and writing give the same answer — because they are the same code. A separate length
+// function could pass its own tests and still drift from this one.
+static void measuring_agrees(const node& n, const source& src) {
+    std::vector<uint8_t> written;
+    detail::emit_node(n, src, std::string(), written);
+    EXPECT_EQ(detail::emitted_size(n, src), written.size())
+        << "measured and written disagree for a " << (int)n.type;
+    for (const auto& k : n.kids) measuring_agrees(*k, src);
+}
+
+TEST(ZCowLaw, MeasuringAgreesWithWritingForEveryShape) {
+    // Span-backed, and every owned shape an edit can produce: a resized array, a
+    // rewritten leaf, a byte string of a different length, and both varints — whose
+    // width is the one thing that cannot be read off a type.
+    document d = make_doc();
+    transient t = d.begin_edit();
+    const char* p[] = {"xs"};
+    node* xs = t.own_path(p, nullptr, 1);
+    set_int(t.append(xs, CaptureType::UInt8), 0x1E);
+
+    node* free_bits = t.append(xs, CaptureType::Bytes);
+    set_bytes(free_bits, (const uint8_t*)"abcd", 4);
+
+    for (auto e : {Enc::Uleb, Enc::Sleb})
+        for (int64_t v : {(int64_t)0, (int64_t)1, (int64_t)127, (int64_t)128,
+                          (int64_t)-1, (int64_t)300000}) {
+            node* c = t.append(xs, CaptureType::Computed);
+            set_int(c, v, e);
+        }
+
+    document v = std::move(t).commit();
+    measuring_agrees(*v.root(), v.src());
+    measuring_agrees(*d.root(), d.src());     // and the untouched version too
+}
+
 // A varint built from nothing has no span, and what says it occupies bytes is its
 // ENCODING. Reading that off the span instead emits it as nothing — which is what a
 // constructed leb would silently do.

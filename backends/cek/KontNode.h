@@ -7,9 +7,10 @@
 #include <cstddef>
 #include <cstdint>
 
-#include "Capture.h"  // bbq::FieldCapture — the shared index runtime that
-                      // FieldCaptureValue references (resolved by outer-namespace
-                      // lookup from bbq::cek). The runtime does NOT depend back.
+#include "CaptureCow.h"  // bbq::zcow::node — the parsed document the machine
+                         // builds and that FieldCaptureValue references (resolved
+                         // by outer-namespace lookup from bbq::cek). The runtime
+                         // does NOT depend back.
 
 namespace bbq::cek {
 
@@ -516,7 +517,7 @@ struct FieldCaptureValue : public Value {
 
     FieldCaptureValue() : Value(kind) {}
 
-    FieldCapture* capture{};
+    zcow::node* capture{};
 };
 
 // StaticKont — sum base inheriting from the shared `KontNode` root.
@@ -1309,6 +1310,7 @@ struct ExtractBitsNode : public StaticKont {
     PrimitiveInfo container{};
     int width_bits{};
     int offset_before{};
+    bool is_signed{};
     KontNode* next{};
 
     KontKind kind() const override { return KontKind::ExtractBitsNode; }

@@ -448,15 +448,22 @@ BitfieldBody <. TypeExpr* *result .>
        (*result)->loc = loc; .)
 .
 
+// `hi: 4`, `hi: unsigned 4`, `hi: signed 4` — signedness optional and unsigned by
+// default, since that is what nearly every format's flag bits are. A signed entry
+// reads back sign-extended from its own width.
 BitfieldEntryRule <. std::vector<BitfieldEntry*> *entries .>
     (. peg::Span name_span; peg::Span width_span;
        std::string name; int64_t width;
+       Signedness sign = Signedness::Unsigned;
        Expr* constr = nullptr; .)
     = ident<name_span>  (. name = name_span.to_string(); SourceLoc loc = Loc(); .)
       ":"
+      [ "signed"   (. sign = Signedness::Signed; .)
+      | "unsigned" (. sign = Signedness::Unsigned; .)
+      ]
       integer<width_span> (. width = std::stoll(width_span.to_string(), nullptr, 0); .)
       [ ConstraintBlock<&constr> ]
-    (. auto* e = new BitfieldEntry(std::move(name), width,
+    (. auto* e = new BitfieldEntry(std::move(name), sign, width,
                constr ? std::optional<Expr*>(constr) : std::nullopt);
        e->loc = loc;
        entries->push_back(e); .)

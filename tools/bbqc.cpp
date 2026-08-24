@@ -289,22 +289,10 @@ int main(int argc, char* argv[]) {
             return 1;
         }
         fprintf(stderr, "bbqc: generated %s\n", reader_name.c_str());
-        // The cpp-zcow (view) WRITER — the dual of the reader: walks the graph the reader
-        // emits and streams grammar-conformant bytes (ZCow is the storage underneath).
-        std::string writer_name = prefix + "Writer.h";
-        try {
-            ::bbq::Compiler cek_compiler;
-            auto* cek_g = cek_compiler.compile_grammar(grammar);
-            if (!cek_g) { fprintf(stderr, "bbqc: compile_grammar failed\n"); return 1; }
-            bbq::render::CompilerCtx ctx{grammar, &sema, cek_g, ""};
-            std::ofstream wout(output_dir + "/" + writer_name);
-            if (!wout) { fprintf(stderr, "bbqc: cannot open %s\n", writer_name.c_str()); return 1; }
-            wout << bbq::render::render_writer_view(ctx, templates_dir, ns);
-        } catch (const std::exception& e) {
-            fprintf(stderr, "bbqc: %s\n", e.what());
-            return 1;
-        }
-        fprintf(stderr, "bbqc: generated %s\n", writer_name.c_str());
+        // No writer is generated for this backend. The reader builds a bbq::zcow
+        // document; editing and serializing are the document's own, dependent fields
+        // included — the parser records what determines them, so nothing downstream
+        // has to re-derive the grammar to write it back.
         return 0;
     }
 }

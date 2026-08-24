@@ -39,8 +39,14 @@ namespace {
 // meta.root points into the arena, which must outlive every assertion.
 struct Parsed {
     bbq::cek::CompiledGrammar* grammar;
-    bbq::CaptureMetadata meta;
+    bbq::zcow::parse_result meta;
     const uint8_t* buf;
+
+    // A handle holds where it is, so the document has to outlive it. Read-only: no
+    // transient, so a setter on a handle built from these raises.
+    const bbq::zcow::document& doc() const { return meta.doc; }
+    bbq::zcow::node* node() const { return const_cast<bbq::zcow::node*>(meta.doc.root()); }
+    const bbq::zcow::source* src() const { return &meta.doc.src(); }
 };
 
 // A test extern parser: consumes a fixed 4 bytes. Registered as "readit" so the
@@ -84,27 +90,23 @@ Parsed cek_parse(const char* spec, const char* rule, const std::vector<uint8_t>&
     machine->arena = arena;
     machine->builtins = &g->builtins;
     machine->ext_parsers = ext_table;
-    bbq::CaptureMetadata meta =
+    bbq::zcow::parse_result meta =
         machine->execute_from(entry, buf, bytes.size(), g->default_little_endian);
-    return {g, meta, buf};
+    return {g, std::move(meta), buf};
 }
 
 // The index-side decode (the CEK reference): pull a scalar child by name and
 // decode it through the SHARED decoder the handle also uses.
-int64_t index_int(const bbq::FieldCapture* parent, const char* name, const uint8_t* buf) {
-    const bbq::FieldCapture* c = bbq::node_child(parent, name);
+int64_t index_int(const bbq::zcow::node* parent, const char* name, const uint8_t* buf) {
+    const bbq::zcow::node* c = bbq::node_child(parent, name);
     EXPECT_NE(c, nullptr) << "no child " << name;
-    int64_t bits = 0; bool sgn = false;
-    EXPECT_TRUE(bbq::decode_int(c, buf, &bits, &sgn)) << "decode_int " << name;
-    return bits;
+    return bbq::node_int(c, buf);
 }
 
-double index_float(const bbq::FieldCapture* parent, const char* name, const uint8_t* buf) {
-    const bbq::FieldCapture* c = bbq::node_child(parent, name);
+double index_float(const bbq::zcow::node* parent, const char* name, const uint8_t* buf) {
+    const bbq::zcow::node* c = bbq::node_child(parent, name);
     EXPECT_NE(c, nullptr) << "no child " << name;
-    double d = 0;
-    EXPECT_TRUE(bbq::decode_float(c, buf, &d)) << "decode_float " << name;
-    return d;
+    return bbq::node_float(c, buf);
 }
 
 }  // namespace
@@ -172,12 +174,12 @@ static const std::vector<uint8_t> kBytes = {
 TEST(RenderTypesCppParity, FlatScalarsMatchCek) {
     Parsed p = cek_parse(kFixture, "Flat", kBytes);
     ASSERT_TRUE(p.meta.success) << "CEK parse failed";
-    ASSERT_NE(p.meta.root, nullptr);
+    ASSERT_NE(p.meta.doc.root(), nullptr);
     // execute_from(rule_entry) returns the struct node itself as root; its
     // children are the fields (the Python binding reads meta.root the same way).
-    const bbq::FieldCapture* flat = p.meta.root;
+    const bbq::zcow::node* flat =p.meta.doc.root();
 
-    zp::Flat h(flat, p.buf, nullptr);
+    zp::Flat h(p.node(), p.src());
 
     // Each scalar: handle == the value the CEK index decodes (parity), and the
     // value matches the known bytes (correctness).
@@ -193,12 +195,14 @@ TEST(RenderTypesCppParity, CowMutateRoundTrips) {
     // set_int/get_int, float via set_float/get_float (NOT truncating set_int).
     Parsed p = cek_parse(kFixture, "Flat", kBytes);
     ASSERT_TRUE(p.meta.success);
-    bbq::zcow zc;
-    zp::Flat h(p.meta.root, p.buf, &zc);
+    // A handle over a transient writes; the same class over a document refuses (see
+    // below). Mutability is a property of the document, not of a second handle type.
+    bbq::zcow::transient t = p.meta.doc.begin_edit();
+    zp::Flat h = zp::Flat_of(t);
 
     EXPECT_EQ(h.u16(), 0x3456);          // baseline
     h.set_u16(0x0042);
-    EXPECT_EQ(h.u16(), 0x0042);          // int override read back
+    EXPECT_EQ(h.u16(), 0x0042);          // read back through the same document
 
     EXPECT_FLOAT_EQ(h.f32(), 1.5f);      // baseline
     h.set_f32(3.25f);
@@ -208,8 +212,8 @@ TEST(RenderTypesCppParity, CowMutateRoundTrips) {
 TEST(RenderTypesCppParity, SignedBoolFloatMatchCek) {
     Parsed p = cek_parse(kFixture, "Flat", kBytes);
     ASSERT_TRUE(p.meta.success) << "CEK parse failed";
-    const bbq::FieldCapture* flat = p.meta.root;
-    zp::Flat h(flat, p.buf, nullptr);
+    const bbq::zcow::node* flat =p.meta.doc.root();
+    zp::Flat h(p.node(), p.src());
 
     EXPECT_EQ(h.i8(),  index_int(flat, "i8",  p.buf)); EXPECT_EQ(h.i8(),  -2);
     EXPECT_EQ(h.i16(), index_int(flat, "i16", p.buf)); EXPECT_EQ(h.i16(), -3);
@@ -222,8 +226,8 @@ TEST(RenderTypesCppParity, SignedBoolFloatMatchCek) {
 TEST(RenderTypesCppParity, BytesAndNestedMatchCek) {
     Parsed p = cek_parse(kFixture, "Flat", kBytes);
     ASSERT_TRUE(p.meta.success);
-    const bbq::FieldCapture* flat = p.meta.root;
-    zp::Flat h(flat, p.buf, nullptr);
+    const bbq::zcow::node* flat =p.meta.doc.root();
+    zp::Flat h(p.node(), p.src());
 
     bbq::bytes_view raw = h.raw();
     ASSERT_EQ(raw.size, 2u);
@@ -240,11 +244,11 @@ TEST(RenderTypesCppParity, BytesAndNestedMatchCek) {
 TEST(RenderTypesCppParity, ArrayOfRuleMatchCek) {
     Parsed p = cek_parse(kFixture, "Flat", kBytes);
     ASSERT_TRUE(p.meta.success);
-    const bbq::FieldCapture* flat = p.meta.root;
-    zp::Flat h(flat, p.buf, nullptr);
+    const bbq::zcow::node* flat =p.meta.doc.root();
+    zp::Flat h(p.node(), p.src());
 
     EXPECT_EQ(h.n(), 2);
-    bbq::seq<zp::Inner> items = h.items();
+    zp::seq<zp::Inner> items = h.items();
     ASSERT_EQ(items.size(), 2u);
     EXPECT_EQ(items[0].a(), 33); EXPECT_EQ(items[0].b(), 1);
     EXPECT_EQ(items[1].a(), 34); EXPECT_EQ(items[1].b(), 2);
@@ -253,25 +257,22 @@ TEST(RenderTypesCppParity, ArrayOfRuleMatchCek) {
 TEST(RenderTypesCppParity, ArrayOfPrimMatchCek) {
     Parsed p = cek_parse(kFixture, "Flat", kBytes);
     ASSERT_TRUE(p.meta.success);
-    const bbq::FieldCapture* flat = p.meta.root;
-    zp::Flat h(flat, p.buf, nullptr);
+    const bbq::zcow::node* flat =p.meta.doc.root();
+    zp::Flat h(p.node(), p.src());
 
     EXPECT_EQ(h.m(), 3);
-    bbq::prim_seq<uint16_t> nums = h.nums();
+    zp::prim_seq<uint16_t> nums = h.nums();
     ASSERT_EQ(nums.size(), 3u);
     EXPECT_EQ(nums[0], 10);
     EXPECT_EQ(nums[1], 20);
     EXPECT_EQ(nums[2], 30);
 
     // Parity against the index decode of each element.
-    const bbq::FieldCapture* arr = bbq::node_child(flat, "nums");
+    const bbq::zcow::node* arr = bbq::node_child(flat, "nums");
     ASSERT_NE(arr, nullptr);
-    ASSERT_EQ(arr->child_count, 3);
-    for (int i = 0; i < arr->child_count; i++) {
-        int64_t bits = 0; bool sgn = false;
-        ASSERT_TRUE(bbq::decode_int(&arr->children[i], p.buf, &bits, &sgn));
-        EXPECT_EQ(nums[(size_t)i], (uint16_t)bits);
-    }
+    ASSERT_EQ(arr->kids.size(), 3u);
+    for (size_t i = 0; i < arr->kids.size(); i++)
+        EXPECT_EQ(nums[i], (uint16_t)bbq::node_int(arr->kids[i].get(), p.buf));
 }
 
 TEST(RenderTypesCppParity, OptionalPresent) {
@@ -279,14 +280,14 @@ TEST(RenderTypesCppParity, OptionalPresent) {
     Parsed p = cek_parse(kFixture, "Opt",
                          {0x01, 0x02, 0x01, 0x01, 0x05, 0x06, 0x00});
     ASSERT_TRUE(p.meta.success);
-    zp::Opt h(p.meta.root, p.buf, nullptr);
+    zp::Opt h(p.node(), p.src());
 
-    bbq::prim_opt<uint16_t> pm = h.pmaybe();
+    zp::prim_opt<uint16_t> pm = h.pmaybe();
     ASSERT_TRUE(pm.has_value());
     EXPECT_EQ(pm.value(), 0x0102);
-    EXPECT_EQ(pm.value(), (uint16_t)index_int(p.meta.root, "pmaybe", p.buf));
+    EXPECT_EQ(pm.value(), (uint16_t)index_int(p.meta.doc.root(), "pmaybe", p.buf));
 
-    bbq::opt<zp::Inner> rm = h.rmaybe();
+    zp::opt<zp::Inner> rm = h.rmaybe();
     ASSERT_TRUE(rm.has_value());
     EXPECT_EQ(rm.value().a(), 5);
     EXPECT_EQ(rm.value().b(), 6);
@@ -296,33 +297,72 @@ TEST(RenderTypesCppParity, OptionalAbsent) {
     // pflag=0 → pmaybe absent; rflag=0 → rmaybe absent (no children for either).
     Parsed p = cek_parse(kFixture, "Opt", {0x00, 0x00});
     ASSERT_TRUE(p.meta.success);
-    zp::Opt h(p.meta.root, p.buf, nullptr);
+    zp::Opt h(p.node(), p.src());
 
     EXPECT_FALSE(h.pmaybe().has_value());
     EXPECT_FALSE(h.rmaybe().has_value());
     // The index agrees: no child by either name.
-    EXPECT_EQ(bbq::node_child(p.meta.root, "pmaybe"), nullptr);
-    EXPECT_EQ(bbq::node_child(p.meta.root, "rmaybe"), nullptr);
+    EXPECT_EQ(bbq::node_child(p.meta.doc.root(), "pmaybe"), nullptr);
+    EXPECT_EQ(bbq::node_child(p.meta.doc.root(), "rmaybe"), nullptr);
 }
 
 TEST(RenderTypesCppParity, BitfieldMatchCek) {
     // byte 0xA5, little-endian (lsb-first): hi=[0,4)=0x5, lo=[4,8)=0xA.
     Parsed p = cek_parse(kFixture, "Bits", {0xA5});
     ASSERT_TRUE(p.meta.success);
-    zp::Bits h(p.meta.root, p.buf, nullptr);
+    zp::Bits h(p.node(), p.src());
 
     EXPECT_EQ(h.hi(), 0x5);
     EXPECT_EQ(h.lo(), 0xA);
-    // Parity: each entry is a Computed capture in the index.
-    EXPECT_EQ(h.hi(), (uint8_t)bbq::node_computed_int(bbq::node_child(p.meta.root, "hi")));
-    EXPECT_EQ(h.lo(), (uint8_t)bbq::node_computed_int(bbq::node_child(p.meta.root, "lo")));
+    // Parity: each entry is a Computed capture in the index. The handle reads through the
+    // container rather than through that value — same answer, and it is what makes a write
+    // visible, since the Computed value is what the parse decoded and does not move.
+    EXPECT_EQ(h.hi(), (uint8_t)bbq::node_int(bbq::node_child(p.meta.doc.root(), "hi"), p.buf));
+    EXPECT_EQ(h.lo(), (uint8_t)bbq::node_int(bbq::node_child(p.meta.doc.root(), "lo"), p.buf));
+}
+
+TEST(RenderTypesCppParity, BitfieldEntriesAreWritable) {
+    // The caller names a field. No shift, no mask, no container width — the grammar knows
+    // the layout, so the generated accessor carries it.
+    Parsed p = cek_parse(kFixture, "Bits", {0xA5});
+    ASSERT_TRUE(p.meta.success);
+    bbq::zcow::transient t = p.meta.doc.begin_edit();
+    zp::Bits h = zp::Bits_of(t);
+
+    EXPECT_EQ(h.hi(), 0x5);
+    h.set_hi(0x3);
+    EXPECT_EQ(h.hi(), 0x3);          // read back through the same document
+    EXPECT_EQ(h.lo(), 0xA);          // the neighbouring entry is untouched
+
+    h.set_lo(0xC);
+    EXPECT_EQ(h.hi(), 0x3);
+    EXPECT_EQ(h.lo(), 0xC);
+    EXPECT_EQ(t.serialize(), (std::vector<uint8_t>{0xC3}));
+
+    // And the edited byte re-parses to the values that were set.
+    Parsed p2 = cek_parse(kFixture, "Bits", t.serialize());
+    ASSERT_TRUE(p2.meta.success);
+    EXPECT_EQ(bbq::node_int(bbq::node_child(p2.meta.doc.root(), "hi"), p2.buf), 0x3);
+    EXPECT_EQ(bbq::node_int(bbq::node_child(p2.meta.doc.root(), "lo"), p2.buf), 0xC);
+}
+
+TEST(RenderTypesCppParity, WritingThroughAReadOnlyDocumentIsRefused) {
+    // One handle class either way. A handle built over a document has nothing to write
+    // into, and says so rather than doing nothing — the check Python needs too, since
+    // it has no const to carry the distinction.
+    Parsed p = cek_parse(kFixture, "Bits", {0xA5});
+    ASSERT_TRUE(p.meta.success);
+    zp::Bits h = zp::Bits_of(p.meta.doc);
+    EXPECT_EQ(h.hi(), 0x5);
+    EXPECT_THROW(h.set_hi(0x3), bbq::zcow::type_error);
+    EXPECT_EQ(h.hi(), 0x5);   // and nothing moved
 }
 
 TEST(RenderTypesCppParity, InlineStructMatchCek) {
     // hdr is an inline anonymous struct → its own handle class Nest_hdr.
     Parsed p = cek_parse(kFixture, "Nest", {0x07, 0x08, 0x00, 0x09});
     ASSERT_TRUE(p.meta.success);
-    zp::Nest h(p.meta.root, p.buf, nullptr);
+    zp::Nest h(p.node(), p.src());
 
     zp::Nest_hdr hdr = h.hdr();
     EXPECT_EQ(hdr.a(), 7);
@@ -330,7 +370,7 @@ TEST(RenderTypesCppParity, InlineStructMatchCek) {
     EXPECT_EQ(h.c(), 9);
 
     // Parity: hdr is a sub-node; its fields decode from the index.
-    const bbq::FieldCapture* hn = bbq::node_child(p.meta.root, "hdr");
+    const bbq::zcow::node*hn = bbq::node_child(p.meta.doc.root(), "hdr");
     ASSERT_NE(hn, nullptr);
     EXPECT_EQ(hdr.a(), (uint8_t)index_int(hn, "a", p.buf));
     EXPECT_EQ(hdr.b(), (uint16_t)index_int(hn, "b", p.buf));
@@ -341,7 +381,7 @@ TEST(RenderTypesCppParity, InlineBitfieldFieldMatchCek) {
     // byte 0xA5 little-endian: hi=0x5, lo=0xA.
     Parsed p = cek_parse(kFixture, "InlineBits", {0x11, 0xA5, 0x22});
     ASSERT_TRUE(p.meta.success);
-    zp::InlineBits h(p.meta.root, p.buf, nullptr);
+    zp::InlineBits h(p.node(), p.src());
 
     EXPECT_EQ(h.lead(), 0x11);
     EXPECT_EQ(h.tail(), 0x22);
@@ -350,10 +390,10 @@ TEST(RenderTypesCppParity, InlineBitfieldFieldMatchCek) {
     EXPECT_EQ(f.lo(), 0xA);
 
     // Parity: flags is a sub-node of computed entries.
-    const bbq::FieldCapture* fn = bbq::node_child(p.meta.root, "flags");
+    const bbq::zcow::node*fn = bbq::node_child(p.meta.doc.root(), "flags");
     ASSERT_NE(fn, nullptr);
-    EXPECT_EQ(f.hi(), (uint8_t)bbq::node_computed_int(bbq::node_child(fn, "hi")));
-    EXPECT_EQ(f.lo(), (uint8_t)bbq::node_computed_int(bbq::node_child(fn, "lo")));
+    EXPECT_EQ(f.hi(), (uint8_t)bbq::node_int(bbq::node_child(fn, "hi"), p.buf));
+    EXPECT_EQ(f.lo(), (uint8_t)bbq::node_int(bbq::node_child(fn, "lo"), p.buf));
 }
 
 TEST(RenderTypesCppParity, UnionMatchedVariant) {
@@ -361,7 +401,7 @@ TEST(RenderTypesCppParity, UnionMatchedVariant) {
     // asInner present, recording variant_tag 0; asPair absent.
     Parsed p = cek_parse(kFixture, "U", {0x05, 0x06, 0x00});
     ASSERT_TRUE(p.meta.success);
-    zp::U h(p.meta.root, p.buf, nullptr);
+    zp::U h(p.node(), p.src());
 
     EXPECT_EQ(h.which(), 0);
     EXPECT_TRUE(h.is_asInner());
@@ -374,7 +414,7 @@ TEST(RenderTypesCppParity, UnionMatchedVariant) {
 TEST(RenderTypesCppParity, AlternativesMatchedVariant) {
     Parsed p = cek_parse(kFixture, "Alts", {0x05, 0x06, 0x00});
     ASSERT_TRUE(p.meta.success);
-    zp::Alts h(p.meta.root, p.buf, nullptr);
+    zp::Alts h(p.node(), p.src());
 
     EXPECT_EQ(h.which(), 0);
     EXPECT_TRUE(h.is_alt_0());
@@ -387,7 +427,7 @@ TEST(RenderTypesCppParity, SwitchScalarArm) {
     // tag=1 → case 0 (uint16le). which() reads the recorded ordinal, not the disc.
     Parsed p = cek_parse(kFixture, "Sw", {0x01, 0x07, 0x00});
     ASSERT_TRUE(p.meta.success);
-    zp::Sw h(p.meta.root, p.buf, nullptr);
+    zp::Sw h(p.node(), p.src());
     EXPECT_EQ(h.tag(), 1);
     EXPECT_EQ(h.body_which(), 0);
     EXPECT_EQ(h.body_case_0(), 7);
@@ -397,7 +437,7 @@ TEST(RenderTypesCppParity, SwitchRulerefArm) {
     // tag=2 → case 1 (Inner).
     Parsed p = cek_parse(kFixture, "Sw", {0x02, 0x05, 0x06, 0x00});
     ASSERT_TRUE(p.meta.success);
-    zp::Sw h(p.meta.root, p.buf, nullptr);
+    zp::Sw h(p.node(), p.src());
     EXPECT_EQ(h.body_which(), 1);
     zp::Inner inr = h.body_case_1();
     EXPECT_EQ(inr.a(), 5);
@@ -408,7 +448,7 @@ TEST(RenderTypesCppParity, SwitchDefaultArm) {
     // tag=9 → default (ordinal after the cases = 2), uint8.
     Parsed p = cek_parse(kFixture, "Sw", {0x09, 0x2A});
     ASSERT_TRUE(p.meta.success);
-    zp::Sw h(p.meta.root, p.buf, nullptr);
+    zp::Sw h(p.node(), p.src());
     EXPECT_EQ(h.body_which(), 2);
     EXPECT_EQ(h.body_default_val(), 0x2A);
 }
@@ -417,7 +457,7 @@ TEST(RenderTypesCppParity, TopLevelSwitchRuleRulerefArm) {
     // peek()==1 → case 0 (Inner); the arm is the root's anonymous first child.
     Parsed p = cek_parse(kFixture, "TopSw", {0x01, 0x55, 0x66});
     ASSERT_TRUE(p.meta.success);
-    zp::TopSw h(p.meta.root, p.buf, nullptr);
+    zp::TopSw h(p.node(), p.src());
     EXPECT_EQ(h.which(), 0);
     zp::Inner inr = h.case_0();
     EXPECT_EQ(inr.a(), 1);
@@ -428,7 +468,7 @@ TEST(RenderTypesCppParity, TopLevelSwitchRuleDefaultArm) {
     // peek()==9 → default (ordinal 1), uint8.
     Parsed p = cek_parse(kFixture, "TopSw", {0x09});
     ASSERT_TRUE(p.meta.success);
-    zp::TopSw h(p.meta.root, p.buf, nullptr);
+    zp::TopSw h(p.node(), p.src());
     EXPECT_EQ(h.which(), 1);
     EXPECT_EQ(h.default_val(), 9);
 }
@@ -437,15 +477,15 @@ TEST(RenderTypesCppParity, OptionalSpan) {
     // n=1 → ob="\xCA\xFE" present, os="abc" present.
     Parsed p = cek_parse(kFixture, "OptSpan", {0x01, 0xCA, 0xFE, 0x61, 0x62, 0x63});
     ASSERT_TRUE(p.meta.success);
-    zp::OptSpan h(p.meta.root, p.buf, nullptr);
+    zp::OptSpan h(p.node(), p.src());
 
-    bbq::span_opt<bbq::bytes_view, uint8_t> ob = h.ob();
+    zp::span_opt<bbq::bytes_view, uint8_t> ob = h.ob();
     ASSERT_TRUE(ob.has_value());
     ASSERT_EQ(ob.value().size, 2u);
     EXPECT_EQ(ob.value().data[0], 0xCA);
     EXPECT_EQ(ob.value().data[1], 0xFE);
 
-    bbq::span_opt<std::string_view, char> os = h.os();
+    zp::span_opt<std::string_view, char> os = h.os();
     ASSERT_TRUE(os.has_value());
     EXPECT_EQ(os.value(), std::string_view("abc"));
 }
@@ -454,7 +494,7 @@ TEST(RenderTypesCppParity, ExternField) {
     // blob = the 4 bytes the extern consumed; ZCow reads the span as bytes_view.
     Parsed p = cek_parse(kFixture, "Ext", {0xAA, 0x01, 0x02, 0x03, 0x04, 0xBB});
     ASSERT_TRUE(p.meta.success);
-    zp::Ext h(p.meta.root, p.buf, nullptr);
+    zp::Ext h(p.node(), p.src());
 
     EXPECT_EQ(h.tag(), 0xAA);
     bbq::bytes_view blob = h.blob();
@@ -468,7 +508,7 @@ TEST(RenderTypesCppParity, NestedArray) {
     // 2x2 matrix [[1,2],[3,4]] — seq<prim_seq<uint8>> composes.
     Parsed p = cek_parse(kFixture, "Matrix", {2, 2, 1, 2, 3, 4});
     ASSERT_TRUE(p.meta.success);
-    zp::Matrix h(p.meta.root, p.buf, nullptr);
+    zp::Matrix h(p.node(), p.src());
 
     auto data = h.data();
     ASSERT_EQ(data.size(), 2u);
@@ -481,13 +521,13 @@ TEST(RenderTypesCppParity, TopLevelTypedefRules) {
     {
         Parsed p = cek_parse(kFixture, "TyByte", {0x2A});
         ASSERT_TRUE(p.meta.success);
-        zp::TyByte h(p.meta.root, p.buf, nullptr);
+        zp::TyByte h(p.node(), p.src());
         EXPECT_EQ(h.value(), 0x2A);
     }
     {
         Parsed p = cek_parse(kFixture, "TyInner", {0x07, 0x09, 0x00});
         ASSERT_TRUE(p.meta.success);
-        zp::TyInner h(p.meta.root, p.buf, nullptr);
+        zp::TyInner h(p.node(), p.src());
         zp::Inner inr = h.value();
         EXPECT_EQ(inr.a(), 7);
         EXPECT_EQ(inr.b(), 9);
@@ -497,7 +537,7 @@ TEST(RenderTypesCppParity, TopLevelTypedefRules) {
 TEST(RenderTypesCppParity, TopLevelOptionalRule) {
     Parsed p = cek_parse(kFixture, "OptTop", {0x2A});
     ASSERT_TRUE(p.meta.success);
-    zp::OptTop h(p.meta.root, p.buf, nullptr);
+    zp::OptTop h(p.node(), p.src());
     ASSERT_TRUE(h.has_value());
     EXPECT_EQ(h.value(), 0x2A);
 }
@@ -510,24 +550,23 @@ TEST(RenderTypesCppParity, TopLevelOptionalRule) {
 TEST(RenderTypesCppParity, EmitUnmutatedIsIdentity) {
     Parsed p = cek_parse(kFixture, "Flat", kBytes);
     ASSERT_TRUE(p.meta.success);
-    bbq::zcow zc;                                            // no edits
-    EXPECT_EQ(bbq::emit(p.buf, kBytes.size(), zc), kBytes);  // identity == memcpy
+    EXPECT_EQ(p.meta.doc.serialize(), kBytes);   // nothing written == memcpy of the input
 }
 
 TEST(RenderTypesCppParity, EmitSameWidthPatchPreservesNeighbors) {
     Parsed p = cek_parse(kFixture, "Flat", kBytes);
     ASSERT_TRUE(p.meta.success);
-    bbq::zcow zc;
-    zp::Flat h(p.meta.root, p.buf, &zc);
+    bbq::zcow::transient t = p.meta.doc.begin_edit();
+    zp::Flat h = zp::Flat_of(t);
     h.set_u16(0x0042);                                       // fixed-width edit -> in-place patch
-    std::vector<uint8_t> out = bbq::emit(p.buf, kBytes.size(), zc);
+    std::vector<uint8_t> out = t.serialize();
     ASSERT_EQ(out.size(), kBytes.size());                   // patched in place, no growth
     for (size_t i = 0; i < out.size(); i++)                 // only the u16 bytes (offset 1..2) move
         if (i != 1 && i != 2) EXPECT_EQ(out[i], kBytes[i]) << i;
     Parsed p2 = cek_parse(kFixture, "Flat", out);
     ASSERT_TRUE(p2.meta.success);
-    EXPECT_EQ(index_int(p2.meta.root, "u16", p2.buf), 0x0042);
-    EXPECT_EQ(index_int(p2.meta.root, "u32", p2.buf), 256);  // neighbor intact
+    EXPECT_EQ(index_int(p2.meta.doc.root(), "u16", p2.buf), 0x0042);
+    EXPECT_EQ(index_int(p2.meta.doc.root(), "u32", p2.buf), 256);  // neighbor intact
 }
 
 TEST(RenderTypesCppParity, EmitLebWidthChangeReserializes) {
@@ -538,36 +577,40 @@ TEST(RenderTypesCppParity, EmitLebWidthChangeReserializes) {
     const char* spec = "Leb = struct { v: uleb128, w: uint8 }";
     Parsed p = cek_parse(spec, "Leb", {0x05, 0xAA});
     ASSERT_TRUE(p.meta.success);
-    bbq::zcow zc;
-    const bbq::FieldCapture* v = bbq::node_child(p.meta.root, "v");
+    bbq::zcow::transient t = p.meta.doc.begin_edit();
+    const char* pv[] = {"v"};
+    bbq::zcow::node* v = t.own_path(pv, nullptr, 1);
     ASSERT_NE(v, nullptr);
-    zc.set_scalar(v, 300, bbq::znode::Enc::Uleb);
-    std::vector<uint8_t> out = bbq::emit(p.buf, 2, zc);
+    bbq::zcow::set_int(v, 300, bbq::zcow::Enc::Uleb);
+    std::vector<uint8_t> out = std::move(t).commit().serialize();
     EXPECT_EQ(out, (std::vector<uint8_t>{0xAC, 0x02, 0xAA}));  // 300 -> AC 02 ; w preserved
     Parsed p2 = cek_parse(spec, "Leb", out);
     ASSERT_TRUE(p2.meta.success);
-    EXPECT_EQ(index_int(p2.meta.root, "v", p2.buf), 300);
-    EXPECT_EQ(index_int(p2.meta.root, "w", p2.buf), 0xAA);
+    EXPECT_EQ(index_int(p2.meta.doc.root(), "v", p2.buf), 300);
+    EXPECT_EQ(index_int(p2.meta.doc.root(), "w", p2.buf), 0xAA);
 }
 
-TEST(RenderTypesCppParity, RemoveDropsWholeSubtreeFromIndex) {
-    // Removing a materialized array element must drop its ENTIRE subtree from the
-    // baseline->overlay map — leaving a descendant entry behind dangles (its znode is
-    // freed with the element). White-box on the path-copy invariant.
+TEST(RenderTypesCppParity, WritingThenRemovingAnElementLeavesNothingBehind) {
+    // This used to assert that removing an element dropped its whole subtree from the
+    // index→overlay map, because a descendant left behind would dangle once the
+    // element's node was freed. There is no such map now — the document is one tree
+    // and a position is a path — so the failure it guarded cannot be expressed. What
+    // is still worth pinning is the behaviour: write into an element, drop it, and
+    // neither the value nor the element survives.
     Parsed p = cek_parse(kFixture, "Flat", kBytes);
     ASSERT_TRUE(p.meta.success);
-    const bbq::FieldCapture* items = bbq::node_child(p.meta.root, "items");
+    const bbq::zcow::node* items = bbq::node_child(p.meta.doc.root(), "items");
     ASSERT_NE(items, nullptr);
-    ASSERT_EQ(items->child_count, 2);
-    const bbq::FieldCapture* elem0   = &items->children[0];
-    const bbq::FieldCapture* elem0_a = bbq::node_child(elem0, "a");
-    ASSERT_NE(elem0_a, nullptr);
+    ASSERT_EQ(items->kids.size(), 2u);
 
-    bbq::zcow zc;
-    zc.set_int(elem0_a, 99);                       // materialize elem0 AND its child 'a'
-    ASSERT_TRUE(zc.by_src_.count(elem0));
-    ASSERT_TRUE(zc.by_src_.count(elem0_a));
-    ASSERT_TRUE(zc.remove_index(items, 0));
-    EXPECT_FALSE(zc.by_src_.count(elem0));         // the element itself
-    EXPECT_FALSE(zc.by_src_.count(elem0_a));       // and its descendant (bug: stayed -> dangling)
+    bbq::zcow::transient t = p.meta.doc.begin_edit();
+    const char* pi[] = {"items"};
+    bbq::zcow::node* arr = t.own_path(pi, nullptr, 1);
+    ASSERT_NE(arr, nullptr);
+    bbq::zcow::set_int(t.own_child(t.own_child(arr, 0), 0), 99);
+    ASSERT_TRUE(t.remove(arr, 0));
+
+    EXPECT_EQ(bbq::zcow::size_of(bbq::zcow::child_named(t.root(), "items")), 1u);
+    // ...and the document it came from is untouched, element and value alike.
+    EXPECT_EQ(bbq::node_child(p.meta.doc.root(), "items")->kids.size(), 2u);
 }

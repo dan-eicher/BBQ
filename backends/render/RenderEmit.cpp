@@ -408,6 +408,22 @@ void Emitter::derive_write_prefixes(json& functions) const {
         }
         return "";
     };
+    // The same, as the DOTTED path — `h.n`, not just `n`. The C writer matches the
+    // read op by its bare target, so that stays; a document records what determines
+    // its count, and that has to name where the field actually is.
+    std::function<std::string(const json&)> count_path = [&](const json& e) -> std::string {
+        const std::string k = e.value("e", std::string());
+        if (k == "field_ref")  return e.value("name", std::string());
+        if (k == "path_value") return count_path(e["x"]);
+        if (k == "path_start") return e.value("name", std::string());
+        if (k == "path_field") {
+            std::string base = e.contains("base") ? count_path(e["base"]) : std::string();
+            std::string f = e.value("field", std::string());
+            if (f.empty()) return "";
+            return base.empty() ? f : base + "." + f;
+        }
+        return "";
+    };
     for (auto& fn : functions) {
         json& ops = fn["ops"];
         std::unordered_map<int, const json*> by_id;
@@ -435,6 +451,9 @@ void Emitter::derive_write_prefixes(json& functions) const {
                         prev["rest_reserve"] = true;
                         rest_prim = prev["prim"];
                         op["rest"] = true;
+                        // The field this window's length is held in, for a producer
+                        // that records it on the document.
+                        op["rest_field"] = e.value("name", std::string());
                     }
                 }
                 rest_stack.push_back(rest_prim);
@@ -450,6 +469,10 @@ void Emitter::derive_write_prefixes(json& functions) const {
                 // REAL length (a re-sized vec → a valid binary), so reserve a placeholder
                 // at that count field's read and patch it with field.count at the array.
                 std::string cf = count_field(op["count"]);
+                // What this array DETERMINES, for a producer that records it on the
+                // document rather than patching bytes at write time.
+                std::string cp = count_path(op["count"]);
+                if (!cp.empty()) op["count_field"] = cp;
                 if (!cf.empty())
                     for (size_t j = i; j-- > 0; ) {
                         json& r = ops[j];
@@ -925,6 +948,13 @@ struct ZCowReader : Emitter {
     // stencils — its post_lower is the base no-op) and decodes-on-access from the
     // just-built index, so it overrides the owning spelling: field refs / path-nav go
     // through the builder, builtins run against the `bbq::reader` (`r`), and the optional
+    // The parser records what only it knows: which field an array's count lives in,
+    // which field measures an @rest window. `derive_write_prefixes` already derives
+    // both from the lowered expressions — it is a lowering pass over the shared
+    // op-list, and the C writer uses the same one. Without it a document this reader
+    // builds could not recompute its dependent fields, and the CEK's could.
+    void post_lower(json& functions) const override { derive_write_prefixes(functions); }
+
     // value IS the child node (no `.value` — the view records the bare leaf).
     std::string field_ref(const std::string& name) const override {
         return "bbq_view_i64(r, \"" + name + "\")";
@@ -974,31 +1004,6 @@ struct ZCowReader : Emitter {
         data["externs"]   = externs;
         data["namespace"] = ns_;
         data["has_ns"]    = !ns_.empty();
-    }
-};
-
-// C++ ZCow WRITER: the dual of ZCowReader over the SAME burg lowering — walks the graph the
-// reader emitted (FieldCapture index + CoW) and streams bytes via bbq::writer, enforcing the
-// grammar. NO fold (boundaries stay runtime stencils, like the reader; the cursor navigates
-// the graph at runtime); post_lower is `derive_write_prefixes` only (the count/@rest/pad
-// linkage), the shared base method. Structure-driven, so the only spelled expr is
-// set_endian's — field refs read the graph node, builtins are inert.
-struct ZCowWriter : Emitter {
-    std::string ns_, dir_;
-    ZCowWriter(std::string ns, std::string dir) : ns_(std::move(ns)), dir_(std::move(dir)) {}
-    std::string template_path() const override { return dir_ + "/writer_view_cpp.inja"; }
-    json fn_header(const std::string& rule) const override {
-        return {{"name", rule + "_write"}, {"kpfx", rule}};   // CamelCase; stencils {rule}_w{id}
-    }
-    // post_lower = derive_write_prefixes ONLY (no fold): it tags the count-field↔array
-    // linkage (count_reserve/count_patch + count_id) the enforcement stencils read.
-    void post_lower(json& functions) const override { derive_write_prefixes(functions); }
-    // The enforcement template spells no exprs and uses no atom mappers (it navigates +
-    // sets counts by literal name, then emit() serializes) — so no spelling overrides /
-    // mappers are needed; only the namespace is injected.
-    void register_mappers(inja::Environment&) const override {}
-    void extra_data(json& data, const CompilerCtx&) const override {
-        data["namespace"] = ns_; data["has_ns"] = !ns_.empty();
     }
 };
 
@@ -1112,27 +1117,10 @@ std::string render_reader_view(const CompilerCtx& ctx, const std::string& templa
     return render_emit(ctx, ZCowReader(ns, templates_dir), lower_grammar(ctx));
 }
 
-// cpp-zcow (view) WRITER — the dual of render_reader_view; ZCowWriter over the same loop.
-std::string render_writer_view(const CompilerCtx& ctx, const std::string& templates_dir,
-                               const std::string& ns) {
-    return render_emit(ctx, ZCowWriter(ns, templates_dir), lower_grammar(ctx));
-}
-
-// The writer op-list, for a consumer that EXECUTES it rather than rendering it (the CEK
-// face compiles at runtime, so there is no generated <Rule>_write to call). The same two
-// passes render_emit runs ahead of the writer template — the structural fold, then
-// ZCowWriter's post_lower (= derive_write_prefixes) — over the same lower_grammar output.
-// The spelling passes render_emit does after this (expr hoisting, the target-root prepend)
-// are identities for ZCowWriter: its target_root is empty and the enforcement template
-// spells no expressions, so the op-list here is exactly the one the template consumes.
-// `fn["rule"]` is left in place (render_emit erases it once a header is merged) — the
-// interpreter resolves `invoke`/`choice` targets by rule name.
-json lower_writer_ops(const CompilerCtx& ctx) {
-    json functions = lower_grammar(ctx);
-    fold_bitfield_constraints(functions);
-    ZCowWriter("", "").post_lower(functions);
-    return functions;
-}
+// The C++ ZCow face has no generated writer. A parse builds the document (bbq::zcow),
+// edits go through it, and serializing is the document's own — including the dependent
+// fields, which the parser records on the nodes that determine them rather than a
+// separate walk re-deriving them from the grammar afterwards.
 
 // c-lite (C view) reader — the C emission of the view lowering; ViewCReader over the same
 // loop. Reader only (no writer / no types header); C uses the name prefix, so no `ns`.

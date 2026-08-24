@@ -26,7 +26,7 @@ module bbq_ir {
 
     type interned       = "const char*"
     type primitive_info = "PrimitiveInfo"
-    type field_capture  = "FieldCapture*"
+    type field_capture  = "zcow::node*"
     type value_slot     = "Value**"
     type value_buf      = "Value**"
     // f64 — 64-bit IEEE float. asdl's built-in `float` resolves to C++
@@ -166,7 +166,10 @@ module bbq_ir {
         // container bytes in place (does NOT advance pos), shift+masks out its
         // value, and yields it; its inverse is a member-wise insert into the
         // shared container bytes (write-back in place).
-        | ExtractBitsNode(primitive_info container, int width_bits, int offset_before, kont_node next)
+        // `is_signed` is the entry's own signedness (BBQ.asdl bitfield_entry): a
+        // signed run is read back sign-extended from its width, and the recorded
+        // index carries the flag so nothing downstream has to ask the grammar.
+        | ExtractBitsNode(primitive_info container, int width_bits, int offset_before, bool is_signed, kont_node next)
         | AdvancePosNode(int by, kont_node next)
         | SetEndianNode(kont_expr endian_expr, kont_node next)
         | ExternalCallNode(interned func_name, interned write_func, kont_node next)

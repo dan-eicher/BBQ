@@ -184,7 +184,7 @@ AUXILIARIES
   make_end_array        : (bool, ir_root) -> ir_root
   make_resync           : (ir_root, ir_root) -> ir_root  // body_entry, end_node
   make_switch_dispatch  : (ir_root, list<ir.switch_case>, ir_root, bool) -> ir_root  // disc, cases, default_target, default_reject
-  make_extract_bits     : (primitive_info, int, int, ir_root) -> ir_root  // container, width_bits, offset_before, next
+  make_extract_bits     : (primitive_info, int, int, bool, ir_root) -> ir_root  // container, width_bits, offset_before, is_signed, next
   make_advance_pos      : (int, ir_root) -> ir_root  // by, next
   make_set_endian       : (ir_root, ir_root) -> ir_root  // expr, next
   make_external_call    : (string, string, ir_root) -> ir_root  // func_name, write_func, next
@@ -742,11 +742,13 @@ PRIVATE (.
     }
     bbq::cek::StaticKont* make_extract_bits(bbq::cek::PrimitiveInfo container,
                                             int width_bits, int offset_before,
+                                            bool is_signed,
                                             bbq::cek::StaticKont* nx) {
         auto* k = arena_->alloc<bbq::cek::ExtractBitsNode>();
         k->container = container;
         k->width_bits = width_bits;
         k->offset_before = offset_before;
+        k->is_signed = is_signed;
         k->next = nx;
         return k;
     }
@@ -789,6 +791,7 @@ PRIVATE (.
             }
             chain = make_extract_bits(container, static_cast<int>(entries[i]->width),
                                       offset_before[i],
+                                      entries[i]->sign == BBQ::Signedness::Signed,
                                       field_dest(nm, tail));
         }
         return chain;

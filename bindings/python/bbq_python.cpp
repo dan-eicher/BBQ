@@ -2,6 +2,24 @@
 //
 // Single-file module, no headers. All types are file-scope statics.
 // Follows the patterns established in ptree-python.
+//
+// This is a WRAPPER over the ZCow document and nothing else. The CEK machine parses a
+// buffer into a zcow::document — one tree, whose nodes either name a span of the input
+// (zero-copy) or carry a value of their own — and every Python operation here is one
+// call into that API. The copy-on-write is entirely ZCow's: a consumer parses a file and
+// walks the tree, and `doc.foo.bar[4] = 42` works without knowing any of it exists.
+//
+// It is the same wrapper the generated C++ handles are, resolved at runtime rather than
+// at codegen: a handle there holds (node, source, transient) and turns a field NAME into
+// one ZCow call, which is exactly what tp_getattro does here — the grammar is a runtime
+// thing on this side, so the name arrives as a string instead of being baked in.
+//
+// Following that model down to the detail that matters: a CONTAINER is owned when it is
+// navigated to (the generated `sub_`), which makes its pointer stable and writable; a
+// LEAF is re-resolved from its container on every access (the generated `r_`) and is
+// never owned by a read. Owning a leaf on read would be a corruption, not an
+// inefficiency — an owned leaf carries its own value, and a read has no value to put
+// there.
 
 #define PY_SSIZE_T_CLEAN
 #include <Python.h>
@@ -10,6 +28,7 @@
 #include <cstdio>
 #include <string>
 #include <sstream>
+#include <vector>
 
 // POSIX (for parse_file)
 #include <sys/types.h>
@@ -26,22 +45,14 @@
 #include "bbq_compile.h"
 #include "Machine.h"
 #include "Capture.h"
-#include "CaptureDecode.h"
-#include "CaptureCow.h"
-
-// The WRITE half: emit() is the lens's `put`, so it runs the grammar-enforcement walk
-// (dependent fields recomputed into the overlay) before ZCow serializes. The op-list is
-// the shared writer lowering; WriterInterp executes it, as the generated C++ writer's
-// stencils render it.
-#include "CompilerCtx.h"
-#include "RenderEmit.h"
-#include "WriterInterp.h"
+#include "CaptureCow.h"     // bbq::zcow — the document, and the whole write side
 
 // bbq.build — the grammar-free byte-construction submodule (its own translation unit)
 #include "bbq_build.h"
 
-using namespace bbq;        // index runtime: FieldCapture, CaptureType, decoders, zcow
-using namespace bbq::cek;   // machine IR: Value, FieldCaptureValue, ...
+using namespace bbq;        // index runtime: CaptureType, ComputedValue
+using namespace bbq::cek;   // machine IR: Value, ...
+namespace zc = bbq::zcow;
 
 
 // ── Forward declarations ────────────────────────────────────────────────────
@@ -58,18 +69,18 @@ extern PyTypeObject PyBBQNodeIter_Type;
 
 static PyObject* PyBBQParseError;
 
-static PyBBQNode* PyBBQNode_New(const FieldCapture* cap, PyBBQResult* result);
+static PyBBQNode* PyBBQNode_New(PyBBQResult* result, zc::node* parent, Py_ssize_t slot);
 
 
 // ── Locking ─────────────────────────────────────────────────────────────────
 //
 // The module declares Py_MOD_GIL_NOT_USED (see PyInit_bbq), so it must serialize its own
-// shared state. Everything guarded here is plain C++ — an unordered_map, a node tree, two
-// parallel arrays — which the interpreter knows nothing about and cannot protect.
+// shared state. Everything guarded here is plain C++ — a node tree, two parallel arrays —
+// which the interpreter knows nothing about and cannot protect.
 //
 // PyMutex, not Py_BEGIN_CRITICAL_SECTION: a critical section is *suspended* when the
 // holding thread blocks, which is right for locking a Python object and wrong for a C++
-// container mid-rehash. The rule that makes a plain mutex safe here is that a lock is only
+// container mid-resize. The rule that makes a plain mutex safe here is that a lock is only
 // ever held over C++ — every PyObject conversion happens before it is taken, so nothing can
 // re-enter the interpreter (and thus this module) while one is held.
 //
@@ -101,16 +112,11 @@ struct BBQLock {
 struct PyBBQSpec {
     PyObject_HEAD
     CompiledGrammar* grammar;
-    // The frontend artifacts, kept alive for the WRITE side: the writer lowering reads the
-    // AST (which the Parser owns) alongside the kont IR. Reads need none of this.
+    // The frontend artifacts, kept alive because the compiled grammar points into what
+    // they own — rule names, interned field names, the builtin table.
     Parser* parser;
     bbqgen::ErrorReporter* errors;
     bbqgen::Sema* sema;
-    // The writer op-list, lowered on the first emit() and cached (see spec_wops). Lowering
-    // it costs ~7x what compiling the grammar does — an 87-rule spec is 15 ms to compile and
-    // 100 ms to lower — and a session that only reads never needs it. `parse` touches none
-    // of it.
-    nlohmann::json* wops;
 
     // Extern parser support
     PyObject** ext_callables;               // Array of strong refs (INCREFed)
@@ -119,40 +125,74 @@ struct PyBBQSpec {
     int ext_capacity;
     ExternalParserTable ext_table;
 
-    // Guards `wops` and the extern registry. register_extern REALLOCS both arrays, so a
-    // parse cannot read them directly — it takes a snapshot under this lock (do_parse).
+    // Guards the extern registry. register_extern REALLOCS both arrays, so a parse
+    // cannot read them directly — it takes a snapshot under this lock (do_parse).
     BBQMutex lock;
 };
 
 struct PyBBQResult {
     PyObject_HEAD
     ParseArena* arena;
-    CaptureMetadata meta;
+    // The document, held as the one transient every node in it comes from. There is no
+    // second structure and nothing overlays anything: this IS the parsed document, and
+    // an edit is a write into it. It is never committed — a caller that goes on editing
+    // after asking for bytes is the normal case here, and transient::serialize settles
+    // the dependent fields exactly as commit does.
+    zc::transient* edit;
+
+    bool success;
+    size_t bytes_consumed;
+    const char* error_message;   // grammar-owned or static; not freed here
+    size_t error_offset;
+
     Py_buffer view;
-    PyBBQSpec* spec;
     bool view_valid;
-    bbq::zcow* zcow;   // copy-on-write overlay, lazily created on first mutation
-    const char* rule;  // the rule this was parsed with — emit() enforces THAT rule's grammar
-    // Guards `zcow` — its creation and every read/write of it. bbq::zcow is an
-    // unordered_map plus a node tree; two threads editing one document corrupt it
-    // (node_for() inserts while another rehashes). Reads of the BASELINE index need no
-    // lock: FieldCapture is immutable after the parse.
+    PyBBQSpec* spec;
+    const char* rule;            // the rule this was parsed with
+
+    // Guards `edit` — every read of the tree and every write into it. A transient is
+    // single-owner by design (L'orange §4.2), and this is what makes one Python object
+    // usable from more than one thread at a time without corrupting it.
     BBQMutex lock;
 };
 
+// A position in the document, addressed the way the generated handles address one: by
+// its CONTAINER and its slot in it. Resolving through the container on each access is
+// what `r_(f)` does in the generated C++ — it is why a write through one handle is
+// visible through another, and why nothing here goes stale when copy-on-write replaces
+// a node. `parent == nullptr` is the root.
 struct PyBBQNode {
     PyObject_HEAD
-    const FieldCapture* capture;
+    zc::node* parent;
+    Py_ssize_t slot;
     PyBBQResult* result;
 };
 
 struct PyBBQNodeIter {
     PyObject_HEAD
     PyBBQResult* result;
-    const FieldCapture* children;
-    int count;
-    int index;
-    bool yield_tuples;  // true for struct → (name, node), false for array → node
+    zc::node* container;   // owned, so it stays put while the iteration runs
+    Py_ssize_t index;
+    bool yield_tuples;     // true for struct → (name, node), false for array → node
+};
+
+
+// Taking a document's lock also takes OWNERSHIP of its transient for this thread.
+//
+// ZCow checks the owning thread on every operation because that is what C++ can observe
+// of single use (L'orange §7.2, §8.1.2) — the thread standing still is a proxy for
+// "nobody else is inside this". A Python ParseResult is one object that any thread may
+// reach, and this module gives it the real property with the mutex: every operation on
+// the document happens under this lock, and a lock is only ever held over C++, so nothing
+// can re-enter. So the proxy is replaced by the guarantee it was approximating, in the
+// single place where the guarantee is actually established — a caller cannot touch the
+// document without coming through here.
+struct DocLock {
+    BBQMutex* m;
+    explicit DocLock(PyBBQResult* r);
+    ~DocLock() { bbq_mutex_unlock(m); }
+    DocLock(const DocLock&) = delete;
+    DocLock& operator=(const DocLock&) = delete;
 };
 
 
@@ -189,233 +229,236 @@ static const char* capture_type_name(CaptureType type) {
     return "unknown";
 }
 
-// Thin Python wrappers over the shared Borrowed-leaf decoders
-// (backends/cpp/runtime/CaptureDecode.h) — the offset→value logic lives there, shared
-// with the compiled C++ face; here we only widen to a Python object / raise.
-static PyObject* decode_int(const FieldCapture* cap, const uint8_t* data) {
-    int64_t bits; bool is_signed;
-    if (!bbq::decode_int(cap, data, &bits, &is_signed)) {
-        if (cap->type == CaptureType::Computed)
-            PyErr_SetString(PyExc_TypeError, "computed value is not numeric");
-        else
-            PyErr_Format(PyExc_TypeError, "cannot convert %s to int",
-                         capture_type_name(cap->type));
-        return NULL;
-    }
-    return is_signed ? PyLong_FromLongLong(bits)
-                     : PyLong_FromUnsignedLongLong((uint64_t)bits);
+DocLock::DocLock(PyBBQResult* r) : m(&r->lock) {
+    bbq_mutex_lock(m);
+    r->edit->adopt();
 }
 
-static PyObject* decode_float(const FieldCapture* cap, const uint8_t* data) {
-    double d;
-    if (!bbq::decode_float(cap, data, &d)) {
-        PyErr_Format(PyExc_TypeError, "cannot convert %s to float",
-                     capture_type_name(cap->type));
-        return NULL;
-    }
-    return PyFloat_FromDouble(d);
-}
+static inline bool is_container(CaptureType t) { return zc::is_container_type(t); }
 
-// A ZCow integer override for `cap` as a PyLong, or null if the field is
-// unmutated. The dynamic face of the same overlay the C++ handles use.
-static PyObject* zcow_int_override(const FieldCapture* cap, PyBBQResult* result) {
-    int64_t v = 0;
-    bool found = false;
-    {
-        BBQLock g(&result->lock);
-        if (result->zcow)
-            if (auto* o = result->zcow->get_int(cap)) { v = *o; found = true; }
-    }
-    return found ? PyLong_FromLongLong(v) : nullptr;
-}
-
-// The overlay, created on demand. Caller holds the result's lock.
-static bbq::zcow* zcow_of(PyBBQResult* result) {
-    if (!result->zcow) result->zcow = new bbq::zcow();
-    return result->zcow;
-}
-
-// Write `value` into leaf node `cap` via the ZCow overlay, dispatched on the
-// field's grammar type so every leaf kind round-trips (not just integers).
+// ── Addressing ──
 //
-// Every PyObject→C conversion happens BEFORE the lock: PyFloat_AsDouble, PyObject_IsTrue
-// and PyLong_AsLongLong can all run arbitrary Python (__float__ / __bool__ / __index__),
-// and re-entering this module while holding the overlay lock would deadlock.
-static int zcow_set_capture(const FieldCapture* cap, PyBBQResult* result, PyObject* value) {
-    CaptureType t = cap->type;
-    if (is_float_type(t)) {
-        double d = PyFloat_AsDouble(value);
-        if (d == -1.0 && PyErr_Occurred()) return -1;
-        BBQLock g(&result->lock);
-        zcow_of(result)->set_float(cap, d);
-        return 0;
-    }
-    if (t == CaptureType::Bytes || t == CaptureType::External) {
-        if (!PyBytes_Check(value)) {
-            PyErr_SetString(PyExc_TypeError, "expected bytes for a bytes field"); return -1;
-        }
-        const char* p = PyBytes_AS_STRING(value);
-        std::vector<uint8_t> bytes(p, p + PyBytes_GET_SIZE(value));
-        BBQLock g(&result->lock);
-        zcow_of(result)->set_bytes(cap, std::move(bytes));
-        return 0;
-    }
-    if (t == CaptureType::String) {
-        std::vector<uint8_t> bytes;
-        if (PyBytes_Check(value)) {
-            const char* p = PyBytes_AS_STRING(value);
-            bytes.assign(p, p + PyBytes_GET_SIZE(value));
-        } else {
-            Py_ssize_t n = 0;
-            const char* s = PyUnicode_AsUTF8AndSize(value, &n);
-            if (!s) return -1;
-            bytes.assign(s, s + n);
-        }
-        BBQLock g(&result->lock);
-        zcow_of(result)->set_bytes(cap, std::move(bytes));
-        return 0;
-    }
-    if (t == CaptureType::Bool) {
-        int b = PyObject_IsTrue(value);
-        if (b < 0) return -1;
-        BBQLock g(&result->lock);
-        zcow_of(result)->set_int(cap, b ? 1 : 0);
-        return 0;
-    }
-    if (t == CaptureType::Struct || t == CaptureType::Array || t == CaptureType::Computed) {
-        PyErr_Format(PyExc_TypeError, "cannot assign directly to a %s field", capture_type_name(t));
-        return -1;
-    }
-    int64_t v = PyLong_AsLongLong(value);   // integer leaf types
-    if (v == -1 && PyErr_Occurred()) return -1;
-    BBQLock g(&result->lock);
-    zcow_of(result)->set_int(cap, v);
-    return 0;
+// Resolve a node from the (container, slot) pair it is addressed by. Caller holds the
+// result's lock.
+static const zc::node* node_of(PyBBQNode* self) {
+    if (!self->parent) return self->result->edit->root();
+    if (self->slot < 0 || (size_t)self->slot >= self->parent->kids.size()) return nullptr;
+    return self->parent->kids[(size_t)self->slot].get();
 }
 
-// Set struct field `key` of `cap` via the ZCow overlay (any leaf type).
-static int zcow_set_field(const FieldCapture* cap, PyBBQResult* result,
-                          const char* key, PyObject* value) {
-    for (int i = 0; i < cap->child_count; i++) {
-        if (cap->children[i].name && strcmp(cap->children[i].name, key) == 0)
-            return zcow_set_capture(&cap->children[i], result, value);
-    }
-    PyErr_Format(PyExc_AttributeError, "no field '%s'", key);
+// The same, owned — so it can be written through, or hold children whose addresses stay
+// valid. This is the generated `sub_`: navigating INTO a container claims it. Caller
+// holds the lock.
+static zc::node* owned_node_of(PyBBQNode* self) {
+    zc::transient* t = self->result->edit;
+    if (!self->parent) return t->root_mut();
+    return t->own_child(self->parent, (size_t)self->slot);
+}
+
+static Py_ssize_t child_slot(const zc::node* c, const char* name) {
+    if (!c) return -1;
+    for (size_t i = 0; i < c->kids.size(); i++)
+        if (c->kids[i]->name && std::strcmp(c->kids[i]->name, name) == 0)
+            return (Py_ssize_t)i;
     return -1;
 }
 
-// Build a raw znode from a Python value for append/splice — ZCow is byte-level, so
-// there is no grammar typing here. bytes/str become a Bytes node (verbatim); a number
-// becomes a fixed-width Scalar at `type_src`'s recorded type (an existing sibling
-// element, pure data). Variable-width (LEB/computed), spans, and composite shapes have
-// no by-value form — supply bytes for those. Returns null + sets an error otherwise.
-static std::unique_ptr<bbq::znode> znode_from_pyvalue(PyObject* value, const FieldCapture* type_src) {
-    auto z = std::make_unique<bbq::znode>();
-    if (bbq_build_is_value(value)) {   // a bbq.build object enters as its serialized bytes
-        std::vector<uint8_t> out;
-        if (!bbq_build_serialize(value, out)) return nullptr;
-        z->kind = bbq::znode::Kind::Bytes;
-        z->bval = std::move(out);
-        return z;
-    }
-    if (PyBytes_Check(value)) {
-        const char* p = PyBytes_AS_STRING(value);
-        z->kind = bbq::znode::Kind::Bytes;
-        z->bval.assign(p, p + PyBytes_GET_SIZE(value));
-        return z;
-    }
-    if (PyUnicode_Check(value)) {
-        Py_ssize_t n = 0; const char* s = PyUnicode_AsUTF8AndSize(value, &n);
-        if (!s) return nullptr;
-        z->kind = bbq::znode::Kind::Bytes;
-        z->bval.assign(s, s + n);
-        return z;
-    }
-    CaptureType t = type_src ? type_src->type : CaptureType::Struct;
-    if (!is_float_type(t) && t != CaptureType::Bool && leaf_width(t) == 0) {
-        PyErr_SetString(PyExc_TypeError,
-            "append/splice: a non-bytes value needs an existing fixed-width element to "
-            "take its type from; supply bytes for a composite or variable-width element");
-        return nullptr;
-    }
-    z->kind = bbq::znode::Kind::Scalar;
-    z->type = t;
-    if (is_float_type(t)) {
-        double d = PyFloat_AsDouble(value);
-        if (d == -1.0 && PyErr_Occurred()) return nullptr;
-        z->fval = d;
-    } else if (t == CaptureType::Bool) {
-        int b = PyObject_IsTrue(value); if (b < 0) return nullptr;
-        z->ival = b ? 1 : 0;
-    } else {
-        int64_t v = PyLong_AsLongLong(value);
-        if (v == -1 && PyErr_Occurred()) return nullptr;
-        z->ival = v;
-    }
-    return z;
-}
+// ── Reading a leaf ──
+//
+// One ZCow call per kind, dispatched on what the PARSER recorded on the node. Nothing
+// here consults the grammar: the type, the bitfield layout and the computed kind are all
+// on the node, which is why a runtime wrapper can be as thin as a generated one.
+static PyObject* node_value(PyBBQResult* result, const zc::node* n) {
+    if (!n) Py_RETURN_NONE;
+    const zc::source& src = result->edit->src();
 
-static PyObject* decode_auto_value(const FieldCapture* cap, PyBBQResult* result) {
-    if (PyObject* ov = zcow_int_override(cap, result)) return ov;
-    const uint8_t* data = (const uint8_t*)result->view.buf;
-
-    switch (cap->type) {
+    switch (n->type) {
         case CaptureType::UInt8:    case CaptureType::UInt16LE: case CaptureType::UInt16BE:
         case CaptureType::UInt32LE: case CaptureType::UInt32BE:
         case CaptureType::UInt64LE: case CaptureType::UInt64BE:
         case CaptureType::Int8:     case CaptureType::Int16LE:  case CaptureType::Int16BE:
         case CaptureType::Int32LE:  case CaptureType::Int32BE:
         case CaptureType::Int64LE:  case CaptureType::Int64BE:
-            return decode_int(cap, data);
+            return PyLong_FromLongLong(zc::read_int(n, src));
 
         case CaptureType::Computed: {
-            // A Computed leaf carries a typed value (compute(...)/leb/bitfield). Project
-            // it to the matching Python type — not always int.
-            auto* cv = cap->computed_value;
+            // A Computed leaf carries a typed value (compute(...)/leb/bitfield entry).
+            // Project it to the matching Python type — not always int. An EDITED one
+            // carries its value directly, which read_int is what knows.
+            if (!n->parsed) return PyLong_FromLongLong(zc::read_int(n, src));
+            auto* cv = n->computed_value;
             if (!cv) return PyLong_FromLongLong(0);
             switch (cv->kind) {
-                case bbq::ComputedValue::Kind::Int:    return PyLong_FromLongLong(cv->i);
-                case bbq::ComputedValue::Kind::Bool:   return PyBool_FromLong(cv->b ? 1 : 0);
-                case bbq::ComputedValue::Kind::Float:  return PyFloat_FromDouble(cv->f);
-                case bbq::ComputedValue::Kind::String: return PyUnicode_FromString(cv->s ? cv->s : "");
+                case ComputedValue::Kind::Int:    return PyLong_FromLongLong(cv->i);
+                case ComputedValue::Kind::Bool:   return PyBool_FromLong(cv->b ? 1 : 0);
+                case ComputedValue::Kind::Float:  return PyFloat_FromDouble(cv->f);
+                case ComputedValue::Kind::String: return PyUnicode_FromString(cv->s ? cv->s : "");
             }
             return PyLong_FromLongLong(0);
         }
 
         case CaptureType::Float32LE: case CaptureType::Float32BE:
         case CaptureType::Float64LE: case CaptureType::Float64BE:
-            return decode_float(cap, data);
+            return PyFloat_FromDouble(zc::read_float(n, src));
 
         case CaptureType::Bool:
-            return PyBool_FromLong(data[cap->start_offset] ? 1 : 0);
+            return PyBool_FromLong(zc::read_int(n, src) ? 1 : 0);
 
         case CaptureType::String: {
-            size_t len = cap->end_offset - cap->start_offset;
-            return PyUnicode_DecodeUTF8(
-                (const char*)(data + cap->start_offset), (Py_ssize_t)len, NULL);
+            std::string_view s = zc::read_str(n, src);
+            return PyUnicode_DecodeUTF8(s.data(), (Py_ssize_t)s.size(), NULL);
         }
 
         case CaptureType::Bytes:
         case CaptureType::External: {
-            size_t len = cap->end_offset - cap->start_offset;
-            return PyBytes_FromStringAndSize(
-                (const char*)(data + cap->start_offset), (Py_ssize_t)len);
+            auto b = zc::read_bytes(n, src);
+            return PyBytes_FromStringAndSize((const char*)b.first, (Py_ssize_t)b.second);
         }
 
         case CaptureType::Struct:
         case CaptureType::Array:
-            return (PyObject*)PyBBQNode_New(cap, result);
+            break;   // containers are not values; the caller hands back a node
     }
     Py_RETURN_NONE;
+}
+
+// ── Writing a leaf ──
+//
+// `n` is already owned (the caller got it from own_child). Every PyObject→C conversion
+// happens BEFORE the lock is taken: PyFloat_AsDouble, PyObject_IsTrue and
+// PyLong_AsLongLong can all run arbitrary Python (__float__ / __bool__ / __index__), and
+// re-entering this module while holding the lock would deadlock.
+struct PendingWrite {
+    enum class Kind { Int, Float, Bytes } kind;
+    int64_t i = 0;
+    double f = 0;
+    std::vector<uint8_t> b;
+    bool as_str = false;
+};
+
+static bool convert_for(CaptureType t, PyObject* value, PendingWrite* out) {
+    if (is_float_type(t)) {
+        double d = PyFloat_AsDouble(value);
+        if (d == -1.0 && PyErr_Occurred()) return false;
+        out->kind = PendingWrite::Kind::Float; out->f = d;
+        return true;
+    }
+    if (t == CaptureType::Bytes || t == CaptureType::External) {
+        if (!PyBytes_Check(value)) {
+            PyErr_SetString(PyExc_TypeError, "expected bytes for a bytes field");
+            return false;
+        }
+        const char* p = PyBytes_AS_STRING(value);
+        out->kind = PendingWrite::Kind::Bytes;
+        out->b.assign(p, p + PyBytes_GET_SIZE(value));
+        return true;
+    }
+    if (t == CaptureType::String) {
+        out->kind = PendingWrite::Kind::Bytes;
+        out->as_str = true;
+        if (PyBytes_Check(value)) {
+            const char* p = PyBytes_AS_STRING(value);
+            out->b.assign(p, p + PyBytes_GET_SIZE(value));
+        } else {
+            Py_ssize_t n = 0;
+            const char* s = PyUnicode_AsUTF8AndSize(value, &n);
+            if (!s) return false;
+            out->b.assign(s, s + n);
+        }
+        return true;
+    }
+    if (t == CaptureType::Bool) {
+        int b = PyObject_IsTrue(value);
+        if (b < 0) return false;
+        out->kind = PendingWrite::Kind::Int; out->i = b ? 1 : 0;
+        return true;
+    }
+    if (is_container(t)) {
+        PyErr_Format(PyExc_TypeError, "cannot assign directly to a %s field",
+                     capture_type_name(t));
+        return false;
+    }
+    int64_t v = PyLong_AsLongLong(value);   // integer leaves, and Computed (leb/compute)
+    if (v == -1 && PyErr_Occurred()) return false;
+    out->kind = PendingWrite::Kind::Int; out->i = v;
+    return true;
+}
+
+// Content supplied as BYTES: bytes, str, or a bbq.build value (which is a byte
+// constructor and enters as what it serializes to). This is the form a composite or
+// variable-width element takes — ZCow is byte-level, so a shape the grammar is not
+// describing arrives as its bytes. Returns 1 = took it, 0 = not that kind of value,
+// -1 = error. Runs Python, so no lock may be held.
+static int as_byte_content(PyObject* value, std::vector<uint8_t>* out) {
+    if (bbq_build_is_value(value))
+        return bbq_build_serialize(value, *out) ? 1 : -1;
+    if (PyBytes_Check(value)) {
+        const char* p = PyBytes_AS_STRING(value);
+        out->assign(p, p + PyBytes_GET_SIZE(value));
+        return 1;
+    }
+    if (PyUnicode_Check(value)) {
+        Py_ssize_t n = 0;
+        const char* s = PyUnicode_AsUTF8AndSize(value, &n);
+        if (!s) return -1;
+        out->assign(s, s + n);
+        return 1;
+    }
+    return 0;
+}
+
+static void apply_write(zc::node* n, const PendingWrite& w) {
+    switch (w.kind) {
+        case PendingWrite::Kind::Int:   zc::set_int(n, w.i, n->enc); break;
+        case PendingWrite::Kind::Float: zc::set_float(n, w.f); break;
+        case PendingWrite::Kind::Bytes:
+            if (w.as_str) zc::set_str(n, std::string_view((const char*)w.b.data(), w.b.size()));
+            else          zc::set_bytes(n, w.b.data(), w.b.size());
+            break;
+    }
+}
+
+// Write `value` into the child of `container` named `key` (or at `index`). This is the
+// generated `set_x`: own the child, then one ZCow setter.
+static int write_child(PyBBQResult* result, PyBBQNode* holder,
+                       const char* key, Py_ssize_t index, PyObject* value) {
+    CaptureType t;
+    Py_ssize_t slot;
+    {
+        DocLock g(result);
+        const zc::node* c = node_of(holder);
+        if (!c || !is_container(c->type)) {
+            PyErr_SetString(PyExc_TypeError, "not a container");
+            return -1;
+        }
+        slot = key ? child_slot(c, key) : index;
+        if (slot < 0 || (size_t)slot >= c->kids.size()) {
+            if (key) PyErr_Format(PyExc_AttributeError, "no field '%s'", key);
+            else     PyErr_SetString(PyExc_IndexError, "index out of range");
+            return -1;
+        }
+        t = c->kids[(size_t)slot]->type;
+    }
+
+    PendingWrite w;
+    if (!convert_for(t, value, &w)) return -1;   // may run Python — no lock held
+
+    DocLock g(result);
+    zc::node* c = owned_node_of(holder);
+    zc::node* child = result->edit->own_child(c, (size_t)slot);
+    if (!child) { PyErr_SetString(PyExc_RuntimeError, "field vanished"); return -1; }
+    apply_write(child, w);
+    return 0;
 }
 
 
 // ── PyBBQNode ───────────────────────────────────────────────────────────────
 
-static PyBBQNode* PyBBQNode_New(const FieldCapture* cap, PyBBQResult* result) {
+static PyBBQNode* PyBBQNode_New(PyBBQResult* result, zc::node* parent, Py_ssize_t slot) {
     PyBBQNode* node = PyObject_GC_New(PyBBQNode, &PyBBQNode_Type);
     if (!node) return NULL;
-    node->capture = cap;
+    node->parent = parent;
+    node->slot = slot;
     Py_INCREF(result);
     node->result = result;
     PyObject_GC_Track((PyObject*)node);
@@ -438,6 +481,23 @@ static int PyBBQNode_clear(PyBBQNode* self) {
     return 0;
 }
 
+// Navigate to a child of `holder`. Navigating INTO a container claims it — the generated
+// `sub_` — because it becomes the address of everything below it, and an owned node is
+// one copy-on-write will not move again. The CHILD is not claimed: a leaf that has been
+// owned carries its own value, and a read has no value to put there, so owning one on a
+// read would not be an inefficiency but a corruption.
+static PyObject* child_node(PyBBQResult* result, PyBBQNode* holder, Py_ssize_t slot) {
+    DocLock g(result);
+    const zc::node* c = node_of(holder);
+    if (!c || slot < 0 || (size_t)slot >= c->kids.size()) {
+        PyErr_SetString(PyExc_IndexError, "index out of range");
+        return NULL;
+    }
+    zc::node* owned = owned_node_of(holder);
+    if (!owned) { PyErr_SetString(PyExc_RuntimeError, "node vanished"); return NULL; }
+    return (PyObject*)PyBBQNode_New(result, owned, slot);
+}
+
 static PyObject* PyBBQNode_getattro(PyBBQNode* self, PyObject* name) {
     // Try standard attributes first (methods, properties)
     PyObject* attr = PyObject_GenericGetAttr((PyObject*)self, name);
@@ -447,80 +507,75 @@ static PyObject* PyBBQNode_getattro(PyBBQNode* self, PyObject* name) {
     const char* key = PyUnicode_AsUTF8(name);
     if (!key) return NULL;
 
-    // Linear scan — Python strings aren't interned in the same pool, use strcmp
-    for (int i = 0; i < self->capture->child_count; i++) {
-        if (self->capture->children[i].name &&
-            strcmp(self->capture->children[i].name, key) == 0) {
-            PyErr_Clear();
-            return (PyObject*)PyBBQNode_New(&self->capture->children[i], self->result);
-        }
-    }
-    return NULL;  // keep AttributeError
+    Py_ssize_t slot;
+    { DocLock g(self->result); slot = child_slot(node_of(self), key); }
+    if (slot < 0) return NULL;   // keep AttributeError
+
+    PyErr_Clear();
+    return child_node(self->result, self, slot);
 }
 
-// `node.field = v` → detach that field to Owned in the ZCow overlay.
+// `node.field = v` — own the field and write it.
 static int PyBBQNode_setattro(PyBBQNode* self, PyObject* name, PyObject* value) {
     if (!value) { PyErr_SetString(PyExc_TypeError, "cannot delete a BBQ field"); return -1; }
     const char* key = PyUnicode_AsUTF8(name);
     if (!key) return -1;
-    return zcow_set_field(self->capture, self->result, key, value);
+    return write_child(self->result, self, key, -1, value);
 }
 
 // ── Number protocol ──
 
-static PyObject* PyBBQNode_nb_int(PyBBQNode* self) {
-    if (PyObject* ov = zcow_int_override(self->capture, self->result)) return ov;
-    return decode_int(self->capture, (const uint8_t*)self->result->view.buf);
+// int()/float() coerce a NUMERIC leaf. Anything else is a TypeError naming the type it
+// was asked to convert — not whatever int() would say about the value it got handed.
+static bool is_numeric_leaf(CaptureType t) {
+    return !is_container(t) && t != CaptureType::String &&
+           t != CaptureType::Bytes && t != CaptureType::External;
 }
 
-static PyObject* PyBBQNode_nb_float(PyBBQNode* self) {
-    const uint8_t* data = (const uint8_t*)self->result->view.buf;
-    CaptureType type = self->capture->type;
-
-    // Native float types
-    if (type == CaptureType::Float32LE || type == CaptureType::Float32BE ||
-        type == CaptureType::Float64LE || type == CaptureType::Float64BE)
-        return decode_float(self->capture, data);
-
-    // Integer promotion
-    PyObject* ival = decode_int(self->capture, data);
-    if (!ival) return NULL;
-    double d = PyLong_AsDouble(ival);
-    Py_DECREF(ival);
-    if (d == -1.0 && PyErr_Occurred()) return NULL;
-    return PyFloat_FromDouble(d);
+static PyObject* coerce(PyBBQNode* self, const char* to) {
+    CaptureType t;
+    PyObject* v;
+    {
+        DocLock g(self->result);
+        const zc::node* n = node_of(self);
+        if (!n) { PyErr_SetString(PyExc_RuntimeError, "node vanished"); return NULL; }
+        t = n->type;
+        if (!is_numeric_leaf(t)) {
+            PyErr_Format(PyExc_TypeError, "cannot convert %s to %s",
+                         capture_type_name(t), to);
+            return NULL;
+        }
+        v = node_value(self->result, n);
+    }
+    if (!v) return NULL;
+    if (PyUnicode_Check(v)) {   // a Computed carrying a string is not numeric either
+        Py_DECREF(v);
+        PyErr_Format(PyExc_TypeError, "cannot convert %s to %s", capture_type_name(t), to);
+        return NULL;
+    }
+    PyObject* r = (to[0] == 'i') ? PyNumber_Long(v) : PyNumber_Float(v);
+    Py_DECREF(v);
+    return r;
 }
+
+static PyObject* PyBBQNode_nb_int(PyBBQNode* self)   { return coerce(self, "int"); }
+static PyObject* PyBBQNode_nb_float(PyBBQNode* self) { return coerce(self, "float"); }
 
 static int PyBBQNode_nb_bool(PyBBQNode* self) {
-    switch (self->capture->type) {
-        case CaptureType::Bool:
-            return ((const uint8_t*)self->result->view.buf)[self->capture->start_offset] ? 1 : 0;
-        case CaptureType::Struct:
-        case CaptureType::Array:
-            return 1;
-        case CaptureType::String:
-        case CaptureType::Bytes:
-        case CaptureType::External:
-            return (self->capture->end_offset > self->capture->start_offset) ? 1 : 0;
-        case CaptureType::Computed: {
-            // Truthy iff the Value pointer exists AND its underlying
-            // value is non-zero / non-empty. Match the runtime's
-            // bool-coercion semantics: IntValue nonzero=true, BoolValue
-            // by-value, others → consider present-ness.
-            auto* v = self->capture->computed_value;
-            if (!v) return 0;
-            if (v->kind == bbq::ComputedValue::Kind::Int)  return v->i != 0 ? 1 : 0;
-            if (v->kind == bbq::ComputedValue::Kind::Bool) return v->b ? 1 : 0;
-            return 1;  // any other present scalar → truthy
-        }
-        default: {
-            PyObject* val = decode_auto_value(self->capture, self->result);
-            if (!val) return -1;
-            int r = PyObject_IsTrue(val);
-            Py_DECREF(val);
-            return r;
-        }
+    CaptureType t;
+    PyObject* v;
+    {
+        DocLock g(self->result);
+        const zc::node* n = node_of(self);
+        if (!n) return 0;
+        t = n->type;
+        if (is_container(t)) return n->kids.empty() ? 0 : 1;
+        v = node_value(self->result, n);
     }
+    if (!v) return -1;
+    int r = PyObject_IsTrue(v);
+    Py_DECREF(v);
+    return r;
 }
 
 static PyNumberMethods PyBBQNode_as_number = {
@@ -541,110 +596,70 @@ static PyNumberMethods PyBBQNode_as_number = {
     (binaryfunc)  NULL,                     // nb_xor
     (binaryfunc)  NULL,                     // nb_or
     (unaryfunc)   PyBBQNode_nb_int,         // nb_int
-    (void*)       NULL,                     // nb_reserved
+    NULL,                                   // nb_reserved
     (unaryfunc)   PyBBQNode_nb_float,       // nb_float
-    (binaryfunc)  NULL,                     // nb_inplace_add
-    (binaryfunc)  NULL,                     // nb_inplace_subtract
-    (binaryfunc)  NULL,                     // nb_inplace_multiply
-    (binaryfunc)  NULL,                     // nb_inplace_remainder
-    (ternaryfunc) NULL,                     // nb_inplace_power
-    (binaryfunc)  NULL,                     // nb_inplace_lshift
-    (binaryfunc)  NULL,                     // nb_inplace_rshift
-    (binaryfunc)  NULL,                     // nb_inplace_and
-    (binaryfunc)  NULL,                     // nb_inplace_xor
-    (binaryfunc)  NULL,                     // nb_inplace_or
-    (binaryfunc)  NULL,                     // nb_floor_divide
-    (binaryfunc)  NULL,                     // nb_true_divide
-    (binaryfunc)  NULL,                     // nb_inplace_floor_divide
-    (binaryfunc)  NULL,                     // nb_inplace_true_divide
-    (unaryfunc)   NULL,                     // nb_index
-    (binaryfunc)  NULL,                     // nb_matrix_multiply
-    (binaryfunc)  NULL,                     // nb_inplace_matrix_multiply
 };
 
 // ── Mapping protocol ──
 
 static Py_ssize_t PyBBQNode_mp_length(PyBBQNode* self) {
-    CaptureType type = self->capture->type;
-    if (type == CaptureType::Struct || type == CaptureType::Array) {
-        // Live like a Python list: reflect overlay appends/deletes when the container
-        // was structurally edited, else the baseline child count.
-        int o;
-        { BBQLock g(&self->result->lock);
-          o = self->result->zcow ? self->result->zcow->overlay_child_count(self->capture) : -1; }
-        return o >= 0 ? o : self->capture->child_count;
-    }
+    DocLock g(self->result);
+    const zc::node* n = node_of(self);
+    if (n && is_container(n->type)) return (Py_ssize_t)zc::size_of(n);
     PyErr_Format(PyExc_TypeError,
                  "object of type 'bbq.Node' (%s) has no len()",
-                 capture_type_name(type));
+                 capture_type_name(n ? n->type : CaptureType::UInt8));
     return -1;
 }
 
 static PyObject* PyBBQNode_mp_subscript(PyBBQNode* self, PyObject* key) {
-    CaptureType ct = self->capture->type;
-    bool is_container = (ct == CaptureType::Struct || ct == CaptureType::Array);
+    CaptureType ct;
+    Py_ssize_t count;
+    {
+        DocLock g(self->result);
+        const zc::node* n = node_of(self);
+        if (!n) { PyErr_SetString(PyExc_RuntimeError, "node vanished"); return NULL; }
+        ct = n->type;
+        count = (Py_ssize_t)zc::size_of(n);
+    }
+    if (!is_container(ct)) {
+        PyErr_Format(PyExc_TypeError, "'bbq.Node' (%s) is not subscriptable",
+                     capture_type_name(ct));
+        return NULL;
+    }
 
-    // Slice
     if (PySlice_Check(key)) {
-        if (!is_container) {
-            PyErr_Format(PyExc_TypeError,
-                         "'bbq.Node' (%s) is not subscriptable",
-                         capture_type_name(ct));
-            return NULL;
-        }
         Py_ssize_t start, stop, step, length;
-        if (PySlice_GetIndicesEx(key, self->capture->child_count,
-                                 &start, &stop, &step, &length) < 0)
+        if (PySlice_GetIndicesEx(key, count, &start, &stop, &step, &length) < 0)
             return NULL;
         PyObject* list = PyList_New(length);
         if (!list) return NULL;
         for (Py_ssize_t i = 0, idx = start; i < length; i++, idx += step) {
-            PyObject* node = (PyObject*)PyBBQNode_New(
-                &self->capture->children[idx], self->result);
+            PyObject* node = child_node(self->result, self, idx);
             if (!node) { Py_DECREF(list); return NULL; }
             PyList_SET_ITEM(list, i, node);
         }
         return list;
     }
 
-    // Integer index
     if (PyIndex_Check(key)) {
-        if (!is_container) {
-            PyErr_Format(PyExc_TypeError,
-                         "'bbq.Node' (%s) is not subscriptable",
-                         capture_type_name(ct));
-            return NULL;
-        }
         Py_ssize_t index = PyNumber_AsSsize_t(key, PyExc_IndexError);
         if (index == -1 && PyErr_Occurred()) return NULL;
-
-        if (index < 0) index += self->capture->child_count;
-
-        if (index < 0 || index >= self->capture->child_count) {
+        if (index < 0) index += count;
+        if (index < 0 || index >= count) {
             PyErr_SetString(PyExc_IndexError, "index out of range");
             return NULL;
         }
-        return (PyObject*)PyBBQNode_New(&self->capture->children[index], self->result);
+        return child_node(self->result, self, index);
     }
 
-    // String key — only valid on containers with named children
     if (PyUnicode_Check(key)) {
-        if (!is_container) {
-            PyErr_Format(PyExc_TypeError,
-                         "'bbq.Node' (%s) is not subscriptable",
-                         capture_type_name(ct));
-            return NULL;
-        }
         const char* name = PyUnicode_AsUTF8(key);
         if (!name) return NULL;
-
-        for (int i = 0; i < self->capture->child_count; i++) {
-            if (self->capture->children[i].name &&
-                strcmp(self->capture->children[i].name, name) == 0)
-                return (PyObject*)PyBBQNode_New(&self->capture->children[i], self->result);
-        }
-        PyErr_SetObject(PyExc_KeyError, key);
-        return NULL;
+        Py_ssize_t slot;
+        { DocLock g(self->result); slot = child_slot(node_of(self), name); }
+        if (slot < 0) { PyErr_SetObject(PyExc_KeyError, key); return NULL; }
+        return child_node(self->result, self, slot);
     }
 
     PyErr_Format(PyExc_TypeError,
@@ -653,58 +668,83 @@ static PyObject* PyBBQNode_mp_subscript(PyBBQNode* self, PyObject* key) {
     return NULL;
 }
 
-// node[i] = v / node[name] = v (CoW-detach the child), or del node[i] (remove).
+// node[i] = v / node[name] = v, or del node[i].
 static int PyBBQNode_mp_ass_subscript(PyBBQNode* self, PyObject* key, PyObject* value) {
-    const FieldCapture* cap = self->capture;
-    if (cap->type != CaptureType::Struct && cap->type != CaptureType::Array) {
+    CaptureType ct;
+    Py_ssize_t count;
+    {
+        DocLock g(self->result);
+        const zc::node* n = node_of(self);
+        if (!n) { PyErr_SetString(PyExc_RuntimeError, "node vanished"); return -1; }
+        ct = n->type;
+        count = (Py_ssize_t)zc::size_of(n);
+    }
+    if (!is_container(ct)) {
         PyErr_Format(PyExc_TypeError, "'bbq.Node' (%s) does not support item assignment",
-                     capture_type_name(cap->type));
+                     capture_type_name(ct));
         return -1;
     }
-    const FieldCapture* child = nullptr;
+
     Py_ssize_t index = -1;
+    const char* name = nullptr;
     if (PyIndex_Check(key)) {
         index = PyNumber_AsSsize_t(key, PyExc_IndexError);
         if (index == -1 && PyErr_Occurred()) return -1;
-        if (index < 0) index += cap->child_count;
-        if (index < 0 || index >= cap->child_count) {
+        if (index < 0) index += count;
+        if (index < 0 || index >= count) {
             PyErr_SetString(PyExc_IndexError, "index out of range"); return -1;
         }
-        child = &cap->children[index];
     } else if (PyUnicode_Check(key)) {
-        const char* name = PyUnicode_AsUTF8(key);
+        name = PyUnicode_AsUTF8(key);
         if (!name) return -1;
-        for (int i = 0; i < cap->child_count; i++)
-            if (cap->children[i].name && strcmp(cap->children[i].name, name) == 0) {
-                child = &cap->children[i]; index = i; break;
-            }
-        if (!child) { PyErr_SetObject(PyExc_KeyError, key); return -1; }
+        DocLock g(self->result);
+        index = child_slot(node_of(self), name);
+        if (index < 0) { PyErr_SetObject(PyExc_KeyError, key); return -1; }
+        name = nullptr;   // resolved to a slot; write by index from here
     } else {
         PyErr_Format(PyExc_TypeError, "indices must be integers or strings, not %.200s",
                      Py_TYPE(key)->tp_name);
         return -1;
     }
+
     if (value == NULL) {   // del node[index]
-        bool ok;
-        { BBQLock g(&self->result->lock);
-          ok = zcow_of(self->result)->remove_index(cap, (size_t)index); }
-        if (!ok) { PyErr_SetString(PyExc_IndexError, "cannot delete"); return -1; }
+        DocLock g(self->result);
+        zc::node* c = owned_node_of(self);
+        if (!c || !self->result->edit->remove(c, (size_t)index)) {
+            PyErr_SetString(PyExc_IndexError, "cannot delete");
+            return -1;
+        }
         return 0;
     }
-    // Splice: replacing a composite array element (`arr[i] = b"..."`) sets a raw byte
-    // subtree via the ZCow splice (CoW path-copy + re-serialize on emit) — ZCow is
-    // byte-level, so the replacement is supplied as bytes. Leaf elements fall through
-    // to the per-type leaf setter.
-    if (cap->type == CaptureType::Array &&
-        (child->type == CaptureType::Struct || child->type == CaptureType::Array)) {
-        PyBBQResult* res = self->result;
-        std::unique_ptr<bbq::znode> elem = znode_from_pyvalue(value, nullptr);
-        if (!elem) return -1;
-        BBQLock g(&res->lock);
-        zcow_of(res)->set_node(child, std::move(elem));
+
+    // Replacing a COMPOSITE element: the shape being put there is not one the grammar is
+    // describing, so it goes in as bytes and the element becomes those bytes (the splice).
+    bool composite;
+    {
+        DocLock g(self->result);
+        const zc::node* c = node_of(self);
+        composite = c && (size_t)index < c->kids.size() &&
+                    is_container(c->kids[(size_t)index]->type);
+    }
+    if (composite) {
+        std::vector<uint8_t> raw;
+        int took = as_byte_content(value, &raw);   // may run Python — no lock held
+        if (took < 0) return -1;
+        if (!took) {
+            PyErr_SetString(PyExc_TypeError,
+                "a composite element is replaced by bytes (or a bbq.build value)");
+            return -1;
+        }
+        DocLock g(self->result);
+        zc::node* c = owned_node_of(self);
+        zc::node* e = self->result->edit->own_child(c, (size_t)index);
+        if (!e || !self->result->edit->splice(e, raw.data(), raw.size())) {
+            PyErr_SetString(PyExc_RuntimeError, "splice failed");
+            return -1;
+        }
         return 0;
     }
-    return zcow_set_capture(child, self->result, value);
+    return write_child(self->result, self, name, index, value);
 }
 
 static PyMappingMethods PyBBQNode_as_mapping = {
@@ -717,16 +757,10 @@ static PyMappingMethods PyBBQNode_as_mapping = {
 
 static int PyBBQNode_sq_contains(PyBBQNode* self, PyObject* value) {
     if (!PyUnicode_Check(value)) return 0;
-
     const char* key = PyUnicode_AsUTF8(value);
     if (!key) { PyErr_Clear(); return 0; }
-
-    for (int i = 0; i < self->capture->child_count; i++) {
-        if (self->capture->children[i].name &&
-            strcmp(self->capture->children[i].name, key) == 0)
-            return 1;
-    }
-    return 0;
+    DocLock g(self->result);
+    return child_slot(node_of(self), key) >= 0 ? 1 : 0;
 }
 
 static PySequenceMethods PyBBQNode_as_sequence = {
@@ -743,14 +777,23 @@ static PySequenceMethods PyBBQNode_as_sequence = {
 };
 
 // ── Buffer protocol ──
-
+//
+// The zero-copy read, when there is one to give: a node still described by its span
+// points straight into the mapped input. Once something has been written to it there is
+// no span to point at, and `raw` (which serializes) is the way to get its bytes.
 static int PyBBQNode_getbuffer(PyBBQNode* self, Py_buffer* view, int flags) {
-    const uint8_t* data = (const uint8_t*)self->result->view.buf;
-    size_t start = self->capture->start_offset;
-    Py_ssize_t len = (Py_ssize_t)(self->capture->end_offset - start);
-
+    DocLock g(self->result);
+    const zc::node* n = node_of(self);
+    const zc::source& src = self->result->edit->src();
+    if (!n || !n->parsed || !src.buf) {
+        PyErr_SetString(PyExc_BufferError,
+                        "node has been edited: it no longer names bytes of the input "
+                        "(use .raw)");
+        return -1;
+    }
     return PyBuffer_FillInfo(view, (PyObject*)self,
-                             (void*)(data + start), len,
+                             (void*)(src.buf + n->start_offset),
+                             (Py_ssize_t)(n->end_offset - n->start_offset),
                              1 /* readonly */, flags);
 }
 
@@ -762,63 +805,63 @@ static PyBufferProcs PyBBQNode_as_buffer = {
 // ── str / repr ──
 
 static PyObject* PyBBQNode_tp_repr(PyBBQNode* self) {
-    const FieldCapture* cap = self->capture;
-    if (cap->name) {
-        return PyUnicode_FromFormat("<bbq.Node '%s' type=%s [0x%zx:0x%zx]>",
-            cap->name, capture_type_name(cap->type),
-            cap->start_offset, cap->end_offset);
-    }
-    return PyUnicode_FromFormat("<bbq.Node type=%s [0x%zx:0x%zx]>",
-        capture_type_name(cap->type),
-        cap->start_offset, cap->end_offset);
+    DocLock g(self->result);
+    const zc::node* n = node_of(self);
+    if (!n) return PyUnicode_FromString("<bbq.Node (gone)>");
+    if (n->name)
+        return PyUnicode_FromFormat("<bbq.Node '%s' type=%s [0x%zx:0x%zx]%s>",
+            n->name, capture_type_name(n->type),
+            n->start_offset, n->end_offset, n->parsed ? "" : " edited");
+    return PyUnicode_FromFormat("<bbq.Node type=%s [0x%zx:0x%zx]%s>",
+        capture_type_name(n->type), n->start_offset, n->end_offset,
+        n->parsed ? "" : " edited");
 }
 
 static PyObject* PyBBQNode_tp_str(PyBBQNode* self) {
-    const FieldCapture* cap = self->capture;
-    const uint8_t* data = (const uint8_t*)self->result->view.buf;
-
-    switch (cap->type) {
-        case CaptureType::String: {
-            size_t len = cap->end_offset - cap->start_offset;
-            return PyUnicode_DecodeUTF8(
-                (const char*)(data + cap->start_offset), (Py_ssize_t)len, NULL);
-        }
-        case CaptureType::Bool:
-            return PyUnicode_FromString(data[cap->start_offset] ? "True" : "False");
-        case CaptureType::Struct:
-        case CaptureType::Array:
-            return PyBBQNode_tp_repr(self);
-        default: {
-            PyObject* val = decode_auto_value(cap, self->result);
-            if (!val) return NULL;
-            PyObject* str = PyObject_Str(val);
-            Py_DECREF(val);
-            return str;
-        }
+    CaptureType t;
+    PyObject* val;
+    {
+        DocLock g(self->result);
+        const zc::node* n = node_of(self);
+        if (!n) return PyUnicode_FromString("");
+        t = n->type;
+        if (is_container(t)) { /* fall through to repr below */ }
+        val = is_container(t) ? nullptr : node_value(self->result, n);
     }
+    if (is_container(t)) return PyBBQNode_tp_repr(self);
+    if (!val) return NULL;
+    if (PyUnicode_Check(val)) return val;
+    PyObject* str = PyObject_Str(val);
+    Py_DECREF(val);
+    return str;
 }
 
 // ── Rich comparison ──
 
 static PyObject* PyBBQNode_richcompare(PyObject* self_obj, PyObject* other, int op) {
     PyBBQNode* self = (PyBBQNode*)self_obj;
-    CaptureType type = self->capture->type;
-
-    // Containers: identity comparison with other nodes
-    if (type == CaptureType::Struct || type == CaptureType::Array) {
-        if (Py_TYPE(other) == &PyBBQNode_Type) {
-            bool eq = (self->capture == ((PyBBQNode*)other)->capture);
-            switch (op) {
-                case Py_EQ: return PyBool_FromLong(eq);
-                case Py_NE: return PyBool_FromLong(!eq);
-                default: Py_RETURN_NOTIMPLEMENTED;
+    CaptureType t;
+    PyObject* val;
+    {
+        DocLock g(self->result);
+        const zc::node* n = node_of(self);
+        if (!n) Py_RETURN_NOTIMPLEMENTED;
+        t = n->type;
+        // Containers: identity comparison with other nodes.
+        if (is_container(t)) {
+            if (Py_TYPE(other) == &PyBBQNode_Type) {
+                PyBBQNode* o = (PyBBQNode*)other;
+                bool eq = (o->result == self->result && node_of(o) == n);
+                switch (op) {
+                    case Py_EQ: return PyBool_FromLong(eq);
+                    case Py_NE: return PyBool_FromLong(!eq);
+                    default: Py_RETURN_NOTIMPLEMENTED;
+                }
             }
+            Py_RETURN_NOTIMPLEMENTED;
         }
-        Py_RETURN_NOTIMPLEMENTED;
+        val = node_value(self->result, n);
     }
-
-    // Leaf nodes: materialize and compare
-    PyObject* val = decode_auto_value(self->capture, self->result);
     if (!val) return NULL;
     PyObject* result = PyObject_RichCompare(val, other, op);
     Py_DECREF(val);
@@ -827,27 +870,33 @@ static PyObject* PyBBQNode_richcompare(PyObject* self_obj, PyObject* other, int 
 
 // ── Iterator ──
 
-static PyObject* PyBBQNode_tp_iter(PyBBQNode* self) {
-    CaptureType type = self->capture->type;
-    if (type != CaptureType::Struct && type != CaptureType::Array) {
-        PyErr_Format(PyExc_TypeError,
-                     "'bbq.Node' (%s) is not iterable",
-                     capture_type_name(type));
-        return NULL;
+static PyObject* make_iter(PyBBQResult* result, PyBBQNode* holder) {
+    zc::node* c;
+    bool tuples;
+    {
+        DocLock g(result);
+        const zc::node* n = node_of(holder);
+        if (!n || !is_container(n->type)) {
+            PyErr_Format(PyExc_TypeError, "'bbq.Node' (%s) is not iterable",
+                         capture_type_name(n ? n->type : CaptureType::UInt8));
+            return NULL;
+        }
+        tuples = (n->type == CaptureType::Struct);
+        c = owned_node_of(holder);   // pinned for the walk
     }
-
     PyBBQNodeIter* iter = PyObject_GC_New(PyBBQNodeIter, &PyBBQNodeIter_Type);
     if (!iter) return NULL;
-
-    Py_INCREF(self->result);
-    iter->result = self->result;
-    iter->children = self->capture->children;
-    iter->count = self->capture->child_count;
+    Py_INCREF(result);
+    iter->result = result;
+    iter->container = c;
     iter->index = 0;
-    iter->yield_tuples = (self->capture->type == CaptureType::Struct);
-
+    iter->yield_tuples = tuples;
     PyObject_GC_Track((PyObject*)iter);
     return (PyObject*)iter;
+}
+
+static PyObject* PyBBQNode_tp_iter(PyBBQNode* self) {
+    return make_iter(self->result, self);
 }
 
 // ── Node methods ──
@@ -855,8 +904,8 @@ static PyObject* PyBBQNode_tp_iter(PyBBQNode* self) {
 static PyObject* PyBBQNode_format(PyBBQNode* self, PyObject* args) {
     PyObject* format_spec;
     if (!PyArg_ParseTuple(args, "U", &format_spec)) return NULL;
-
-    PyObject* val = decode_auto_value(self->capture, self->result);
+    PyObject* val;
+    { DocLock g(self->result); val = node_value(self->result, node_of(self)); }
     if (!val) return NULL;
     PyObject* result = PyObject_Format(val, format_spec);
     Py_DECREF(val);
@@ -865,28 +914,32 @@ static PyObject* PyBBQNode_format(PyBBQNode* self, PyObject* args) {
 
 // Helper: append names from getset and methods tables to a list
 static int append_type_attrs(PyObject* list, PyTypeObject* type) {
-    // Properties from tp_getset
     if (type->tp_getset) {
         for (PyGetSetDef* gs = type->tp_getset; gs->name; gs++) {
             PyObject* s = PyUnicode_FromString(gs->name);
-            if (!s || PyList_Append(list, s) < 0) {
-                Py_XDECREF(s);
-                return -1;
-            }
+            if (!s || PyList_Append(list, s) < 0) { Py_XDECREF(s); return -1; }
             Py_DECREF(s);
         }
     }
-    // Methods from tp_methods (skip dunder)
     if (type->tp_methods) {
         for (PyMethodDef* m = type->tp_methods; m->ml_name; m++) {
             if (m->ml_name[0] == '_' && m->ml_name[1] == '_') continue;
             PyObject* s = PyUnicode_FromString(m->ml_name);
-            if (!s || PyList_Append(list, s) < 0) {
-                Py_XDECREF(s);
-                return -1;
-            }
+            if (!s || PyList_Append(list, s) < 0) { Py_XDECREF(s); return -1; }
             Py_DECREF(s);
         }
+    }
+    return 0;
+}
+
+// The child field names of `c`, appended to `list`. Caller holds the lock.
+static int append_child_names(PyObject* list, const zc::node* c) {
+    if (!c) return 0;
+    for (const auto& k : c->kids) {
+        if (!k->name) continue;
+        PyObject* s = PyUnicode_FromString(k->name);
+        if (!s || PyList_Append(list, s) < 0) { Py_XDECREF(s); return -1; }
+        Py_DECREF(s);
     }
     return 0;
 }
@@ -894,56 +947,41 @@ static int append_type_attrs(PyObject* list, PyTypeObject* type) {
 static PyObject* PyBBQNode_dir(PyBBQNode* self, PyObject*) {
     PyObject* list = PyList_New(0);
     if (!list) return NULL;
-
-    if (append_type_attrs(list, &PyBBQNode_Type) < 0) {
-        Py_DECREF(list);
-        return NULL;
-    }
-
-    // Append child field names
-    for (int i = 0; i < self->capture->child_count; i++) {
-        if (self->capture->children[i].name) {
-            PyObject* s = PyUnicode_FromString(self->capture->children[i].name);
-            if (!s || PyList_Append(list, s) < 0) {
-                Py_XDECREF(s);
-                Py_DECREF(list);
-                return NULL;
-            }
-            Py_DECREF(s);
-        }
-    }
+    if (append_type_attrs(list, &PyBBQNode_Type) < 0) { Py_DECREF(list); return NULL; }
+    DocLock g(self->result);
+    if (append_child_names(list, node_of(self)) < 0) { Py_DECREF(list); return NULL; }
     return list;
 }
 
 static PyObject* PyBBQNode_keys(PyBBQNode* self, PyObject*) {
     PyObject* list = PyList_New(0);
     if (!list) return NULL;
-
-    for (int i = 0; i < self->capture->child_count; i++) {
-        if (self->capture->children[i].name) {
-            PyObject* s = PyUnicode_FromString(self->capture->children[i].name);
-            if (!s || PyList_Append(list, s) < 0) {
-                Py_XDECREF(s);
-                Py_DECREF(list);
-                return NULL;
-            }
-            Py_DECREF(s);
-        }
-    }
+    DocLock g(self->result);
+    if (append_child_names(list, node_of(self)) < 0) { Py_DECREF(list); return NULL; }
     return list;
 }
 
+// The named children, as nodes. Slots are collected under the lock and turned into
+// Python objects after it — child_node takes the lock itself.
+static bool named_slots(PyBBQResult* result, PyBBQNode* holder,
+                        std::vector<std::pair<Py_ssize_t, std::string>>* out) {
+    DocLock g(result);
+    const zc::node* c = node_of(holder);
+    if (!c) return false;
+    for (size_t i = 0; i < c->kids.size(); i++)
+        if (c->kids[i]->name) out->emplace_back((Py_ssize_t)i, c->kids[i]->name);
+    return true;
+}
+
 static PyObject* PyBBQNode_values(PyBBQNode* self, PyObject*) {
+    std::vector<std::pair<Py_ssize_t, std::string>> slots;
+    if (!named_slots(self->result, self, &slots)) return PyList_New(0);
     PyObject* list = PyList_New(0);
     if (!list) return NULL;
-
-    for (int i = 0; i < self->capture->child_count; i++) {
-        if (!self->capture->children[i].name) continue;
-        PyObject* node = (PyObject*)PyBBQNode_New(&self->capture->children[i], self->result);
+    for (const auto& s : slots) {
+        PyObject* node = child_node(self->result, self, s.first);
         if (!node || PyList_Append(list, node) < 0) {
-            Py_XDECREF(node);
-            Py_DECREF(list);
-            return NULL;
+            Py_XDECREF(node); Py_DECREF(list); return NULL;
         }
         Py_DECREF(node);
     }
@@ -951,49 +989,72 @@ static PyObject* PyBBQNode_values(PyBBQNode* self, PyObject*) {
 }
 
 static PyObject* PyBBQNode_items(PyBBQNode* self, PyObject*) {
+    std::vector<std::pair<Py_ssize_t, std::string>> slots;
+    if (!named_slots(self->result, self, &slots)) return PyList_New(0);
     PyObject* list = PyList_New(0);
     if (!list) return NULL;
-
-    for (int i = 0; i < self->capture->child_count; i++) {
-        const FieldCapture* child = &self->capture->children[i];
-        if (!child->name) continue;
-
-        PyObject* name = PyUnicode_FromString(child->name);
+    for (const auto& s : slots) {
+        PyObject* name = PyUnicode_FromString(s.second.c_str());
         if (!name) { Py_DECREF(list); return NULL; }
-
-        PyObject* node = (PyObject*)PyBBQNode_New(child, self->result);
+        PyObject* node = child_node(self->result, self, s.first);
         if (!node) { Py_DECREF(name); Py_DECREF(list); return NULL; }
-
         PyObject* tuple = PyTuple_Pack(2, name, node);
-        Py_DECREF(name);
-        Py_DECREF(node);
+        Py_DECREF(name); Py_DECREF(node);
         if (!tuple) { Py_DECREF(list); return NULL; }
-        if (PyList_Append(list, tuple) < 0) {
-            Py_DECREF(tuple);
-            Py_DECREF(list);
-            return NULL;
-        }
+        if (PyList_Append(list, tuple) < 0) { Py_DECREF(tuple); Py_DECREF(list); return NULL; }
         Py_DECREF(tuple);
     }
     return list;
 }
 
-// node.append(value): add an element to an array. ZCow is byte-level — a number takes
-// the array's existing element type (a sibling, pure data); bytes/str append verbatim
-// (the form for a composite or variable-width element). The array's child count updates
-// live (like a Python list); the format's count field is dependent and emit() derives it.
+// node.append(value): add an element to an array. The element takes the array's existing
+// element type (a sibling — pure data, no grammar lookup); bytes and str append as a
+// bytes element, which is the form a composite or variable-width element takes. The
+// array's length updates immediately; the format's count field is a DEPENDENT field and
+// ZCow derives it when the document is serialized.
 static PyObject* PyBBQNode_append(PyBBQNode* self, PyObject* value) {
-    const FieldCapture* cap = self->capture;
-    if (cap->type != CaptureType::Array) {
-        PyErr_SetString(PyExc_TypeError, "append() requires an array node");
-        return NULL;
+    {
+        DocLock g(self->result);
+        const zc::node* n = node_of(self);
+        if (!n || n->type != CaptureType::Array) {
+            PyErr_SetString(PyExc_TypeError, "append() requires an array node");
+            return NULL;
+        }
     }
-    PyBBQResult* res = self->result;
-    const FieldCapture* sib = (cap->child_count > 0) ? &cap->children[0] : nullptr;
-    std::unique_ptr<bbq::znode> elem = znode_from_pyvalue(value, sib);
-    if (!elem) return NULL;
-    BBQLock g(&res->lock);
-    zcow_of(res)->append(cap, std::move(elem));
+
+    std::vector<uint8_t> raw;
+    int took = as_byte_content(value, &raw);   // may run Python — no lock held
+    if (took < 0) return NULL;
+    if (took) {
+        DocLock g(self->result);
+        zc::node* c = owned_node_of(self);
+        zc::node* e = self->result->edit->append(c, CaptureType::Bytes);
+        if (!e) { PyErr_SetString(PyExc_RuntimeError, "append failed"); return NULL; }
+        zc::set_bytes(e, raw.data(), raw.size());
+        Py_RETURN_NONE;
+    }
+
+    CaptureType elem;
+    {
+        DocLock g(self->result);
+        const zc::node* n = node_of(self);
+        if (!n || n->kids.empty()) {
+            PyErr_SetString(PyExc_TypeError,
+                "append: an empty array has no element type to take — append bytes "
+                "(or a bbq.build value), or give the array an element first");
+            return NULL;
+        }
+        elem = n->kids[0]->type;
+    }
+
+    PendingWrite w;
+    if (!convert_for(elem, value, &w)) return NULL;   // may run Python — no lock held
+
+    DocLock g(self->result);
+    zc::node* c = owned_node_of(self);
+    zc::node* e = self->result->edit->append(c, elem);
+    if (!e) { PyErr_SetString(PyExc_RuntimeError, "append failed"); return NULL; }
+    apply_write(e, w);
     Py_RETURN_NONE;
 }
 
@@ -1001,7 +1062,7 @@ static PyMethodDef PyBBQNode_methods[] = {
     {"__format__", (PyCFunction)PyBBQNode_format, METH_VARARGS,
      "Format node value with format spec."},
     {"append",     (PyCFunction)PyBBQNode_append, METH_O,
-     "append(value): add an element to an array node (typed from the grammar)."},
+     "append(value): add an element to an array node (typed from its siblings)."},
     {"__dir__",    (PyCFunction)PyBBQNode_dir,    METH_NOARGS,
      "List attributes including child field names."},
     {"keys",       (PyCFunction)PyBBQNode_keys,   METH_NOARGS,
@@ -1016,45 +1077,74 @@ static PyMethodDef PyBBQNode_methods[] = {
 // ── Properties ──
 
 static PyObject* PyBBQNode_get_offset(PyBBQNode* self, void*) {
-    return Py_BuildValue("(nn)",
-        (Py_ssize_t)self->capture->start_offset,
-        (Py_ssize_t)self->capture->end_offset);
+    DocLock g(self->result);
+    const zc::node* n = node_of(self);
+    if (!n) Py_RETURN_NONE;
+    return Py_BuildValue("(nn)", (Py_ssize_t)n->start_offset, (Py_ssize_t)n->end_offset);
 }
 
+// This node's bytes as they stand — the span it was parsed from, or what it would
+// serialize to once something has been written to it.
 static PyObject* PyBBQNode_get_raw(PyBBQNode* self, void*) {
-    const uint8_t* data = (const uint8_t*)self->result->view.buf;
-    size_t start = self->capture->start_offset;
-    size_t len = self->capture->end_offset - start;
-    return PyBytes_FromStringAndSize((const char*)(data + start), (Py_ssize_t)len);
+    std::vector<uint8_t> out;
+    {
+        DocLock g(self->result);
+        const zc::node* n = node_of(self);
+        if (!n) Py_RETURN_NONE;
+        zc::detail::emit_node(*n, self->result->edit->src(), std::string(), out);
+    }
+    return PyBytes_FromStringAndSize((const char*)out.data(), (Py_ssize_t)out.size());
 }
 
 static PyObject* PyBBQNode_get_capture_type(PyBBQNode* self, void*) {
-    return PyUnicode_FromString(capture_type_name(self->capture->type));
+    DocLock g(self->result);
+    const zc::node* n = node_of(self);
+    return PyUnicode_FromString(capture_type_name(n ? n->type : CaptureType::UInt8));
 }
 
 static PyObject* PyBBQNode_get_name(PyBBQNode* self, void*) {
-    if (self->capture->name)
-        return PyUnicode_FromString(self->capture->name);
+    DocLock g(self->result);
+    const zc::node* n = node_of(self);
+    if (n && n->name) return PyUnicode_FromString(n->name);
     Py_RETURN_NONE;
 }
 
+// A leaf's value; a container is its own value — it stays a node, which is what makes
+// `.value` uniform to walk without materializing a subtree nobody asked for.
 static PyObject* PyBBQNode_get_value(PyBBQNode* self, void*) {
-    return decode_auto_value(self->capture, self->result);
+    PyObject* v;
+    {
+        DocLock g(self->result);
+        const zc::node* n = node_of(self);
+        if (n && is_container(n->type)) return Py_NewRef((PyObject*)self);
+        v = node_value(self->result, n);
+    }
+    return v;
 }
 
 // The arm/case ordinal the parser recorded for a union/alternatives/switch node
-// (0 = first arm, 1 = second, …), or None when this node is not a variant. Pure
-// data off the parsed capture — like offset/capture_type, not a grammar query.
+// (0 = first arm, 1 = second, …), or None when this node is not a variant. Pure data off
+// the parsed node — like offset/capture_type, not a grammar query.
 static PyObject* PyBBQNode_get_variant_tag(PyBBQNode* self, void*) {
-    if (self->capture->variant_tag < 0) Py_RETURN_NONE;
-    return PyLong_FromLong(self->capture->variant_tag);
+    DocLock g(self->result);
+    const zc::node* n = node_of(self);
+    if (!n || n->variant_tag < 0) Py_RETURN_NONE;
+    return PyLong_FromLong(n->variant_tag);
+}
+
+// Whether this node still names bytes of the input — false once something has been
+// written to it. The zero-copy half of ZCow, made visible rather than guessed at.
+static PyObject* PyBBQNode_get_parsed(PyBBQNode* self, void*) {
+    DocLock g(self->result);
+    const zc::node* n = node_of(self);
+    return PyBool_FromLong(n && n->parsed);
 }
 
 static PyGetSetDef PyBBQNode_getset[] = {
     {(char*)"offset",       (getter)PyBBQNode_get_offset,       NULL,
      (char*)"(start, end) byte offset tuple", NULL},
     {(char*)"raw",          (getter)PyBBQNode_get_raw,          NULL,
-     (char*)"raw bytes from buffer", NULL},
+     (char*)"this node's bytes as they stand", NULL},
     {(char*)"capture_type", (getter)PyBBQNode_get_capture_type, NULL,
      (char*)"capture type name string", NULL},
     {(char*)"name",         (getter)PyBBQNode_get_name,         NULL,
@@ -1063,6 +1153,8 @@ static PyGetSetDef PyBBQNode_getset[] = {
      (char*)"auto-materialized Python value", NULL},
     {(char*)"variant_tag",  (getter)PyBBQNode_get_variant_tag,  NULL,
      (char*)"union/switch arm ordinal, or None if not a variant", NULL},
+    {(char*)"parsed",       (getter)PyBBQNode_get_parsed,       NULL,
+     (char*)"True while this node still names bytes of the input", NULL},
     {NULL, NULL, NULL, NULL, NULL}
 };
 
@@ -1082,31 +1174,23 @@ PyTypeObject PyBBQNode_Type = {
     &PyBBQNode_as_number,                   // tp_as_number
     &PyBBQNode_as_sequence,                 // tp_as_sequence
     &PyBBQNode_as_mapping,                  // tp_as_mapping
-    PyObject_HashNotImplemented,            // tp_hash
+    NULL,                                   // tp_hash
     NULL,                                   // tp_call
     (reprfunc)PyBBQNode_tp_str,             // tp_str
     (getattrofunc)PyBBQNode_getattro,       // tp_getattro
     (setattrofunc)PyBBQNode_setattro,       // tp_setattro
     &PyBBQNode_as_buffer,                   // tp_as_buffer
     Py_TPFLAGS_DEFAULT | Py_TPFLAGS_HAVE_GC, // tp_flags
-    NULL,                                   // tp_doc
+    PyDoc_STR("A position in a parsed BBQ document."), // tp_doc
     (traverseproc)PyBBQNode_traverse,       // tp_traverse
     (inquiry)PyBBQNode_clear,               // tp_clear
-    PyBBQNode_richcompare,                  // tp_richcompare
+    (richcmpfunc)PyBBQNode_richcompare,     // tp_richcompare
     0,                                      // tp_weaklistoffset
     (getiterfunc)PyBBQNode_tp_iter,         // tp_iter
     NULL,                                   // tp_iternext
     PyBBQNode_methods,                      // tp_methods
     NULL,                                   // tp_members
     PyBBQNode_getset,                       // tp_getset
-    NULL,                                   // tp_base
-    NULL,                                   // tp_dict
-    NULL,                                   // tp_descr_get
-    NULL,                                   // tp_descr_set
-    0,                                      // tp_dictoffset
-    NULL,                                   // tp_init
-    NULL,                                   // tp_alloc
-    NULL,                                   // tp_new
 };
 
 
@@ -1129,29 +1213,31 @@ static int PyBBQNodeIter_clear(PyBBQNodeIter* self) {
 }
 
 static PyObject* PyBBQNodeIter_iternext(PyBBQNodeIter* self) {
-    if (self->index >= self->count)
-        return NULL;  // StopIteration — tp_iternext convention
-
-    const FieldCapture* child = &self->children[self->index++];
-
-    if (self->yield_tuples) {
-        // Struct: yield (name, node)
-        PyObject* name = child->name
-            ? PyUnicode_FromString(child->name)
-            : Py_NewRef(Py_None);
-        if (!name) return NULL;
-
-        PyBBQNode* node = PyBBQNode_New(child, self->result);
-        if (!node) { Py_DECREF(name); return NULL; }
-
-        PyObject* tuple = PyTuple_Pack(2, name, node);
-        Py_DECREF(name);
-        Py_DECREF(node);
-        return tuple;
+    Py_ssize_t i = self->index;
+    const char* name = nullptr;
+    bool container;
+    {
+        DocLock g(self->result);
+        if (i < 0 || (size_t)i >= self->container->kids.size())
+            return NULL;  // StopIteration — tp_iternext convention
+        const zc::node* k = self->container->kids[(size_t)i].get();
+        name = k->name;
+        container = is_container(k->type);
+        if (container) self->result->edit->own_child(self->container, (size_t)i);
     }
+    self->index++;
 
-    // Array: yield node
-    return (PyObject*)PyBBQNode_New(child, self->result);
+    PyBBQNode* node = PyBBQNode_New(self->result, self->container, i);
+    if (!node) return NULL;
+
+    if (!self->yield_tuples) return (PyObject*)node;
+
+    PyObject* key = name ? PyUnicode_FromString(name) : Py_NewRef(Py_None);
+    if (!key) { Py_DECREF(node); return NULL; }
+    PyObject* tuple = PyTuple_Pack(2, key, node);
+    Py_DECREF(key);
+    Py_DECREF(node);
+    return tuple;
 }
 
 PyTypeObject PyBBQNodeIter_Type = {
@@ -1186,10 +1272,14 @@ PyTypeObject PyBBQNodeIter_Type = {
 
 
 // ── PyBBQResult ─────────────────────────────────────────────────────────────
+//
+// The document. Everything about its CONTENT is the root node's, and is forwarded there
+// rather than reimplemented — what belongs here is what is about the parse: whether it
+// succeeded, how far it got, and the bytes it turns back into.
 
 static void PyBBQResult_dealloc(PyBBQResult* self) {
     PyObject_GC_UnTrack((PyObject*)self);
-    delete self->zcow;
+    delete self->edit;
     delete self->arena;
     if (self->view_valid)
         PyBuffer_Release(&self->view);
@@ -1213,96 +1303,106 @@ static int PyBBQResult_clear(PyBBQResult* self) {
     return 0;
 }
 
+// The root, as a node. Everything the document forwards goes through this.
+static PyBBQNode* result_root(PyBBQResult* self) {
+    { DocLock g(self);
+      if (!self->edit->root()) {
+          PyErr_SetString(PyExc_AttributeError, "no parse tree");
+          return NULL;
+      } }
+    return PyBBQNode_New(self, nullptr, -1);
+}
+
 static PyObject* PyBBQResult_getattro(PyBBQResult* self, PyObject* name) {
     PyObject* attr = PyObject_GenericGetAttr((PyObject*)self, name);
     if (attr) return attr;
     if (!PyErr_ExceptionMatches(PyExc_AttributeError)) return NULL;
 
-    if (!self->meta.root) return NULL;  // keep AttributeError
-
     const char* key = PyUnicode_AsUTF8(name);
     if (!key) return NULL;
 
-    for (int i = 0; i < self->meta.root->child_count; i++) {
-        if (self->meta.root->children[i].name &&
-            strcmp(self->meta.root->children[i].name, key) == 0) {
-            PyErr_Clear();
-            return (PyObject*)PyBBQNode_New(&self->meta.root->children[i], self);
-        }
-    }
-    return NULL;  // keep AttributeError
+    Py_ssize_t slot;
+    { DocLock g(self); slot = child_slot(self->edit->root(), key); }
+    if (slot < 0) return NULL;   // keep AttributeError
+
+    PyErr_Clear();
+    PyBBQNode* root = PyBBQNode_New(self, nullptr, -1);
+    if (!root) return NULL;
+    PyObject* child = child_node(self, root, slot);
+    Py_DECREF(root);
+    return child;
 }
 
-// `result.field = v` → detach that top-level field to Owned in the overlay.
 static int PyBBQResult_setattro(PyBBQResult* self, PyObject* name, PyObject* value) {
     if (!value) { PyErr_SetString(PyExc_TypeError, "cannot delete a BBQ field"); return -1; }
-    if (!self->meta.root) { PyErr_SetString(PyExc_AttributeError, "no parse tree"); return -1; }
     const char* key = PyUnicode_AsUTF8(name);
     if (!key) return -1;
-    return zcow_set_field(self->meta.root, self, key, value);
+    { DocLock g(self);
+      if (!self->edit->root()) {
+          PyErr_SetString(PyExc_AttributeError, "no parse tree"); return -1;
+      } }
+    PyBBQNode* root = PyBBQNode_New(self, nullptr, -1);
+    if (!root) return -1;
+    int rc = write_child(self, root, key, -1, value);
+    Py_DECREF(root);
+    return rc;
 }
 
 // ── Result repr ──
 
 static PyObject* PyBBQResult_tp_repr(PyBBQResult* self) {
-    if (!self->meta.success) {
-        return PyUnicode_FromFormat(
-            "<bbq.ParseResult failed at offset 0x%zx>",
-            self->meta.error_offset);
-    }
-
-    // Build field names string
+    if (!self->success)
+        return PyUnicode_FromFormat("<bbq.ParseResult failed at offset 0x%zx>",
+                                    self->error_offset);
     std::string fields;
-    if (self->meta.root) {
-        for (int i = 0; i < self->meta.root->child_count; i++) {
-            if (self->meta.root->children[i].name) {
+    {
+        DocLock g(self);
+        if (const zc::node* r = self->edit->root())
+            for (const auto& k : r->kids) {
+                if (!k->name) continue;
                 if (!fields.empty()) fields += ", ";
-                fields += self->meta.root->children[i].name;
+                fields += k->name;
             }
-        }
     }
-
-    return PyUnicode_FromFormat(
-        "<bbq.ParseResult ok %zd bytes [%s]>",
-        self->meta.bytes_consumed, fields.c_str());
+    return PyUnicode_FromFormat("<bbq.ParseResult ok %zd bytes [%s]>",
+                                self->bytes_consumed, fields.c_str());
 }
 
 // ── Result properties ──
 
 static PyObject* PyBBQResult_get_success(PyBBQResult* self, void*) {
-    return PyBool_FromLong(self->meta.success);
+    return PyBool_FromLong(self->success);
 }
 
 static PyObject* PyBBQResult_get_bytes_consumed(PyBBQResult* self, void*) {
-    return PyLong_FromSize_t(self->meta.bytes_consumed);
+    return PyLong_FromSize_t(self->bytes_consumed);
 }
 
 static PyObject* PyBBQResult_get_error_message(PyBBQResult* self, void*) {
-    if (self->meta.error_message)
-        return PyUnicode_FromString(self->meta.error_message);
-    Py_RETURN_NONE;
+    if (!self->error_message) Py_RETURN_NONE;
+    return PyUnicode_FromString(self->error_message);
 }
 
 static PyObject* PyBBQResult_get_error_offset(PyBBQResult* self, void*) {
-    return PyLong_FromSize_t(self->meta.error_offset);
+    return PyLong_FromSize_t(self->error_offset);
 }
 
 static PyObject* PyBBQResult_get_root(PyBBQResult* self, void*) {
-    if (!self->meta.root) Py_RETURN_NONE;
-    return (PyObject*)PyBBQNode_New(self->meta.root, self);
+    { DocLock g(self); if (!self->edit->root()) Py_RETURN_NONE; }
+    return (PyObject*)PyBBQNode_New(self, nullptr, -1);
 }
 
 static PyGetSetDef PyBBQResult_getset[] = {
     {(char*)"success",        (getter)PyBBQResult_get_success,        NULL,
-     (char*)"True if parse succeeded", NULL},
+     (char*)"whether the parse succeeded", NULL},
     {(char*)"bytes_consumed", (getter)PyBBQResult_get_bytes_consumed, NULL,
-     (char*)"number of bytes consumed", NULL},
+     (char*)"how many bytes the parse consumed", NULL},
     {(char*)"error_message",  (getter)PyBBQResult_get_error_message,  NULL,
-     (char*)"error message or None", NULL},
+     (char*)"failure message, or None", NULL},
     {(char*)"error_offset",   (getter)PyBBQResult_get_error_offset,   NULL,
-     (char*)"byte offset of error", NULL},
+     (char*)"offset the parse gave up at", NULL},
     {(char*)"root",           (getter)PyBBQResult_get_root,           NULL,
-     (char*)"root Node of the parse tree", NULL},
+     (char*)"the root node", NULL},
     {NULL, NULL, NULL, NULL, NULL}
 };
 
@@ -1311,276 +1411,194 @@ static PyGetSetDef PyBBQResult_getset[] = {
 static PyObject* PyBBQResult_dir(PyBBQResult* self, PyObject*) {
     PyObject* list = PyList_New(0);
     if (!list) return NULL;
-
-    if (append_type_attrs(list, &PyBBQResult_Type) < 0) {
-        Py_DECREF(list);
-        return NULL;
-    }
-
-    if (self->meta.root) {
-        for (int i = 0; i < self->meta.root->child_count; i++) {
-            if (self->meta.root->children[i].name) {
-                PyObject* s = PyUnicode_FromString(self->meta.root->children[i].name);
-                if (!s || PyList_Append(list, s) < 0) {
-                    Py_XDECREF(s);
-                    Py_DECREF(list);
-                    return NULL;
-                }
-                Py_DECREF(s);
-            }
-        }
-    }
+    if (append_type_attrs(list, &PyBBQResult_Type) < 0) { Py_DECREF(list); return NULL; }
+    DocLock g(self);
+    if (append_child_names(list, self->edit->root()) < 0) { Py_DECREF(list); return NULL; }
     return list;
 }
 
-// The spec's writer op-list, lowered on first use. Null + a Python error on failure.
-// Once published it is immutable, so callers read it without the lock.
-static const nlohmann::json* spec_wops(PyBBQSpec* spec) {
-    BBQLock g(&spec->lock);
-    if (spec->wops) return spec->wops;
-    bbq::render::CompilerCtx ctx{spec->parser->ast, spec->sema, spec->grammar, ""};
-    try {
-        spec->wops = new nlohmann::json(bbq::render::lower_writer_ops(ctx));
-    } catch (const std::exception& e) {
-        PyErr_Format(PyBBQParseError, "writer lowering failed: %s", e.what());
-        return nullptr;
-    }
-    return spec->wops;
-}
-
-// `put` — the write half of the lens. ZCow (bbq::emit) is the byte serializer; it knows
-// bytes, not the format. So the grammar walk runs first over the edited overlay and
-// recomputes the DEPENDENT fields the edits invalidated (array counts, @rest window
-// sizes), then ZCow serializes the now-consistent document. Unedited, that is the
-// identity — GetPut, byte for byte; edited, the result re-parses to the edit — PutGet.
+// `put` — the write half of the lens, and one ZCow call. Serializing settles the
+// DEPENDENT fields the edits invalidated (array counts, @rest window sizes) and then
+// emits: unedited that is the identity, byte for byte — GetPut — and edited, the result
+// re-parses to the edit — PutGet. An edit that resizes nothing patches the input in
+// place, so bytes no field covers survive it.
 static PyObject* PyBBQResult_emit(PyBBQResult* self, PyObject*) {
-    const uint8_t* b = self->view_valid ? (const uint8_t*)self->view.buf : nullptr;
-    size_t l = self->view_valid ? (size_t)self->view.len : 0;
+    // A failed parse produced no document, so there is nothing to serialize and nothing
+    // to enforce a grammar over: what comes back is the input, unchanged.
+    { DocLock g(self);
+      if (!self->edit->root())
+          return PyBytes_FromStringAndSize(
+              self->view_valid ? (const char*)self->view.buf : "",
+              self->view_valid ? self->view.len : 0); }
 
-    if (!self->meta.success || !self->meta.root) {
-        // A failed parse has no document to enforce a grammar over; the overlay is
-        // whatever it was, so this is the raw serialization by definition.
-        bbq::zcow empty;
-        BBQLock g(&self->lock);
-        std::vector<uint8_t> raw = bbq::emit(b, l, self->zcow ? *self->zcow : empty);
-        return PyBytes_FromStringAndSize((const char*)raw.data(), (Py_ssize_t)raw.size());
-    }
-
-    // Lowered before the overlay lock is taken: spec_wops takes the SPEC's lock, and
-    // holding two locks at once is how a lock order gets invented.
-    const nlohmann::json* wops = spec_wops(self->spec);
-    if (!wops) return NULL;
-
-    std::string err;
     std::vector<uint8_t> out;
-    {
-        // The walk both reads and WRITES the overlay (it recomputes dependent fields into
-        // it), so it takes the same lock every mutation does.
-        BBQLock g(&self->lock);
-        out = bbq::render::run_writer(*wops, self->rule, self->meta.root, b, l,
-                                      zcow_of(self), &err);
-    }
-    if (out.empty() && !err.empty()) {
-        PyErr_Format(PyBBQParseError, "emit: %s", err.c_str());
-        return NULL;
-    }
+    { DocLock g(self); out = self->edit->serialize(); }
     return PyBytes_FromStringAndSize((const char*)out.data(), (Py_ssize_t)out.size());
 }
 
-// The structured delta set since parse: a list of dicts
-// {path, offset:(start,end), old, new} — a typed, path-addressed diff.
+// What is no longer the input: every leaf that stopped being described by its span,
+// with the value the file held and the value it holds now. A node still span-backed
+// cannot have changed, which is what keeps this proportional to the edit.
+static void collect_deltas(PyBBQResult* self, const zc::node* n, const std::string& path,
+                           std::vector<std::pair<std::string, const zc::node*>>* out) {
+    if (!n || n->parsed) return;
+    if (is_container(n->type)) {
+        for (size_t i = 0; i < n->kids.size(); i++) {
+            const zc::node& k = *n->kids[i];
+            const char* nm = k.name;
+            collect_deltas(self, &k,
+                (nm && *nm) ? (path.empty() ? std::string(nm) : path + "." + nm)
+                            : path + "[" + std::to_string(i) + "]", out);
+        }
+        return;
+    }
+    out->emplace_back(path, n);
+}
+
 static PyObject* PyBBQResult_deltas(PyBBQResult* self, PyObject*) {
     PyObject* list = PyList_New(0);
-    if (!list) return list;
-    // Snapshot the diff under the lock, then build the Python objects outside it —
-    // PyBytes/PyLong construction must not run while the overlay lock is held.
-    std::vector<bbq::delta_info> ds;
+    if (!list) return NULL;
+
+    // Snapshot under the lock, build the Python objects after it — PyBytes/PyLong
+    // construction must not run while the lock is held.
+    struct Row { std::string path; size_t start, end; PyObject* old_v; PyObject* new_v; };
+    std::vector<Row> rows;
     {
-        BBQLock g(&self->lock);
-        if (!self->zcow) return list;
-        ds = bbq::deltas((const uint8_t*)self->view.buf, *self->zcow);
+        DocLock g(self);
+        std::vector<std::pair<std::string, const zc::node*>> hits;
+        collect_deltas(self, self->edit->root(), std::string(), &hits);
+        const zc::source& src = self->edit->src();
+        for (const auto& h : hits) {
+            const zc::node* n = h.second;
+            // What the file said: the same node read as if it were still its span.
+            zc::node was = *n;
+            was.parsed = true;
+            PyObject* old_v = (n->end_offset > n->start_offset && src.buf)
+                ? node_value(self, &was) : Py_NewRef(Py_None);
+            PyObject* new_v = node_value(self, n);
+            rows.push_back({h.first, n->start_offset, n->end_offset, old_v, new_v});
+        }
     }
-    for (const auto& d : ds) {
-        PyObject* old_o = d.is_bytes
-            ? PyBytes_FromStringAndSize((const char*)d.old_bytes.data(), (Py_ssize_t)d.old_bytes.size())
-            : PyLong_FromLongLong(d.old_int);
-        PyObject* new_o = d.is_bytes
-            ? PyBytes_FromStringAndSize((const char*)d.new_bytes.data(), (Py_ssize_t)d.new_bytes.size())
-            : PyLong_FromLongLong(d.new_int);
+    for (auto& r : rows) {
         PyObject* item = Py_BuildValue("{s:s,s:(nn),s:O,s:O}",
-            "path", d.path.c_str(),
-            "offset", (Py_ssize_t)d.start, (Py_ssize_t)d.end,
-            "old", old_o, "new", new_o);
-        Py_XDECREF(old_o); Py_XDECREF(new_o);
+            "path", r.path.c_str(),
+            "offset", (Py_ssize_t)r.start, (Py_ssize_t)r.end,
+            "old", r.old_v ? r.old_v : Py_None,
+            "new", r.new_v ? r.new_v : Py_None);
+        Py_XDECREF(r.old_v); Py_XDECREF(r.new_v);
         if (item) { PyList_Append(list, item); Py_DECREF(item); }
     }
     return list;
+}
+
+static PyObject* PyBBQResult_bytes(PyBBQResult* self, PyObject*) {
+    return PyBBQResult_emit(self, NULL);
 }
 
 static PyMethodDef PyBBQResult_methods[] = {
     {"__dir__", (PyCFunction)PyBBQResult_dir, METH_NOARGS,
      "List attributes including parsed field names."},
     {"emit", (PyCFunction)PyBBQResult_emit, METH_NOARGS,
-     "Serialize back to bytes: enforce the grammar over the edited document "
-     "(dependent fields — array counts, @rest sizes — recomputed), then blit the "
-     "input and patch what changed. Byte-identical to the input if nothing was "
-     "changed; re-parses to the edit if something was."},
+     "Serialize back to bytes: the dependent fields (array counts, @rest sizes) are "
+     "recomputed from what the edits produced, then the input is blitted and what "
+     "changed is patched into it. Byte-identical to the input if nothing was changed; "
+     "re-parses to the edit if something was."},
+    {"__bytes__", (PyCFunction)PyBBQResult_bytes, METH_NOARGS,
+     "bytes(result) — the same as emit()."},
     {"deltas", (PyCFunction)PyBBQResult_deltas, METH_NOARGS,
-     "The structured diff since parse: list of {path, offset, old, new}."},
+     "What is no longer the input: list of {path, offset, old, new}."},
     {NULL, NULL, 0, NULL}
 };
 
-// ── Result iteration and contains ──
+// ── Result iteration, contains, and mapping — all the root node's ──
 
 static PyObject* PyBBQResult_tp_iter(PyBBQResult* self) {
-    if (!self->meta.root) {
-        PyErr_SetString(PyExc_RuntimeError, "no parse result");
-        return NULL;
-    }
-
-    PyBBQNodeIter* iter = PyObject_GC_New(PyBBQNodeIter, &PyBBQNodeIter_Type);
-    if (!iter) return NULL;
-
-    Py_INCREF(self);
-    iter->result = self;
-    iter->children = self->meta.root->children;
-    iter->count = self->meta.root->child_count;
-    iter->index = 0;
-    iter->yield_tuples = true;  // ParseResult root is always struct-like
-
-    PyObject_GC_Track((PyObject*)iter);
-    return (PyObject*)iter;
+    PyBBQNode* root = result_root(self);
+    if (!root) return NULL;
+    PyObject* it = make_iter(self, root);
+    Py_DECREF(root);
+    return it;
 }
 
 static int PyBBQResult_sq_contains(PyBBQResult* self, PyObject* value) {
     if (!PyUnicode_Check(value)) return 0;
-    if (!self->meta.root) return 0;
-
     const char* key = PyUnicode_AsUTF8(value);
     if (!key) { PyErr_Clear(); return 0; }
-
-    for (int i = 0; i < self->meta.root->child_count; i++) {
-        if (self->meta.root->children[i].name &&
-            strcmp(self->meta.root->children[i].name, key) == 0)
-            return 1;
-    }
-    return 0;
+    DocLock g(self);
+    return child_slot(self->edit->root(), key) >= 0 ? 1 : 0;
 }
 
 static PySequenceMethods PyBBQResult_as_sequence = {
-    (lenfunc)        NULL,                       // sq_length
-    (binaryfunc)     NULL,                       // sq_concat
-    (ssizeargfunc)   NULL,                       // sq_repeat
-    (ssizeargfunc)   NULL,                       // sq_item
-    NULL,                                        // was sq_slice
-    (ssizeobjargproc)NULL,                       // sq_ass_item
-    NULL,                                        // was sq_ass_slice
-    (objobjproc)     PyBBQResult_sq_contains,    // sq_contains
-    (binaryfunc)     NULL,                       // sq_inplace_concat
-    (ssizeargfunc)   NULL,                       // sq_inplace_repeat
+    (lenfunc)        NULL,                    // sq_length
+    (binaryfunc)     NULL,                    // sq_concat
+    (ssizeargfunc)   NULL,                    // sq_repeat
+    (ssizeargfunc)   NULL,                    // sq_item
+    NULL,                                     // was sq_slice
+    (ssizeobjargproc)NULL,                    // sq_ass_item
+    NULL,                                     // was sq_ass_slice
+    (objobjproc)     PyBBQResult_sq_contains, // sq_contains
+    (binaryfunc)     NULL,                    // sq_inplace_concat
+    (ssizeargfunc)   NULL,                    // sq_inplace_repeat
 };
 
-// ── Result mapping protocol ──
-
 static Py_ssize_t PyBBQResult_mp_length(PyBBQResult* self) {
-    if (!self->meta.root) return 0;
-    return self->meta.root->child_count;
+    DocLock g(self);
+    return (Py_ssize_t)zc::size_of(self->edit->root());
 }
 
 static PyObject* PyBBQResult_mp_subscript(PyBBQResult* self, PyObject* key) {
-    if (!self->meta.root) {
-        PyErr_SetString(PyExc_RuntimeError, "no parse result");
-        return NULL;
-    }
+    PyBBQNode* root = result_root(self);
+    if (!root) return NULL;
+    PyObject* v = PyBBQNode_mp_subscript(root, key);
+    Py_DECREF(root);
+    return v;
+}
 
-    // Slice
-    if (PySlice_Check(key)) {
-        Py_ssize_t start, stop, step, length;
-        if (PySlice_GetIndicesEx(key, self->meta.root->child_count,
-                                 &start, &stop, &step, &length) < 0)
-            return NULL;
-        PyObject* list = PyList_New(length);
-        if (!list) return NULL;
-        for (Py_ssize_t i = 0, idx = start; i < length; i++, idx += step) {
-            PyObject* node = (PyObject*)PyBBQNode_New(
-                &self->meta.root->children[idx], self);
-            if (!node) { Py_DECREF(list); return NULL; }
-            PyList_SET_ITEM(list, i, node);
-        }
-        return list;
-    }
-
-    // Integer index
-    if (PyIndex_Check(key)) {
-        Py_ssize_t index = PyNumber_AsSsize_t(key, PyExc_IndexError);
-        if (index == -1 && PyErr_Occurred()) return NULL;
-
-        if (index < 0) index += self->meta.root->child_count;
-
-        if (index < 0 || index >= self->meta.root->child_count) {
-            PyErr_SetString(PyExc_IndexError, "index out of range");
-            return NULL;
-        }
-        return (PyObject*)PyBBQNode_New(&self->meta.root->children[index], self);
-    }
-
-    // String key
-    if (PyUnicode_Check(key)) {
-        const char* name = PyUnicode_AsUTF8(key);
-        if (!name) return NULL;
-
-        for (int i = 0; i < self->meta.root->child_count; i++) {
-            if (self->meta.root->children[i].name &&
-                strcmp(self->meta.root->children[i].name, name) == 0)
-                return (PyObject*)PyBBQNode_New(&self->meta.root->children[i], self);
-        }
-        PyErr_SetObject(PyExc_KeyError, key);
-        return NULL;
-    }
-
-    PyErr_Format(PyExc_TypeError,
-                 "indices must be integers or strings, not %.200s",
-                 Py_TYPE(key)->tp_name);
-    return NULL;
+static int PyBBQResult_mp_ass_subscript(PyBBQResult* self, PyObject* key, PyObject* value) {
+    PyBBQNode* root = result_root(self);
+    if (!root) return -1;
+    int rc = PyBBQNode_mp_ass_subscript(root, key, value);
+    Py_DECREF(root);
+    return rc;
 }
 
 static PyMappingMethods PyBBQResult_as_mapping = {
     (lenfunc)      PyBBQResult_mp_length,
     (binaryfunc)   PyBBQResult_mp_subscript,
-    (objobjargproc)NULL,
+    (objobjargproc)PyBBQResult_mp_ass_subscript,
 };
 
 PyTypeObject PyBBQResult_Type = {
     PyVarObject_HEAD_INIT(NULL, 0)
-    "bbq.ParseResult",                     // tp_name
-    sizeof(PyBBQResult),                   // tp_basicsize
-    0,                                     // tp_itemsize
-    (destructor)PyBBQResult_dealloc,       // tp_dealloc
-    0,                                     // tp_vectorcall_offset
-    NULL,                                  // tp_getattr
-    NULL,                                  // tp_setattr
-    NULL,                                  // tp_as_async
-    (reprfunc)PyBBQResult_tp_repr,         // tp_repr
-    NULL,                                  // tp_as_number
-    &PyBBQResult_as_sequence,              // tp_as_sequence
-    &PyBBQResult_as_mapping,               // tp_as_mapping
-    NULL,                                  // tp_hash
-    NULL,                                  // tp_call
-    NULL,                                  // tp_str
-    (getattrofunc)PyBBQResult_getattro,    // tp_getattro
-    (setattrofunc)PyBBQResult_setattro,    // tp_setattro
-    NULL,                                  // tp_as_buffer
+    "bbq.ParseResult",                      // tp_name
+    sizeof(PyBBQResult),                    // tp_basicsize
+    0,                                      // tp_itemsize
+    (destructor)PyBBQResult_dealloc,        // tp_dealloc
+    0,                                      // tp_vectorcall_offset
+    NULL,                                   // tp_getattr
+    NULL,                                   // tp_setattr
+    NULL,                                   // tp_as_async
+    (reprfunc)PyBBQResult_tp_repr,          // tp_repr
+    NULL,                                   // tp_as_number
+    &PyBBQResult_as_sequence,               // tp_as_sequence
+    &PyBBQResult_as_mapping,                // tp_as_mapping
+    NULL,                                   // tp_hash
+    NULL,                                   // tp_call
+    NULL,                                   // tp_str
+    (getattrofunc)PyBBQResult_getattro,     // tp_getattro
+    (setattrofunc)PyBBQResult_setattro,     // tp_setattro
+    NULL,                                   // tp_as_buffer
     Py_TPFLAGS_DEFAULT | Py_TPFLAGS_HAVE_GC, // tp_flags
-    NULL,                                  // tp_doc
-    (traverseproc)PyBBQResult_traverse,    // tp_traverse
-    (inquiry)PyBBQResult_clear,            // tp_clear
-    NULL,                                  // tp_richcompare
-    0,                                     // tp_weaklistoffset
-    (getiterfunc)PyBBQResult_tp_iter,      // tp_iter
-    NULL,                                  // tp_iternext
-    PyBBQResult_methods,                   // tp_methods
-    NULL,                                  // tp_members
-    PyBBQResult_getset,                    // tp_getset
+    PyDoc_STR("A parsed BBQ document."),    // tp_doc
+    (traverseproc)PyBBQResult_traverse,     // tp_traverse
+    (inquiry)PyBBQResult_clear,             // tp_clear
+    NULL,                                   // tp_richcompare
+    0,                                      // tp_weaklistoffset
+    (getiterfunc)PyBBQResult_tp_iter,       // tp_iter
+    NULL,                                   // tp_iternext
+    PyBBQResult_methods,                    // tp_methods
+    NULL,                                   // tp_members
+    PyBBQResult_getset,                     // tp_getset
 };
 
 
@@ -1591,11 +1609,10 @@ static void PyBBQSpec_dealloc(PyBBQSpec* self) {
         Py_XDECREF(self->ext_callables[i]);
     PyMem_Free(self->ext_callables);
     PyMem_Free(self->ext_entries);
-    delete self->wops;
     delete self->grammar;
     delete self->sema;      // holds a reference to *errors, so it goes first
     delete self->errors;
-    delete self->parser;    // owns the AST the lowering read
+    delete self->parser;    // owns the AST
     Py_TYPE(self)->tp_free((PyObject*)self);
 }
 
@@ -1689,11 +1706,9 @@ static PyObject* PyBBQSpec_register_extern(PyBBQSpec* self, PyObject* args) {
     Py_RETURN_NONE;
 }
 
-// Core parse logic — takes ownership of view on success
 static PyObject* do_parse(PyBBQSpec* self, Py_buffer* view, const char* rule_name) {
     KontNode* entry = nullptr;
-    // The RESOLVED rule name (the grammar's own interned copy, so it outlives the call):
-    // emit() enforces this rule's grammar, so the result has to remember which one it is.
+    // The RESOLVED rule name (the grammar's own interned copy, so it outlives the call).
     const char* resolved = nullptr;
     if (rule_name) {
         for (int i = 0; i < self->grammar->rule_count; i++)
@@ -1737,7 +1752,7 @@ static PyObject* do_parse(PyBBQSpec* self, Py_buffer* view, const char* rule_nam
     if (!ext_snapshot.empty())
         machine.ext_parsers = &ext_table;
 
-    CaptureMetadata meta = machine.execute_from(
+    zc::parse_result pr = machine.execute_from(
         entry,
         (const uint8_t*)view->buf,
         (size_t)view->len,
@@ -1751,10 +1766,15 @@ static PyObject* do_parse(PyBBQSpec* self, Py_buffer* view, const char* rule_nam
         return NULL;
     }
     result->arena = arena;
-    result->meta = meta;
+    // The document, taken as the one transient every node comes from. It is never
+    // committed: a caller here edits, asks for bytes, and goes on editing.
+    result->edit = new zc::transient(pr.doc.begin_edit());
+    result->success = pr.success;
+    result->bytes_consumed = pr.bytes_consumed;
+    result->error_message = pr.error_message;
+    result->error_offset = pr.error_offset;
     result->view = *view;       // transfer buffer ownership
     result->view_valid = true;
-    result->zcow = nullptr;     // created on first mutation
     result->rule = resolved;
     result->lock = BBQ_MUTEX_INIT;   // PyObject_GC_New does not zero
     Py_INCREF(self);
@@ -1816,7 +1836,8 @@ static PyObject* PyBBQSpec_parse_file(PyBBQSpec* self, PyObject* args, PyObject*
         }
         Py_DECREF(empty);
     } else {
-        // mmap via Python's mmap module
+        // mmap via Python's mmap module — the zero-copy half is the point: the document
+        // names spans of THIS mapping, and an unedited emit() is one blit out of it.
         PyObject* mmap_mod = PyImport_ImportModule("mmap");
         if (!mmap_mod) { close(fd); return NULL; }
 
@@ -1849,84 +1870,78 @@ static PyObject* PyBBQSpec_parse_file(PyBBQSpec* self, PyObject* args, PyObject*
 // ── Spec properties ──
 
 static PyObject* PyBBQSpec_get_rules(PyBBQSpec* self, void*) {
-    PyObject* list = PyList_New(self->grammar->rule_count);
+    PyObject* list = PyList_New(0);
     if (!list) return NULL;
     for (int i = 0; i < self->grammar->rule_count; i++) {
-        PyObject* name = PyUnicode_FromString(self->grammar->rules[i].name);
-        if (!name) { Py_DECREF(list); return NULL; }
-        PyList_SET_ITEM(list, i, name);
+        PyObject* s = PyUnicode_FromString(self->grammar->rules[i].name);
+        if (!s || PyList_Append(list, s) < 0) { Py_XDECREF(s); Py_DECREF(list); return NULL; }
+        Py_DECREF(s);
     }
     return list;
 }
 
 static PyObject* PyBBQSpec_get_default_endian(PyBBQSpec* self, void*) {
-    return PyUnicode_FromString(
-        self->grammar->default_little_endian ? "little" : "big");
+    return PyUnicode_FromString(self->grammar->default_little_endian ? "little" : "big");
 }
 
 static PyGetSetDef PyBBQSpec_getset[] = {
     {(char*)"rules",          (getter)PyBBQSpec_get_rules,          NULL,
      (char*)"list of rule names", NULL},
     {(char*)"default_endian", (getter)PyBBQSpec_get_default_endian, NULL,
-     (char*)"\"little\" or \"big\"", NULL},
+     (char*)"'little' or 'big'", NULL},
     {NULL, NULL, NULL, NULL, NULL}
 };
 
 static PyMethodDef PyBBQSpec_methods[] = {
-    {"parse",      (PyCFunction)PyBBQSpec_parse,
+    {"parse", (PyCFunction)(void(*)(void))PyBBQSpec_parse, METH_VARARGS | METH_KEYWORDS,
+     "parse(data, rule=None) -> ParseResult"},
+    {"parse_file", (PyCFunction)(void(*)(void))PyBBQSpec_parse_file,
      METH_VARARGS | METH_KEYWORDS,
-     "parse(data, *, rule=None) -> ParseResult\n\n"
-     "Parse binary data. data must support the buffer protocol."},
-    {"parse_file", (PyCFunction)PyBBQSpec_parse_file,
-     METH_VARARGS | METH_KEYWORDS,
-     "parse_file(path, *, rule=None) -> ParseResult\n\n"
-     "Parse a binary file (mmap'd for zero-copy)."},
-    {"register_extern", (PyCFunction)PyBBQSpec_register_extern,
-     METH_VARARGS,
-     "register_extern(name, callable) -> None\n\n"
-     "Register an external parser function. callable(memoryview) -> int bytes consumed, or None on failure."},
+     "parse_file(path, rule=None) -> ParseResult"},
+    {"register_extern", (PyCFunction)PyBBQSpec_register_extern, METH_VARARGS,
+     "register_extern(name, callable): supply an external parser for `name`."},
     {NULL, NULL, 0, NULL}
 };
 
 PyTypeObject PyBBQSpec_Type = {
     PyVarObject_HEAD_INIT(NULL, 0)
-    "bbq.Spec",                            // tp_name
-    sizeof(PyBBQSpec),                     // tp_basicsize
-    0,                                     // tp_itemsize
-    (destructor)PyBBQSpec_dealloc,         // tp_dealloc
-    0,                                     // tp_vectorcall_offset
-    NULL,                                  // tp_getattr
-    NULL,                                  // tp_setattr
-    NULL,                                  // tp_as_async
-    NULL,                                  // tp_repr
-    NULL,                                  // tp_as_number
-    NULL,                                  // tp_as_sequence
-    NULL,                                  // tp_as_mapping
-    NULL,                                  // tp_hash
-    NULL,                                  // tp_call
-    NULL,                                  // tp_str
-    NULL,                                  // tp_getattro
-    NULL,                                  // tp_setattro
-    NULL,                                  // tp_as_buffer
-    Py_TPFLAGS_DEFAULT,                    // tp_flags
-    "Compiled BBQ grammar",                // tp_doc
-    NULL,                                  // tp_traverse
-    NULL,                                  // tp_clear
-    NULL,                                  // tp_richcompare
-    0,                                     // tp_weaklistoffset
-    NULL,                                  // tp_iter
-    NULL,                                  // tp_iternext
-    PyBBQSpec_methods,                     // tp_methods
-    NULL,                                  // tp_members
-    PyBBQSpec_getset,                      // tp_getset
+    "bbq.Spec",                             // tp_name
+    sizeof(PyBBQSpec),                      // tp_basicsize
+    0,                                      // tp_itemsize
+    (destructor)PyBBQSpec_dealloc,          // tp_dealloc
+    0,                                      // tp_vectorcall_offset
+    NULL,                                   // tp_getattr
+    NULL,                                   // tp_setattr
+    NULL,                                   // tp_as_async
+    NULL,                                   // tp_repr
+    NULL,                                   // tp_as_number
+    NULL,                                   // tp_as_sequence
+    NULL,                                   // tp_as_mapping
+    NULL,                                   // tp_hash
+    NULL,                                   // tp_call
+    NULL,                                   // tp_str
+    NULL,                                   // tp_getattro
+    NULL,                                   // tp_setattro
+    NULL,                                   // tp_as_buffer
+    Py_TPFLAGS_DEFAULT,                     // tp_flags
+    PyDoc_STR("A compiled BBQ grammar."),   // tp_doc
+    NULL,                                   // tp_traverse
+    NULL,                                   // tp_clear
+    NULL,                                   // tp_richcompare
+    0,                                      // tp_weaklistoffset
+    NULL,                                   // tp_iter
+    NULL,                                   // tp_iternext
+    PyBBQSpec_methods,                      // tp_methods
+    NULL,                                   // tp_members
+    PyBBQSpec_getset,                       // tp_getset
 };
 
 
 // ── Module functions ────────────────────────────────────────────────────────
 
 static PyObject* compile_source(const char* source, Py_ssize_t length) {
-    // The Parser owns the AST and the Sema its resolved facts; both outlive this call
-    // because the writer lowering consumes them (the Spec frees them in dealloc).
+    // The Parser owns the AST and the Sema its resolved facts; the compiled grammar
+    // points into what they own, so both outlive this call (the Spec frees them).
     Parser* parser = new Parser();
     parser->init(source, (int)length);
     if (!parser->parse()) {
@@ -1960,7 +1975,6 @@ static PyObject* compile_source(const char* source, Py_ssize_t length) {
     spec->parser = parser;
     spec->errors = errors;
     spec->sema = sema;
-    spec->wops = nullptr;
     spec->ext_callables = nullptr;
     spec->ext_entries = nullptr;
     spec->ext_count = 0;
@@ -1973,48 +1987,38 @@ static PyObject* compile_source(const char* source, Py_ssize_t length) {
 static PyObject* bbq_compile(PyObject* /*self*/, PyObject* args, PyObject* kwargs) {
     const char* path;
     static const char* kwlist[] = {"path", NULL};
-
-    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "s",
-                                     (char**)kwlist, &path))
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "s", (char**)kwlist, &path))
         return NULL;
 
-    FILE* f = fopen(path, "r");
+    FILE* f = fopen(path, "rb");
     if (!f) {
         PyErr_SetFromErrnoWithFilename(PyExc_OSError, path);
         return NULL;
     }
-
-    fseek(f, 0, SEEK_END);
-    long size = ftell(f);
-    fseek(f, 0, SEEK_SET);
-
-    std::string source((size_t)size, '\0');
-    size_t nread = fread(&source[0], 1, (size_t)size, f);
+    std::string text;
+    char buf[8192];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof buf, f)) > 0) text.append(buf, n);
     fclose(f);
-    source.resize(nread);
 
-    return compile_source(source.c_str(), (Py_ssize_t)nread);
+    return compile_source(text.data(), (Py_ssize_t)text.size());
 }
 
 static PyObject* bbq_compile_string(PyObject* /*self*/, PyObject* args, PyObject* kwargs) {
     const char* source;
-    Py_ssize_t source_len;
+    Py_ssize_t length;
     static const char* kwlist[] = {"source", NULL};
-
-    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "s#",
-                                     (char**)kwlist, &source, &source_len))
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "s#", (char**)kwlist, &source, &length))
         return NULL;
-
-    return compile_source(source, source_len);
+    return compile_source(source, length);
 }
 
 static PyMethodDef bbq_module_methods[] = {
-    {"compile",        (PyCFunction)bbq_compile,
+    {"compile", (PyCFunction)(void(*)(void))bbq_compile, METH_VARARGS | METH_KEYWORDS,
+     "compile(path) -> Spec: compile a .bbq grammar file."},
+    {"compile_string", (PyCFunction)(void(*)(void))bbq_compile_string,
      METH_VARARGS | METH_KEYWORDS,
-     "compile(path) -> Spec\n\nCompile a BBQ spec file."},
-    {"compile_string", (PyCFunction)bbq_compile_string,
-     METH_VARARGS | METH_KEYWORDS,
-     "compile_string(source) -> Spec\n\nCompile a BBQ spec from a string."},
+     "compile_string(source) -> Spec: compile a grammar from a string."},
     {NULL, NULL, 0, NULL}
 };
 
@@ -2023,20 +2027,14 @@ static PyMethodDef bbq_module_methods[] = {
 
 static struct PyModuleDef bbq_moduledef = {
     PyModuleDef_HEAD_INIT,
-    "bbq",                                 // m_name
-    "BBQ binary format parser",            // m_doc
-    -1,                                    // m_size
-    bbq_module_methods,                    // m_methods
+    "bbq",
+    PyDoc_STR("Binary format parsing with the BBQ CEK machine."),
+    -1,
+    bbq_module_methods,
+    NULL, NULL, NULL, NULL
 };
 
-#if defined(__cplusplus)
-extern "C"
-#endif
-#if defined(__GNUC__) && __GNUC__ >= 4
-__attribute__ ((visibility("default")))
-#endif
-
-PyObject*
+PyMODINIT_FUNC
 PyInit_bbq(void)
 {
     PyObject* m;
@@ -2047,11 +2045,10 @@ PyInit_bbq(void)
     }
 
     /* Free-threaded builds: this module serializes its own shared state (the Spec's
-     * writer-op cache and extern registry, each Result's overlay — see the locking note
-     * near the top), so it does not need the interpreter to do it. Without this
-     * declaration importing bbq would re-enable the GIL for the whole process.
-     * PyUnstable_Module_SetGIL is the single-phase-init spelling and exists only in the
-     * free-threaded build. */
+     * extern registry, each Result's document — see the locking note near the top), so
+     * it does not need the interpreter to do it. Without this declaration importing bbq
+     * would re-enable the GIL for the whole process. PyUnstable_Module_SetGIL is the
+     * single-phase-init spelling and exists only in the free-threaded build. */
 #ifdef Py_GIL_DISABLED
     PyUnstable_Module_SetGIL(m, Py_MOD_GIL_NOT_USED);
 #endif

@@ -132,7 +132,9 @@ struct CEKMachine {
     bool little_endian = true;
 
     // ── Output ──────────────────────────────────────────────
-    CaptureBuilder builder;
+    // The machine builds the document itself: nodes come out span-backed, so a
+    // parse nobody edits owns no values and serializes as one memcpy of the input.
+    zcow::builder builder;
 
     // ── Memory ──────────────────────────────────────────────
     ParseArena* arena = nullptr;
@@ -153,8 +155,8 @@ struct CEKMachine {
     const char* best_error_msg = nullptr;
 
     // ── Entry point ─────────────────────────────────────────
-    CaptureMetadata execute_from(KontNode* entry, const uint8_t* data,
-                                 size_t length, bool default_little_endian = true);
+    zcow::parse_result execute_from(KontNode* entry, const uint8_t* data,
+                                    size_t length, bool default_little_endian = true);
 
     // ── Error ───────────────────────────────────────────────
     void fail(const char* message);

@@ -7,9 +7,10 @@
 #include <cstddef>
 #include <cstdint>
 
-#include "Capture.h"  // bbq::FieldCapture — the shared index runtime that
-                      // FieldCaptureValue references (resolved by outer-namespace
-                      // lookup from bbq::cek). The runtime does NOT depend back.
+#include "CaptureCow.h"  // bbq::zcow::node — the parsed document the machine
+                         // builds and that FieldCaptureValue references (resolved
+                         // by outer-namespace lookup from bbq::cek). The runtime
+                         // does NOT depend back.
 
 namespace bbq::cek {
 

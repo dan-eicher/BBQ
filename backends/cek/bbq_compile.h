@@ -526,11 +526,13 @@ private:
     }
     bbq::cek::StaticKont* make_extract_bits(bbq::cek::PrimitiveInfo container,
                                             int width_bits, int offset_before,
+                                            bool is_signed,
                                             bbq::cek::StaticKont* nx) {
         auto* k = arena_->alloc<bbq::cek::ExtractBitsNode>();
         k->container = container;
         k->width_bits = width_bits;
         k->offset_before = offset_before;
+        k->is_signed = is_signed;
         k->next = nx;
         return k;
     }
@@ -573,6 +575,7 @@ private:
             }
             chain = make_extract_bits(container, static_cast<int>(entries[i]->width),
                                       offset_before[i],
+                                      entries[i]->sign == BBQ::Signedness::Signed,
                                       field_dest(nm, tail));
         }
         return chain;

@@ -1,13 +1,26 @@
-{# BBQ C++ typed-view header — rendered from the type model. Each rule is a
-   handle over a FieldCapture node + input buffer + a CoW store; accessors decode
-   lazily (or read the CoW override), setters detach to Owned. The store is
-   shared down to sub-handles so nested mutations propagate. #}
+{# BBQ C++ typed handles — rendered from the type model.
+
+   One class per rule, whose members are the grammar's own vocabulary: a field, an
+   element, a variant arm. The only thing these add over calling bbq::zcow directly
+   is what the grammar knows statically — the field's NAME and its TYPE — so a typo
+   is a compile error and `u8()` returns uint8_t. The Python binding does the same
+   job dynamically through __getattr__; a compiled grammar can do it statically.
+
+   Every accessor is ONE call into bbq::zcow. The zero-copy reads and the
+   copy-on-write writes are the document's, not reimplemented here: a handle holds
+   where it is and nothing else. If a body below ever branches on storage, this file
+   has grown a second copy of ZCow and is wrong.
+
+   A handle over a document reads; one over a transient reads and writes. That is
+   one class either way, because mutability is a property of the document — and
+   because the Python binding wraps the same object model and has no const. #}
 #pragma once
 
 #include <cstdint>
 #include <cstddef>
 #include <string_view>
 #include <vector>
+#include "CaptureCow.h"
 #include "bbq_node.h"
 
 {% if has_ns %}
@@ -18,51 +31,170 @@ namespace {{ namespace }} {
 class {{ name }};
 {% endfor %}
 
+{# The typed shapes for the grammar's composite constructors. Each holds a handle's
+   position and forwards to bbq::zcow; the element type is what the grammar said. #}
+template <class T>
+struct seq {
+    bbq::zcow::node* n{}; const bbq::zcow::source* s{}; bbq::zcow::transient* t{};
+    size_t size() const { return bbq::zcow::size_of(n); }
+    bool empty() const { return size() == 0; }
+    T operator[](size_t i) const {
+        return T{t ? t->own_child(n, i)
+                   : const_cast<bbq::zcow::node*>(bbq::zcow::child_at(n, i)), s, t};
+    }
+    struct iterator {
+        const seq* q; size_t i;
+        T operator*() const { return (*q)[i]; }
+        iterator& operator++() { ++i; return *this; }
+        bool operator!=(const iterator& o) const { return i != o.i; }
+    };
+    iterator begin() const { return {this, 0}; }
+    iterator end() const { return {this, size()}; }
+};
+
+template <class T>
+struct prim_seq {
+    bbq::zcow::node* n{}; const bbq::zcow::source* s{}; bbq::zcow::transient* t{};
+    size_t size() const { return bbq::zcow::size_of(n); }
+    bool empty() const { return size() == 0; }
+    T operator[](size_t i) const {
+        return (T)bbq::zcow::read_int(bbq::zcow::child_at(n, i), *s);
+    }
+    void set(size_t i, T v) const {
+        bbq::zcow::set_int(t ? t->own_child(n, i) : nullptr, (int64_t)v);
+    }
+    struct iterator {
+        const prim_seq* q; size_t i;
+        T operator*() const { return (*q)[i]; }
+        iterator& operator++() { ++i; return *this; }
+        bool operator!=(const iterator& o) const { return i != o.i; }
+    };
+    iterator begin() const { return {this, 0}; }
+    iterator end() const { return {this, size()}; }
+};
+
+template <class V, class E>
+struct span_seq {
+    bbq::zcow::node* n{}; const bbq::zcow::source* s{}; bbq::zcow::transient* t{};
+    size_t size() const { return bbq::zcow::size_of(n); }
+    bool empty() const { return size() == 0; }
+    V operator[](size_t i) const {
+        auto b = bbq::zcow::read_bytes(bbq::zcow::child_at(n, i), *s);
+        return V{(const E*)b.first, b.second};
+    }
+    struct iterator {
+        const span_seq* q; size_t i;
+        V operator*() const { return (*q)[i]; }
+        iterator& operator++() { ++i; return *this; }
+        bool operator!=(const iterator& o) const { return i != o.i; }
+    };
+    iterator begin() const { return {this, 0}; }
+    iterator end() const { return {this, size()}; }
+};
+
+{# An optional is present exactly when the parse recorded something for it. #}
+template <class T>
+struct opt {
+    bbq::zcow::node* n{}; const bbq::zcow::source* s{}; bbq::zcow::transient* t{};
+    bool has_value() const { return n != nullptr; }
+    explicit operator bool() const { return has_value(); }
+    T value() const { return T{n, s, t}; }
+};
+
+template <class T>
+struct prim_opt {
+    bbq::zcow::node* n{}; const bbq::zcow::source* s{}; bbq::zcow::transient* t{};
+    bool has_value() const { return n != nullptr; }
+    explicit operator bool() const { return has_value(); }
+    T value() const { return (T)bbq::zcow::read_int(n, *s); }
+};
+
+template <class V, class E>
+struct span_opt {
+    bbq::zcow::node* n{}; const bbq::zcow::source* s{}; bbq::zcow::transient* t{};
+    bool has_value() const { return n != nullptr; }
+    explicit operator bool() const { return has_value(); }
+    V value() const { auto b = bbq::zcow::read_bytes(n, *s); return V{(const E*)b.first, b.second}; }
+};
+
 {% for c in classes %}
 class {{ c.name }} {
-    const bbq::FieldCapture* n_;
-    const uint8_t* buf_;
-    bbq::zcow* zc_;
+    bbq::zcow::node* n_ = nullptr;
+    const bbq::zcow::source* s_ = nullptr;
+    bbq::zcow::transient* t_ = nullptr;   // null over a document: reads only
+
+    // Reaching a child. Reading takes the document's node; writing takes the one the
+    // transient owns, which is the copy-on-write step and is bbq::zcow's, not ours.
+    const bbq::zcow::node* r_(const char* f) const { return bbq::zcow::child_named(n_, f); }
+    bbq::zcow::node* w_(const char* f) const {
+        if (!t_) throw bbq::zcow::type_error("this document is read-only");
+        return t_->own_child(n_, f);
+    }
+    bbq::zcow::node* sub_(const char* f) const {
+        return t_ ? t_->own_child(n_, f) : const_cast<bbq::zcow::node*>(r_(f));
+    }
 public:
-    {{ c.name }}(const bbq::FieldCapture* n, const uint8_t* buf, bbq::zcow* zc = nullptr)
-        : n_(n), buf_(buf), zc_(zc) {}
+    {{ c.name }}() = default;
+    {{ c.name }}(bbq::zcow::node* n, const bbq::zcow::source* s,
+                 bbq::zcow::transient* t = nullptr) : n_(n), s_(s), t_(t) {}
+    bool valid() const { return n_ != nullptr; }
 
 {% if existsIn(c, "value_class") %}
 {% if c.is_optional %}
-    bool has_value() const { return n_->child_count > 0; }
+    bool has_value() const { return bbq::zcow::size_of(n_) > 0; }
 {% endif %}
     {{ c.value_ctype }} value() const { return {{ c.value_expr }}; }
 {% else %}
 {% for f in c.fields %}
 {% if f.type.t == "scalar" and f.type.prim.kind == "bytes" %}
-    bbq::bytes_view {{ f.name }}() const { auto* _c = bbq::node_child(n_, "{{ f.name }}"); if (zc_) { if (auto* _o = zc_->get_bytes(_c)) return { _o->data(), _o->size() }; } return { buf_ + _c->start_offset, (size_t)(_c->end_offset - _c->start_offset) }; }
-    void set_{{ f.name }}(const uint8_t* _d, size_t _n) { zc_->set_bytes(bbq::node_child(n_, "{{ f.name }}"), std::vector<uint8_t>(_d, _d + _n)); }
+    bbq::bytes_view {{ f.name }}() const { auto _b = bbq::zcow::read_bytes(r_("{{ f.name }}"), *s_); return {_b.first, _b.second}; }
+    void set_{{ f.name }}(const uint8_t* _d, size_t _n) { bbq::zcow::set_bytes(w_("{{ f.name }}"), _d, _n); }
 {% else if f.type.t == "scalar" and f.type.prim.kind == "string" %}
-    std::string_view {{ f.name }}() const { auto* _c = bbq::node_child(n_, "{{ f.name }}"); if (zc_) { if (auto* _o = zc_->get_bytes(_c)) return { (const char*)_o->data(), _o->size() }; } return { (const char*)(buf_ + _c->start_offset), (size_t)(_c->end_offset - _c->start_offset) }; }
-    void set_{{ f.name }}(std::string_view _s) { zc_->set_bytes(bbq::node_child(n_, "{{ f.name }}"), std::vector<uint8_t>(_s.begin(), _s.end())); }
+    std::string_view {{ f.name }}() const { return bbq::zcow::read_str(r_("{{ f.name }}"), *s_); }
+    void set_{{ f.name }}(std::string_view _s) { bbq::zcow::set_str(w_("{{ f.name }}"), _s); }
 {% else if f.type.t == "scalar" and f.type.prim.kind == "float" %}
-    {{ cpp_type(f.type) }} {{ f.name }}() const { auto* _c = bbq::node_child(n_, "{{ f.name }}"); if (zc_) { if (auto* _o = zc_->get_float(_c)) return ({{ cpp_type(f.type) }})*_o; } return ({{ cpp_type(f.type) }})bbq::node_float(_c, buf_); }
-    void set_{{ f.name }}({{ cpp_type(f.type) }} _v) { zc_->set_float(bbq::node_child(n_, "{{ f.name }}"), (double)_v); }
+    {{ cpp_type(f.type) }} {{ f.name }}() const { return ({{ cpp_type(f.type) }})bbq::zcow::read_float(r_("{{ f.name }}"), *s_); }
+    void set_{{ f.name }}({{ cpp_type(f.type) }} _v) { bbq::zcow::set_float(w_("{{ f.name }}"), (double)_v); }
 {% else if f.type.t == "scalar" %}
-    {{ cpp_type(f.type) }} {{ f.name }}() const { auto* _c = bbq::node_child(n_, "{{ f.name }}"); if (zc_) { if (auto* _o = zc_->get_int(_c)) return ({{ cpp_type(f.type) }})*_o; } return ({{ cpp_type(f.type) }})bbq::node_int(_c, buf_); }
-    void set_{{ f.name }}({{ cpp_type(f.type) }} _v) { zc_->set_int(bbq::node_child(n_, "{{ f.name }}"), (int64_t)_v); }
+    {{ cpp_type(f.type) }} {{ f.name }}() const { return ({{ cpp_type(f.type) }})bbq::zcow::read_int(r_("{{ f.name }}"), *s_); }
+    void set_{{ f.name }}({{ cpp_type(f.type) }} _v) { bbq::zcow::set_int(w_("{{ f.name }}"), (int64_t)_v); }
+{% else if f.type.t == "bits" %}
+{# A bitfield entry has no storage of its own — its value lives in the run's bytes,
+   and only the run has those. Both directions name the run and the entry, which is
+   what bbq::zcow::read_bits/write_bits take; the layout came from the parser. #}
+    {{ cpp_type(f.type) }} {{ f.name }}() const { return ({{ cpp_type(f.type) }})bbq::zcow::read_bits(n_, "{{ f.name }}", *s_); }
+    void set_{{ f.name }}({{ cpp_type(f.type) }} _v) {
+        if (!t_) throw bbq::zcow::type_error("this document is read-only");
+        bbq::zcow::write_bits(n_, "{{ f.name }}", *s_, (int64_t)_v);
+    }
 {% else if f.type.t == "computed" %}
-    {{ cpp_type(f.type) }} {{ f.name }}() const { return bbq::node_computed_val<{{ cpp_type(f.type) }}>(bbq::node_child(n_, "{{ f.name }}")); }
+{# Derived by the grammar, so there is no setter: writing one could only disagree
+   with whatever it is computed from. Read at the RESULT type — a float compute read
+   through the integer path would be silently truncated. #}
+{% if f.type.prim.kind == "float" %}
+    {{ cpp_type(f.type) }} {{ f.name }}() const { return ({{ cpp_type(f.type) }})bbq::zcow::read_float(r_("{{ f.name }}"), *s_); }
+{% else if f.type.prim.kind == "string" %}
+    std::string_view {{ f.name }}() const { return bbq::zcow::read_str(r_("{{ f.name }}"), *s_); }
+{% else if f.type.prim.kind == "bytes" %}
+    bbq::bytes_view {{ f.name }}() const { auto _b = bbq::zcow::read_bytes(r_("{{ f.name }}"), *s_); return {_b.first, _b.second}; }
+{% else %}
+    {{ cpp_type(f.type) }} {{ f.name }}() const { return ({{ cpp_type(f.type) }})bbq::zcow::read_int(r_("{{ f.name }}"), *s_); }
+{% endif %}
 {% else if f.type.t == "ruleref" %}
-    {{ f.type.rule }} {{ f.name }}() const { return {{ f.type.rule }}(bbq::node_child(n_, "{{ f.name }}"), buf_, zc_); }
+    {{ f.type.rule }} {{ f.name }}() const { return {{ f.type.rule }}{sub_("{{ f.name }}"), s_, t_}; }
 {% else if f.type.t == "named" %}
-    {{ f.type.name }} {{ f.name }}() const { return {{ f.type.name }}(bbq::node_child(n_, "{{ f.name }}"), buf_, zc_); }
+    {{ f.type.name }} {{ f.name }}() const { return {{ f.type.name }}{sub_("{{ f.name }}"), s_, t_}; }
 {% else if f.type.t == "array" %}
-    {{ cpp_type(f.type) }} {{ f.name }}() const { return { bbq::node_child(n_, "{{ f.name }}"), buf_, zc_ }; }
+    {{ cpp_type(f.type) }} {{ f.name }}() const { return { sub_("{{ f.name }}"), s_, t_ }; }
 {% else if f.type.t == "optional" %}
-    {{ cpp_type(f.type) }} {{ f.name }}() const { return { bbq::node_child(n_, "{{ f.name }}"), buf_, zc_ }; }
+    {{ cpp_type(f.type) }} {{ f.name }}() const { return { sub_("{{ f.name }}"), s_, t_ }; }
 {% else if f.type.t == "tagged_inline" %}
-    int {{ f.name }}_which() const { auto* _c = bbq::node_child(n_, "{{ f.name }}"); return _c ? _c->variant_tag : -1; }
+    int {{ f.name }}_which() const { const bbq::zcow::node* _c = r_("{{ f.name }}"); return _c ? _c->variant_tag : -1; }
 {% for m in f.type.members %}
     {{ cpp_type(m.type) }} {{ f.name }}_{{ m.name }}() const { return {{ cpp_decode_child(m.type, f.name) }}; }
 {% endfor %}
 {% else if f.type.t == "verbatim" %}
-    bbq::bytes_view {{ f.name }}() const { auto* _c = bbq::node_child(n_, "{{ f.name }}"); return { buf_ + _c->start_offset, (size_t)(_c->end_offset - _c->start_offset) }; }
+    bbq::bytes_view {{ f.name }}() const { auto _b = bbq::zcow::read_bytes(r_("{{ f.name }}"), *s_); return {_b.first, _b.second}; }
 {% else %}
 #error unsupported C++ field type {{ f.type.t }}
 {% endif %}
@@ -71,37 +203,54 @@ public:
 };
 
 {% endfor %}
-{# Tagged-union handles (union/alternatives): the matched arm is a named child that
-   records variant_tag. which() reads the recorded decision; is_<v>()/<v>() expose
-   each variant (only valid when present). #}
 {% for c in tagged_classes %}
 class {{ c.name }} {
-    const bbq::FieldCapture* n_;
-    const uint8_t* buf_;
-    bbq::zcow* zc_;
+    bbq::zcow::node* n_ = nullptr;
+    const bbq::zcow::source* s_ = nullptr;
+    bbq::zcow::transient* t_ = nullptr;
+
+    const bbq::zcow::node* r_(const char* f) const { return bbq::zcow::child_named(n_, f); }
+    bbq::zcow::node* sub_(const char* f) const {
+        return t_ ? t_->own_child(n_, f) : const_cast<bbq::zcow::node*>(r_(f));
+    }
 public:
-    {{ c.name }}(const bbq::FieldCapture* n, const uint8_t* buf, bbq::zcow* zc = nullptr)
-        : n_(n), buf_(buf), zc_(zc) {}
+    {{ c.name }}() = default;
+    {{ c.name }}(bbq::zcow::node* n, const bbq::zcow::source* s,
+                 bbq::zcow::transient* t = nullptr) : n_(n), s_(s), t_(t) {}
+    bool valid() const { return n_ != nullptr; }
 
 {% if c.variant_named %}
     int which() const {
 {% for v in c.variants %}
-        if (auto* _c = bbq::node_child(n_, "{{ v.member }}")) return _c->variant_tag;
+        if (const bbq::zcow::node* _c = r_("{{ v.member }}")) return _c->variant_tag;
 {% endfor %}
         return -1;
     }
 {% for v in c.variants %}
-    bool is_{{ v.member }}() const { return bbq::node_child(n_, "{{ v.member }}") != nullptr; }
+    bool is_{{ v.member }}() const { return r_("{{ v.member }}") != nullptr; }
     {{ cpp_type(v.type) }} {{ v.member }}() const { return {{ cpp_decode_child(v.type, v.member) }}; }
 {% endfor %}
 {% else %}
-    int which() const { return n_->child_count ? n_->children[0].variant_tag : -1; }
+    int which() const {
+        const bbq::zcow::node* _c = bbq::zcow::child_at(n_, 0);
+        return _c ? _c->variant_tag : -1;
+    }
 {% for v in c.variants %}
     {{ cpp_type(v.type) }} {{ v.member }}() const { return {{ cpp_decode_first(v.type) }}; }
 {% endfor %}
 {% endif %}
 };
 
+{% endfor %}
+{# Opening a document with the rule the grammar named, so a caller never assembles a
+   handle out of a node and a buffer by hand. #}
+{% for c in classes %}
+inline {{ c.name }} {{ c.name }}_of(const bbq::zcow::document& _d) {
+    return {{ c.name }}{const_cast<bbq::zcow::node*>(_d.root()), &_d.src()};
+}
+inline {{ c.name }} {{ c.name }}_of(bbq::zcow::transient& _t) {
+    return {{ c.name }}{_t.root_mut(), &_t.src(), &_t};
+}
 {% endfor %}
 {% if has_ns %}
 }  // namespace {{ namespace }}

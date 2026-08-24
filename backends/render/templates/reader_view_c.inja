@@ -77,7 +77,15 @@ static bool {{ fn.kpfx }}_k{{ o.id }}(bbq_view_ctx_t* ctx) {
       if (!bbq_advance(&ctx->cur, {{ prim_bytes(o.prim) }})) return bbq_fail(&ctx->cur, "{{ o.msg }}");
       uint64_t _bf = bbq_view_read_at(ctx, _s, {{ prim_bytes(o.prim) }}, {{ o.prim.be }}, {{ o.prim.native }});
 {% for m in o.members %}
-      bbq_view_add_computed_int(ctx, "{{ m.target }}", (int64_t)((_bf >> {{ m.shift }}) & {{ m.mask }}));
+{# A signed entry is sign-extended from its OWN width, not the container's — a 4-bit
+   0xD is -3. Masking alone would report 13, and the value would disagree with what
+   the grammar declared. #}
+      { int64_t _v = (int64_t)((_bf >> {{ m.shift }}) & {{ m.mask }});
+{% if m.signed %}
+        if ({{ m.end }} - {{ m.start }} < 64 && (_v & ((int64_t)1 << ({{ m.end }} - {{ m.start }} - 1))))
+            _v -= ((int64_t)1 << ({{ m.end }} - {{ m.start }}));
+{% endif %}
+        bbq_view_add_computed_int(ctx, "{{ m.target }}", _v); }
 {% if existsIn(m, "where") %}
       if (!({{ m.where }})) return bbq_fail(&ctx->cur, "{{ m.where_msg }}");
 {% endif %}

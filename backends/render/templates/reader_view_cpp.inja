@@ -32,7 +32,7 @@ static bool {{ fn.kpfx }}_entry(bbq::reader& r) { return {{ fn.kpfx }}_k{{ fn.en
 {% endfor %}
 
 {% for fn in functions %}
-bbq::CaptureMetadata {{ fn.name }}(const uint8_t* data, size_t len, bbq::ParseArena& arena) {
+bbq::zcow::parse_result {{ fn.name }}(const uint8_t* data, size_t len, bbq::ParseArena& arena) {
     bbq::reader r(data, len, arena);
     r.little_endian = {% if default_le %}true{% else %}false{% endif %}; r.endian_seeded = true;
     bool _ok = {{ fn.kpfx }}_entry(r);
@@ -52,13 +52,13 @@ static bool {{ fn.kpfx }}_k{{ o.id }}(bbq::reader& r) {
 {% else %}
     { size_t _s = r.pos;
       if (!r.advance({{ prim_bytes(o.prim) }})) return r.fail("{{ o.msg }}");
-      r.builder.add_field("{{ o.target }}", _s, r.pos, {{ capture_expr(o.prim) }}); }
+      r.builder.add_field({% if o.target != "" %}"{{ o.target }}"{% else %}nullptr{% endif %}, _s, r.pos,{{ capture_expr(o.prim) }}); }
 {% endif %}
     return {{ fn.kpfx }}_k{{ o.next }}(r);
 {% else if o.op == "read_bytes" %}
     { size_t _s = r.pos;
       if (!r.advance((size_t)({{ o.len }}))) return r.fail("{{ o.msg }}");
-      r.builder.add_field("{{ o.target }}", _s, r.pos, {% if o.is_string %}bbq::CaptureType::String{% else %}bbq::CaptureType::Bytes{% endif %}); }
+      r.builder.add_field({% if o.target != "" %}"{{ o.target }}"{% else %}nullptr{% endif %}, _s, r.pos,{% if o.is_string %}bbq::CaptureType::String{% else %}bbq::CaptureType::Bytes{% endif %}); }
     return {{ fn.kpfx }}_k{{ o.next }}(r);
 {% else if o.op == "constraint" %}
     if (!({{ o.expr }})) return r.fail("{{ o.msg }}");
@@ -70,8 +70,18 @@ static bool {{ fn.kpfx }}_k{{ o.id }}(bbq::reader& r) {
     { size_t _s = r.pos;
       if (!r.advance({{ prim_bytes(o.prim) }})) return r.fail("{{ o.msg }}");
       uint64_t _bf = r.read_at(_s, {{ prim_bytes(o.prim) }}, {{ o.prim.be }}, {{ o.prim.native }});
+{# The run owns the bytes its entries are read out of, and each entry records where it
+   sits and whether it is signed (Ftypes §3.4). Recorded here so nothing downstream has
+   to re-derive the layout to write one back — the same tags the CEK records. #}
+      r.builder.scope_is_bits_run({{ o.msb_first }});
 {% for m in o.members %}
-      r.add_computed_int("{{ m.target }}", (int64_t)((_bf >> {{ m.shift }}) & {{ m.mask }}));
+      { int64_t _v = (int64_t)((_bf >> {{ m.shift }}) & {{ m.mask }});
+{% if m.signed %}
+        if ({{ m.end }} - {{ m.start }} < 64 && (_v & (int64_t(1) << ({{ m.end }} - {{ m.start }} - 1))))
+            _v -= (int64_t(1) << ({{ m.end }} - {{ m.start }}));
+{% endif %}
+        bbq::zcow::node* _e = r.add_computed_int("{{ m.target }}", _v);
+        _e->bits = { {{ m.start }}, {{ m.end }}, {% if m.signed %}true{% else %}false{% endif %}, true }; }
 {% if existsIn(m, "where") %}
       if (!({{ m.where }})) return r.fail("{{ m.where_msg }}");
 {% endif %}
@@ -82,6 +92,11 @@ static bool {{ fn.kpfx }}_k{{ o.id }}(bbq::reader& r) {
     if (!r.seek_checked((size_t)({{ o.expr }}))) return false;
     return {{ fn.kpfx }}_k{{ o.next }}(r);
 {% else if o.op == "push_interval" %}
+{% if existsIn(o, "rest_field") %}
+{# A window whose end is `pos + <a field>` — how @rest lowers — means that field holds
+   the byte length of what the window covers. The scope it belongs to records it. #}
+    r.builder.scope_determines_rest("{{ o.rest_field }}");
+{% endif %}
     if (!r.push_interval_checked((size_t)({% if o.relative %}r.pos + {% endif %}({{ o.expr }})))) return false;
     return {{ fn.kpfx }}_k{{ o.next }}(r);
 {% else if o.op == "pop_interval" %}
@@ -102,7 +117,7 @@ static bool {{ fn.kpfx }}_k{{ o.id }}(bbq::reader& r) {
       if (!{{ o.func }}(r.data + r.pos, r.remaining(), &_c)) return r.fail("{{ o.msg }}");
       if (r.pos + _c > r.effective_end()) return r.fail("{{ o.msg }}");
       r.pos += _c;
-      r.builder.add_field("{{ o.target }}", _s, r.pos, bbq::CaptureType::External); }
+      r.builder.add_field({% if o.target != "" %}"{{ o.target }}"{% else %}nullptr{% endif %}, _s, r.pos,bbq::CaptureType::External); }
     return {{ fn.kpfx }}_k{{ o.next }}(r);
 {% else if o.op == "optional_prim" %}
     if ({{ o.cond }}) {
@@ -113,7 +128,7 @@ static bool {{ fn.kpfx }}_k{{ o.id }}(bbq::reader& r) {
 {% else %}
         size_t _s = r.pos;
         if (!r.advance({{ prim_bytes(o.prim) }})) return r.fail("{{ o.msg }}");
-        r.builder.add_field("{{ o.target }}", _s, r.pos, {{ capture_expr(o.prim) }});
+        r.builder.add_field({% if o.target != "" %}"{{ o.target }}"{% else %}nullptr{% endif %}, _s, r.pos,{{ capture_expr(o.prim) }});
 {% endif %}
     }
     return {{ fn.kpfx }}_k{{ o.next }}(r);
@@ -129,13 +144,21 @@ static bool {{ fn.kpfx }}_k{{ o.id }}(bbq::reader& r) {
 {% else if o.op == "end_optional" %}
     return true;
 {% else if o.op == "begin_struct" %}
-    r.builder.begin_struct("{{ o.name }}", r.pos);
+{# An array element is anonymous: its name must be absent, not empty, or node_path spells
+   it `gs.` instead of `gs[0]` and every element collapses to one path. The CEK records
+   nullptr here, so a view-built index that recorded "" would disagree with it. #}
+    r.builder.begin_struct({% if o.name != "" %}"{{ o.name }}"{% else %}nullptr{% endif %}, r.pos);
     return {{ fn.kpfx }}_k{{ o.next }}(r);
 {% else if o.op == "end_struct" %}
     r.builder.end_struct(r.pos);
     return {{ fn.kpfx }}_k{{ o.next }}(r);
 {% else if o.op == "array_begin" %}
     { int64_t _n = (int64_t)({{ o.count }});   // count decode-on-access, before the scope opens
+{% if existsIn(o, "count_field") %}
+{# What this array determines, recorded while the grammar still says so — the same
+   thing the CEK records at BeginArrayNode. Armed here because the scope opens next. #}
+      r.builder.set_pending_count_field("{{ o.count_field }}");
+{% endif %}
       r.begin_array("{{ o.field }}");
       if (_n == 0) return {{ fn.kpfx }}_k{{ o.end }}(r);  // EndArray closes it
       r.push_loop(_n); }
@@ -171,6 +194,9 @@ static bool {{ fn.kpfx }}_k{{ o.id }}(bbq::reader& r) {
     // (eof-before-count fails); uncounted stops at the window end.
 {% if o.counted %}
     int64_t _n = (int64_t)({{ o.count }});   // decode count in the PARENT scope, before the array opens
+{% if existsIn(o, "count_field") %}
+    r.builder.set_pending_count_field("{{ o.count_field }}");
+{% endif %}
     r.begin_array("{{ o.field }}");
     r.push_loop(_n);
     for (;;) {

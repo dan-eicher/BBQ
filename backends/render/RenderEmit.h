@@ -47,13 +47,6 @@ std::string render_writer_decls(const CompilerCtx& ctx);
 std::string render_reader_view(const CompilerCtx& ctx, const std::string& template_path,
                                const std::string& ns);
 
-// Render the cpp-zcow (view) WRITERS: the dual of render_reader_view over the SAME burg
-// lowering (ZCowWriter) — `<Rule>_write(const FieldCapture* root, const uint8_t* buf,
-// bbq::zcow* zc) -> std::vector<uint8_t>`, walking the graph the reader emits and streaming
-// grammar-conformant bytes. ZCow (zcow/emit) is the storage; this enforces the grammar.
-std::string render_writer_view(const CompilerCtx& ctx, const std::string& template_path,
-                               const std::string& ns);
-
 // Render the c-lite (C view) readers: the SAME burg lowering driven through the C view
 // emitter + `reader_view_c.inja`, producing `bbq_capture_metadata <pfx>_<rule>_read(...)`
 // functions that build a span index over the input (decode-on-access, no backing store).
@@ -63,12 +56,5 @@ std::string render_reader_view_c(const CompilerCtx& ctx, const std::string& temp
 // Forward declarations for every rule's c-lite reader — `bbq_capture_metadata
 // <pfx>_<rule>_read(const uint8_t*, size_t, bbq_arena*);` (for the generated header).
 std::string render_reader_view_c_decls(const CompilerCtx& ctx);
-
-// The ZCow WRITER op-list: the neutral lowering plus the writer's derive pass (the
-// count-field↔array and @rest linkage), with `fn["rule"]` intact. This is the one producer
-// behind both writer consumers — `writer_view_cpp.inja` RENDERS it into per-rule stencils,
-// and `bbq::render::run_writer` (WriterInterp.h) EXECUTES it for a grammar compiled at
-// runtime. A dynamic backend that lowered the kont graph itself would be a second grammar.
-nlohmann::json lower_writer_ops(const CompilerCtx& ctx);
 
 }  // namespace bbq::render

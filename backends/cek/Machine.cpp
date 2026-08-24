@@ -182,10 +182,10 @@ void CEKMachine::fail(const char* message) {
     failed = true;
 }
 
-CaptureMetadata CEKMachine::execute_from(KontNode* entry,
-                                         const uint8_t* data,
-                                         size_t length,
-                                         bool default_little_endian) {
+zcow::parse_result CEKMachine::execute_from(KontNode* entry,
+                                            const uint8_t* data,
+                                            size_t length,
+                                            bool default_little_endian) {
     // Initialize machine state for a fresh parse. env and frame_top
     // are NOT reset — callers (production drivers, tests) are
     // responsible for setting them up before invocation. Production
@@ -203,8 +203,7 @@ CaptureMetadata CEKMachine::execute_from(KontNode* entry,
     builder.clear();
 
     if (entry == nullptr) {
-        return builder.finish(*arena, false, 0,
-                              "no entry kont", 0);
+        return builder.finish(false, 0, input, input_length, "no entry kont", 0);
     }
     kont_stack.push_back(entry);
 
@@ -217,11 +216,11 @@ CaptureMetadata CEKMachine::execute_from(KontNode* entry,
     }
 
     if (failed) {
-        return builder.finish(*arena, false, pos,
+        return builder.finish(false, pos, input, input_length,
                               best_error_msg ? best_error_msg : "parse failed",
                               best_error_pos);
     }
-    return builder.finish(*arena, true, pos);
+    return builder.finish(true, pos, input, input_length);
 }
 
 // --- Layer 2 leaf kont invokes ---
@@ -291,7 +290,7 @@ void BufferKont::invoke(CEKMachine* m) const {
     // `@buffer`: the enclosing construct's consumed byte interval [start, pos), as a
     // FieldCaptureValue a verification function reads over (m->input[start..end)).
     // start = the innermost open capture scope, or 0 for an inlined top-level struct.
-    auto* cap = m->arena->alloc<FieldCapture>();
+    auto* cap = m->builder.make_free();
     cap->start_offset = m->builder.current_scope_start();
     cap->end_offset = m->pos;
     cap->type = CaptureType::Bytes;
@@ -896,10 +895,10 @@ void CallApplyKont::invoke(CEKMachine* m) const {
 // ── Path navigation ───────────────────────────────────────
 
 void PathStartKont::invoke(CEKMachine* m) const {
-    const FieldCapture* cap = m->builder.find_field(this->name);
+    zcow::node* cap = m->builder.find_field(this->name);
     if (!cap) { m->fail("path: field not found"); return; }
     auto* fcv = m->arena->alloc<FieldCaptureValue>();
-    fcv->capture = const_cast<FieldCapture*>(cap);
+    fcv->capture = cap;
     m->result = fcv;
 }
 
@@ -914,10 +913,10 @@ void FieldAccessApplyKont::invoke(CEKMachine* m) const {
     Value* v = m->result;
     if (!v || v->tag != ValueTag::FieldCaptureValue) { m->fail("path: bad base"); return; }
     auto* base = static_cast<FieldCaptureValue*>(v)->capture;
-    const FieldCapture* child = m->builder.find_child(base, this->field);
+    zcow::node* child = m->builder.find_child(base, this->field);
     if (!child) { m->fail("path: field not in capture"); return; }
     auto* fcv = m->arena->alloc<FieldCaptureValue>();
-    fcv->capture = const_cast<FieldCapture*>(child);
+    fcv->capture = child;
     m->result = fcv;
 }
 
@@ -939,10 +938,10 @@ void IndexAccessApplyKont::invoke(CEKMachine* m) const {
     if (!idx_v || idx_v->tag != ValueTag::IntValue) { m->fail("path: index not integer"); return; }
     auto* base = static_cast<FieldCaptureValue*>(base_v)->capture;
     int idx = static_cast<int>(static_cast<IntValue*>(idx_v)->v);
-    const FieldCapture* child = m->builder.find_child_at(base, idx);
+    zcow::node* child = m->builder.find_child_at(base, idx);
     if (!child) { m->fail("path: index out of range"); return; }
     auto* fcv = m->arena->alloc<FieldCaptureValue>();
-    fcv->capture = const_cast<FieldCapture*>(child);
+    fcv->capture = child;
     m->result = fcv;
 }
 
@@ -1021,7 +1020,7 @@ void BindComputeStoreKont::invoke(CEKMachine* m) const {
     // Producer: wrap the computed value as a Computed FieldCaptureValue at the
     // current position (no bytes consumed); the store konts that follow record it
     // (Computed → value in the tree) and bind it.
-    auto* cap = m->arena->alloc<FieldCapture>();
+    auto* cap = m->builder.make_free();
     cap->start_offset = m->pos;
     cap->end_offset = m->pos;
     cap->type = CaptureType::Computed;
@@ -1067,7 +1066,7 @@ void MatchBytesApplyKont::invoke(CEKMachine* m) const {
     m->pos += static_cast<size_t>(len);
     // Producer: yield the byte span as a FieldCaptureValue (no scalar value, so
     // computed_value stays null); the store konts that follow record/bind it.
-    auto* cap = m->arena->alloc<FieldCapture>();
+    auto* cap = m->builder.make_free();
     cap->start_offset = start;
     cap->end_offset = m->pos;
     cap->type = this->is_string ? CaptureType::String : CaptureType::Bytes;
@@ -1148,8 +1147,62 @@ static void push_resync_savepoint(CEKMachine* m, KontNode* resync_target) {
     m->frame_top = sp;
 }
 
+// The field an array's bound names, when the bound is nothing but a reference to
+// one — `[n]`, or `[h.n]` a struct deeper. Anything computed — `n * 2`,
+// `min(a,b)`, `count(...)` over an expression — determines no single field, so this
+// yields false and nothing is claimed that could not be maintained.
+static bool count_path_of(const KontNode* e, std::string& out) {
+    if (!e) return false;
+    switch (e->kind()) {
+    case KontKind::RefKont: {
+        const auto* r = static_cast<const RefKont*>(e);
+        const char* s = (r->resolved_path && *r->resolved_path) ? r->resolved_path : r->name;
+        if (!s || !*s) return false;
+        out = s;
+        return true;
+    }
+    case KontKind::PathStartKont: {
+        const auto* p = static_cast<const PathStartKont*>(e);
+        if (!p->name || !*p->name) return false;
+        out = p->name;
+        return true;
+    }
+    case KontKind::FieldAccessKont: {
+        const auto* f = static_cast<const FieldAccessKont*>(e);
+        std::string base;
+        if (!count_path_of(f->base, base) || !f->field || !*f->field) return false;
+        out = base + "." + f->field;
+        return true;
+    }
+    // A path yields a reference to the capture; this reads the value out of it.
+    // Either way the field it names is the same.
+    case KontKind::CaptureValueKont:
+        return count_path_of(static_cast<const CaptureValueKont*>(e)->path, out);
+    default:
+        return false;
+    }
+}
+
+// The composed path needs to outlive the parse that recorded it, so it lives in the
+// same arena as everything else the parse produced.
+static const char* count_field_of(CEKMachine* m, const KontNode* expr) {
+    std::string path;
+    if (!count_path_of(expr, path)) return nullptr;
+    char* s = static_cast<char*>(m->arena->allocate(path.size() + 1, alignof(char)));
+    std::memcpy(s, path.c_str(), path.size() + 1);
+    return s;
+}
+
 void BeginArrayNode::invoke(CEKMachine* m) const {
     if (this->mode == ArrayMode::FixedCount || this->mode == ArrayMode::Count) {
+        // Record the dependent field while the grammar still says what it is: when
+        // this array's bound is a plain field reference, that field IS its element
+        // count, and nothing downstream should have to re-derive it from the
+        // grammar. Recorded here for the same reason the variant tag is — the
+        // decision is known now and cheap to keep.
+        if (const char* cf = count_field_of(m, this->count_expr))
+            m->builder.set_pending_count_field(cf);
+
         // count_expr is non-null; evaluate it then site-consumer sets up frame.
         auto* check = m->arena->alloc<BeginArrayWithLimitKont>();
         check->array_name = this->array_name;
@@ -1400,13 +1453,32 @@ void ExtractBitsNode::invoke(CEKMachine* m) const {
 
     auto* iv = m->arena->alloc<IntValue>();
     iv->v = (raw >> shift) & mask;
+    // A signed entry is sign-extended from its own width, so the value bound under
+    // the member name is the value reading the run gives — the two halves of the
+    // document have to agree about what the field says.
+    if (this->is_signed && this->width_bits > 0 && this->width_bits < 64 &&
+        (iv->v & (int64_t(1) << (this->width_bits - 1))))
+        iv->v -= (int64_t(1) << this->width_bits);
     // Producer: yield the extracted bits as a Computed value over the container's
     // (shared) interval; the store konts that follow record/bind it.
-    auto* cap = m->arena->alloc<FieldCapture>();
+    auto* cap = m->builder.make_free();
     cap->start_offset = start;
     cap->end_offset = end;
     cap->type = CaptureType::Computed;
     cap->computed_value = lower_computed(*m->arena, iv);
+    // Where this entry sits in the run, recorded now — the shift and mask above are
+    // the grammar's, and re-deriving them downstream is what a tag exists to avoid.
+    // (Ftypes §3.4 records a signed flag per entry too; a BitfieldEntry in BBQ.asdl
+    // carries only a width, so every entry here is unsigned.)
+    cap->bits.start = (uint8_t)shift;
+    cap->bits.end = (uint8_t)(shift + this->width_bits);
+    cap->bits.is_signed = this->is_signed;
+    cap->bits.is_entry = true;
+    // The scope holding the members IS the run: it owns their bytes, and `msb_first`
+    // says which way they are laid out. Recorded per member; the members of one run
+    // all agree, so the last one wins and says the same thing as the first.
+    m->builder.scope_is_bits_run(msb_first);
+
     auto* fcv = m->arena->alloc<FieldCaptureValue>();
     fcv->capture = cap;
     m->result = fcv;
@@ -1444,7 +1516,7 @@ void ExternalCallNode::invoke(CEKMachine* m) const {
     m->pos += consumed;
     // Producer: yield the external span as a FieldCaptureValue (no scalar value);
     // the store konts that follow record/bind it.
-    auto* cap = m->arena->alloc<FieldCapture>();
+    auto* cap = m->builder.make_free();
     cap->start_offset = start;
     cap->end_offset = m->pos;
     cap->type = CaptureType::External;
@@ -1723,6 +1795,19 @@ void SeekApplyKont::invoke(CEKMachine* m) const {
 }
 
 void PushIntervalNode::invoke(CEKMachine* m) const {
+    // A window whose end is `pos + <a field>` — how `@rest` lowers — means that
+    // field holds the byte length of everything the window covers. Record it on the
+    // scope the window belongs to, while the grammar still says so; resizing that
+    // content later has to move the field, and by then nothing else knows which one
+    // it is. A computed bound names no single field and records nothing.
+    if (this->relative) {
+        std::string path;
+        if (count_path_of(this->expr, path) && path.find('.') == std::string::npos) {
+            char* s = static_cast<char*>(m->arena->allocate(path.size() + 1, alignof(char)));
+            std::memcpy(s, path.c_str(), path.size() + 1);
+            m->builder.scope_determines_rest(s);
+        }
+    }
     auto* apply = m->arena->alloc<PushIntervalApplyKont>();
     apply->relative = this->relative;
     apply->next = this->next;
@@ -1861,10 +1946,14 @@ void MatchPrimitiveNode::invoke(CEKMachine* m) const {
         // Producer: yield a placeable FieldCaptureValue to ac; place() records/
         // binds/discards it. No capture or bind here, and no spine push — the
         // place node's PlaceApplyKont is already queued beneath this producer.
-        auto* cap = m->arena->alloc<FieldCapture>();
+        auto* cap = m->builder.make_free();
         cap->start_offset = start;
         cap->end_offset = m->pos;
         cap->type = CaptureType::Computed;
+        // A varint's value is decoded rather than read at a fixed width, but it does
+        // occupy bytes — so the encoding is recorded, or writing one back could not
+        // reproduce them.
+        cap->enc = (prim.encoding == PrimEncoding::Uleb) ? zcow::Enc::Uleb : zcow::Enc::Sleb;
         cap->computed_value = lower_computed(*m->arena, iv);
         auto* fcv = m->arena->alloc<FieldCaptureValue>();
         fcv->capture = cap;
@@ -1889,7 +1978,7 @@ void MatchPrimitiveNode::invoke(CEKMachine* m) const {
     // Producer: yield a placeable FieldCaptureValue to ac. The value is carried
     // for the env binding; place() applies the "value in the tree only for
     // Computed" rule, so a fixed primitive's tree capture stays valueless.
-    auto* cap = m->arena->alloc<FieldCapture>();
+    auto* cap = m->builder.make_free();
     cap->start_offset = start;
     cap->end_offset = end;
     cap->type = ct;
@@ -1904,7 +1993,7 @@ void MatchPrimitiveNode::invoke(CEKMachine* m) const {
 // Each reads the producer's value from ac (a FieldCaptureValue carrying the
 // interval + type + value) and does exactly one thing with it.
 
-static FieldCapture* place_value(CEKMachine* m, const char* who) {
+static zcow::node* place_value(CEKMachine* m, const char* who) {
     Value* v = m->result;
     if (!v || v->tag != ValueTag::FieldCaptureValue) {
         m->fail(who);
@@ -1914,19 +2003,25 @@ static FieldCapture* place_value(CEKMachine* m, const char* who) {
 }
 
 void CaptureKont::invoke(CEKMachine* m) const {
-    FieldCapture* cap = place_value(m, "capture: no value");
+    zcow::node* cap = place_value(m, "capture: no value");
     if (!cap) return;
     // The output node carries a value only for Computed types; a fixed
     // primitive's span is re-decoded, so its node stays valueless (parity).
     ComputedValue* tree_val = (cap->type == CaptureType::Computed) ? cap->computed_value
                                                                    : nullptr;
-    m->builder.add_field(this->name, cap->start_offset, cap->end_offset,
-                         cap->type, tree_val);
+    zcow::node* rec = m->builder.add_field(this->name, cap->start_offset, cap->end_offset,
+                                           cap->type, tree_val);
+    // The carrier holds what the producer knew about this value, and the recorded node
+    // is where that belongs: a bitfield member knows where it sits in its run, and a
+    // varint knows its encoding — without which writing one back emits nothing at all,
+    // because its width is a property of the value and not of the span.
+    rec->bits = cap->bits;
+    rec->enc = cap->enc;
     m->push_kont(this->next);
 }
 
 void StoreEnvKont::invoke(CEKMachine* m) const {
-    FieldCapture* cap = place_value(m, "store_env: no value");
+    zcow::node* cap = place_value(m, "store_env: no value");
     if (!cap) return;
     auto* new_env = m->arena->alloc<Environment>();
     new_env->binding.name = this->name;

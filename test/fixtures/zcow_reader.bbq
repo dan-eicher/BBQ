@@ -66,8 +66,13 @@ U     = union { asA: VA, asB: VB }
 Alts  = VA | VB
 
 # bitfield — entries are Computed captures (container read + shift/mask at parse).
+# The run owns the bytes; an entry records where it sits and whether it is signed,
+# so reading one is derived from the run and writing one is read-modify-write on it.
 Bf       = bitfield<uint8> { hi: 4, lo: 4 }
 InlineBf = struct { lead: uint8, flags: bitfield<uint8> { hi: 4, lo: 4 }, tail: uint8 }
+# A signed entry is read back sign-extended from its own width — how instruction
+# encodings carry immediates. `unsigned` is the default and is spelled here too.
+SBf      = bitfield<uint8> { imm: signed 4, tag: unsigned 4 }
 
 # uncounted arrays — eof (until window end) + until(predicate), unbounded loop.
 Eof = struct { items: array<Pair>(none, eof) }

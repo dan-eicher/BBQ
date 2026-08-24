@@ -73,145 +73,37 @@ inline double node_float(const FieldCapture* c, const uint8_t* buf) {
     return d;
 }
 
-// A typed sequence over an array index node: element handle T built per child,
-// sharing the CoW store so element mutations are seen through the parent.
-template <class T>
-struct seq {
-    const FieldCapture* n = nullptr;
-    const uint8_t* buf = nullptr;
-    zcow* z = nullptr;
-
-    size_t size() const { return n ? (size_t)n->child_count : 0; }
-    bool empty() const { return size() == 0; }
-    // Brace-init so the element T composes uniformly: a handle class (its
-    // (n,buf,z) ctor), or a nested container (seq/opt, aggregate {n,buf,z}).
-    T operator[](size_t i) const { return T{&n->children[i], buf, z}; }
-
-    struct iterator {
-        const FieldCapture* n; const uint8_t* buf; zcow* z; size_t i;
-        T operator*() const { return T{&n->children[i], buf, z}; }
-        iterator& operator++() { ++i; return *this; }
-        bool operator!=(const iterator& o) const { return i != o.i; }
-    };
-    iterator begin() const { return {n, buf, z, 0}; }
-    iterator end() const { return {n, buf, z, size()}; }
-};
-
-// A typed sequence over an array of bytes/string elements: each child is a span;
-// the view analogue of prim_seq. V is bytes_view/std::string_view, C its element.
-template <class V, class C>
-struct span_seq {
-    const FieldCapture* n = nullptr;
-    const uint8_t* buf = nullptr;
-    zcow* z = nullptr;
-
-    size_t size() const { return n ? (size_t)n->child_count : 0; }
-    bool empty() const { return size() == 0; }
-    V at(size_t i) const {
-        const FieldCapture* c = &n->children[i];
-        if (z) { if (const std::vector<uint8_t>* o = z->get_bytes(c))
-                     return V{ (const C*)o->data(), o->size() }; }
-        return V{ (const C*)(buf + c->start_offset),
-                  (size_t)(c->end_offset - c->start_offset) };
+// The same three over a document node. The generated parser reads back its own
+// captures mid-parse — an array's count before its elements — and what it holds by
+// then is a zcow::node, so these keep the emitted spelling the same either side.
+inline const zcow::node* node_child(const zcow::node* n, const char* name) {
+    return n ? zcow::child_named(n, name) : nullptr;
+}
+inline int64_t node_int(const zcow::node* c, const uint8_t* buf) {
+    if (!c) return 0;
+    if (c->type == CaptureType::Computed) {
+        int64_t v = 0;
+        return zcow::computed_int(c, &v) ? v : 0;
     }
-    V operator[](size_t i) const { return at(i); }
+    int64_t bits = 0; bool sgn = false;
+    zcow::decode_int(c, buf, &bits, &sgn);
+    return bits;
+}
+// A computed value needs no buffer: it is carried, not read back out of a span.
+inline int64_t node_computed_int(const zcow::node* c) {
+    int64_t v = 0;
+    return (c && zcow::computed_int(c, &v)) ? v : 0;
+}
+inline double node_float(const zcow::node* c, const uint8_t* buf) {
+    if (!c) return 0;
+    double d = 0;
+    zcow::decode_float(c, buf, &d);
+    return d;
+}
 
-    struct iterator {
-        const span_seq* s; size_t i;
-        V operator*() const { return s->at(i); }
-        iterator& operator++() { ++i; return *this; }
-        bool operator!=(const iterator& o) const { return i != o.i; }
-    };
-    iterator begin() const { return {this, 0}; }
-    iterator end() const { return {this, size()}; }
-};
-
-// A typed sequence over an array of PRIMITIVE elements: each child decodes to a
-// scalar T (lazily, or the CoW int override) through the shared decoders — the
-// element analogue of the scalar field accessors. Distinct from seq<T> (which
-// constructs a handle class per child) because a primitive has no handle ctor.
-template <class T>
-struct prim_seq {
-    const FieldCapture* n = nullptr;
-    const uint8_t* buf = nullptr;
-    zcow* z = nullptr;
-
-    size_t size() const { return n ? (size_t)n->child_count : 0; }
-    bool empty() const { return size() == 0; }
-
-    T at(size_t i) const {
-        const FieldCapture* c = &n->children[i];
-        if constexpr (std::is_floating_point_v<T>) {
-            double d = 0; decode_float(c, buf, &d); return (T)d;
-        } else {
-            if (z) { if (const int64_t* o = z->get_int(c)) return (T)*o; }
-            int64_t bits = 0; bool sgn = false; decode_int(c, buf, &bits, &sgn);
-            return (T)bits;
-        }
-    }
-    T operator[](size_t i) const { return at(i); }
-
-    struct iterator {
-        const prim_seq* s; size_t i;
-        T operator*() const { return s->at(i); }
-        iterator& operator++() { ++i; return *this; }
-        bool operator!=(const iterator& o) const { return i != o.i; }
-    };
-    iterator begin() const { return {this, 0}; }
-    iterator end() const { return {this, size()}; }
-};
-
-// An optional ruleref/struct value: present iff the index holds a child for it
-// (absent optionals leave no child). value() is only valid when has_value().
-template <class T>
-struct opt {
-    const FieldCapture* n = nullptr;  // null ⇒ absent
-    const uint8_t* buf = nullptr;
-    zcow* z = nullptr;
-
-    bool has_value() const { return n != nullptr; }
-    explicit operator bool() const { return n != nullptr; }
-    T value() const { return T{n, buf, z}; }   // handle ctor or nested container
-};
-
-// An optional PRIMITIVE value: present iff the index holds a child; value()
-// decodes the scalar (or its CoW override) like prim_seq's element.
-template <class T>
-struct prim_opt {
-    const FieldCapture* n = nullptr;  // null ⇒ absent
-    const uint8_t* buf = nullptr;
-    zcow* z = nullptr;
-
-    bool has_value() const { return n != nullptr; }
-    explicit operator bool() const { return n != nullptr; }
-    T value() const {
-        if constexpr (std::is_floating_point_v<T>) {
-            double d = 0; decode_float(n, buf, &d); return (T)d;
-        } else {
-            if (z) { if (const int64_t* o = z->get_int(n)) return (T)*o; }
-            int64_t bits = 0; bool sgn = false; decode_int(n, buf, &bits, &sgn);
-            return (T)bits;
-        }
-    }
-};
-
-// An optional bytes/string span: present iff the index holds a child; value()
-// returns the borrowed span (or its CoW override). V is bytes_view or
-// std::string_view; C is the byte/char element type.
-template <class V, class C>
-struct span_opt {
-    const FieldCapture* n = nullptr;  // null ⇒ absent
-    const uint8_t* buf = nullptr;
-    zcow* z = nullptr;
-
-    bool has_value() const { return n != nullptr; }
-    explicit operator bool() const { return n != nullptr; }
-    V value() const {
-        if (z) { if (const std::vector<uint8_t>* o = z->get_bytes(n))
-                     return V{ (const C*)o->data(), o->size() }; }
-        return V{ (const C*)(buf + n->start_offset),
-                  (size_t)(n->end_offset - n->start_offset) };
-    }
-};
+// The typed containers now live in CaptureCow.h, over a cursor rather than over
+// (node, buffer, overlay). Keeping a second set here that read size() from one place
+// and elements from another is what let a view report contents it would never
+// serialize.
 
 }  // namespace bbq

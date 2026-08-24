@@ -19,7 +19,6 @@
 #include "CompilerCtx.h"
 #include "RenderTypes.h"
 #include "RenderEmit.h"
-#include "WriterInterp.h"
 #include "CTypeMapper.h"
 #include "bbq_node.h"
 
@@ -27,20 +26,15 @@
 // NON-inline; render_view_parser_test owns that include. Forward-declare the entries
 // we call here (resolved at link) to avoid multiply-defining them.
 namespace zr {
-#define ZR(R) bbq::CaptureMetadata R##_read(const uint8_t*, size_t, bbq::ParseArena&);
+#define ZR(R) bbq::zcow::parse_result R##_read(const uint8_t*, size_t, bbq::ParseArena&);
 ZR(Flat) ZR(Nest) ZR(Arr) ZR(Pair) ZR(Outer) ZR(RArr) ZR(Bytes) ZR(Str) ZR(Wh) ZR(WhTwice)
 ZR(Comp) ZR(Iv) ZR(Pos) ZR(Op) ZR(Bare) ZR(Sw) ZR(VA) ZR(VB) ZR(U) ZR(Alts)
-ZR(Bf) ZR(InlineBf) ZR(Eof) ZR(Unt) ZR(Es) ZR(RsItem) ZR(Resync) ZR(Ext)
+ZR(Bf) ZR(SBf) ZR(InlineBf) ZR(Eof) ZR(Unt) ZR(Es) ZR(RsItem) ZR(Resync) ZR(Ext)
 ZR(SwRange) ZR(Tern) ZR(Bstart) ZR(Rest) ZR(RestEof) ZR(Cnt) ZR(TopSw) ZR(Np) ZR(OScope)
 ZR(AllPrim) ZR(Leb) ZR(LebArr) ZR(LebOpt) ZR(Mat) ZR(OptSpan)
 ZR(TyByte) ZR(TyRule) ZR(OptTop) ZR(NestGrp) ZR(NestArr) ZR(FComp)
 #undef ZR
 }  // namespace zr
-
-// The generated zr:: ZCow WRITER (the dual of the reader): `<Rule>_write(root, buf, zc)`
-// re-emits the graph the reader built. Included here (the only consumer); defines the
-// writer functions in this TU.
-#include "ZcowReaderWriter.h"
 
 #include <sys/wait.h>
 #include <unordered_map>
@@ -49,6 +43,7 @@ ZR(TyByte) ZR(TyRule) ZR(OptTop) ZR(NestGrp) ZR(NestArr) ZR(FComp)
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <deque>
 #include <set>
 #include <sstream>
 #include <string>
@@ -80,7 +75,7 @@ std::string fixture_for_c() {
 }
 
 // CEK reference (returns metadata so callers compare the index directly).
-bbq::CaptureMetadata cek_meta_x(bbq::cek::CompiledGrammar* cg, const char* rule,
+bbq::zcow::parse_result cek_meta_x(bbq::cek::CompiledGrammar* cg, const char* rule,
                                 const uint8_t* buf, size_t len) {
     auto* arena = new bbq::ParseArena();
     auto* m = new bbq::cek::CEKMachine();
@@ -103,9 +98,6 @@ struct CRoundtrip {
     bool ok = false;
     bool sanitized = false;   // built with a working ASan/UBSan runtime (OOB → abort)
     std::string err;
-    // The writer op-list the cpp-zcow writer template was rendered from — the SAME list the
-    // dynamic writer (WriterInterp) executes. Kept so the two consumers can be compared.
-    nlohmann::json wops;
 };
 
 // A sanitizer-capable C compiler invocation, probed once. clang ships its own sanitizer
@@ -144,7 +136,6 @@ CRoundtrip build_c_roundtrip(const std::vector<std::string>& rules) {
     auto* cg = g->compile_grammar(parser->ast);
     ctx.ir = cg;
     rt.cek_cg = cg;
-    rt.wops = bbq::render::lower_writer_ops(ctx);
 
     std::string dir = "/tmp/bbq_cross_" + std::to_string(getpid());
     system(("mkdir -p " + dir).c_str());
@@ -246,19 +237,19 @@ std::vector<uint8_t> c_roundtrip(const std::string& bin, const char* rule,
 // match, not the offsets). Covers every node shape: a writer that drops a field, picks the
 // wrong arm, or mis-encodes a scalar diverges here.
 void cmp_node(const std::string& path,
-              const bbq::FieldCapture* a, const uint8_t* abuf,
-              const bbq::FieldCapture* b, const uint8_t* bbuf) {
+              const bbq::zcow::node* a, const uint8_t* abuf,
+              const bbq::zcow::node* b, const uint8_t* bbuf) {
     using CT = bbq::CaptureType;
     ASSERT_NE(a, nullptr) << path; ASSERT_NE(b, nullptr) << path;
     ASSERT_EQ((int)a->type, (int)b->type) << path << " type";
     EXPECT_EQ(a->variant_tag, b->variant_tag) << path << " variant_tag";
-    ASSERT_EQ(a->child_count, b->child_count) << path << " child_count";
+    ASSERT_EQ(a->kids.size(), b->kids.size()) << path << " child count";
     if (a->type == CT::Struct || a->type == CT::Array) {
-        for (int i = 0; i < a->child_count; i++) {
-            const char* an = a->children[i].name, *bn = b->children[i].name;
+        for (size_t i = 0; i < a->kids.size(); i++) {
+            const char* an = a->kids[i]->name, *bn = b->kids[i]->name;
             EXPECT_EQ(std::string(an ? an : ""), std::string(bn ? bn : "")) << path << " name@" << i;
             cmp_node(path + "/" + (an ? an : std::to_string(i)),
-                     &a->children[i], abuf, &b->children[i], bbuf);
+                     a->kids[i].get(), abuf, b->kids[i].get(), bbuf);
         }
     } else if (a->type == CT::Computed) {
         ASSERT_NE(a->computed_value, nullptr) << path; ASSERT_NE(b->computed_value, nullptr) << path;
@@ -316,7 +307,7 @@ std::string hexdump(const std::vector<uint8_t>& b) {
     return s;
 }
 
-using ViewReadFn = bbq::CaptureMetadata (*)(const uint8_t*, size_t, bbq::ParseArena&);
+using ViewReadFn = bbq::zcow::parse_result(*)(const uint8_t*, size_t, bbq::ParseArena&);
 struct XCase { const char* rule; ViewReadFn read; std::vector<uint8_t> valid; };
 
 // EVERY fixture rule + authored bytes (the same denominator as the view test's
@@ -344,6 +335,7 @@ std::vector<XCase> xcases() {
         {"U", zr::U_read, {0x01,0x0A}},
         {"Alts", zr::Alts_read, {0x02,0x0B}},
         {"Bf", zr::Bf_read, {0xA5}},
+        {"SBf", zr::SBf_read, {0x2D}},   // imm: signed 4 = -3, tag: unsigned 4 = 2
         {"InlineBf", zr::InlineBf_read, {0x11,0xA5,0x22}},
         {"Eof", zr::Eof_read, {1,2,3,4}},
         {"Unt", zr::Unt_read, {1,2,3}},
@@ -378,21 +370,8 @@ std::vector<XCase> xcases() {
     };
 }
 
-// rule → its ZCow writer (the dual of the per-rule read fn in xcases). Same denominator.
-using ViewWriteFn = std::vector<uint8_t> (*)(const bbq::FieldCapture*, const uint8_t*, size_t, bbq::zcow*);
-ViewWriteFn wfn_for(const std::string& r) {
-    static const std::unordered_map<std::string, ViewWriteFn> m = {
-#define ZW(R) {#R, zr::R##_write},
-        ZW(Flat) ZW(Nest) ZW(Arr) ZW(Pair) ZW(Outer) ZW(RArr) ZW(Bytes) ZW(Str) ZW(Wh) ZW(WhTwice)
-        ZW(Comp) ZW(Iv) ZW(Pos) ZW(Op) ZW(Bare) ZW(Sw) ZW(VA) ZW(VB) ZW(U) ZW(Alts)
-        ZW(Bf) ZW(InlineBf) ZW(Eof) ZW(Unt) ZW(Es) ZW(RsItem) ZW(Resync) ZW(Ext)
-        ZW(SwRange) ZW(Tern) ZW(Bstart) ZW(Rest) ZW(RestEof) ZW(Cnt) ZW(TopSw) ZW(Np) ZW(OScope)
-        ZW(AllPrim) ZW(Leb) ZW(LebArr) ZW(LebOpt) ZW(Mat) ZW(OptSpan)
-        ZW(TyByte) ZW(TyRule) ZW(OptTop) ZW(NestGrp) ZW(NestArr) ZW(FComp)
-#undef ZW
-    };
-    auto it = m.find(r); return it == m.end() ? nullptr : it->second;
-}
+// There is no per-rule writer table any more: a parse is a document, and writing it
+// back is `doc.serialize()` whichever producer built it.
 
 // Build the sanitized C reader+writer harness once for the whole fixture; every test
 // shares it (the compile is the expensive part).
@@ -414,14 +393,14 @@ const CRoundtrip& shared_rt() {
 // an ASan/UBSan subprocess (hostile input is the headline property) like the C-owning gate.
 
 // C++ dump of a CEK FieldCapture tree — byte-identical format to the C harness's dump_node.
-void dump_cek_node(const std::string& path, const bbq::FieldCapture* nd,
+void dump_cek_node(const std::string& path, const bbq::zcow::node* nd,
                    const uint8_t* buf, std::ostream& o) {
     using CT = bbq::CaptureType;
     o << path << " t=" << (int)nd->type << " vt=" << nd->variant_tag << " ";
     if (nd->type == CT::Struct || nd->type == CT::Array) {
-        o << "n=" << nd->child_count << "\n";
-        for (int i = 0; i < nd->child_count; i++) {
-            const bbq::FieldCapture* ch = &nd->children[i];
+        o << "n=" << nd->kids.size() << "\n";
+        for (size_t i = 0; i < nd->kids.size(); i++) {
+            const bbq::zcow::node* ch = nd->kids[i].get();
             // An unnamed child (array element: name null OR "") keys by index — the same
             // null/"" normalization cmp_node uses, so the C and CEK dumps agree.
             dump_cek_node(path + "/" + (ch->name && ch->name[0] ? std::string(ch->name) : std::to_string(i)),
@@ -450,7 +429,7 @@ void dump_cek_node(const std::string& path, const bbq::FieldCapture* nd,
         o << "i=" << bbq::node_int(nd, buf) << "\n";
     }
 }
-std::string dump_cek(const bbq::FieldCapture* root, const uint8_t* buf) {
+std::string dump_cek(const bbq::zcow::node* root, const uint8_t* buf) {
     std::stringstream ss; dump_cek_node("$", root, buf, ss); return ss.str();
 }
 
@@ -562,7 +541,7 @@ TEST(CrossBackend, CWriterToCppReaderFullFixture) {
     for (auto& c : xcases()) {
         SCOPED_TRACE(c.rule);
         // The authored bytes' truth, per the oracle.
-        bbq::CaptureMetadata ck_auth = cek_meta_x(rt.cek_cg, c.rule, c.valid.data(), c.valid.size());
+        bbq::zcow::parse_result ck_auth = cek_meta_x(rt.cek_cg, c.rule, c.valid.data(), c.valid.size());
         ASSERT_TRUE(ck_auth.success) << c.rule << ": CEK rejected authored bytes";
 
         // Round-trip through the C backend: read authored → write from the owning struct.
@@ -572,20 +551,20 @@ TEST(CrossBackend, CWriterToCppReaderFullFixture) {
         std::copy(cb.begin(), cb.end(), buf);
 
         // The oracle and the C++ ZCow reader both decode the C WRITER's output.
-        bbq::CaptureMetadata ck_out = cek_meta_x(rt.cek_cg, c.rule, buf, cb.size());
+        bbq::zcow::parse_result ck_out = cek_meta_x(rt.cek_cg, c.rule, buf, cb.size());
         ASSERT_TRUE(ck_out.success) << c.rule << ": CEK rejected C-writer bytes";
         bbq::ParseArena arena;
-        bbq::CaptureMetadata vm = c.read(buf, cb.size(), arena);
+        bbq::zcow::parse_result vm = c.read(buf, cb.size(), arena);
         ASSERT_TRUE(vm.success) << c.rule << ": C++ reader rejected C-writer bytes";
 
         // (1) writer fidelity: the writer's output decodes to the authored value tree.
         // (Including `until(@remaining)` arrays: burg matched the terminator shape and
         // the writer reserves the trailing context, so even those round-trip — no skip.)
         cmp_node(std::string(c.rule) + " (writer-fidelity)",
-                 ck_out.root, buf, ck_auth.root, c.valid.data());
+                 ck_out.doc.root(), buf, ck_auth.doc.root(), c.valid.data());
         // (2) Twofer: the C++ reader agrees with the CEK on the writer's bytes.
         cmp_node(std::string(c.rule) + " (cpp-reader vs cek)",
-                 vm.root, buf, ck_out.root, buf);
+                 vm.doc.root(), buf, ck_out.doc.root(), buf);
 
         // (3) Negative axis on the writer's OWN output: truncate every prefix and corrupt
         // every byte; the C++ ZCow reader must accept iff the CEK does, never overrun or
@@ -593,8 +572,8 @@ TEST(CrossBackend, CWriterToCppReaderFullFixture) {
         // surface a reader sees — this is the bitcoins net.
         for (size_t L = 0; L <= cb.size(); L++) {
             bbq::ParseArena na;
-            bbq::CaptureMetadata nv = c.read(buf, L, na);
-            bbq::CaptureMetadata nk = cek_meta_x(rt.cek_cg, c.rule, buf, L);
+            bbq::zcow::parse_result nv = c.read(buf, L, na);
+            bbq::zcow::parse_result nk = cek_meta_x(rt.cek_cg, c.rule, buf, L);
             EXPECT_EQ(nv.success, nk.success)
                 << c.rule << ": truncated writer output @ " << L << "/" << cb.size()
                 << " (cpp=" << nv.success << " cek=" << nk.success << ")";
@@ -607,8 +586,8 @@ TEST(CrossBackend, CWriterToCppReaderFullFixture) {
                 auto* bb = new uint8_t[bad.size()];
                 std::copy(bad.begin(), bad.end(), bb);
                 bbq::ParseArena na;
-                bbq::CaptureMetadata nv = c.read(bb, bad.size(), na);
-                bbq::CaptureMetadata nk = cek_meta_x(rt.cek_cg, c.rule, bb, bad.size());
+                bbq::zcow::parse_result nv = c.read(bb, bad.size(), na);
+                bbq::zcow::parse_result nk = cek_meta_x(rt.cek_cg, c.rule, bb, bad.size());
                 EXPECT_EQ(nv.success, nk.success)
                     << c.rule << ": corrupt writer output byte[" << pos << "]=0x"
                     << std::hex << (int)delta << " (cpp=" << nv.success << " cek=" << nk.success << ")";
@@ -628,54 +607,64 @@ TEST(CrossBackend, CppWriterToCReaderFullFixture) {
 
     for (auto& c : xcases()) {
         SCOPED_TRACE(c.rule);
-        ViewWriteFn wfn = wfn_for(c.rule);
-        ASSERT_NE(wfn, nullptr) << c.rule << ": no ZCow writer";
-
-        bbq::CaptureMetadata ck_auth = cek_meta_x(rt.cek_cg, c.rule, c.valid.data(), c.valid.size());
+        bbq::zcow::parse_result ck_auth =
+            cek_meta_x(rt.cek_cg, c.rule, c.valid.data(), c.valid.size());
         ASSERT_TRUE(ck_auth.success) << c.rule << ": CEK rejected authored bytes";
 
-        // Build the graph (ZCow reader), then re-emit it (ZCow writer, unmutated).
+        // Parse with the generated reader, then write the document back out. There is
+        // no generated writer any more: a parse IS a document, and serializing it is
+        // the document's own.
         bbq::ParseArena arena;
-        bbq::CaptureMetadata vm = c.read(c.valid.data(), c.valid.size(), arena);
+        bbq::zcow::parse_result vm = c.read(c.valid.data(), c.valid.size(), arena);
         ASSERT_TRUE(vm.success) << c.rule << ": ZCow reader rejected authored bytes";
-        std::vector<uint8_t> wb = wfn(vm.root, c.valid.data(), c.valid.size(), nullptr);
-        ASSERT_FALSE(wb.empty()) << c.rule << ": ZCow writer produced no bytes";
+        std::vector<uint8_t> wb = vm.doc.serialize();
+        ASSERT_FALSE(wb.empty()) << c.rule << ": serializing produced no bytes";
         auto* wbuf = new uint8_t[wb.size()]; std::copy(wb.begin(), wb.end(), wbuf);
 
-        // (0) GetPut — put(get(c), c) = c. With no edit the lens must return the input
-        // BYTE for byte, not merely something that decodes to the same values: the whole
-        // point of keeping the baseline (the Borrowed spans emit() blits) is that the
-        // information `get` discarded survives `put`. cmp_node below cannot see a lost
-        // constant/padding byte, so the law needs its own assertion.
-        EXPECT_EQ(wb, c.valid) << c.rule << ": GetPut violated — unedited re-emit is not byte-identical\n"
-                               << "  in : " << hexdump(c.valid) << "\n  out: " << hexdump(wb);
+        // (0) GetPut — put(get(c), c) = c. With no edit the document must give back the
+        // input BYTE for byte, not merely something that decodes to the same values:
+        // keeping the parsed spans is what makes the information `get` discarded — a
+        // constant, padding, a byte no field covers — survive `put`. cmp_node below
+        // cannot see a lost padding byte, so the law needs its own assertion.
+        //
+        // Against what the rule CONSUMED, which may be a prefix: a rule that stops on
+        // how much input is left (`Unt`) leaves a tail it never described, and a
+        // document cannot write back bytes it was never told about.
+        std::vector<uint8_t> consumed(c.valid.begin(),
+                                      c.valid.begin() + vm.bytes_consumed);
+        EXPECT_EQ(wb, consumed) << c.rule << ": GetPut violated — unedited re-emit is not byte-identical\n"
+                                << "  in : " << hexdump(consumed) << "\n  out: " << hexdump(wb);
 
-        // (0b) The DYNAMIC writer (WriterInterp) EXECUTES the same op-list these stencils
-        // were RENDERED from. Byte-equality on every fixture rule, so every construct's
-        // enforcement path — switch, choice, optional, resync, bitfield, intervals — is
-        // held to the generated writer, not just the rules the mutate table edits.
-        std::string ierr;
-        std::vector<uint8_t> ib = bbq::render::run_writer(rt.wops, c.rule, vm.root,
-                                                          c.valid.data(), c.valid.size(), nullptr, &ierr);
-        ASSERT_FALSE(ib.empty()) << c.rule << ": dynamic writer produced no bytes: " << ierr;
-        EXPECT_EQ(ib, wb) << c.rule << ": dynamic writer diverges from the generated stencils\n"
-                          << "  gen: " << hexdump(wb) << "\n  dyn: " << hexdump(ib);
+        // There used to be a second writer here — an interpreter over the same op-list
+        // the stencils were rendered from — and this asserted the two agreed byte for
+        // byte. There is one writer now: the document's own, whichever producer built
+        // it, so there is nothing left to diverge.
 
-        // (1) Fidelity: the ZCow writer's bytes decode (oracle) to the authored value tree.
-        bbq::CaptureMetadata ck_out = cek_meta_x(rt.cek_cg, c.rule, wbuf, wb.size());
-        ASSERT_TRUE(ck_out.success) << c.rule << ": CEK rejected ZCow-writer bytes";
-        cmp_node(std::string(c.rule) + " (zcow-writer fidelity)",
-                 ck_out.root, wbuf, ck_auth.root, c.valid.data());
+        // (1) Fidelity: the written bytes decode (oracle) to the authored value tree.
+        //
+        // Not for a rule whose TERMINATION reads how much input is left: the document
+        // covers what the rule consumed, so feeding that back gives the rule a shorter
+        // input and it legitimately stops earlier. `Unt` is
+        // `array<uint8>(none, until(@remaining < 2))` — three bytes in takes two
+        // elements, and re-parsing those two takes one. Demonstrated directly in
+        // cek_tests; the byte-identity check above still applies and still holds.
+        const bool termination_reads_remaining = std::strcmp(c.rule, "Unt") == 0;
+        bbq::zcow::parse_result ck_out = cek_meta_x(rt.cek_cg, c.rule, wbuf, wb.size());
+        ASSERT_TRUE(ck_out.success) << c.rule << ": CEK rejected the written bytes";
+        if (!termination_reads_remaining)
+            cmp_node(std::string(c.rule) + " (write fidelity)",
+                     ck_out.doc.root(), wbuf, ck_auth.doc.root(), c.valid.data());
 
         // (2) CppWriter → CReader: the C owning reader reads the ZCow-writer's bytes and
         // round-trips them; the result decodes to the authored value tree too.
         std::vector<uint8_t> cb = c_roundtrip(rt.bin, c.rule, wb);
         ASSERT_FALSE(cb.empty()) << c.rule << ": C reader rejected ZCow-writer bytes";
         auto* cbuf = new uint8_t[cb.size()]; std::copy(cb.begin(), cb.end(), cbuf);
-        bbq::CaptureMetadata ck_c = cek_meta_x(rt.cek_cg, c.rule, cbuf, cb.size());
+        bbq::zcow::parse_result ck_c = cek_meta_x(rt.cek_cg, c.rule, cbuf, cb.size());
         ASSERT_TRUE(ck_c.success) << c.rule << ": CEK rejected C-reader round-trip of ZCow-writer bytes";
-        cmp_node(std::string(c.rule) + " (cpp-writer -> c-reader)",
-                 ck_c.root, cbuf, ck_auth.root, c.valid.data());
+        if (!termination_reads_remaining)   // same reason as (1)
+            cmp_node(std::string(c.rule) + " (cpp-writer -> c-reader)",
+                     ck_c.doc.root(), cbuf, ck_auth.doc.root(), c.valid.data());
 
         // (3) Negative axis (plan completion bar): truncate every prefix + corrupt every byte
         // of the ZCow-WRITER's output; the C owning reader must accept iff the CEK does, never
@@ -703,132 +692,271 @@ TEST(CrossBackend, CppWriterToCReaderFullFixture) {
     }
 }
 
+// ── Derived fields are identifiable ─────────────────────────────────────────
+// A count or @rest size is the writer's to compute, not the caller's to set. Which nodes
+// those are is a property of the GRAMMAR, so only the enforcement walk can say — the
+// capture looks like any other integer. Everything above (a generated handle omitting the
+// setter, the Python face refusing the assignment) needs this answer, so it is pinned here
+// rather than assumed.
+TEST(CrossBackend, DerivedFieldsAreIdentifiable) {
+    const CRoundtrip& rt = shared_rt();
+    ASSERT_TRUE(rt.ok) << rt.err;
+
+    // Derivedness is recorded on the node that determines the field, at the moment the
+    // parser knew — so answering this is reading the document, not re-walking the
+    // grammar. The path reported is the one the annotation names, qualified by where
+    // the container sits.
+    // `scope` is where this node's OWN annotation resolves — its enclosing container —
+    // while `path` is where the node itself is. An array's count is named in the scope
+    // holding the array, so `gs`'s count is `m` at the top while the count of the `xs`
+    // inside `gs[0]` is `gs[0].n`.
+    std::function<void(const bbq::zcow::node*, const std::string&, const std::string&,
+                       std::set<std::string>&)> walk =
+        [&](const bbq::zcow::node* n, const std::string& scope, const std::string& path,
+            std::set<std::string>& out) {
+            if (!n) return;
+            if (n->derives != bbq::zcow::node::Derives::Nothing && n->determines)
+                out.insert(scope.empty() ? n->determines : scope + "." + n->determines);
+            for (size_t i = 0; i < n->kids.size(); i++) {
+                const bbq::zcow::node* k = n->kids[i].get();
+                std::string kpath = (k->name && *k->name)
+                    ? (path.empty() ? std::string(k->name) : path + "." + k->name)
+                    : path + "[" + std::to_string(i) + "]";
+                walk(k, path, kpath, out);
+            }
+        };
+
+    auto derived_paths = [&](const char* rule, const std::vector<uint8_t>& v, ViewReadFn rd) {
+        static std::deque<bbq::ParseArena> arenas;   // the document outlives the call
+        static std::deque<bbq::zcow::parse_result> kept;
+        arenas.emplace_back();
+        kept.push_back(rd(v.data(), v.size(), arenas.back()));
+        EXPECT_TRUE(kept.back().success) << rule;
+        std::set<std::string> paths;
+        walk(kept.back().doc.root(), "", "", paths);
+        return paths;
+    };
+
+    // `Arr = struct { n: uint8, xs: array<uint16le>[n] }` — n is the count.
+    EXPECT_EQ(derived_paths("Arr", {0x03,0x10,0x00,0x20,0x00,0x30,0x00}, zr::Arr_read),
+              (std::set<std::string>{"n"}));
+
+    // `Np = struct { h: struct { n: uint8 }, xs: array<uint8>[h.n] }` — a count reached
+    // through a path still resolves to the node that holds it.
+    EXPECT_EQ(derived_paths("Np", {0x03,0xAA,0xBB,0xCC}, zr::Np_read),
+              (std::set<std::string>{"h.n"}));
+
+    // `RestEof = struct { sz: uleb128 @rest, xs: array<uint8>(none, eof) }` — a window size.
+    EXPECT_EQ(derived_paths("RestEof", {0x03,10,20,30}, zr::RestEof_read),
+              (std::set<std::string>{"sz"}));
+
+    // `NestArr = struct { m: uint8, gs: array<NestGrp>[m] }`, NestGrp carrying its own
+    // count: the walk descends into element bodies, so every per-element count is named.
+    EXPECT_EQ(derived_paths("NestArr", {0x02, 0x01,0x11, 0x02,0x22,0x33}, zr::NestArr_read),
+              (std::set<std::string>{"m", "gs[0].n", "gs[1].n"}));
+
+    // A rule with no derived field must report none — the answer is not "everything
+    // integral looks like a count".
+    EXPECT_TRUE(derived_paths("Flat", {0x12,0x56,0x34,0x00,0x01,0x00,0x00,0x01,0x02,
+                                       0xFC,0xFF,0xFF,0xFF}, zr::Flat_read).empty());
+    EXPECT_TRUE(derived_paths("Pair", {0x07,0x08}, zr::Pair_read).empty());
+}
+
+// ── Both C++ producers build the same document ──────────────────────────────
+// This suite's job is only that the producers AGREE. What each of them does on its
+// own — round trips, the laws, dependent fields, bitfields — is its own suite's
+// (`cek_tests`, `cpp_tests`), because a layer that can only be checked against
+// another layer has no evidence of its own.
+TEST(CrossBackend, BothProducersBuildTheSameDocument) {
+    const CRoundtrip& rt = shared_rt();
+    ASSERT_TRUE(rt.ok) << rt.err;
+
+    for (auto& c : xcases()) {
+        SCOPED_TRACE(c.rule);
+        bbq::ParseArena ar;
+        bbq::zcow::parse_result vm = c.read(c.valid.data(), c.valid.size(), ar);
+        ASSERT_TRUE(vm.success) << c.rule << ": view reader rejected authored bytes";
+        bbq::zcow::parse_result ck = cek_meta_x(rt.cek_cg, c.rule, c.valid.data(), c.valid.size());
+        ASSERT_TRUE(ck.success) << c.rule << ": CEK rejected authored bytes";
+
+        // Every node of every rule: type, variant tag, child count, and the decoded
+        // value or span. Not a hand-picked scalar.
+        cmp_node(std::string(c.rule) + " (view vs cek)",
+                 vm.doc.root(), c.valid.data(), ck.doc.root(), c.valid.data());
+    }
+}
+
+// The grammar knowledge only a PARSER can record — which field holds an array's
+// count, which measures an @rest window, where a bitfield entry sits — has to be
+// recorded the same by both, or a document from one is editable and one from the
+// other silently is not. This is the tag-level counterpart of the comparison above,
+// which sees structure and values but not annotations.
+TEST(CrossBackend, BothProducersRecordTheSameGrammarKnowledge) {
+    const CRoundtrip& rt = shared_rt();
+    ASSERT_TRUE(rt.ok) << rt.err;
+
+    std::function<void(const std::string&, const bbq::zcow::node*, const bbq::zcow::node*)> same_tags =
+        [&](const std::string& at, const bbq::zcow::node* a, const bbq::zcow::node* b) {
+            ASSERT_NE(a, nullptr) << at; ASSERT_NE(b, nullptr) << at;
+            EXPECT_EQ((int)a->derives, (int)b->derives) << at << " derives";
+            EXPECT_EQ(std::string(a->determines ? a->determines : ""),
+                      std::string(b->determines ? b->determines : "")) << at << " determines";
+            EXPECT_EQ(a->bits_container, b->bits_container) << at << " bits run";
+            if (a->bits_container && b->bits_container)
+                EXPECT_EQ(a->bits_msb_first, b->bits_msb_first) << at << " bits order";
+            EXPECT_EQ(a->bits.is_entry, b->bits.is_entry) << at << " bits entry";
+            if (a->bits.is_entry && b->bits.is_entry) {
+                EXPECT_EQ((int)a->bits.start, (int)b->bits.start) << at << " bit start";
+                EXPECT_EQ((int)a->bits.end, (int)b->bits.end) << at << " bit end";
+                EXPECT_EQ(a->bits.is_signed, b->bits.is_signed) << at << " bit signedness";
+            }
+            ASSERT_EQ(a->kids.size(), b->kids.size()) << at;
+            for (size_t i = 0; i < a->kids.size(); i++) {
+                const char* nm = a->kids[i]->name;
+                same_tags((nm && *nm) ? at + "." + nm : at + "[" + std::to_string(i) + "]",
+                          a->kids[i].get(), b->kids[i].get());
+            }
+        };
+
+    for (auto& c : xcases()) {
+        SCOPED_TRACE(c.rule);
+        bbq::ParseArena ar;
+        bbq::zcow::parse_result vm = c.read(c.valid.data(), c.valid.size(), ar);
+        ASSERT_TRUE(vm.success) << c.rule;
+        bbq::zcow::parse_result ck = cek_meta_x(rt.cek_cg, c.rule, c.valid.data(), c.valid.size());
+        ASSERT_TRUE(ck.success) << c.rule;
+        same_tags(c.rule, vm.doc.root(), ck.doc.root());
+    }
+}
+
 // ── The MUTATE axis — the whole point of ZCow. Parse → graph → CoW-edit via the zcow
 // overlay → ZCow writer re-emits → the bytes decode (CEK oracle) to the EDITED value tree,
 // derived fields (counts) consistent. Value edit, array remove, array append.
 TEST(CrossBackend, CppWriterMutateRoundTrip) {
     const CRoundtrip& rt = shared_rt();
     ASSERT_TRUE(rt.ok) << rt.err;
-    auto reemit = [&](const char* rule, ViewReadFn rd, ViewWriteFn wr, const std::vector<uint8_t>& v,
-                      std::function<void(const bbq::FieldCapture*, bbq::zcow&)> mut,
-                      std::function<void(const bbq::CaptureMetadata&, const uint8_t*)> check) {
-        bbq::ParseArena ar; bbq::CaptureMetadata vm = rd(v.data(), v.size(), ar);
+    // Parse with the GENERATED reader, edit the document it built, write it back, and
+    // let the CEK judge the result. There is no writer to compare against any more —
+    // a parse is a document and serializing is the document's own — so what this
+    // proves is that the generated reader's document carries the dependent-field
+    // linkage, and that an edit through it produces bytes the grammar accepts.
+    auto reemit = [&](const char* rule, ViewReadFn rd, const std::vector<uint8_t>& v,
+                      std::function<void(bbq::zcow::transient&)> mut,
+                      std::function<void(const bbq::zcow::parse_result&, const uint8_t*)> check) {
+        bbq::ParseArena ar;
+        bbq::zcow::parse_result vm = rd(v.data(), v.size(), ar);
         ASSERT_TRUE(vm.success) << rule << ": reader rejected authored";
-        bbq::zcow zc; mut(vm.root, zc);
-        std::vector<uint8_t> wb = wr(vm.root, v.data(), v.size(), &zc);
-        ASSERT_FALSE(wb.empty()) << rule << ": writer produced no bytes";
 
-        // The dynamic writer, given the SAME edit from an independent parse + overlay (the
-        // first writer already wrote its recomputed counts into `zc`, so reusing it would
-        // hand the interpreter an answer instead of asking for one).
-        bbq::ParseArena ar2; bbq::CaptureMetadata vm2 = rd(v.data(), v.size(), ar2);
-        ASSERT_TRUE(vm2.success) << rule << ": reader rejected authored (dynamic pass)";
-        bbq::zcow zc2; mut(vm2.root, zc2);
-        std::string ierr;
-        std::vector<uint8_t> ib = bbq::render::run_writer(rt.wops, rule, vm2.root,
-                                                          v.data(), v.size(), &zc2, &ierr);
-        ASSERT_FALSE(ib.empty()) << rule << ": dynamic writer produced no bytes: " << ierr;
-        EXPECT_EQ(ib, wb) << rule << ": dynamic writer diverges from the generated stencils\n"
-                          << "  gen: " << hexdump(wb) << "\n  dyn: " << hexdump(ib);
+        bbq::zcow::transient t = vm.doc.begin_edit();
+        mut(t);
+        std::vector<uint8_t> wb = std::move(t).commit().serialize();
+        ASSERT_FALSE(wb.empty()) << rule << ": serializing produced no bytes";
 
         auto* b = new uint8_t[wb.size()]; std::copy(wb.begin(), wb.end(), b);
-        bbq::CaptureMetadata ck = cek_meta_x(rt.cek_cg, rule, b, wb.size());
-        ASSERT_TRUE(ck.success) << rule << ": CEK rejected the re-emitted (edited) bytes";
+        bbq::zcow::parse_result ck = cek_meta_x(rt.cek_cg, rule, b, wb.size());
+        ASSERT_TRUE(ck.success) << rule << ": CEK rejected the re-emitted (edited) bytes\n"
+                                << "  bytes: " << hexdump(wb);
         check(ck, b);
+    };
+
+    // Reaching a node to write, by name then index.
+    auto path_to = [](bbq::zcow::transient& t, std::initializer_list<const char*> names,
+                      std::initializer_list<size_t> idx) {
+        std::vector<const char*> ns(names);
+        std::vector<size_t> is(idx);
+        return t.own_path(ns.data(), is.data(), ns.size());
     };
 
     // (1) same-width scalar value edit: Flat.u8 → 0x99.
     { SCOPED_TRACE("Flat.u8 = 0x99");
-      reemit("Flat", zr::Flat_read, zr::Flat_write,
+      reemit("Flat", zr::Flat_read,
              {0x12,0x56,0x34,0x00,0x01,0x00,0x00,0x01,0x02,0xFC,0xFF,0xFF,0xFF},
-             [](const bbq::FieldCapture* r, bbq::zcow& zc){ zc.set_int(bbq::node_child(r,"u8"), 0x99); },
-             [](const bbq::CaptureMetadata& ck, const uint8_t* b){
-                 EXPECT_EQ(bbq::node_int(bbq::node_child(ck.root,"u8"), b), 0x99);
-                 EXPECT_EQ(bbq::node_int(bbq::node_child(ck.root,"u16"), b), 0x3456); }); }
+             [&](bbq::zcow::transient& t){
+                 bbq::zcow::set_int(path_to(t, {"u8"}, {0}), 0x99); },
+             [](const bbq::zcow::parse_result& ck, const uint8_t* b){
+                 EXPECT_EQ(bbq::node_int(bbq::node_child(ck.doc.root(),"u8"), b), 0x99);
+                 EXPECT_EQ(bbq::node_int(bbq::node_child(ck.doc.root(),"u16"), b), 0x3456); }); }
 
     // (2) array element value edit: Arr.xs[1] → 0x0099 (structure unchanged).
     { SCOPED_TRACE("Arr.xs[1] = 0x99");
-      reemit("Arr", zr::Arr_read, zr::Arr_write, {0x03,0x10,0x00,0x20,0x00,0x30,0x00},
-             [](const bbq::FieldCapture* r, bbq::zcow& zc){
-                 const bbq::FieldCapture* xs = bbq::node_child(r,"xs"); zc.set_int(&xs->children[1], 0x0099); },
-             [](const bbq::CaptureMetadata& ck, const uint8_t* b){
-                 const bbq::FieldCapture* xs = bbq::node_child(ck.root,"xs");
-                 ASSERT_EQ(xs->child_count, 3); EXPECT_EQ(bbq::node_int(&xs->children[1], b), 0x0099); }); }
+      reemit("Arr", zr::Arr_read, {0x03,0x10,0x00,0x20,0x00,0x30,0x00},
+             [&](bbq::zcow::transient& t){
+                 bbq::zcow::set_int(path_to(t, {"xs", nullptr}, {0, 1}), 0x0099); },
+             [](const bbq::zcow::parse_result& ck, const uint8_t* b){
+                 const bbq::zcow::node* xs = bbq::node_child(ck.doc.root(),"xs");
+                 ASSERT_EQ(xs->kids.size(), 3u);
+                 EXPECT_EQ(bbq::node_int(xs->kids[1].get(), b), 0x0099); }); }
 
     // (3) array REMOVE: Arr.xs remove[0] → n=2, xs=[0x20,0x30] (count must update).
     { SCOPED_TRACE("Arr.xs remove[0]");
-      reemit("Arr", zr::Arr_read, zr::Arr_write, {0x03,0x10,0x00,0x20,0x00,0x30,0x00},
-             [](const bbq::FieldCapture* r, bbq::zcow& zc){ zc.remove_index(bbq::node_child(r,"xs"), 0); },
-             [](const bbq::CaptureMetadata& ck, const uint8_t* b){
-                 EXPECT_EQ(bbq::node_int(bbq::node_child(ck.root,"n"), b), 2);
-                 const bbq::FieldCapture* xs = bbq::node_child(ck.root,"xs");
-                 ASSERT_EQ(xs->child_count, 2);
-                 EXPECT_EQ(bbq::node_int(&xs->children[0], b), 0x0020);
-                 EXPECT_EQ(bbq::node_int(&xs->children[1], b), 0x0030); }); }
+      reemit("Arr", zr::Arr_read, {0x03,0x10,0x00,0x20,0x00,0x30,0x00},
+             [&](bbq::zcow::transient& t){ t.remove(path_to(t, {"xs"}, {0}), 0); },
+             [](const bbq::zcow::parse_result& ck, const uint8_t* b){
+                 EXPECT_EQ(bbq::node_int(bbq::node_child(ck.doc.root(),"n"), b), 2);
+                 const bbq::zcow::node* xs = bbq::node_child(ck.doc.root(),"xs");
+                 ASSERT_EQ(xs->kids.size(), 2u);
+                 EXPECT_EQ(bbq::node_int(xs->kids[0].get(), b), 0x0020);
+                 EXPECT_EQ(bbq::node_int(xs->kids[1].get(), b), 0x0030); }); }
 
     // (4) array APPEND: Arr.xs += 0x0040 → n=4 (count + the new element).
     { SCOPED_TRACE("Arr.xs append 0x40");
-      reemit("Arr", zr::Arr_read, zr::Arr_write, {0x03,0x10,0x00,0x20,0x00,0x30,0x00},
-             [](const bbq::FieldCapture* r, bbq::zcow& zc){
-                 auto e = std::make_unique<bbq::znode>();
-                 e->kind = bbq::znode::Kind::Scalar; e->type = bbq::CaptureType::UInt16LE; e->ival = 0x0040;
-                 zc.append(bbq::node_child(r,"xs"), std::move(e)); },
-             [](const bbq::CaptureMetadata& ck, const uint8_t* b){
-                 EXPECT_EQ(bbq::node_int(bbq::node_child(ck.root,"n"), b), 4);
-                 const bbq::FieldCapture* xs = bbq::node_child(ck.root,"xs");
-                 ASSERT_EQ(xs->child_count, 4);
-                 EXPECT_EQ(bbq::node_int(&xs->children[3], b), 0x0040); }); }
+      reemit("Arr", zr::Arr_read, {0x03,0x10,0x00,0x20,0x00,0x30,0x00},
+             [&](bbq::zcow::transient& t){
+                 bbq::zcow::set_int(t.append(path_to(t, {"xs"}, {0}),
+                                             bbq::CaptureType::UInt16LE), 0x0040); },
+             [](const bbq::zcow::parse_result& ck, const uint8_t* b){
+                 EXPECT_EQ(bbq::node_int(bbq::node_child(ck.doc.root(),"n"), b), 4);
+                 const bbq::zcow::node* xs = bbq::node_child(ck.doc.root(),"xs");
+                 ASSERT_EQ(xs->kids.size(), 4u);
+                 EXPECT_EQ(bbq::node_int(xs->kids[3].get(), b), 0x0040); }); }
 
     // (5) PATH count `[h.n]`: Np.xs append 0xDD → h.n recomputed to 4 (the count field lives
     // in a sub-struct; mark_count records it in `h`'s scope, the array sets it). Dual of the
     // C writer's PathCountRecomputedOnModify.
     { SCOPED_TRACE("Np.xs append 0xDD (path count h.n)");
-      reemit("Np", zr::Np_read, zr::Np_write, {0x03,0xAA,0xBB,0xCC},
-             [](const bbq::FieldCapture* r, bbq::zcow& zc){
-                 auto e = std::make_unique<bbq::znode>();
-                 e->kind = bbq::znode::Kind::Scalar; e->type = bbq::CaptureType::UInt8; e->ival = 0xDD;
-                 zc.append(bbq::node_child(r,"xs"), std::move(e)); },
-             [](const bbq::CaptureMetadata& ck, const uint8_t* b){
-                 EXPECT_EQ(bbq::node_int(bbq::node_child(bbq::node_child(ck.root,"h"),"n"), b), 4);
-                 const bbq::FieldCapture* xs = bbq::node_child(ck.root,"xs");
-                 ASSERT_EQ(xs->child_count, 4);
-                 EXPECT_EQ(bbq::node_int(&xs->children[3], b), 0xDD); }); }
+      reemit("Np", zr::Np_read, {0x03,0xAA,0xBB,0xCC},
+             [&](bbq::zcow::transient& t){
+                 bbq::zcow::set_int(t.append(path_to(t, {"xs"}, {0}),
+                                             bbq::CaptureType::UInt8), 0xDD); },
+             [](const bbq::zcow::parse_result& ck, const uint8_t* b){
+                 EXPECT_EQ(bbq::node_int(
+                     bbq::node_child(bbq::node_child(ck.doc.root(),"h"),"n"), b), 4);
+                 const bbq::zcow::node* xs = bbq::node_child(ck.doc.root(),"xs");
+                 ASSERT_EQ(xs->kids.size(), 4u);
+                 EXPECT_EQ(bbq::node_int(xs->kids[3].get(), b), 0xDD); }); }
 
     // (6) @rest recompute: RestEof.xs += 40 → sz must become 4 (the window's new byte length),
     // NOT the stored 3. The window holds an eof array, so the edit changes its length; the
     // writer recomputes the @rest size from the edited content. Dual of RestSizeRecomputedOnModify.
     { SCOPED_TRACE("RestEof.xs append 40 (@rest size)");
-      reemit("RestEof", zr::RestEof_read, zr::RestEof_write, {0x03,10,20,30},
-             [](const bbq::FieldCapture* r, bbq::zcow& zc){
-                 auto e = std::make_unique<bbq::znode>();
-                 e->kind = bbq::znode::Kind::Scalar; e->type = bbq::CaptureType::UInt8; e->ival = 40;
-                 zc.append(bbq::node_child(r,"xs"), std::move(e)); },
-             [](const bbq::CaptureMetadata& ck, const uint8_t* b){
-                 EXPECT_EQ(bbq::node_int(bbq::node_child(ck.root,"sz"), b), 4);
-                 const bbq::FieldCapture* xs = bbq::node_child(ck.root,"xs");
-                 ASSERT_EQ(xs->child_count, 4);
-                 EXPECT_EQ(bbq::node_int(&xs->children[3], b), 40); }); }
+      reemit("RestEof", zr::RestEof_read, {0x03,10,20,30},
+             [&](bbq::zcow::transient& t){
+                 bbq::zcow::set_int(t.append(path_to(t, {"xs"}, {0}),
+                                             bbq::CaptureType::UInt8), 40); },
+             [](const bbq::zcow::parse_result& ck, const uint8_t* b){
+                 EXPECT_EQ(bbq::node_int(bbq::node_child(ck.doc.root(),"sz"), b), 4);
+                 const bbq::zcow::node* xs = bbq::node_child(ck.doc.root(),"xs");
+                 ASSERT_EQ(xs->kids.size(), 4u);
+                 EXPECT_EQ(bbq::node_int(xs->kids[3].get(), b), 40); }); }
 
     // (7) NESTED per-element count: NestArr.gs[0].xs += 0x99 → gs[0].n recomputed to 2 (the
     // inner array's count, NOT the outer gs count which stays 2). Proves the walk DESCENDS into
     // element bodies — emit() alone can't fix an inner count it's blind to.
     { SCOPED_TRACE("NestArr.gs[0].xs append 0x99 (nested count)");
-      reemit("NestArr", zr::NestArr_read, zr::NestArr_write, {0x02, 0x01,0x11, 0x02,0x22,0x33},
-             [](const bbq::FieldCapture* r, bbq::zcow& zc){
-                 const bbq::FieldCapture* gs = bbq::node_child(r,"gs");
-                 const bbq::FieldCapture* xs0 = bbq::node_child(&gs->children[0],"xs");
-                 auto e = std::make_unique<bbq::znode>();
-                 e->kind = bbq::znode::Kind::Scalar; e->type = bbq::CaptureType::UInt8; e->ival = 0x99;
-                 zc.append(xs0, std::move(e)); },
-             [](const bbq::CaptureMetadata& ck, const uint8_t* b){
-                 EXPECT_EQ(bbq::node_int(bbq::node_child(ck.root,"m"), b), 2);   // outer count unchanged
-                 const bbq::FieldCapture* gs = bbq::node_child(ck.root,"gs");
-                 ASSERT_EQ(gs->child_count, 2);
-                 EXPECT_EQ(bbq::node_int(bbq::node_child(&gs->children[0],"n"), b), 2);   // inner count fixed
-                 const bbq::FieldCapture* xs0 = bbq::node_child(&gs->children[0],"xs");
-                 ASSERT_EQ(xs0->child_count, 2);
-                 EXPECT_EQ(bbq::node_int(&xs0->children[1], b), 0x99);
-                 EXPECT_EQ(bbq::node_int(bbq::node_child(&gs->children[1],"n"), b), 2); }); }   // sibling intact
+      reemit("NestArr", zr::NestArr_read, {0x02, 0x01,0x11, 0x02,0x22,0x33},
+             [&](bbq::zcow::transient& t){
+                 bbq::zcow::set_int(
+                     t.append(path_to(t, {"gs", nullptr, "xs"}, {0, 0, 0}),
+                              bbq::CaptureType::UInt8), 0x99); },
+             [](const bbq::zcow::parse_result& ck, const uint8_t* b){
+                 EXPECT_EQ(bbq::node_int(bbq::node_child(ck.doc.root(),"m"), b), 2);  // outer unchanged
+                 const bbq::zcow::node* gs = bbq::node_child(ck.doc.root(),"gs");
+                 ASSERT_EQ(gs->kids.size(), 2u);
+                 EXPECT_EQ(bbq::node_int(bbq::node_child(gs->kids[0].get(),"n"), b), 2);  // inner fixed
+                 const bbq::zcow::node* xs0 = bbq::node_child(gs->kids[0].get(),"xs");
+                 ASSERT_EQ(xs0->kids.size(), 2u);
+                 EXPECT_EQ(bbq::node_int(xs0->kids[1].get(), b), 0x99);
+                 EXPECT_EQ(bbq::node_int(bbq::node_child(gs->kids[1].get(),"n"), b), 2); }); }  // sibling intact
 }
 
 // Meta-check: every rule in the fixture (i.e. every grammar feature it exercises) must
@@ -867,9 +995,9 @@ TEST(CrossBackend, ViewCReaderMatchesCek) {
 
     for (auto& c : xcases()) {
         SCOPED_TRACE(c.rule);
-        bbq::CaptureMetadata ck = cek_meta_x(rt.cek_cg, c.rule, c.valid.data(), c.valid.size());
+        bbq::zcow::parse_result ck= cek_meta_x(rt.cek_cg, c.rule, c.valid.data(), c.valid.size());
         ASSERT_TRUE(ck.success) << c.rule << ": CEK rejected authored bytes";
-        std::string cek_d = dump_cek(ck.root, c.valid.data());
+        std::string cek_d = dump_cek(ck.doc.root(), c.valid.data());
 
         std::vector<uint8_t> out = c_roundtrip(cl.bin, c.rule, c.valid);   // normal mode → index dump
         std::string cl_d(out.begin(), out.end());

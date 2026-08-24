@@ -617,15 +617,17 @@ struct EndianSwitch : public TypeExpr {
 struct BitfieldEntry : public ASTNode {
     BitfieldEntry(
         std::string name,
+        Signedness sign,
         int64_t width,
         std::optional<Expr*> constraint
     )
-        : name(name), width(width), constraint(std::move(constraint)) {}
+        : name(name), sign(sign), width(width), constraint(std::move(constraint)) {}
 
     void accept(ASTVisitor& visitor) override { visitor.visit(this); }
     NodeKind node_kind() const override { return NodeKind::BitfieldEntry; }
 
     std::string name;
+    Signedness sign;
     int64_t width;
     std::optional<Expr*> constraint;
 };

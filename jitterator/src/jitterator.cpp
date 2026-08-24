@@ -93,12 +93,12 @@ struct ElfInfo {
 static ElfInfo parse_elf(const uint8_t* data, size_t size) {
     ElfInfo info;
     bbq::ParseArena arena;      // owns the capture index; outlives the handles below
-    bbq::CaptureMetadata r = elf::Elf64_read(data, size, arena);
+    bbq::zcow::parse_result r = elf::Elf64_read(data, size, arena);
     if (!r.success) {
         info.error = "ELF64 parse failed";
         return info;
     }
-    elf::Elf64 e(r.root, data, nullptr);   // zero-copy view over `data` (index in `arena`)
+    elf::Elf64 e = elf::Elf64_of(r.doc);   // zero-copy; the arena above holds the index
     auto ehdr = e.ehdr();
     auto shdrs = e.shdrs();
 
@@ -145,9 +145,9 @@ static ElfInfo parse_elf(const uint8_t* data, size_t size) {
             if (sym_off + entsize > size) continue;
 
             bbq::ParseArena sym_arena;
-            bbq::CaptureMetadata sr = elf::Elf64_Sym_read(data + sym_off, size - sym_off, sym_arena);
+            bbq::zcow::parse_result sr = elf::Elf64_Sym_read(data + sym_off, size - sym_off, sym_arena);
             if (!sr.success) continue;
-            elf::Elf64_Sym sym(sr.root, data + sym_off, nullptr);
+            elf::Elf64_Sym sym = elf::Elf64_Sym_of(sr.doc);
 
             // Global function symbols in .text
             if (sym.st_bind() < STB_GLOBAL) continue;
@@ -187,9 +187,9 @@ static ElfInfo parse_elf(const uint8_t* data, size_t size) {
             if (rela_off + entsize > size) continue;
 
             bbq::ParseArena rela_arena;
-            bbq::CaptureMetadata rr = elf::Elf64_Rela_read(data + rela_off, size - rela_off, rela_arena);
+            bbq::zcow::parse_result rr = elf::Elf64_Rela_read(data + rela_off, size - rela_off, rela_arena);
             if (!rr.success) continue;
-            elf::Elf64_Rela rela(rr.root, data + rela_off, nullptr);
+            elf::Elf64_Rela rela = elf::Elf64_Rela_of(rr.doc);
 
             // Resolve symbol name
             uint32_t sym_idx = rela.r_sym();
@@ -201,9 +201,9 @@ static ElfInfo parse_elf(const uint8_t* data, size_t size) {
             if (sym_off + st_entsize > size) continue;
 
             bbq::ParseArena sym_arena;
-            bbq::CaptureMetadata sr = elf::Elf64_Sym_read(data + sym_off, size - sym_off, sym_arena);
+            bbq::zcow::parse_result sr = elf::Elf64_Sym_read(data + sym_off, size - sym_off, sym_arena);
             if (!sr.success) continue;
-            elf::Elf64_Sym sym(sr.root, data + sym_off, nullptr);
+            elf::Elf64_Sym sym = elf::Elf64_Sym_of(sr.doc);
 
             const char* name = elf_string(data, size, e, symtab.sh_link(), sym.st_name());
 

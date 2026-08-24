@@ -88,7 +88,6 @@ target_link_libraries(bbq_shapegen PUBLIC bbq_frontend bbq_ctypes)
 add_library(bbq_render STATIC
     backends/render/RenderEmit.cpp
     backends/render/CompilerCtx.cpp
-    backends/render/WriterInterp.cpp
     ${CMAKE_CURRENT_BINARY_DIR}/BbqMatcher.h
 )
 target_include_directories(bbq_render PUBLIC
@@ -134,8 +133,7 @@ add_custom_command(
 # parser (the index-builder), both compiled into the test so the parser's index is
 # parity-checked against the CEK. Grows with the view profile.
 set(ZCOW_READER_HDRS ${CMAKE_CURRENT_BINARY_DIR}/ZcowReaderTypes.h
-                     ${CMAKE_CURRENT_BINARY_DIR}/ZcowReaderReader.h
-                     ${CMAKE_CURRENT_BINARY_DIR}/ZcowReaderWriter.h)
+                     ${CMAKE_CURRENT_BINARY_DIR}/ZcowReaderReader.h)
 add_custom_command(
     OUTPUT ${ZCOW_READER_HDRS}
     COMMAND bbqc -backend cpp
@@ -147,8 +145,7 @@ add_custom_command(
             ${CMAKE_CURRENT_SOURCE_DIR}/test/fixtures/zcow_reader.bbq
             ${CMAKE_CURRENT_SOURCE_DIR}/backends/render/templates/types_cpp.inja
             ${CMAKE_CURRENT_SOURCE_DIR}/backends/render/templates/reader_view_cpp.inja
-            ${CMAKE_CURRENT_SOURCE_DIR}/backends/render/templates/writer_view_cpp.inja
-    COMMENT "bbqc: zcow_reader.bbq -> ZcowReader{Types,Reader,Writer}.h (C++ view parser + writer)"
+    COMMENT "bbqc: zcow_reader.bbq -> ZcowReader{Types,Reader}.h (C++ view parser)"
     VERBATIM
 )
 
@@ -174,6 +171,27 @@ target_include_directories(bbq_tests PRIVATE ${CMAKE_CURRENT_BINARY_DIR})  # gen
 target_compile_definitions(bbq_tests PRIVATE
     SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
 add_test(NAME bbq_tests COMMAND bbq_tests)
+
+# ZCow — the parsed document. The foundation layer, so it builds and tests on its
+# own: no grammar, no parser, no generated code, nothing above it.
+add_executable(zcow_tests test/bbq_document_test.cpp)
+target_link_libraries(zcow_tests PRIVATE bbq_index_runtime GTest::GTest GTest::Main)
+add_test(NAME zcow_tests COMMAND zcow_tests)
+
+# The generated C++ backend — the same laws and the same fixture matrix as cek_tests,
+# over documents its own reader built. Index parity with the CEK is not evidence that
+# what this backend produces writes back correctly; that needs its own suite.
+add_executable(cpp_tests test/cpp_backend_test.cpp ${ZCOW_READER_HDRS})
+target_link_libraries(cpp_tests PRIVATE bbq_index_runtime GTest::GTest GTest::Main)
+target_include_directories(cpp_tests PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
+add_test(NAME cpp_tests COMMAND cpp_tests)
+
+# The CEK machine — the reference the generators are generating against. Its own
+# target, so it can be verified without the backends that consume it.
+add_executable(cek_tests test/cek_test.cpp)
+target_link_libraries(cek_tests PRIVATE bbq_cek_backend bbq_ctypes GTest::GTest GTest::Main)
+target_compile_definitions(cek_tests PRIVATE SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+add_test(NAME cek_tests COMMAND cek_tests)
 
 add_executable(lib_tests lib/tests/test_worklist.cpp)
 target_include_directories(lib_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/lib)
@@ -202,7 +220,7 @@ if(Python3_FOUND)
         POSITION_INDEPENDENT_CODE ON)
 
     add_library(bbq_python MODULE bindings/python/bbq_python.cpp bindings/python/bbq_build.cpp)
-    target_link_libraries(bbq_python PRIVATE bbq_frontend bbq_cek_backend bbq_render Python3::Python)
+    target_link_libraries(bbq_python PRIVATE bbq_frontend bbq_cek_backend Python3::Python)
     set_target_properties(bbq_python PROPERTIES
         PREFIX ""
         OUTPUT_NAME "bbq"

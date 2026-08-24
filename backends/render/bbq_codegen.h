@@ -240,7 +240,9 @@ inline std::string prim_ctype(const PrimitiveInfo& p) {
 // shift/masking each member out (MSB-first for a big-endian container). Marks the
 // trailing ExtractBits + AdvancePos absorbed. Returns the members, the container
 // prim descriptor, and the next stencil id (past the AdvancePos).
-struct BitfieldInfo { json members; json prim; int next; };
+// `msb_first` is Ftypes' `swap?` already resolved against the default endianness —
+// the run's own property, not something each access is told.
+struct BitfieldInfo { json members; json prim; int next; bool msb_first = false; };
 
 inline BitfieldInfo collapse_bitfield(Emit& e, const KontNode* first) {
     const PrimitiveInfo& cont = static_cast<const ExtractBitsNode*>(first)->container;
@@ -259,7 +261,12 @@ inline BitfieldInfo collapse_bitfield(Emit& e, const KontNode* first) {
         const KontNode* after = (c->kind() == KontKind::CaptureKont) ? c->succ(0)->succ(0) : c->succ(0);
         int shift = be ? (cbits - eb->offset_before - eb->width_bits) : eb->offset_before;
         int64_t mask = (int64_t)((1ull << eb->width_bits) - 1);
-        members.push_back({{"target", name}, {"shift", shift}, {"mask", mask}});  // leaf; fold prepends
+        // shift/mask are what the read needs; start/end/signed are what the DOCUMENT
+        // needs, so an entry can be written back without re-deriving the grammar
+        // (Ftypes §3.4: an entry records its signedness and its start and end bit).
+        members.push_back({{"target", name}, {"shift", shift}, {"mask", mask},
+                           {"start", shift}, {"end", shift + eb->width_bits},
+                           {"signed", eb->is_signed}});  // leaf; fold prepends
         if (m != first) e.absorbed.insert(m);
         // An entry's `where` sits between its extract and the next one. The run is one
         // container read, so the check belongs INSIDE it, against the entry just
@@ -278,7 +285,7 @@ inline BitfieldInfo collapse_bitfield(Emit& e, const KontNode* first) {
         m = after;
     }
     if (m && m->kind() == KontKind::AdvancePosNode) { e.absorbed.insert(m); m = m->succ(0); }
-    return { members, prim_json(cont, e.default_le), e.next_id(m) };
+    return { members, prim_json(cont, e.default_le), e.next_id(m), be };
 }
 
 // ── cg_jump ─────────────────────────────────────────────────────────

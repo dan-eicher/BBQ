@@ -223,7 +223,15 @@ static bool {{ fn.kpfx }}_k{{ o.id }}(bbq_ctx_t* ctx, {{ fn.type }}* out, size_t
         {{ ctype(o.prim) }} _bf;
         if (!{{ read_fn(o.prim) }}(ctx, &_bf)) return bbq_fail(ctx, "{{ o.msg }}");
 {% for m in o.members %}
+{# Sign-extended from the entry's own width when the grammar declared it signed. #}
+{% if m.signed %}
+        { int64_t _v = (int64_t)((_bf >> {{ m.shift }}) & {{ m.mask }});
+          if ({{ m.end }} - {{ m.start }} < 64 && (_v & ((int64_t)1 << ({{ m.end }} - {{ m.start }} - 1))))
+              _v -= ((int64_t)1 << ({{ m.end }} - {{ m.start }}));
+          {{ m.target }} = _v; }
+{% else %}
         {{ m.target }} = (_bf >> {{ m.shift }}) & {{ m.mask }};
+{% endif %}
 {% if existsIn(m, "where") %}
         if (!({{ m.where }})) return bbq_fail(ctx, "{{ m.where_msg }}");
 {% endif %}

@@ -59,7 +59,12 @@ module BBQ {
                   | Bitfield(primitive_kind container, bitfield_entry* entries)
                   | EndianSwitch(expr endian_expr)
 
-    bitfield_entry = BitfieldEntry(identifier name, int64 width,
+    // An entry names a run of bits inside the container. `sign` is the same
+    // signedness a Primitive declares — a signed entry is read back sign-extended
+    // from its width, so a 4-bit field holding 0xD is -3. Signed bit runs are how
+    // instruction encodings carry immediates (a RISC-V I-type immediate is a signed
+    // 12-bit field in a 32-bit word).
+    bitfield_entry = BitfieldEntry(identifier name, signedness sign, int64 width,
                                    expr? constraint)
 
     field         = Field(identifier name, type_expr body,

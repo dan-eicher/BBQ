@@ -319,17 +319,28 @@ spec.register_extern("decompress_zlib", fn)   # fn(memoryview) -> int | None
 ### 4.8 Bitfield
 
 Extracts sub-byte fields from an integer container using shift-mask operations.
-The container type provides byte count, signedness, and endianness. Entry widths
-must sum to the container's total bit count.
+The container type provides byte count and endianness. Entry widths must sum to
+the container's total bit count.
 
 Big-endian containers use MSB-first ordering (first entry at highest bits).
 Little-endian containers use LSB-first ordering (first entry at lowest bits).
+
+An entry may be declared `signed` or `unsigned`; `unsigned` is the default, and is
+what a format's flag bits almost always are. A signed entry is read back
+sign-extended from **its own width**, not the container's — a 4-bit entry holding
+`0xD` reads as `-3`. Signed bit runs are how instruction encodings carry
+immediates: a RISC-V I-type immediate is a signed 12-bit field inside a 32-bit
+word, and an ARM branch offset is a signed 24-bit field.
+
+An entry has no storage of its own — its value is derived from the container's
+bytes. Writing one is therefore a read-modify-write of the container, which is why
+writing one entry is visible to its neighbours.
 
 ```
 bitfield_body = "<" primitive_keyword ">"
                 "{" [ bitfield_entry ( "," bitfield_entry )* ","? ] "}"
 
-bitfield_entry = identifier ":" integer
+bitfield_entry = identifier ":" [ "signed" | "unsigned" ] integer
 ```
 
 ```bbq
@@ -353,6 +364,12 @@ TCPFlags = bitfield<uint8> {
     reset: 1,
     syn: 1,
     fin: 1
+}
+
+# A signed entry, sign-extended from its own width: `imm` holding 0xD reads as -3.
+Encoded = bitfield<uint8> {
+    imm: signed 4,
+    tag: unsigned 4
 }
 ```
 
@@ -672,6 +689,13 @@ TCPFlags = bitfield<uint8> {
     reset: 1,
     syn: 1,
     fin: 1
+}
+
+# A packed instruction field: the displacement is a signed offset, the register
+# index is not. `disp` holding 0xFFF reads as -1, not 4095.
+Operand = bitfield<uint16le> {
+    reg:  unsigned 4,
+    disp: signed 12
 }
 ```
 

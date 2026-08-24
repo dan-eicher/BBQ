@@ -34,7 +34,38 @@ struct TypeLowerer {
     Sema& sema;
     CTypeMapper tm;
 
-    TypeLowerer(Sema& s, const std::string& prefix) : sema(s), tm(s, prefix) {}
+    TypeLowerer(Sema& s, const std::string& prefix, bool default_le)
+        : sema(s), tm(s, prefix), default_le_(default_le) {}
+    bool default_le_ = true;
+
+    // A bitfield entry's bit position in the container. Entries are declared MSB-first for
+    // a big-endian container and LSB-first for a little-endian one, so the shift is either
+    // measured down from the top or accumulated from the bottom. Carrying it in the model
+    // is what lets the generated accessor mask for the caller: the grammar knows the
+    // layout, so nobody using the handle has to.
+    json bitfield_entries(Bitfield* bf) {
+        int cbits = 8;
+        bool be = false;
+        if (auto* ik = dynamic_cast<IntegerKind*>(bf->container)) {
+            cbits = width_bits(ik->width);
+            be = ik->endian == Endianness::Big ||
+                 (ik->endian == Endianness::Default && !default_le_);
+        }
+        json entries = json::array();
+        int offset_before = 0;
+        for (auto* e : bf->entries) {
+            const int w = (int)e->width;
+            const int shift = be ? (cbits - offset_before - w) : offset_before;
+            entries.push_back({{"name", e->name}, {"width", e->width},
+                               {"shift", shift},
+                               {"mask", (uint64_t)((1ull << w) - 1)},
+                               {"signed", e->sign == Signedness::Signed},
+                               {"be", be},
+                               {"container_bits", cbits}});
+            offset_before += w;
+        }
+        return entries;
+    }
 
     // ── Neutral type tree (the shared contract; the c_type/cpp_type mapper
     // callbacks walk it). Carries STRUCTURE + raw names + neutral prim descriptors
@@ -87,9 +118,7 @@ struct TypeLowerer {
             }
             case NodeKind::Bitfield: {
                 auto* bf = static_cast<Bitfield*>(t);
-                json entries = json::array();
-                for (auto* e : bf->entries) entries.push_back({{"width", e->width}, {"name", e->name}});
-                return {{"t", "bitfield_inline"}, {"entries", entries}};
+                return {{"t", "bitfield_inline"}, {"entries", bitfield_entries(bf)}};
             }
             default: return {{"t", "unknown"}};
         }
@@ -410,13 +439,9 @@ struct TypeLowerer {
             case NodeKind::RuleRef:
             case NodeKind::Extern:
                 return {{"kind", "typedef"}, {"name", rn}, {"underlying", type_node(body)}};
-            case NodeKind::Bitfield: {
-                auto* bf = static_cast<Bitfield*>(body);
-                json entries = json::array();
-                for (auto* entry : bf->entries)
-                    entries.push_back({{"width", entry->width}, {"name", entry->name}});
-                return {{"kind", "bitfield"}, {"name", rn}, {"entries", entries}};
-            }
+            case NodeKind::Bitfield:
+                return {{"kind", "bitfield"}, {"name", rn},
+                        {"entries", bitfield_entries(static_cast<Bitfield*>(body))}};
             default: return {{"kind", "unknown"}};
         }
     }
@@ -437,15 +462,18 @@ static std::string ctype_prim(const json& p) {
     if (k == "string") return "bbq_string_t";
     return "/*?prim*/";
 }
-static std::string bitfield_ctype(int64_t w) {
-    if (w <= 8)  return "uint8_t";
-    if (w <= 16) return "uint16_t";
-    if (w <= 32) return "uint32_t";
-    return "uint64_t";
+// A signed entry is read back sign-extended from its own width, so the field it lands
+// in has to be signed — an unsigned spelling would report a 4-bit 0xD as 13 while the
+// grammar declared -3.
+static std::string bitfield_ctype(int64_t w, bool is_signed = false) {
+    if (w <= 8)  return is_signed ? "int8_t"  : "uint8_t";
+    if (w <= 16) return is_signed ? "int16_t" : "uint16_t";
+    if (w <= 32) return is_signed ? "int32_t" : "uint32_t";
+    return is_signed ? "int64_t" : "uint64_t";
 }
 // The one shared lowering — both render_types_c and render_types_cpp call it.
 json lower_type_model(const CompilerCtx& ctx) {
-    TypeLowerer lower(*ctx.sema, ctx.prefix);
+    TypeLowerer lower(*ctx.sema, ctx.prefix, ctx.default_le());
     return lower.build(ctx.ast);
 }
 
@@ -491,13 +519,17 @@ std::string render_types_c(const CompilerCtx& ctx, const std::string& template_p
         }
         if (t == "bitfield_inline") {
             std::string s = "struct { ";
-            for (auto& e : n["entries"]) s += bitfield_ctype(e["width"].get<int64_t>()) + " " + e["name"].get<std::string>() + "; ";
+            for (auto& e : n["entries"])
+                s += bitfield_ctype(e["width"].get<int64_t>(), e.value("signed", false))
+                   + " " + e["name"].get<std::string>() + "; ";
             return s + "}";
         }
         return "/*?type*/";
     };
     env.add_callback("c_type", 1, [&](inja::Arguments& a) { return c_type(*a[0]); });
-    env.add_callback("bitfield_type", 1, [&](inja::Arguments& a) { return bitfield_ctype(a[0]->get<int64_t>()); });
+    env.add_callback("bitfield_type", 2, [&](inja::Arguments& a) {
+        return bitfield_ctype(a[0]->get<int64_t>(), a[1]->get<bool>());
+    });
     // Canonical CamelCase name → C struct tag (c_sname) / typedef name (c_tname),
     // through the one C namer. The template never spells names itself.
     env.add_callback("c_sname", 1, [&](inja::Arguments& a) { return namer.prefixed_name(a[0]->get<std::string>()); });
@@ -523,7 +555,7 @@ std::function<std::string(const json&)> make_cpp_type() {
     auto self = std::make_shared<std::function<std::string(const json&)>>();
     *self = [self](const json& n) -> std::string {
         std::string t = n["t"];
-        if (t == "scalar" || t == "computed") {
+        if (t == "scalar" || t == "computed" || t == "bits") {
             const json& p = n["prim"];
             std::string k = p["kind"];
             if (k == "bytes")  return "bbq::bytes_view";
@@ -532,35 +564,35 @@ std::function<std::string(const json&)> make_cpp_type() {
             if (k == "float")  return p["w"].get<int>() == 64 ? "double" : "float";
             return (p["signed"].get<bool>() ? "int" : "uint") + std::to_string(p["w"].get<int>()) + "_t";
         }
-        if (t == "ruleref")  return n["rule"].get<std::string>();   // CamelCase class, as-is
+        // A handle is one class, not a pair parameterised on a cursor type: whether it
+        // can be written is a property of the document it came from, which the cursor
+        // it holds already carries.
+        if (t == "ruleref")  return n["rule"].get<std::string>();
         if (t == "named")    return n["name"].get<std::string>();
-        if (t == "verbatim") return "bbq::bytes_view";   // extern = the index span
+        if (t == "verbatim") return "bbq::bytes_view";   // extern = the recorded span
         if (t == "array") {
-            // Numeric elements decode per-child (prim_seq); bytes/string borrow a
-            // span (span_seq); ruleref/named/nested-container elements brace-construct
-            // a handle/container per child (seq).
+            // Numbers decode per element; bytes/string borrow a span; anything with
+            // structure gets a handle per element.
             const json& e = n["elem"];
             std::string et = e["t"];
             if (et == "scalar" || et == "computed") {
                 std::string k = e["prim"]["kind"];
-                if (k == "bytes")  return "bbq::span_seq<bbq::bytes_view, uint8_t>";
-                if (k == "string") return "bbq::span_seq<std::string_view, char>";
-                return "bbq::prim_seq<" + (*self)(e) + ">";
+                if (k == "bytes")  return "span_seq<bbq::bytes_view, uint8_t>";
+                if (k == "string") return "span_seq<std::string_view, char>";
+                return "prim_seq<" + (*self)(e) + ">";
             }
-            return "bbq::seq<" + (*self)(e) + ">";
+            return "seq<" + (*self)(e) + ">";
         }
         if (t == "optional") {
-            // prim_opt decodes a numeric scalar; span_opt borrows a bytes/string
-            // span; opt wraps a handle class (ruleref/struct).
             const json& e = n["elem"];
             std::string et = e["t"];
             if (et == "scalar" || et == "computed") {
                 std::string k = e["prim"]["kind"];
-                if (k == "bytes")  return "bbq::span_opt<bbq::bytes_view, uint8_t>";
-                if (k == "string") return "bbq::span_opt<std::string_view, char>";
-                return "bbq::prim_opt<" + (*self)(e) + ">";
+                if (k == "bytes")  return "span_opt<bbq::bytes_view, uint8_t>";
+                if (k == "string") return "span_opt<std::string_view, char>";
+                return "prim_opt<" + (*self)(e) + ">";
             }
-            return "bbq::opt<" + (*self)(e) + ">";
+            return "opt<" + (*self)(e) + ">";
         }
         return "/*?cpptype*/";
     };
@@ -572,36 +604,62 @@ std::function<std::string(const json&)> make_cpp_type() {
 // accessor name and the index child differ. Union variants capture under their
 // variant name; switch arms under the field name; a top-level switch rule's arm is
 // the root's anonymous children[0]. Mirrors the per-type field accessors.
+// Read the node expression `c` denotes, as type `n` — one bbq::zcow call per case.
+// The buffer, the offsets and the copy-on-write are the document's; nothing here
+// reaches past a call into it.
 std::string cpp_decode_ptr(const json& n, const std::string& c,
                            const std::function<std::string(const json&)>& cpp_type) {
     std::string t = n["t"];
-    if (t == "scalar" || t == "computed") {
-        const json& p = n["prim"];
-        std::string k = p["kind"];
-        std::string ty = cpp_type(n);
-        if (k == "bytes")  return "bbq::bytes_view{ buf_ + " + c + "->start_offset, (size_t)(" + c + "->end_offset - " + c + "->start_offset) }";
-        if (k == "string") return "std::string_view{ (const char*)(buf_ + " + c + "->start_offset), (size_t)(" + c + "->end_offset - " + c + "->start_offset) }";
-        if (t == "computed") return "(" + ty + ")bbq::node_computed_int(" + c + ")";
-        if (k == "float")  return "(" + ty + ")bbq::node_float(" + c + ", buf_)";
-        return "(" + ty + ")bbq::node_int(" + c + ", buf_)";   // recorded type, not a static atom
+    if (t == "scalar" || t == "computed" || t == "verbatim") {
+        std::string k = (t == "verbatim") ? "bytes" : n["prim"]["kind"].get<std::string>();
+        if (k == "bytes")
+            return "[&]{ auto _b = bbq::zcow::read_bytes(" + c + ", *s_);"
+                   " return bbq::bytes_view{_b.first, _b.second}; }()";
+        if (k == "string") return "bbq::zcow::read_str(" + c + ", *s_)";
+        if (k == "float")
+            return "(" + cpp_type(n) + ")bbq::zcow::read_float(" + c + ", *s_)";
+        return "(" + cpp_type(n) + ")bbq::zcow::read_int(" + c + ", *s_)";
     }
-    // extern: the index holds only the consumed span (CaptureType::External) — the
-    // ZCow read is that span; the typed interpretation is the user's parse-time extern.
-    if (t == "verbatim")
-        return "bbq::bytes_view{ buf_ + " + c + "->start_offset, (size_t)(" + c + "->end_offset - " + c + "->start_offset) }";
-    // ruleref/named handles and nested containers (seq/opt) all brace-construct
-    // from the node pointer — one uniform spelling over cpp_type.
-    return cpp_type(n) + "{ " + c + ", buf_, zc_ }";
+    // A handle or a container: hand it where it is. Braces because a container is an
+    // aggregate of (node, source, transient) and a handle's ctor takes the same three.
+    return cpp_type(n) + "{ " + c + ", s_, t_ }";
 }
-// Decode a named child (union variant / switch field arm).
+// A bitfield entry as a class field. It carries its position in the container, so the
+// generated accessor masks on the caller's behalf — a bitfield entry has no storage of
+// its own, and making the consumer supply a shift would be handing them the one detail a
+// grammar compiler exists to remove.
+json bits_field(const json& e) {
+    const int w = e["width"].get<int>();
+    const int sw = w <= 8 ? 8 : (w <= 16 ? 16 : (w <= 32 ? 32 : 64));
+    // A signed entry is read back sign-extended from its own width, so the field it
+    // is presented as has to be signed too — a 4-bit `0xD` is -3, and an unsigned
+    // spelling would report 13 while the document says otherwise.
+    const bool sgn = e.value("signed", false);
+    return {{"name", e["name"]},
+            {"type", {{"t", "bits"},
+                      {"prim", {{"kind", "int"}, {"w", sw}, {"signed", sgn}}},
+                      {"shift", e["shift"]}, {"mask", e["mask"]},
+                      {"signed", sgn}, {"width", w}, {"be", e["be"]}}}};
+}
+
+// Decode a named child (union variant / switch field arm). A handle or container
+// needs the writable node, since it may be written through; a value only needs to
+// be read.
 std::string cpp_decode_child(const json& n, const std::string& child,
                              const std::function<std::string(const json&)>& cpp_type) {
-    return cpp_decode_ptr(n, "bbq::node_child(n_, \"" + child + "\")", cpp_type);
+    const std::string t = n["t"];
+    const bool by_value = (t == "scalar" || t == "computed" || t == "verbatim");
+    return cpp_decode_ptr(n, (by_value ? "r_(\"" : "sub_(\"") + child + "\")", cpp_type);
 }
-// Decode the root's first (anonymous) child — a top-level switch rule's arm.
+// Decode the first (anonymous) child — a top-level switch rule's arm.
 std::string cpp_decode_first(const json& n,
                              const std::function<std::string(const json&)>& cpp_type) {
-    return cpp_decode_ptr(n, "(&n_->children[0])", cpp_type);
+    const std::string t = n["t"];
+    const bool by_value = (t == "scalar" || t == "computed" || t == "verbatim");
+    return cpp_decode_ptr(n, by_value
+        ? "bbq::zcow::child_at(n_, 0)"
+        : "(t_ ? t_->own_child(n_, (size_t)0) "
+          ": const_cast<bbq::zcow::node*>(bbq::zcow::child_at(n_, 0)))", cpp_type);
 }
 
 }  // namespace
@@ -627,13 +685,7 @@ std::string render_types_cpp(const CompilerCtx& ctx,
         // computed field per entry, storage width rounded up to a C++ integer.
         if (kind == "bitfield") {
             json fields = json::array();
-            for (auto& e : d["entries"]) {
-                int w = e["width"].get<int>();
-                int sw = w <= 8 ? 8 : (w <= 16 ? 16 : (w <= 32 ? 32 : 64));
-                fields.push_back({{"name", e["name"]},
-                    {"type", {{"t", "computed"},
-                              {"prim", {{"kind", "int"}, {"w", sw}, {"signed", false}}}}}});
-            }
+            for (auto& e : d["entries"]) fields.push_back(bits_field(e));
             forward.push_back(d["name"]);
             classes.push_back({{"name", d["name"]}, {"fields", fields}});
             continue;
@@ -692,13 +744,7 @@ std::string render_types_cpp(const CompilerCtx& ctx,
             if (f["type"]["t"] != "bitfield_inline") continue;
             std::string cn = d["name"].get<std::string>() + "_" + f["name"].get<std::string>();
             json bf_fields = json::array();
-            for (auto& e : f["type"]["entries"]) {
-                int w = e["width"].get<int>();
-                int sw = w <= 8 ? 8 : (w <= 16 ? 16 : (w <= 32 ? 32 : 64));
-                bf_fields.push_back({{"name", e["name"]},
-                    {"type", {{"t", "computed"},
-                              {"prim", {{"kind", "int"}, {"w", sw}, {"signed", false}}}}}});
-            }
+            for (auto& e : f["type"]["entries"]) bf_fields.push_back(bits_field(e));
             forward.push_back(cn);
             classes.push_back({{"name", cn}, {"fields", bf_fields}});
             f["type"] = {{"t", "named"}, {"name", cn}};

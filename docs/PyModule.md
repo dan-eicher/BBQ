@@ -3,11 +3,19 @@
 CPython C API extension wrapping the CEK VM. The workflow is **parse · explore ·
 edit · emit** for prototyping grammars and exploring binary formats: parse a real
 binary, get a zero-copy Python container, poke and edit it, and serialize back to
-bytes. `parse`/`emit` are the `get`/`put` of a well-behaved lens: an unedited
-`emit()` returns the input byte for byte, and an edited one re-parses to the edit
-that was made — so **dependent fields** (array counts, `@rest` window sizes) are
-recomputed for you, never maintained by hand. See [Bidirectional.md](Bidirectional.md)
-for the laws and what they do and do not claim.
+bytes. An unedited `emit()` returns the input byte for byte, and `emit()`
+recomputes the fields the grammar **derives** — array counts, `@rest` window
+sizes — from the edited document, so those are never maintained by hand.
+
+`emit()` does not validate: it recomputes derived fields and copies everything
+else through. An edit that changes what shape follows it (a switch discriminant,
+a field a `where` constrains) leaves the writer replaying the shape the parse
+recorded, and the result may not re-parse. Check it yourself if that matters:
+
+```python
+out = r.emit()
+assert spec.parse(out).success
+```
 
 A separate `bbq.build` submodule constructs binary content from scratch (a typed
 byte-emitter — the struct-tier analogue of Python's `struct`).
@@ -27,24 +35,35 @@ byte-emitter — the struct-tier analogue of Python's `struct`).
 │            .Struct(**fields)  .Array(*elems)  → bytes(x)     │
 ├──────────────────────────────────────────────────────────────┤
 │  C++                                                         │
-│  bbq_python.cpp : Spec / ParseResult / Node over the CEK    │
-│                   parse + the bbq::zcow overlay (edit/emit)  │
+│  bbq_python.cpp : Spec / ParseResult / Node — a wrapper over │
+│                   the bbq::zcow document the CEK parses into │
 │  bbq_build.cpp  : grammar-free byte construction (knows only │
 │                   bytes; meets the parse side at bytes only) │
 ├──────────────────────────────────────────────────────────────┤
-│  CEK VM (parse)  ·  WriterInterp (grammar enforcement)       │
-│                  ·  bbq::zcow / bbq::emit (overlay + bytes)  │
+│  CEK VM (parse)  ·  bbq::zcow (the document: read/edit/emit) │
 └──────────────────────────────────────────────────────────────┘
 ```
 
-The parse produces a `FieldCapture` index over the input buffer (zero-copy reads).
-Edits go through the `bbq::zcow` copy-on-write overlay. ZCow itself knows only bytes —
-it has no concept of grammar, counts, or validity — so `emit()` first walks the
-grammar over the edited overlay and recomputes the dependent fields the edits
-invalidated, then hands off to ZCow, which blits unchanged (Borrowed) ranges and
-re-serializes changed (Owned) ones. The walk is the shared writer lowering
-(`lower_writer_ops`), executed rather than rendered: the same op-list `bbqc` turns
-into the generated C++ ZCow writer.
+The parse produces a `bbq::zcow::document` — one tree, whose nodes either name a
+span of the input (zero-copy: a read decodes in place, and an unedited `emit()` is
+one blit) or carry a value of their own. This module is a **wrapper over that API
+and nothing else**: every Python operation is one ZCow call, and the copy-on-write
+is entirely ZCow's.
+
+It is the same wrapper the generated C++ handles are, resolved at runtime rather
+than at codegen. A handle there holds `(node, source, transient)` and turns a field
+*name* into one ZCow call; here the grammar is a runtime thing, so the name arrives
+as a string through `tp_getattro`. Following that down to the detail that matters: a
+`Node` is addressed by its **container and its slot**, and re-resolves through the
+container on each access — the generated `r_(f)` — which is why a write through one
+node is visible through another and why nothing goes stale when copy-on-write
+replaces a node. Navigating *into* a container claims it (the generated `sub_`); a
+leaf is never claimed by a read, because an owned leaf carries its own value and a
+read has no value to put there.
+
+Nothing walks the grammar on the way out. The dependent fields — array counts,
+`@rest` window sizes — are recorded by the **parser**, at the moment it knows, and
+ZCow makes them true when the document is serialized.
 
 ## Types
 
@@ -79,12 +98,12 @@ Container protocols: `result.field`, `result["field"]`, `result[i]`, slices, `le
 
 | Method | Description |
 |--------|-------------|
-| `emit() -> bytes` | Enforce the grammar over the edited overlay (dependent fields recomputed), then serialize. Byte-identical to the input if unedited; re-parses to the edit if not. |
-| `deltas() -> list[dict]` | The structured diff since parse: `{path, offset, old, new}` per changed field. |
+| `emit() -> bytes`, `bytes(r)` | Serialize. The dependent fields (array counts, `@rest` sizes) are recomputed from what the edits produced, then the input is blitted and what changed is patched into it — so an edit that resizes nothing leaves bytes no field covers exactly where they were. Byte-identical to the input if unedited; re-parses to the edit if not. |
+| `deltas() -> list[dict]` | What is no longer the input: `{path, offset, old, new}` for every leaf that stopped being described by its span. A span-backed node cannot have changed, which is what keeps this proportional to the edit rather than the file. |
 
 ### `bbq.Node`
 
-The core lazy, zero-copy type over a single `FieldCapture`.
+A position in the document, addressed by its container and its slot.
 
 **Read / navigate:** `.field`, `["field"]`, `[i]` (negative ok), `[a:b]` slices,
 `len()`, `in`, iteration (struct → `(name, node)`, array → nodes), `keys()`/`values()`/`items()`, `dict(node)`, `dir()`.
@@ -93,9 +112,12 @@ The core lazy, zero-copy type over a single `FieldCapture`.
 `.value` (auto), rich comparison (`== 42`, `< 100`), `f"{node:08x}"`, `repr`.
 `hash()` raises (nodes have `__eq__`).
 
-**Properties:** `offset` `(start,end)`, `raw` (bytes), `capture_type` (str), `name`
-(`str|None`), `value`, and **`variant_tag`** — the union/switch arm ordinal, or
-`None` if the node is not a variant.
+**Properties:** `offset` `(start,end)`, `raw` (this node's bytes as they stand),
+`capture_type` (str), `name` (`str|None`), `value`, **`variant_tag`** — the
+union/switch arm ordinal, or `None` if the node is not a variant — and **`parsed`**,
+true while the node still names bytes of the input. `memoryview(node)` is the
+zero-copy read and is available exactly while `parsed` is true; once something has
+been written there are no input bytes to point at, and `raw` is the way to get them.
 
 **Edit (copy-on-write, byte-level):**
 
@@ -149,9 +171,9 @@ data = bytes(rec)                 # a whole binary from scratch
 
 The two layers meet only at **bytes**:
 
-- **New file from nothing:** `bytes(bbq.build.Struct(...))` — no parse, no overlay.
-- **Add to a parsed file:** the build object's bytes cross into the ZCow overlay as
-  an Owned node; `emit()` stitches them with the untouched (zero-copy) original.
+- **New file from nothing:** `bytes(bbq.build.Struct(...))` — no parse, no document.
+- **Add to a parsed file:** the build object's bytes cross into the document as a node
+  that carries them; `emit()` stitches them with the untouched (zero-copy) original.
 
 ```python
 r = spec.parse(data)
@@ -220,12 +242,19 @@ interpreter:
 
 | State | Guard |
 |---|---|
-| `Spec`'s writer op-list cache, extern registry | a `PyMutex` on the `Spec` |
-| each `ParseResult`'s ZCow overlay (creation, every edit, `emit`, `deltas`) | a `PyMutex` on the result |
+| `Spec`'s extern registry | a `PyMutex` on the `Spec` |
+| each `ParseResult`'s document — every read of the tree and every write into it | a `PyMutex` on the result |
 | `bbq.build` `Struct`'s parallel `names`/`children` lists | a critical section on the object |
 
 Locks are only ever held over C++ — every `PyObject` conversion happens before one
 is taken, so nothing can re-enter the interpreter while a lock is held.
+
+Taking a document's lock also takes **ownership** of its transient for the calling
+thread (`zcow::transient::adopt`). ZCow checks the owning thread on every operation
+because that is what C++ can observe of single use; a `ParseResult` is one object any
+thread may reach, and this module gives it the real property with the mutex. So the
+proxy is replaced by the guarantee it was approximating, in the one place where that
+guarantee is established — nothing touches the document without coming through there.
 
 What this does **not** promise is that concurrent edits to *one* `ParseResult` are
 meaningful; they are merely safe. Which of two racing writes wins is up to the

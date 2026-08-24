@@ -26,7 +26,7 @@ struct ReturnFrame : Frame {
     KontNode* return_to = nullptr;
     Environment* saved_env = nullptr;
     size_t start_pos = 0;
-    CaptureBuilder::Mark capture_mark{};
+    zcow::builder::Mark capture_mark{};
     // Caller's static failure target — copied from the InvokeRuleNode
     // at push time. Non-null when the call sits inside an alt /
     // optional / array-resync scope; null at top-level call sites.
@@ -49,7 +49,7 @@ struct Savepoint : Frame {
     bool saved_endian = true;
     size_t saved_kont_size = 0;
     int saved_interval_depth = 0;   // unwind any intervals opened inside the arm
-    CaptureBuilder::Mark capture_mark{};
+    zcow::builder::Mark capture_mark{};
     KontNode* on_fail_target = nullptr;
 
     Savepoint() { type = FrameType::Savepoint; }
@@ -67,7 +67,7 @@ struct LoopFrame : Frame {
     Environment* saved_env = nullptr;
     size_t saved_pos = 0;
     bool saved_endian = true;
-    CaptureBuilder::Mark capture_mark{};
+    zcow::builder::Mark capture_mark{};
 
     LoopFrame() { type = FrameType::Loop; }
 };

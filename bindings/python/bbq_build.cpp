@@ -89,15 +89,15 @@ bool bbq_build_serialize(PyObject* o, std::vector<uint8_t>& out) {
         auto* L = reinterpret_cast<PyBuildLeaf*>(o);
         switch (L->kind) {
         case BL_INT: {
-            size_t w = bbq::leaf_width(L->type), p = out.size(); out.resize(p + w);
+            size_t w = bbq::zcow::leaf_width(L->type), p = out.size(); out.resize(p + w);
             bbq::encode_int(out.data(), p, L->type, L->ival); return true;
         }
         case BL_FLOAT: {
-            size_t w = bbq::leaf_width(L->type), p = out.size(); out.resize(p + w);
+            size_t w = bbq::zcow::leaf_width(L->type), p = out.size(); out.resize(p + w);
             bbq::encode_float(out.data(), p, L->type, L->fval); return true;
         }
-        case BL_ULEB: bbq::encode_uleb128(out, static_cast<uint64_t>(L->ival)); return true;
-        case BL_SLEB: bbq::encode_sleb128(out, L->ival); return true;
+        case BL_ULEB: bbq::zcow::encode_uleb128(out, static_cast<uint64_t>(L->ival)); return true;
+        case BL_SLEB: bbq::zcow::encode_sleb128(out, L->ival); return true;
         case BL_BYTES: {
             char* p; Py_ssize_t n;
             if (PyBytes_AsStringAndSize(L->blob, &p, &n) < 0) return false;

@@ -11,8 +11,9 @@
 // runtime so the view parser depends only on backends/cpp/runtime (no C runtime,
 // no bbq::cek). It grows per feature (loops/checkpoints land with arrays/optional).
 //
-#include "Capture.h"        // bbq::CaptureBuilder / CaptureType / CaptureMetadata
-#include "CaptureDecode.h"  // bbq::decode_int (count decode-on-access)
+#include "Capture.h"        // bbq::CaptureType / ComputedValue
+#include "CaptureCow.h"     // bbq::zcow — the document this reader builds
+#include "CaptureDecode.h"  // the span decoders (count decode-on-access)
 #include "ParseArena.h"     // bbq::ParseArena
 #include "bbq_machine.h"    // bbq::machine — the shared endian register + loop stack
 #include "bbq_node.h"       // bbq::bytes_view — the non-scalar field_ref span
@@ -35,7 +36,7 @@ struct reader : machine {
     std::vector<size_t> interval_starts;
     std::vector<size_t> interval_ends;
 
-    CaptureBuilder builder;          // builds the FieldCapture index
+    zcow::builder builder;           // builds the document — the same one the CEK builds
     ParseArena* arena = nullptr;     // for computed-value allocation during parse
     const char* error = nullptr;
 
@@ -124,11 +125,13 @@ struct reader : machine {
 
     // Record a computed field (compute(...)/bitfield entry): the evaluated value,
     // arena-owned, decoded on access via node_computed_int.
-    void add_computed_int(const char* name, int64_t v) {
+    // Returns the node, so a caller can record what else it knows about the value —
+    // a bitfield entry's place in its run.
+    zcow::node* add_computed_int(const char* name, int64_t v) {
         auto* cv = arena->alloc<ComputedValue>();
         cv->kind = ComputedValue::Kind::Int;
         cv->i = v;
-        builder.add_computed(name, cv, pos);
+        return builder.add_computed(name, cv, pos);
     }
 
     // Record a computed field at the C++ expression's NATURAL type — bool/float/int — so
@@ -145,11 +148,17 @@ struct reader : machine {
 
     // Record a Computed int over an explicit span [start, pos) — the varint readers'
     // capture (the span is the consumed LEB bytes, not a zero-width point).
-    void record_computed(const char* name, int64_t v, size_t start) {
+    // `enc` matters on the way OUT: a varint's value is decoded rather than read at a
+    // fixed width — which is why it is recorded as computed at all — so writing one
+    // back has to re-encode it, and only the encoding says how. Without it the field
+    // serializes to nothing.
+    void record_computed(const char* name, int64_t v, size_t start,
+                         zcow::Enc enc = zcow::Enc::Fixed) {
         auto* cv = arena->alloc<ComputedValue>();
         cv->kind = ComputedValue::Kind::Int;
         cv->i = v;
-        builder.add_computed(name, cv, start, pos);
+        zcow::node* n = builder.add_computed(name, cv, start, pos);
+        n->enc = enc;
     }
 
     // ── LEB128 varints (uleb128 / sleb64) — variable-length, so the byte span is
@@ -170,7 +179,8 @@ struct reader : machine {
             }
             result |= (uint64_t)(byte & 0x7f) << shift;
             if (!(byte & 0x80)) { pos = start + (size_t)i + 1;
-                                  record_computed(name, (int64_t)result, start); return true; }
+                                  record_computed(name, (int64_t)result, start, zcow::Enc::Uleb);
+                                  return true; }
             shift += 7;
         }
         return fail("invalid uleb128");                                        // unterminated
@@ -188,7 +198,7 @@ struct reader : machine {
             if (!(byte & 0x80)) {
                 if (shift < bits && (byte & 0x40)) result |= -((int64_t)1 << shift);  // sign-extend
                 pos = start + (size_t)i + 1;
-                record_computed(name, result, start);
+                record_computed(name, result, start, zcow::Enc::Sleb);
                 return true;
             }
         }
@@ -203,7 +213,7 @@ struct reader : machine {
         size_t interval_depth;
         size_t loop_depth;
         bool little_endian;
-        CaptureBuilder::Mark mark;
+        zcow::builder::Mark mark;
     };
     checkpoint save() {
         return { pos, interval_starts.size(), loop_index_stack.size(),
@@ -219,8 +229,8 @@ struct reader : machine {
         builder.restore(c.mark);
     }
 
-    CaptureMetadata finish(bool ok) {
-        return builder.finish(*arena, ok, pos, error);
+    zcow::parse_result finish(bool ok) {
+        return builder.finish(ok, pos, data, length, error);
     }
 };
 
@@ -228,16 +238,21 @@ struct reader : machine {
 // access for expressions (e.g. an array count `[n]`). The generated parser spells
 // field references as bbq_view_i64(r, "name") (the ViewProfile field_ref hook).
 inline int64_t bbq_view_i64(reader& r, const char* name) {
-    const FieldCapture* c = r.builder.find_field_str(name);
+    const zcow::node* c = r.builder.find_field_str(name);
+    if (!c) return 0;
+    if (c->type == CaptureType::Computed) {
+        int64_t v = 0;
+        return zcow::computed_int(c, &v) ? v : 0;
+    }
     int64_t bits = 0; bool sgn = false;
-    if (c) decode_int(c, r.data, &bits, &sgn);
+    zcow::decode_int(c, r.data, &bits, &sgn);
     return bits;
 }
 
 // A field reference to a NON-SCALAR (Bytes/String/External) capture as its
 // [start,end) span — the ViewProfile field_ref_bytes hook (dual of bbq_view_i64).
 inline bytes_view bbq_view_bytes(reader& r, const char* name) {
-    const FieldCapture* c = r.builder.find_field_str(name);
+    const zcow::node* c = r.builder.find_field_str(name);
     if (!c) return {};
     return { r.data + c->start_offset, (size_t)(c->end_offset - c->start_offset) };
 }

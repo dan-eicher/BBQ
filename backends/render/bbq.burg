@@ -464,6 +464,7 @@ spine: SwitchDispatchNode(expr) = 1 (. SwitchDispatchNode* sw = (SwitchDispatchN
 spine: ExtractBitsNode    = 1 (. if (!E.absorbed.count(node)) {
         BitfieldInfo bf = collapse_bitfield(E, node);
         E.node(node, "bitfield", {{"members", bf.members}, {"prim", bf.prim},
+                                  {"msb_first", bf.msb_first},
                                   {"next", bf.next}, {"msg", "bitfield read failed"}});
         } .);
 spine: SetEndianNode(expr) = 1 (. E.node(node, "set_endian",

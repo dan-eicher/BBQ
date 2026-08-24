@@ -67,10 +67,17 @@ struct FieldCapture {
     }
 };
 
+// The result of a parse: the document, plus how the parse went. `bytes_consumed` and the
+// error fields are facts about the PARSE; the data itself is reached as a `bbq::Document`
+// (bbq_document.h, `document_of`). `root`/`buf` are how that document is minted — a
+// consumer navigates the Document rather than the index, so that it never has to carry the
+// buffer alongside the index and keep them in step by hand.
 struct CaptureMetadata {
     bool success = false;
     size_t bytes_consumed = 0;
     FieldCapture* root = nullptr;
+    const uint8_t* buf = nullptr;   // what the captures' offsets point into
+    size_t len = 0;
 
     const char* error_message = nullptr;
     size_t error_offset = 0;
@@ -154,12 +161,18 @@ public:
         }
     }
 
+    // `buf`/`len` are the bytes the captures index. They are recorded here so the result
+    // can hand out a Document; without them a consumer has to carry the buffer separately
+    // and pair it with the index at every access, which is what this replaces.
     CaptureMetadata finish(ParseArena& arena, bool success, size_t bytes_consumed,
+                           const uint8_t* buf, size_t len,
                            const char* error_message = nullptr,
                            size_t error_offset = 0) {
         CaptureMetadata meta;
         meta.success = success;
         meta.bytes_consumed = bytes_consumed;
+        meta.buf = buf;
+        meta.len = len;
         meta.error_message = error_message;
         meta.error_offset = error_offset;
 

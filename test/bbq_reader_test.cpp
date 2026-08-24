@@ -59,15 +59,15 @@ TEST(BbqReader, BuildsDecodableStructIndex) {
     ASSERT_TRUE(r.advance(2));
     r.builder.add_field("y", s, r.pos, r.int_capture(16, false, false, false));
 
-    CaptureMetadata meta = r.finish(true);
+    zcow::parse_result meta = r.finish(true);
     ASSERT_TRUE(meta.success);
-    ASSERT_NE(meta.root, nullptr);
-    ASSERT_EQ(meta.root->child_count, 2);
+    ASSERT_NE(meta.doc.root(), nullptr);
+    ASSERT_EQ(meta.doc.root()->kids.size(), 2u);
 
     int64_t bits = 0; bool sgn = false;
-    ASSERT_TRUE(decode_int(node_child(meta.root, "x"), buf, &bits, &sgn));
+    ASSERT_TRUE(zcow::decode_int(node_child(meta.doc.root(),"x"), buf, &bits, &sgn));
     EXPECT_EQ(bits, 0x12);
-    ASSERT_TRUE(decode_int(node_child(meta.root, "y"), buf, &bits, &sgn));
+    ASSERT_TRUE(zcow::decode_int(node_child(meta.doc.root(),"y"), buf, &bits, &sgn));
     EXPECT_EQ(bits, 0x1234);
 }
 

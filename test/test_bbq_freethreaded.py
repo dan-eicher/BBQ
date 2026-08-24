@@ -52,12 +52,12 @@ def _run(fn, threads=THREADS):
         raise AssertionError(f"{len(errors)} thread(s) failed:\n\n" + "\n".join(errors[:3]))
 
 
-# ── S1: the lazily lowered writer op-list ────────────────────────────────────
-# One Spec, many threads, all reaching emit() for the first time at once. An
-# unguarded `if (!wops) wops = lower(...)` lowers twice and leaks one of them;
-# a torn read hands run_writer a half-built object.
+# ── S1: one Spec, many parses ────────────────────────────────────────────────
+# One compiled grammar, many threads parsing and emitting through it at once. The
+# grammar is read-only once compiled, so this is the case that must need no guarding
+# at all — and GetPut is what says each parse got its own document.
 
-def s1_wops_cache():
+def s1_shared_spec():
     spec = bbq.compile(_fixture())
     data = bytes([0x03, 0x10, 0x00, 0x20, 0x00, 0x30, 0x00])
 
@@ -105,11 +105,12 @@ def s2_extern_registry():
         churner.join(timeout=5)
 
 
-# ── S3: the per-result overlay ───────────────────────────────────────────────
-# zcow is created lazily at three sites and then mutated. Concurrent edits to
-# ONE result must not crash or corrupt; which write wins is up to the schedule.
+# ── S3: the per-result document ──────────────────────────────────────────────
+# One document, edited from several threads. Concurrent edits to ONE result must not
+# crash or corrupt; which write wins is up to the schedule. This is also what says the
+# transient's ownership follows the lock rather than the thread that parsed.
 
-def s3_overlay():
+def s3_document():
     spec = bbq.compile_string("Foo = struct { x: uint8, y: uint8, z: uint8 }")
     data = bytes([1, 2, 3])
 
@@ -130,11 +131,11 @@ def s3_overlay():
 
 
 # ── S4: bbq.build containers ─────────────────────────────────────────────────
-# Struct/Array hold Python lists mutated in place; concurrent append on one
-# object is a list mutation race.
+# Struct/Array are zcow nodes whose children are a vector mutated in place; concurrent
+# append on one object is a race the interpreter knows nothing about.
 
 def s4_build_containers():
-    # Array.append is a single PyList_Append, which the interpreter makes atomic.
+    # Append is one push_back under the object's critical section.
     for _ in range(30):
         arr = b.Array()
 
@@ -146,9 +147,9 @@ def s4_build_containers():
         assert len(arr) == 4 * 50, f"lost appends: len={len(arr)} want {4 * 50}"
         assert len(bytes(arr)) == 4 * 50, "serialized length disagrees with len()"
 
-    # Struct field assignment is check-then-act across TWO parallel lists: look the name
-    # up, then append to `names` and to `children` as separate operations. Interleave two
-    # threads there and the lists desynchronize — every field must still have a value.
+    # Struct field assignment is check-then-act: look the name up, then place the value.
+    # Split those and two threads both find a name absent and both append it, so the
+    # struct carries the field twice — which no amount of locking each half would fix.
     for _ in range(60):
         s = b.Struct()
 
@@ -160,7 +161,7 @@ def s4_build_containers():
         _run(work, threads=4)
         keys, vals = list(s.keys()), list(s.values())
         assert len(keys) == len(vals), (
-            f"names/children desynchronized: {len(keys)} names, {len(vals)} values")
+            f"names and values disagree: {len(keys)} names, {len(vals)} values")
         assert len(keys) == len(s), f"len() disagrees: len={len(s)} keys={len(keys)}"
         assert len(set(keys)) == len(keys), "a field name was recorded twice"
         bytes(s)                                             # must not crash or read past
@@ -191,9 +192,9 @@ def _fixture():
 
 
 STRESSORS = [
-    ("S1 wops cache", s1_wops_cache),
+    ("S1 shared spec", s1_shared_spec),
     ("S2 extern registry", s2_extern_registry),
-    ("S3 result overlay", s3_overlay),
+    ("S3 result document", s3_document),
     ("S4 build containers", s4_build_containers),
     ("S5 independent parses", s5_independent_parses),
 ]

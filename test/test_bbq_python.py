@@ -1862,6 +1862,34 @@ class TestBuild:
         got = [(int(it.v), int(it.w)) for it in r2.items]
         assert int(r2.n) == 2 and got == [(9, 8), (3, 4)]
 
+    def test_built_value_joins_the_document_as_structure(self):
+        # A constructed value IS a node, so adding one to a parse grafts structure rather
+        # than the bytes it would have serialized to: it stays navigable and writable, and
+        # the count it changed is derived like any other.
+        spec = bbq.compile_string(
+            "It = struct { v: uint8, w: uint8 }\nT = struct { n: uint8, items: array<It>[n] }")
+        r = spec.parse(bytes([1, 1, 2]), rule="T")
+        r.items.append(B.Struct(v=B.u8(3), w=B.u8(4)))
+
+        el = r.items[1]
+        assert el.capture_type == "struct" and len(el) == 2   # not an opaque blob
+        assert (int(el.v), int(el.w)) == (3, 4)
+        el.v = 9                                              # and writable in place
+        assert int(el.v) == 9
+
+        r2 = spec.parse(r.emit(), rule="T")
+        assert int(r2.n) == 2
+        assert [(int(i.v), int(i.w)) for i in r2.items] == [(1, 2), (9, 4)]
+
+    def test_built_value_replacing_an_element_is_also_structure(self):
+        spec = bbq.compile_string(
+            "It = struct { v: uint8, w: uint8 }\nT = struct { n: uint8, items: array<It>[n] }")
+        r = spec.parse(bytes([2, 1, 2, 3, 4]), rule="T")
+        r.items[0] = B.Struct(v=B.u8(9), w=B.u8(8))
+        assert (int(r.items[0].v), int(r.items[0].w)) == (9, 8)
+        assert (int(r.items[1].v), int(r.items[1].w)) == (3, 4)   # neighbour untouched
+        assert spec.parse(r.emit(), rule="T").emit() == bytes([2, 9, 8, 3, 4])
+
     def test_build_new_file_from_scratch(self):
         spec = bbq.compile_string("Rec = struct { magic: uint32be, n: uint8, xs: array<uint16le>[n] }")
         data = bytes(B.Struct(magic=B.u32(0xCAFEBABE, endian="big"), n=B.u8(3),

@@ -384,27 +384,27 @@ static bool convert_for(CaptureType t, PyObject* value, PendingWrite* out) {
     return true;
 }
 
-// Content supplied as BYTES: bytes, str, or a bbq.build value (which is a byte
-// constructor and enters as what it serializes to). This is the form a composite or
-// variable-width element takes — ZCow is byte-level, so a shape the grammar is not
-// describing arrives as its bytes. Returns 1 = took it, 0 = not that kind of value,
-// -1 = error. Runs Python, so no lock may be held.
-static int as_byte_content(PyObject* value, std::vector<uint8_t>* out) {
-    if (bbq_build_is_value(value))
-        return bbq_build_serialize(value, *out) ? 1 : -1;
-    if (PyBytes_Check(value)) {
-        const char* p = PyBytes_AS_STRING(value);
-        out->assign(p, p + PyBytes_GET_SIZE(value));
-        return 1;
-    }
+// Content supplied as a SUBTREE rather than a field value: a bbq.build value, or raw
+// bytes. This is the form a composite element takes — the grammar is not describing the
+// shape, the caller is. A build value is already a ZCow node, so it grafts in as
+// structure and stays navigable; bytes become a node that holds them, which is as much
+// structure as bytes carry. Returns the node, or null with 0 in `*is_kind` when the value
+// is simply not one of these. Runs Python, so no lock may be held.
+static zc::node_ptr as_subtree(PyObject* value, int* is_kind) {
+    *is_kind = 1;
+    if (bbq_build_is_value(value) || PyBytes_Check(value) || PyByteArray_Check(value))
+        return bbq_build_node(value);
     if (PyUnicode_Check(value)) {
         Py_ssize_t n = 0;
         const char* s = PyUnicode_AsUTF8AndSize(value, &n);
-        if (!s) return -1;
-        out->assign(s, s + n);
-        return 1;
+        if (!s) return nullptr;
+        auto node = std::make_shared<zc::node>();
+        node->type = CaptureType::String;
+        zc::set_str(node.get(), std::string_view(s, (size_t)n));
+        return node;
     }
-    return 0;
+    *is_kind = 0;
+    return nullptr;
 }
 
 static void apply_write(zc::node* n, const PendingWrite& w) {
@@ -727,19 +727,18 @@ static int PyBBQNode_mp_ass_subscript(PyBBQNode* self, PyObject* key, PyObject* 
                     is_container(c->kids[(size_t)index]->type);
     }
     if (composite) {
-        std::vector<uint8_t> raw;
-        int took = as_byte_content(value, &raw);   // may run Python — no lock held
-        if (took < 0) return -1;
-        if (!took) {
+        int kind = 0;
+        zc::node_ptr sub = as_subtree(value, &kind);   // may run Python — no lock held
+        if (kind && !sub) return -1;
+        if (!kind) {
             PyErr_SetString(PyExc_TypeError,
-                "a composite element is replaced by bytes (or a bbq.build value)");
+                "a composite element is replaced by a bbq.build value or bytes");
             return -1;
         }
         DocLock g(self->result);
         zc::node* c = owned_node_of(self);
-        zc::node* e = self->result->edit->own_child(c, (size_t)index);
-        if (!e || !self->result->edit->splice(e, raw.data(), raw.size())) {
-            PyErr_SetString(PyExc_RuntimeError, "splice failed");
+        if (!c || !self->result->edit->replace(c, (size_t)index, std::move(sub))) {
+            PyErr_SetString(PyExc_RuntimeError, "replace failed");
             return -1;
         }
         return 0;
@@ -1022,15 +1021,17 @@ static PyObject* PyBBQNode_append(PyBBQNode* self, PyObject* value) {
         }
     }
 
-    std::vector<uint8_t> raw;
-    int took = as_byte_content(value, &raw);   // may run Python — no lock held
-    if (took < 0) return NULL;
-    if (took) {
+    int kind = 0;
+    zc::node_ptr sub = as_subtree(value, &kind);   // may run Python — no lock held
+    if (kind && !sub) return NULL;
+    if (kind) {
+        sub->name = nullptr;                      // an array element is anonymous
         DocLock g(self->result);
         zc::node* c = owned_node_of(self);
-        zc::node* e = self->result->edit->append(c, CaptureType::Bytes);
-        if (!e) { PyErr_SetString(PyExc_RuntimeError, "append failed"); return NULL; }
-        zc::set_bytes(e, raw.data(), raw.size());
+        if (!c || !self->result->edit->append(c, std::move(sub))) {
+            PyErr_SetString(PyExc_RuntimeError, "append failed");
+            return NULL;
+        }
         Py_RETURN_NONE;
     }
 

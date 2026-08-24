@@ -240,6 +240,87 @@ TEST(ZCow, AppendedElementsHaveNoSpanAndDoNotReachBack) {
     EXPECT_EQ(size_of(field(d.root(), "xs")), 2u);
 }
 
+// A subtree built from nothing joins the document as STRUCTURE, not as the bytes it
+// would have serialized to — so it can be navigated and written afterwards. This is what
+// a constructed value is: nodes, the same ones a parse makes, minus the spans.
+static node_ptr built_pair(uint8_t v, uint8_t w) {
+    auto s = std::make_shared<node>();
+    s->type = CaptureType::Struct; s->parsed = false;
+    for (auto [nm, val] : {std::pair<const char*, uint8_t>{"v", v}, {"w", w}}) {
+        auto k = std::make_shared<node>();
+        k->name = nm; k->type = CaptureType::UInt8;
+        set_int(k.get(), val);
+        s->kids.push_back(std::move(k));
+    }
+    return s;
+}
+
+TEST(ZCow, AnExistingSubtreeCanBeAppendedAndIsStillStructure) {
+    document d = make_doc();
+    transient t = d.begin_edit();
+    const char* p[] = {"xs"};
+    node* xs = t.own_path(p, nullptr, 1);
+    ASSERT_NE(t.append(xs, built_pair(0x63, 0x64)), nullptr);
+
+    document v = std::move(t).commit();
+    const node* added = child_at(field(v.root(), "xs"), 2);
+    ASSERT_NE(added, nullptr);
+    EXPECT_EQ(size_of(added), 2u);                                   // not flattened
+    EXPECT_EQ(read_int(child_named(added, "w"), v.src()), 0x64);     // and navigable
+    EXPECT_EQ(v.serialize(), bytes_of({0xDE, 0xAD, 0xBE, 0xEF, 0x02, 0x0A, 0x14, 0x63, 0x64}));
+}
+
+// A varint built from nothing has no span, and what says it occupies bytes is its
+// ENCODING. Reading that off the span instead emits it as nothing — which is what a
+// constructed leb would silently do.
+TEST(ZCow, AConstructedVarintEmitsEvenThoughItHasNoSpan) {
+    auto root = std::make_shared<node>();
+    root->type = CaptureType::Struct; root->parsed = false;
+    for (int64_t v : {(int64_t)300, (int64_t)1}) {
+        auto k = std::make_shared<node>();
+        k->type = CaptureType::Computed;
+        set_int(k.get(), v, Enc::Uleb);
+        root->kids.push_back(std::move(k));
+    }
+    EXPECT_EQ(document(root, nullptr).serialize(), bytes_of({0xAC, 0x02, 0x01}));
+
+    // ...and a compute(), which really does occupy nothing, still emits nothing.
+    auto c = std::make_shared<node>();
+    c->type = CaptureType::Computed;
+    set_int(c.get(), 99);
+    root->kids.push_back(c);
+    EXPECT_EQ(document(root, nullptr).serialize(), bytes_of({0xAC, 0x02, 0x01}));
+}
+
+TEST(ZCow, AnExistingSubtreeCanReplaceAnElement) {
+    document d = make_doc();
+    transient t = d.begin_edit();
+    const char* p[] = {"xs"};
+    node* xs = t.own_path(p, nullptr, 1);
+    ASSERT_TRUE(t.replace(xs, 0, built_pair(0x11, 0x22)));
+
+    document v = std::move(t).commit();
+    EXPECT_EQ(size_of(field(v.root(), "xs")), 2u);   // still two elements
+    EXPECT_EQ(v.serialize(), bytes_of({0xDE, 0xAD, 0xBE, 0xEF, 0x02, 0x11, 0x22, 0x14}));
+}
+
+// An attached subtree is owned by nobody, so writing into it copies it first — the
+// document it was attached to is the only one that changes.
+TEST(ZCow, WritingIntoAnAttachedSubtreeCopiesIt) {
+    node_ptr shared = built_pair(1, 2);
+    document d = make_doc();
+    transient t = d.begin_edit();
+    const char* p[] = {"xs"};
+    t.append(t.own_path(p, nullptr, 1), shared);
+
+    node* in_tree = t.own_child(t.own_child(t.own_path(p, nullptr, 1), 2), 0);
+    set_int(in_tree, 0x7F);
+    document v = std::move(t).commit();
+
+    EXPECT_EQ(read_int(child_at(child_at(field(v.root(), "xs"), 2), 0), v.src()), 0x7F);
+    EXPECT_EQ(shared->kids[0]->ival, 1);   // the subtree the caller still holds
+}
+
 // Splicing replaces a subtree with bytes the caller supplies — the shape it had is gone,
 // so its children go too, and the neighbours around it are untouched.
 TEST(ZCow, SpliceReplacesASubtreeWithBytes) {

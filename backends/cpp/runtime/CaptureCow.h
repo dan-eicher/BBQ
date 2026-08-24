@@ -277,8 +277,9 @@ inline void emit_node(const node& n, const source& src, const std::string& at,
     if (n.type == CaptureType::Computed) {
         // A compute() occupies no bytes. A varint does — its value is decoded rather
         // than read at a fixed width, which is why it is recorded as computed at all
-        // — so writing one back has to re-encode it.
-        if (n.end_offset <= n.start_offset) return;
+        // — so writing one back has to re-encode it. Which of the two this is, is the
+        // ENCODING and not the span: a varint built from nothing never had a span, and
+        // reading that as "occupies no bytes" would emit it as nothing.
         if (n.enc == Enc::Uleb) encode_uleb128(out, (uint64_t)n.ival);
         else if (n.enc == Enc::Sleb) encode_sleb128(out, n.ival);
         return;
@@ -327,8 +328,9 @@ inline bool changes_length(const node& n) {
         return false;
     }
     // A computed value with no bytes cannot change any length; a varint's encoded
-    // width tracks its value, so writing one can.
-    if (n.type == CaptureType::Computed) return n.end_offset > n.start_offset;
+    // width tracks its value, so writing one can — and which it is, is the encoding,
+    // for the same reason emitting one goes by the encoding.
+    if (n.type == CaptureType::Computed) return n.enc != Enc::Fixed;
     if (n.end_offset <= n.start_offset) return true;    // no span: content with no origin
     if (n.enc != Enc::Fixed) return true;               // a varint's width tracks its value
     if (n.type == CaptureType::Bytes || n.type == CaptureType::String)
@@ -547,6 +549,29 @@ public:
         container->resized = true;
         container->kids.push_back(std::move(e));
         return container->kids.back().get();
+    }
+
+    // The same, for a subtree that already exists — one built from nothing, or lifted
+    // out of another document. It arrives owned by nobody, so the first write down into
+    // it clones exactly as it would for anything else shared; nothing here is special
+    // about where it came from. This is what lets a constructed value BE structure in
+    // the document instead of collapsing to the bytes it would have serialized to.
+    node* append(node* container, node_ptr child) {
+        check();
+        if (!container || !child) return nullptr;
+        container->parsed = false;
+        container->resized = true;
+        container->kids.push_back(std::move(child));
+        return container->kids.back().get();
+    }
+
+    bool replace(node* container, size_t i, node_ptr child) {
+        check();
+        if (!container || !child || i >= container->kids.size()) return false;
+        container->parsed = false;
+        container->resized = true;
+        container->kids[i] = std::move(child);
+        return true;
     }
 
     // pop! — drop an element. Nothing dangles: a caller holding the removed node's

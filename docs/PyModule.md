@@ -17,8 +17,10 @@ out = r.emit()
 assert spec.parse(out).success
 ```
 
-A separate `bbq.build` submodule constructs binary content from scratch (a typed
-byte-emitter — the struct-tier analogue of Python's `struct`).
+A separate `bbq.build` submodule constructs binary content from scratch — the
+struct-tier analogue of Python's `struct`, and grammar-free: you say `u32` and mean it.
+What it produces is a document, so a constructed value can be handed straight to a
+parsed one and stays structure there.
 
 **Source:** `bindings/python/bbq_python.cpp` (parse/edit) + `bindings/python/bbq_build.cpp` (construction)
 **Tests:** `test/test_bbq_python.py` (215 tests) + `test/test_bbq_freethreaded.py` (free-threading stress)
@@ -37,8 +39,8 @@ byte-emitter — the struct-tier analogue of Python's `struct`).
 │  C++                                                         │
 │  bbq_python.cpp : Spec / ParseResult / Node — a wrapper over │
 │                   the bbq::zcow document the CEK parses into │
-│  bbq_build.cpp  : grammar-free byte construction (knows only │
-│                   bytes; meets the parse side at bytes only) │
+│  bbq_build.cpp  : grammar-free construction — the same nodes │
+│                   minus the spans; meets the parse side there│
 ├──────────────────────────────────────────────────────────────┤
 │  CEK VM (parse)  ·  bbq::zcow (the document: read/edit/emit) │
 └──────────────────────────────────────────────────────────────┘
@@ -137,9 +139,13 @@ a count nested inside an array element, and an `@rest` window's size.
 
 ## `bbq.build` — construction from scratch
 
-A grammar-free factory of typed byte-emitters. Build mirrors read: leaves are typed
-scalars (a value, no children); containers are dict-/list-like; `bytes(x)` is the one
-shared verb.
+A grammar-free factory of typed values. Build mirrors read because it is the same
+thing: **a constructed value is a `bbq::zcow` node** — the node a parse makes, minus
+the span, since a span is what a node was read from and this one was not read from
+anything. So leaves are typed scalars, containers are dict-/list-like, and `bytes(x)`
+is `document::serialize()`, the same writer everything else goes through.
+
+It knows nothing about grammars: you say `u32` and mean it.
 
 **Leaf factories** (little-endian default; `endian="big"` to flip):
 `u8 u16 u32 u64  i8 i16 i32 i64  f32 f64`, `leb(v)` / `sleb(v)`, `text(s)` (UTF-8) /
@@ -171,18 +177,21 @@ data = bytes(rec)                 # a whole binary from scratch
 
 The two layers meet only at **bytes**:
 
-- **New file from nothing:** `bytes(bbq.build.Struct(...))` — no parse, no document.
-- **Add to a parsed file:** the build object's bytes cross into the document as a node
-  that carries them; `emit()` stitches them with the untouched (zero-copy) original.
+- **New file from nothing:** `bytes(bbq.build.Struct(...))` — a document with no source,
+  serialized. No parse involved.
+- **Add to a parsed file:** the value is **grafted in as structure**, because it was
+  nodes all along; `emit()` stitches it with the untouched (zero-copy) original, and any
+  dependent field it moved — the array's count — is derived like any other.
 
 ```python
 r = spec.parse(data)
-r.records.append(b.Struct(v=b.u8(3), w=b.u8(4)))   # enters as bytes
-out = r.emit()
+r.records.append(b.Struct(v=b.u8(3), w=b.u8(4)))
+r.records[-1].v = 9          # still structure: navigable and writable in place
+out = r.emit()               # `n` derived from what the edit produced
 ```
 
-A built object added to a parse is opaque bytes in the tree afterward — re-parse to
-navigate it as structure.
+The two layers meet at **nodes**, not at bytes. Plain `bytes` may be supplied wherever a
+value is, and become a node holding them — which is as much structure as bytes carry.
 
 ## CaptureType → Python value
 

@@ -25,7 +25,12 @@
 #include "bbq_node.h"        // bbq::node_child / decode_int / bytes_view / seq + Capture
 #include "ZcowParityTypes.h" // generated handle classes (namespace zp)
 
+#include "coverage_gate.h"   // rule / arm / optional coverage, shared with cross_backend
+
 #include <cstdint>
+#include <fstream>
+#include <sstream>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -111,41 +116,20 @@ double index_float(const bbq::zcow::node* parent, const char* name, const uint8_
 
 }  // namespace
 
-// Spec text must match test/fixtures/zcow_parity.bbq (cmake generates the header
-// from that file; this string drives the CEK side). Kept inline so the parse and
-// the codegen come from the same source of truth at review time.
-static const char* kFixture =
-    "@endian little\n"
-    "Inner = struct { a: uint8, b: uint16le }\n"
-    "Flat = struct {\n"
-    "  u8: uint8, u16: uint16le, u32: uint32le, be16: uint16be,\n"
-    "  i8: int8, i16: int16le, i32: int32le, flag: bool,\n"
-    "  f32: float32le, f64: float64le,\n"
-    "  raw: bytes[2], s: string[3], hi: compute((u8 >> 4) & 0x0F : uint8),\n"
-    "  inner: Inner, n: uint8, items: array<Inner>[n],\n"
-    "  m: uint8, nums: array<uint16le>[m]\n"
-    "}\n"
-    "Opt = struct {\n"
-    "  pflag: uint8, pmaybe: optional<uint16le> where pflag == 1,\n"
-    "  rflag: uint8, rmaybe: optional<Inner> where rflag == 1\n"
-    "}\n"
-    "Bits = bitfield<uint8> { hi: 4, lo: 4 }\n"
-    "Nest = struct { hdr: struct { a: uint8, b: uint16le }, c: uint8 }\n"
-    "InlineBits = struct { lead: uint8,\n"
-    "  flags: bitfield<uint8> { hi: 4, lo: 4 }, tail: uint8 }\n"
-    "Pair = struct { p: uint8, q: uint8 }\n"
-    "U = union { asInner: Inner, asPair: Pair }\n"
-    "Alts = Inner | Pair\n"
-    "Sw = struct { tag: uint8,\n"
-    "  body: switch(tag) { 1: uint16le; 2: Inner; default: uint8; } }\n"
-    "TopSw = switch(peek()) { 1: Inner; default: uint8; }\n"
-    "OptSpan = struct { n: uint8, ob: optional<bytes[2]> where n == 1,\n"
-    "  os: optional<string[3]> where n == 1 }\n"
-    "Ext = struct { tag: uint8, blob: extern(\"readit\", \"uint32_t\"), tail: uint8 }\n"
-    "Matrix = struct { rows: uint8, cols: uint8, data: array<array<uint8>[cols]>[rows] }\n"
-    "TyByte = uint8\n"
-    "TyInner = Inner\n"
-    "OptTop = optional<uint8>\n";
+// THE fixture — the same file cmake generates ZcowParityTypes.h from. This used to be
+// an inline copy of it, "kept inline so the parse and the codegen come from the same
+// source of truth at review time", which is a claim and not a mechanism: two copies
+// drift, and when they do this suite compares a handle against one grammar and the CEK
+// against another, which is the one thing a PARITY test cannot be allowed to do.
+static const std::string& fixture() {
+    static const std::string s = [] {
+        std::ifstream f(std::string(SOURCE_DIR) + "/test/fixtures/zcow_parity.bbq");
+        std::stringstream ss; ss << f.rdbuf();
+        return ss.str();
+    }();
+    return s;
+}
+static const char* kFixture = fixture().c_str();
 
 // Bytes laid out for the fields above (little-endian unless suffixed be):
 //  u8=0x12  u16=0x3456  u32=256  be16=258  raw={0xAA,0xBB}
@@ -608,4 +592,90 @@ TEST(RenderTypesCppParity, WritingThenRemovingAnElementLeavesNothingBehind) {
     EXPECT_EQ(bbq::zcow::size_of(bbq::zcow::child_named(t.root(), "items")), 1u);
     // ...and the document it came from is untouched, element and value alike.
     EXPECT_EQ(bbq::node_child(p.meta.doc.root(), "items")->kids.size(), 2u);
+}
+
+// ── Coverage gates over this fixture ────────────────────────────────────────
+//
+// This suite had none. It is the C++↔CEK PARITY matrix and its own header calls the
+// fixture "the green baseline, not the finish line" — but nothing counted what the
+// baseline actually reached, so a rule, an arm or an optional's other half could go
+// unparsed here indefinitely. Same three gates as cross_backend_test, same helpers.
+
+namespace {
+
+// Every rule of the fixture and the inputs this suite parses it with. A rule appears
+// once per ARM it can take, which is what makes the gates below satisfiable.
+struct PCase { const char* rule; std::vector<uint8_t> bytes; };
+
+std::vector<PCase> pcases() {
+    return {
+        {"Inner", {0x07, 0x09, 0x00}},
+        {"Flat", kBytes},
+        {"Opt", {0x00, 0x00}},                                  // both optionals absent
+        {"Opt", {0x01, 0x07, 0x00, 0x01, 0x09, 0x0B, 0x00}},    // both present
+        {"Bits", {0xA5}},
+        {"Nest", {0x07, 0x08, 0x00, 0x09}},
+        {"InlineBits", {0x11, 0xA5, 0x22}},
+        {"Pair", {0x05, 0x06}},
+        // These arms are told apart by LENGTH, not by a guard: Inner is three bytes
+        // (uint8 + uint16le) and Pair is two, so the second arm is only reachable on
+        // input too short for the first. Nothing had ever taken it.
+        {"U", {0x05, 0x06, 0x00}},                              // arm 0: asInner
+        {"U", {0x05, 0x06}},                                    // arm 1: asPair
+        {"Alts", {0x05, 0x06, 0x00}},                           // arm 0: Inner
+        {"Alts", {0x05, 0x06}},                                 // arm 1: Pair
+        {"Sw", {0x01, 0x07, 0x00}},                             // arm 0: case 1
+        {"Sw", {0x02, 0x05, 0x06, 0x00}},                       // arm 1: case 2 → Inner
+        {"Sw", {0x09, 0x2A}},                                   // arm 2: default
+        {"TopSw", {0x01, 0x55, 0x66}},                          // arm 0: peek()==1
+        {"TopSw", {0x09}},                                      // arm 1: default
+        {"OptSpan", {0x01, 0xCA, 0xFE, 0x61, 0x62, 0x63}},      // both spans present
+        {"OptSpan", {0x00}},                                    // both skipped
+        {"Ext", {0xAA, 0x01, 0x02, 0x03, 0x04, 0xBB}},
+        {"Matrix", {2, 2, 1, 2, 3, 4}},
+        {"TyByte", {0x2A}},
+        {"TyInner", {0x07, 0x09, 0x00}},
+        {"OptTop", {0x2A}},
+    };
+}
+
+std::vector<BBQ::Rule*> parity_rules() {
+    auto* parser = new Parser();
+    parser->init(kFixture, (int)fixture().size());
+    EXPECT_TRUE(parser->parse());
+    static bbqgen::ErrorReporter rep;
+    auto* sema = new Sema(rep);
+    EXPECT_TRUE(sema->analyze(parser->ast));
+    return sema->sorted_rules();
+}
+
+std::map<std::string, coverage::Reached> parity_reached() {
+    std::map<std::string, coverage::Reached> out;
+    for (const auto& c : pcases()) {
+        Parsed p = cek_parse(kFixture, c.rule, c.bytes);
+        if (!p.meta.success) continue;
+        coverage::observe(p.meta.doc.root(), out[c.rule]);
+    }
+    return out;
+}
+
+}  // namespace
+
+TEST(RenderTypesCppParity, EveryFixtureRuleHasACase) {
+    std::set<std::string> covered;
+    for (const auto& c : pcases()) covered.insert(c.rule);
+    EXPECT_EQ(coverage::missing_rules(parity_rules(), covered), "")
+        << "parity fixture rules with NO case (untested != optional)";
+}
+
+TEST(RenderTypesCppParity, EveryVariantArmIsExercised) {
+    auto reached = parity_reached();
+    EXPECT_EQ(coverage::missing_arms(parity_rules(), reached), "")
+        << "variant arms no input ever takes (untested != optional)";
+}
+
+TEST(RenderTypesCppParity, EveryOptionalIsExercisedBothWays) {
+    auto reached = parity_reached();
+    EXPECT_EQ(coverage::missing_optional_sides(parity_rules(), reached), "")
+        << "optionals only ever seen one way (untested != optional)";
 }

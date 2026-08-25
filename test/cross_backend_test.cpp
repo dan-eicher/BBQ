@@ -22,6 +22,7 @@
 #include "CTypeMapper.h"
 #include "bbq_node.h"
 #include "zcow_cases.h"       // the shared fixture input table
+#include "coverage_gate.h"    // rule / arm / optional coverage, shared with the parity suite
 
 #include <sys/wait.h>
 #include <unordered_map>
@@ -900,113 +901,34 @@ TEST(CrossBackend, CppWriterMutateRoundTrip) {
 // fail — so "no test for it" is a red build, not a silent skip. Every column (C writer,
 // C++ ZCow writer, C-owning reader, AND the c-lite view reader) iterates this same
 // xcases() denominator, so a covered rule is covered on every column — including c-lite.
-// Every ARM the grammar declares, not every rule that has an input.
+// ── Coverage gates ──────────────────────────────────────────────────────────
 //
-// A rule with three switch arms and one case passes EveryFixtureRuleHasACase while two
-// thirds of it is never parsed by anything — and a wrong arm is exactly the bug that
-// matters, because it is what decides how the following bytes are read. So the
-// denominator comes from the grammar (`alts`, `variants`, `cases` + `default`) and the
-// numerator from what the parser actually recorded: `variant_tag` is the arm it took.
+// The rules and the shapes live in test/coverage_gate.h, shared with the parity
+// fixture's suite — a gate only one fixture has is how the other goes uncounted.
+
 namespace {
 
-// Every (node name, arm ordinal) a rule declares — one entry per arm, each of which
-// some input has to make the parser record. A ruleref is not descended into: the rule
-// it names carries its own arms.
-//
-// The two shapes differ in where the tag lands, and the generated `which()` shows it: a
-// SWITCH tags one field with the ordinal it took, so the arms are (field, 0..N-1); a
-// UNION or ALTERNATIVES tags the variant NODE that is present, so the arms are
-// (variant name, its ordinal) and only one exists per parse.
-void declared_arms(BBQ::TypeExpr* t, const std::string& field,
-                   std::vector<std::pair<std::string, int>>& out) {
-    if (!t) return;
-    switch (t->node_kind()) {
-    case BBQ::NodeKind::Switch: {
-        auto* s = static_cast<BBQ::Switch*>(t);
-        int arms = (int)s->cases.size() + (s->default_ ? 1 : 0);
-        for (int a = 0; a < arms; a++) out.emplace_back(field, a);
-        for (auto* c : s->cases) declared_arms(c->target, field, out);
-        if (s->default_ && (*s->default_)->target)
-            declared_arms(*(*s->default_)->target, field, out);
-        return;
+// Parse every case with the CEK and record what it reached, per rule.
+std::map<std::string, coverage::Reached> reached_by_rule(const CRoundtrip& rt) {
+    std::map<std::string, coverage::Reached> out;
+    for (auto& c : xcases()) {
+        bbq::zcow::parse_result ck =
+            cek_meta_x(rt.cek_cg, c.rule, c.valid.data(), c.valid.size());
+        if (!ck.success) continue;      // rejection is the other columns' business
+        coverage::observe(ck.doc.root(), out[c.rule]);
     }
-    case BBQ::NodeKind::Union: {
-        auto* u = static_cast<BBQ::Union*>(t);
-        for (size_t i = 0; i < u->variants.size(); i++) {
-            out.emplace_back(u->variants[i]->name, (int)i);
-            declared_arms(u->variants[i]->body, u->variants[i]->name, out);
-        }
-        return;
-    }
-    case BBQ::NodeKind::Alternatives: {
-        auto* a = static_cast<BBQ::Alternatives*>(t);
-        for (size_t i = 0; i < a->alts.size(); i++)
-            out.emplace_back("alt_" + std::to_string(i), (int)i);
-        return;
-    }
-    case BBQ::NodeKind::Struct:
-        for (auto* f : static_cast<BBQ::Struct*>(t)->fields)
-            declared_arms(f->body, f->name, out);
-        return;
-    case BBQ::NodeKind::Array:
-        declared_arms(static_cast<BBQ::Array*>(t)->element, field, out);
-        return;
-    case BBQ::NodeKind::Optional:
-        declared_arms(static_cast<BBQ::Optional*>(t)->element, field, out);
-        return;
-    default:
-        return;
-    }
+    return out;
 }
 
-// Which arms a parse actually took: field name -> the tags seen at it. An unnamed
-// tagged node is the rule's own top level, filed under "".
-void taken_arms(const bbq::zcow::node* n, const char* name,
-                std::map<std::string, std::set<int>>& out) {
-    if (!n) return;
-    if (n->variant_tag >= 0) out[name ? name : ""].insert(n->variant_tag);
-    for (const auto& k : n->kids) taken_arms(k.get(), k->name ? k->name : name, out);
-}
-
-// An optional is the other two-way decision a grammar makes, and it carries no tag:
-// the arm IS whether the node is there. A rule tested only with the field present has
-// never run the code that skips it — and skipping is the half that moves everything
-// after it.
-void declared_optionals(BBQ::TypeExpr* t, const std::string& field,
-                        std::vector<std::string>& out) {
-    if (!t) return;
-    switch (t->node_kind()) {
-    case BBQ::NodeKind::Optional:
-        out.push_back(field);
-        declared_optionals(static_cast<BBQ::Optional*>(t)->element, field, out);
-        return;
-    case BBQ::NodeKind::Struct:
-        for (auto* f : static_cast<BBQ::Struct*>(t)->fields)
-            declared_optionals(f->body, f->name, out);
-        return;
-    case BBQ::NodeKind::Array:
-        declared_optionals(static_cast<BBQ::Array*>(t)->element, field, out);
-        return;
-    case BBQ::NodeKind::Switch: {
-        auto* s = static_cast<BBQ::Switch*>(t);
-        for (auto* c : s->cases) declared_optionals(c->target, field, out);
-        if (s->default_ && (*s->default_)->target)
-            declared_optionals(*(*s->default_)->target, field, out);
-        return;
-    }
-    case BBQ::NodeKind::Union:
-        for (auto* v : static_cast<BBQ::Union*>(t)->variants)
-            declared_optionals(v->body, v->name, out);
-        return;
-    default:
-        return;
-    }
-}
-
-void present_names(const bbq::zcow::node* n, std::set<std::string>& out) {
-    if (!n) return;
-    if (n->name) out.insert(n->name);
-    for (const auto& k : n->kids) present_names(k.get(), out);
+std::vector<BBQ::Rule*> fixture_rules() {
+    std::string spec = fixture_for_c();
+    auto* parser = new Parser();
+    parser->init(spec.c_str(), (int)spec.size());
+    EXPECT_TRUE(parser->parse());
+    auto* errs = new ErrorReporter();
+    auto* sema = new Sema(*errs);
+    EXPECT_TRUE(sema->analyze(parser->ast));
+    return sema->sorted_rules();
 }
 
 }  // namespace
@@ -1014,95 +936,24 @@ void present_names(const bbq::zcow::node* n, std::set<std::string>& out) {
 TEST(CrossBackend, EveryVariantArmIsExercised) {
     const CRoundtrip& rt = shared_rt();
     ASSERT_TRUE(rt.ok) << rt.err;
-
-    std::string spec = fixture_for_c();
-    auto* parser = new Parser();
-    parser->init(spec.c_str(), (int)spec.size());
-    ASSERT_TRUE(parser->parse());
-    auto* errs = new ErrorReporter();
-    auto* sema = new Sema(*errs);
-    ASSERT_TRUE(sema->analyze(parser->ast));
-
-    // What every input of a rule between them managed to take.
-    std::map<std::string, std::map<std::string, std::set<int>>> taken;
-    for (auto& c : xcases()) {
-        bbq::zcow::parse_result ck =
-            cek_meta_x(rt.cek_cg, c.rule, c.valid.data(), c.valid.size());
-        if (!ck.success) continue;                       // covered by the other tests
-        taken_arms(ck.doc.root(), nullptr, taken[c.rule]);
-    }
-
-    std::string missing;
-    for (auto* r : sema->sorted_rules()) {
-        std::vector<std::pair<std::string, int>> want;
-        declared_arms(r->body, std::string(), want);
-        for (const auto& [key, arm] : want)
-            if (!taken[r->name][key].count(arm))
-                missing += (missing.empty() ? "" : ", ") + r->name +
-                           (key.empty() ? "" : "." + key) + " arm " + std::to_string(arm);
-    }
-    EXPECT_TRUE(missing.empty())
-        << "variant arms no input ever takes (untested ≠ optional): " << missing;
+    auto reached = reached_by_rule(rt);
+    EXPECT_EQ(coverage::missing_arms(fixture_rules(), reached), "")
+        << "variant arms no input ever takes (untested != optional)";
 }
 
 TEST(CrossBackend, EveryOptionalIsExercisedBothWays) {
     const CRoundtrip& rt = shared_rt();
     ASSERT_TRUE(rt.ok) << rt.err;
-
-    std::string spec = fixture_for_c();
-    auto* parser = new Parser();
-    parser->init(spec.c_str(), (int)spec.size());
-    ASSERT_TRUE(parser->parse());
-    auto* errs = new ErrorReporter();
-    auto* sema = new Sema(*errs);
-    ASSERT_TRUE(sema->analyze(parser->ast));
-
-    // Every successful parse of a rule, as the set of field names it produced.
-    std::map<std::string, std::vector<std::set<std::string>>> seen;
-    for (auto& c : xcases()) {
-        bbq::zcow::parse_result ck =
-            cek_meta_x(rt.cek_cg, c.rule, c.valid.data(), c.valid.size());
-        if (!ck.success) continue;
-        std::set<std::string> names;
-        present_names(ck.doc.root(), names);
-        seen[c.rule].push_back(std::move(names));
-    }
-
-    std::string missing;
-    for (auto* r : sema->sorted_rules()) {
-        std::vector<std::string> opts;
-        declared_optionals(r->body, std::string(), opts);
-        for (const auto& f : opts) {
-            if (f.empty()) continue;              // a rule that IS an optional: see below
-            bool ever_present = false, ever_absent = false;
-            for (const auto& names : seen[r->name])
-                (names.count(f) ? ever_present : ever_absent) = true;
-            if (!ever_present || !ever_absent)
-                missing += (missing.empty() ? "" : ", ") + r->name + "." + f +
-                           (ever_present ? " never absent" : " never present");
-        }
-    }
-    EXPECT_TRUE(missing.empty())
-        << "optionals only ever seen one way (untested ≠ optional): " << missing;
+    auto reached = reached_by_rule(rt);
+    EXPECT_EQ(coverage::missing_optional_sides(fixture_rules(), reached), "")
+        << "optionals only ever seen one way (untested != optional)";
 }
 
 TEST(CrossBackend, EveryFixtureRuleHasACase) {
-    std::string spec = fixture_for_c();
-    auto* parser = new Parser();
-    parser->init(spec.c_str(), (int)spec.size());
-    ASSERT_TRUE(parser->parse());
-    auto* errs = new ErrorReporter();
-    auto* sema = new Sema(*errs);
-    ASSERT_TRUE(sema->analyze(parser->ast));
-
     std::set<std::string> covered;
     for (auto& c : xcases()) covered.insert(c.rule);
-
-    std::string missing;
-    for (auto* r : sema->sorted_rules())
-        if (!covered.count(r->name)) missing += std::string(missing.empty() ? "" : ", ") + r->name;
-    EXPECT_TRUE(missing.empty())
-        << "fixture rules with NO cross-backend case (untested ≠ optional): " << missing;
+    EXPECT_EQ(coverage::missing_rules(fixture_rules(), covered), "")
+        << "fixture rules with NO cross-backend case (untested != optional)";
 }
 
 // ── c-lite POSITIVE: the C view reader's index == the CEK's, per fixture rule. The

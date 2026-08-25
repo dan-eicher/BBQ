@@ -462,15 +462,6 @@ static std::string ctype_prim(const json& p) {
     if (k == "string") return "bbq_string_t";
     return "/*?prim*/";
 }
-// A signed entry is read back sign-extended from its own width, so the field it lands
-// in has to be signed — an unsigned spelling would report a 4-bit 0xD as 13 while the
-// grammar declared -3.
-static std::string bitfield_ctype(int64_t w, bool is_signed = false) {
-    if (w <= 8)  return is_signed ? "int8_t"  : "uint8_t";
-    if (w <= 16) return is_signed ? "int16_t" : "uint16_t";
-    if (w <= 32) return is_signed ? "int32_t" : "uint32_t";
-    return is_signed ? "int64_t" : "uint64_t";
-}
 // The one shared lowering — both render_types_c and render_types_cpp call it.
 json lower_type_model(const CompilerCtx& ctx) {
     TypeLowerer lower(*ctx.sema, ctx.prefix, ctx.default_le());
@@ -500,9 +491,9 @@ std::string render_types_c(const CompilerCtx& ctx, const std::string& template_p
     env.set_trim_blocks(true);
     env.set_lstrip_blocks(true);
 
-    // Recursive C spelling of a neutral type-use node. Rule/struct names go
-    // through the ONE canonical C namer (CTypeMapper) — never a reimplementation,
-    // so the names can't drift from the model's defs.
+    // Recursive C spelling of a neutral type-use node. Rule/struct names and the
+    // bitfield entry types go through the ONE canonical C mapper (CTypeMapper) —
+    // never a reimplementation, so they can't drift from the model's defs.
     CTypeMapper namer(*ctx.sema, ctx.prefix);
     std::function<std::string(const json&)> c_type = [&](const json& n) -> std::string {
         std::string t = n["t"];
@@ -520,7 +511,8 @@ std::string render_types_c(const CompilerCtx& ctx, const std::string& template_p
         if (t == "bitfield_inline") {
             std::string s = "struct { ";
             for (auto& e : n["entries"])
-                s += bitfield_ctype(e["width"].get<int64_t>(), e.value("signed", false))
+                s += namer.bitfield_entry_type(e["width"].get<int64_t>(),
+                                               e.value("signed", false))
                    + " " + e["name"].get<std::string>() + "; ";
             return s + "}";
         }
@@ -528,7 +520,7 @@ std::string render_types_c(const CompilerCtx& ctx, const std::string& template_p
     };
     env.add_callback("c_type", 1, [&](inja::Arguments& a) { return c_type(*a[0]); });
     env.add_callback("bitfield_type", 2, [&](inja::Arguments& a) {
-        return bitfield_ctype(a[0]->get<int64_t>(), a[1]->get<bool>());
+        return namer.bitfield_entry_type(a[0]->get<int64_t>(), a[1]->get<bool>());
     });
     // Canonical CamelCase name → C struct tag (c_sname) / typedef name (c_tname),
     // through the one C namer. The template never spells names itself.

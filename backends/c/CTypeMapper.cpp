@@ -60,7 +60,9 @@ std::string CTypeMapper::c_type(TypeExpr* type) const {
     } else if (auto* bf = dynamic_cast<Bitfield*>(type)) {
         std::string result = "struct { ";
         for (auto* entry : bf->entries)
-            result += bitfield_entry_type(entry->width) + " " + entry->name + "; ";
+            result += bitfield_entry_type(entry->width,
+                                          entry->sign == Signedness::Signed)
+                    + " " + entry->name + "; ";
         result += "}";
         return result;
     }
@@ -88,11 +90,14 @@ std::string CTypeMapper::primitive_c_type(PrimitiveKind* kind) const {
     return "/* unknown primitive */";
 }
 
-std::string CTypeMapper::bitfield_entry_type(int64_t width) const {
-    if (width <= 8)  return "uint8_t";
-    if (width <= 16) return "uint16_t";
-    if (width <= 32) return "uint32_t";
-    return "uint64_t";
+// The smallest C integer the entry's bits fit in. A signed entry is read back
+// sign-extended from its OWN width, so the field it lands in has to be signed —
+// an unsigned spelling would report a 4-bit 0xD as 13 where the grammar said -3.
+std::string CTypeMapper::bitfield_entry_type(int64_t width, bool is_signed) const {
+    if (width <= 8)  return is_signed ? "int8_t"  : "uint8_t";
+    if (width <= 16) return is_signed ? "int16_t" : "uint16_t";
+    if (width <= 32) return is_signed ? "int32_t" : "uint32_t";
+    return is_signed ? "int64_t" : "uint64_t";
 }
 
 }  // namespace bbqgen_c

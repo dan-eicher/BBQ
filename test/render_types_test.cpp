@@ -88,6 +88,25 @@ TEST(RenderTypes, Bitfield) {
     EXPECT_TRUE(has(h, "uint8_t low;"));
 }
 
+// A signed entry is read back sign-extended from its own width, so the field it lands
+// in has to be signed; the entries beside it keep the unsigned default. The needles
+// carry the leading space because "int16_t imm;" is a substring of "uint16_t imm;",
+// and a pin that cannot go red is not a pin.
+TEST(RenderTypes, SignedBitfieldEntry) {
+    auto h = render("Imm = bitfield<uint32be> { op: 8, imm: signed 12, rest: unsigned 12 }");
+    EXPECT_TRUE(has(h, "struct imm {"));
+    EXPECT_TRUE(has(h, " uint8_t op;"));
+    EXPECT_TRUE(has(h, " int16_t imm;"));
+    EXPECT_TRUE(has(h, " uint16_t rest;"));
+}
+
+// The inline spelling is a second call site — a bitfield FIELD is spelled where it
+// sits, not hoisted to a rule of its own.
+TEST(RenderTypes, SignedBitfieldEntryInline) {
+    auto h = render("Insn = struct { lead: uint8, bits: bitfield<uint32be> { imm: signed 12, rest: 20 } }");
+    EXPECT_TRUE(has(h, "struct { int16_t imm; uint32_t rest; } bits;"));
+}
+
 TEST(RenderTypes, BytesFieldFreed) {
     auto h = render("Foo = struct { len: uint8, data: bytes[len] }");
     EXPECT_TRUE(has(h, "bbq_bytes_t data;"));

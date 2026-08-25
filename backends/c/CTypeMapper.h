@@ -36,7 +36,7 @@ public:
     // TypeExpr / primitive → C type spelling.
     std::string c_type(BBQ::TypeExpr* type) const;
     std::string primitive_c_type(BBQ::PrimitiveKind* kind) const;
-    std::string bitfield_entry_type(int64_t width) const;
+    std::string bitfield_entry_type(int64_t width, bool is_signed) const;
 
     // Inline structs in declaration order — delegated to Sema (the resolved fact),
     // for backends that emit their defs.

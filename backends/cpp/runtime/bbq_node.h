@@ -25,19 +25,6 @@ struct bytes_view {
     size_t size = 0;
 };
 
-// Read a computed value at its REAL stored kind, converted to T — so a float/bool
-// compute isn't flattened through the int path (the dual of reader::add_computed_val).
-template <class T>
-inline T node_computed_val(const zcow::node* c) {
-    const ComputedValue* cv = c ? c->computed_value : nullptr;
-    if (!cv) return T{};
-    switch (cv->kind) {
-    case ComputedValue::Kind::Float: return static_cast<T>(cv->f);
-    case ComputedValue::Kind::Bool:  return static_cast<T>(cv->b);
-    default:                         return static_cast<T>(cv->i);
-    }
-}
-
 // Decode a scalar through its RECORDED type (not a static atom), so it follows a
 // runtime-resolved endian — e.g. an unsuffixed prim after a mid-struct `@endian`
 // switch. The same decode the CEK does.

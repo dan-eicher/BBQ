@@ -327,13 +327,23 @@ std::vector<XCase> xcases() {
         {"Comp", zr::Comp_read, {0xA5}},
         {"Iv", zr::Iv_read, {0x02,0xFF,0x2A}},
         {"Pos", zr::Pos_read, {0x0A,0x0B}},
-        {"Op", zr::Op_read, {0x01,0x34,0x12,0x05,0x06}},
-        {"Bare", zr::Bare_read, {0x0A,0x2A}},
-        {"Sw", zr::Sw_read, {0x01,0x34,0x12}},
+        {"Op", zr::Op_read, {0x01,0x34,0x12,0x05,0x06}},   // f==1: both optionals present
+        {"Op", zr::Op_read, {0x00}},                       // f!=1: both skipped
+        {"Bare", zr::Bare_read, {0x0A,0x2A}},              // the bare optional taken
+        {"Bare", zr::Bare_read, {0x0A}},                   // ...and not taken (input ends)
+        // A rule appears once per ARM it can take. Every axis below — the producers
+        // agreeing, the round trips, the truncation and corruption sweeps — then runs
+        // on each arm, because which arm was taken decides how the bytes after it are
+        // read. EveryVariantArmIsExercised is what says this list is complete.
+        {"Sw", zr::Sw_read, {0x01,0x34,0x12}},          // arm 0: case 1 → uint16le
+        {"Sw", zr::Sw_read, {0x02,0x05,0x06}},          // arm 1: case 2 → Pair
+        {"Sw", zr::Sw_read, {0x09,0x2A}},               // arm 2: default → uint8
         {"VA", zr::VA_read, {0x01,0x0A}},
         {"VB", zr::VB_read, {0x02,0x0B}},
-        {"U", zr::U_read, {0x01,0x0A}},
-        {"Alts", zr::Alts_read, {0x02,0x0B}},
+        {"U", zr::U_read, {0x01,0x0A}},                 // arm 0: asA (VA, t==1)
+        {"U", zr::U_read, {0x02,0x0B}},                 // arm 1: asB (VB, t==2)
+        {"Alts", zr::Alts_read, {0x01,0x0A}},           // arm 0: VA
+        {"Alts", zr::Alts_read, {0x02,0x0B}},           // arm 1: VB
         {"Bf", zr::Bf_read, {0xA5}},
         {"SBf", zr::SBf_read, {0x2D}},   // imm: signed 4 = -3, tag: unsigned 4 = 2
         {"InlineBf", zr::InlineBf_read, {0x11,0xA5,0x22}},
@@ -343,13 +353,15 @@ std::vector<XCase> xcases() {
         {"RsItem", zr::RsItem_read, {0x05}},
         {"Resync", zr::Resync_read, {0x02,0x00,0x05,0x00,0x07}},
         {"Ext", zr::Ext_read, {0xAA,0x01,0x02,0x03,0x04,0xBB}},
-        {"SwRange", zr::SwRange_read, {0x02,0x34,0x12}},
+        {"SwRange", zr::SwRange_read, {0x02,0x34,0x12}},   // arm 0: the 1..3 range case
+        {"SwRange", zr::SwRange_read, {0x09,0x2A}},        // arm 1: default → uint8
         {"Tern", zr::Tern_read, {0x05}},
         {"Bstart", zr::Bstart_read, {0x0A,0x0B}},
         {"Rest", zr::Rest_read, {0x02,0x34,0x12}},
         {"RestEof", zr::RestEof_read, {0x03,10,20,30}},
         {"Cnt", zr::Cnt_read, {0x03,10,20,30}},
-        {"TopSw", zr::TopSw_read, {0x01,0x22}},
+        {"TopSw", zr::TopSw_read, {0x01,0x22}},            // arm 0: peek()==1 → Pair
+        {"TopSw", zr::TopSw_read, {0x05}},                 // arm 1: default → uint8
         {"Np", zr::Np_read, {0x03,0xAA,0xBB,0xCC}},
         {"OScope", zr::OScope_read, {0x03,0x03,0xFF,0x10,0x20,0x30}},
         {"AllPrim", zr::AllPrim_read, {0x12,0xFE,0x56,0x34,0x01,0x02,0xFD,0xFF,
@@ -358,9 +370,11 @@ std::vector<XCase> xcases() {
             0x00,0x00,0xC0,0x3F,0x00,0x00,0x00,0x00,0x00,0x00,0x04,0x40,0x01}},
         {"Leb", zr::Leb_read, {0xAC,0x02,0x7B,0x42}},
         {"LebArr", zr::LebArr_read, {0x03,0x01,0xAC,0x02,0x05}},
-        {"LebOpt", zr::LebOpt_read, {0x01,0xAC,0x02,0x42}},
+        {"LebOpt", zr::LebOpt_read, {0x01,0xAC,0x02,0x42}},   // f==1: the varint present
+        {"LebOpt", zr::LebOpt_read, {0x00,0x42}},             // f!=1: skipped, tail moves up
         {"Mat", zr::Mat_read, {0x02,0x03,1,2,3,4,5,6}},
-        {"OptSpan", zr::OptSpan_read, {0x01,0xAA,0xBB,0x61,0x62,0x63}},
+        {"OptSpan", zr::OptSpan_read, {0x01,0xAA,0xBB,0x61,0x62,0x63}},  // n==1: both spans
+        {"OptSpan", zr::OptSpan_read, {0x00}},                           // n!=1: both skipped
         {"TyByte", zr::TyByte_read, {0x2A}},
         {"TyRule", zr::TyRule_read, {0x07,0x08}},
         {"OptTop", zr::OptTop_read, {0x2A}},
@@ -964,6 +978,192 @@ TEST(CrossBackend, CppWriterMutateRoundTrip) {
 // fail — so "no test for it" is a red build, not a silent skip. Every column (C writer,
 // C++ ZCow writer, C-owning reader, AND the c-lite view reader) iterates this same
 // xcases() denominator, so a covered rule is covered on every column — including c-lite.
+// Every ARM the grammar declares, not every rule that has an input.
+//
+// A rule with three switch arms and one case passes EveryFixtureRuleHasACase while two
+// thirds of it is never parsed by anything — and a wrong arm is exactly the bug that
+// matters, because it is what decides how the following bytes are read. So the
+// denominator comes from the grammar (`alts`, `variants`, `cases` + `default`) and the
+// numerator from what the parser actually recorded: `variant_tag` is the arm it took.
+namespace {
+
+// Every (node name, arm ordinal) a rule declares — one entry per arm, each of which
+// some input has to make the parser record. A ruleref is not descended into: the rule
+// it names carries its own arms.
+//
+// The two shapes differ in where the tag lands, and the generated `which()` shows it: a
+// SWITCH tags one field with the ordinal it took, so the arms are (field, 0..N-1); a
+// UNION or ALTERNATIVES tags the variant NODE that is present, so the arms are
+// (variant name, its ordinal) and only one exists per parse.
+void declared_arms(BBQ::TypeExpr* t, const std::string& field,
+                   std::vector<std::pair<std::string, int>>& out) {
+    if (!t) return;
+    switch (t->node_kind()) {
+    case BBQ::NodeKind::Switch: {
+        auto* s = static_cast<BBQ::Switch*>(t);
+        int arms = (int)s->cases.size() + (s->default_ ? 1 : 0);
+        for (int a = 0; a < arms; a++) out.emplace_back(field, a);
+        for (auto* c : s->cases) declared_arms(c->target, field, out);
+        if (s->default_ && (*s->default_)->target)
+            declared_arms(*(*s->default_)->target, field, out);
+        return;
+    }
+    case BBQ::NodeKind::Union: {
+        auto* u = static_cast<BBQ::Union*>(t);
+        for (size_t i = 0; i < u->variants.size(); i++) {
+            out.emplace_back(u->variants[i]->name, (int)i);
+            declared_arms(u->variants[i]->body, u->variants[i]->name, out);
+        }
+        return;
+    }
+    case BBQ::NodeKind::Alternatives: {
+        auto* a = static_cast<BBQ::Alternatives*>(t);
+        for (size_t i = 0; i < a->alts.size(); i++)
+            out.emplace_back("alt_" + std::to_string(i), (int)i);
+        return;
+    }
+    case BBQ::NodeKind::Struct:
+        for (auto* f : static_cast<BBQ::Struct*>(t)->fields)
+            declared_arms(f->body, f->name, out);
+        return;
+    case BBQ::NodeKind::Array:
+        declared_arms(static_cast<BBQ::Array*>(t)->element, field, out);
+        return;
+    case BBQ::NodeKind::Optional:
+        declared_arms(static_cast<BBQ::Optional*>(t)->element, field, out);
+        return;
+    default:
+        return;
+    }
+}
+
+// Which arms a parse actually took: field name -> the tags seen at it. An unnamed
+// tagged node is the rule's own top level, filed under "".
+void taken_arms(const bbq::zcow::node* n, const char* name,
+                std::map<std::string, std::set<int>>& out) {
+    if (!n) return;
+    if (n->variant_tag >= 0) out[name ? name : ""].insert(n->variant_tag);
+    for (const auto& k : n->kids) taken_arms(k.get(), k->name ? k->name : name, out);
+}
+
+// An optional is the other two-way decision a grammar makes, and it carries no tag:
+// the arm IS whether the node is there. A rule tested only with the field present has
+// never run the code that skips it — and skipping is the half that moves everything
+// after it.
+void declared_optionals(BBQ::TypeExpr* t, const std::string& field,
+                        std::vector<std::string>& out) {
+    if (!t) return;
+    switch (t->node_kind()) {
+    case BBQ::NodeKind::Optional:
+        out.push_back(field);
+        declared_optionals(static_cast<BBQ::Optional*>(t)->element, field, out);
+        return;
+    case BBQ::NodeKind::Struct:
+        for (auto* f : static_cast<BBQ::Struct*>(t)->fields)
+            declared_optionals(f->body, f->name, out);
+        return;
+    case BBQ::NodeKind::Array:
+        declared_optionals(static_cast<BBQ::Array*>(t)->element, field, out);
+        return;
+    case BBQ::NodeKind::Switch: {
+        auto* s = static_cast<BBQ::Switch*>(t);
+        for (auto* c : s->cases) declared_optionals(c->target, field, out);
+        if (s->default_ && (*s->default_)->target)
+            declared_optionals(*(*s->default_)->target, field, out);
+        return;
+    }
+    case BBQ::NodeKind::Union:
+        for (auto* v : static_cast<BBQ::Union*>(t)->variants)
+            declared_optionals(v->body, v->name, out);
+        return;
+    default:
+        return;
+    }
+}
+
+void present_names(const bbq::zcow::node* n, std::set<std::string>& out) {
+    if (!n) return;
+    if (n->name) out.insert(n->name);
+    for (const auto& k : n->kids) present_names(k.get(), out);
+}
+
+}  // namespace
+
+TEST(CrossBackend, EveryVariantArmIsExercised) {
+    const CRoundtrip& rt = shared_rt();
+    ASSERT_TRUE(rt.ok) << rt.err;
+
+    std::string spec = fixture_for_c();
+    auto* parser = new Parser();
+    parser->init(spec.c_str(), (int)spec.size());
+    ASSERT_TRUE(parser->parse());
+    auto* errs = new ErrorReporter();
+    auto* sema = new Sema(*errs);
+    ASSERT_TRUE(sema->analyze(parser->ast));
+
+    // What every input of a rule between them managed to take.
+    std::map<std::string, std::map<std::string, std::set<int>>> taken;
+    for (auto& c : xcases()) {
+        bbq::zcow::parse_result ck =
+            cek_meta_x(rt.cek_cg, c.rule, c.valid.data(), c.valid.size());
+        if (!ck.success) continue;                       // covered by the other tests
+        taken_arms(ck.doc.root(), nullptr, taken[c.rule]);
+    }
+
+    std::string missing;
+    for (auto* r : sema->sorted_rules()) {
+        std::vector<std::pair<std::string, int>> want;
+        declared_arms(r->body, std::string(), want);
+        for (const auto& [key, arm] : want)
+            if (!taken[r->name][key].count(arm))
+                missing += (missing.empty() ? "" : ", ") + r->name +
+                           (key.empty() ? "" : "." + key) + " arm " + std::to_string(arm);
+    }
+    EXPECT_TRUE(missing.empty())
+        << "variant arms no input ever takes (untested ≠ optional): " << missing;
+}
+
+TEST(CrossBackend, EveryOptionalIsExercisedBothWays) {
+    const CRoundtrip& rt = shared_rt();
+    ASSERT_TRUE(rt.ok) << rt.err;
+
+    std::string spec = fixture_for_c();
+    auto* parser = new Parser();
+    parser->init(spec.c_str(), (int)spec.size());
+    ASSERT_TRUE(parser->parse());
+    auto* errs = new ErrorReporter();
+    auto* sema = new Sema(*errs);
+    ASSERT_TRUE(sema->analyze(parser->ast));
+
+    // Every successful parse of a rule, as the set of field names it produced.
+    std::map<std::string, std::vector<std::set<std::string>>> seen;
+    for (auto& c : xcases()) {
+        bbq::zcow::parse_result ck =
+            cek_meta_x(rt.cek_cg, c.rule, c.valid.data(), c.valid.size());
+        if (!ck.success) continue;
+        std::set<std::string> names;
+        present_names(ck.doc.root(), names);
+        seen[c.rule].push_back(std::move(names));
+    }
+
+    std::string missing;
+    for (auto* r : sema->sorted_rules()) {
+        std::vector<std::string> opts;
+        declared_optionals(r->body, std::string(), opts);
+        for (const auto& f : opts) {
+            if (f.empty()) continue;              // a rule that IS an optional: see below
+            bool ever_present = false, ever_absent = false;
+            for (const auto& names : seen[r->name])
+                (names.count(f) ? ever_present : ever_absent) = true;
+            if (!ever_present || !ever_absent)
+                missing += (missing.empty() ? "" : ", ") + r->name + "." + f +
+                           (ever_present ? " never absent" : " never present");
+        }
+    }
+    EXPECT_TRUE(missing.empty())
+        << "optionals only ever seen one way (untested ≠ optional): " << missing;
+}
+
 TEST(CrossBackend, EveryFixtureRuleHasACase) {
     std::string spec = fixture_for_c();
     auto* parser = new Parser();

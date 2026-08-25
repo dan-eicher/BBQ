@@ -22,6 +22,7 @@
 #include "bbq_node.h"
 #include "ZcowReaderTypes.h"    // generated handle classes (namespace zr)
 #include "ZcowReaderReader.h"   // generated view parser (namespace zr)
+#include "zcow_cases.h"         // the shared fixture input table
 
 using namespace bbq;
 
@@ -34,71 +35,13 @@ bool readit(const uint8_t*, size_t len, size_t* consumed) {
 
 namespace {
 
-using ReadFn = zcow::parse_result (*)(const uint8_t*, size_t, ParseArena&);
+using ReadFn = zcow_fixture::ReadFn;
+using Case = zcow_fixture::Case;
 
-struct Case { const char* rule; ReadFn read; std::vector<uint8_t> bytes; };
-
-// Every rule in the fixture, which is every `type_expr` constructor the grammar has.
-// A rule added to the fixture and not listed here is a hole, so this table is the
-// coverage claim.
-const std::vector<Case>& cases() {
-    static const std::vector<Case> c = {
-        {"Flat", zr::Flat_read, {0x12,0x56,0x34,0x00,0x01,0x00,0x00,0x01,0x02,0xFC,0xFF,0xFF,0xFF}},
-        {"Nest", zr::Nest_read, {0x07,0x09,0x00,0x0B}},
-        {"Arr", zr::Arr_read, {0x03,0x10,0x00,0x20,0x00,0x30,0x00}},
-        {"Pair", zr::Pair_read, {0x07,0x08}},
-        {"Outer", zr::Outer_read, {0x55,0x07,0x08}},
-        {"RArr", zr::RArr_read, {0x02,1,2,3,4}},
-        {"Bytes", zr::Bytes_read, {0x03,0xAA,0xBB,0xCC}},
-        {"Str", zr::Str_read, {0x61,0x62,0x63}},
-        {"Wh", zr::Wh_read, {0x01,0x2A}},
-        {"WhTwice", zr::WhTwice_read, {0x05,0x0A,0x2A}},
-        {"Comp", zr::Comp_read, {0xA5}},
-        {"Iv", zr::Iv_read, {0x02,0xFF,0x2A}},
-        {"Pos", zr::Pos_read, {0x0A,0x0B}},
-        {"Op", zr::Op_read, {0x01,0x34,0x12,0x05,0x06}},
-        {"Bare", zr::Bare_read, {0x0A,0x2A}},
-        {"Sw", zr::Sw_read, {0x01,0x34,0x12}},
-        {"VA", zr::VA_read, {0x01,0x0A}},
-        {"VB", zr::VB_read, {0x02,0x0B}},
-        {"U", zr::U_read, {0x01,0x0A}},
-        {"Alts", zr::Alts_read, {0x02,0x0B}},
-        {"Bf", zr::Bf_read, {0xA5}},
-        {"SBf", zr::SBf_read, {0x2D}},
-        {"InlineBf", zr::InlineBf_read, {0x11,0xA5,0x22}},
-        {"Eof", zr::Eof_read, {1,2,3,4}},
-        {"Unt", zr::Unt_read, {1,2,3}},
-        {"Es", zr::Es_read, {0x34,0x12,0x12,0x34}},
-        {"RsItem", zr::RsItem_read, {0x05}},
-        {"Resync", zr::Resync_read, {0x02,0x00,0x05,0x00,0x07}},
-        {"Ext", zr::Ext_read, {0xAA,0x01,0x02,0x03,0x04,0xBB}},
-        {"SwRange", zr::SwRange_read, {0x02,0x34,0x12}},
-        {"Tern", zr::Tern_read, {0x05}},
-        {"Bstart", zr::Bstart_read, {0x0A,0x0B}},
-        {"Rest", zr::Rest_read, {0x02,0x34,0x12}},
-        {"RestEof", zr::RestEof_read, {0x03,10,20,30}},
-        {"Cnt", zr::Cnt_read, {0x03,10,20,30}},
-        {"TopSw", zr::TopSw_read, {0x01,0x22}},
-        {"Np", zr::Np_read, {0x03,0xAA,0xBB,0xCC}},
-        {"OScope", zr::OScope_read, {0x03,0x03,0xFF,0x10,0x20,0x30}},
-        {"AllPrim", zr::AllPrim_read, {0x12,0xFE,0x56,0x34,0x01,0x02,0xFD,0xFF,
-            0x00,0x01,0x00,0x00,0x01,0x02,0x03,0x04,0xFC,0xFF,0xFF,0xFF,
-            0x00,0x01,0x00,0x00,0x00,0x00,0x00,0x00,0xFB,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
-            0x00,0x00,0xC0,0x3F,0x00,0x00,0x00,0x00,0x00,0x00,0x04,0x40,0x01}},
-        {"Leb", zr::Leb_read, {0xAC,0x02,0x7B,0x42}},
-        {"LebArr", zr::LebArr_read, {0x03,0x01,0xAC,0x02,0x05}},
-        {"LebOpt", zr::LebOpt_read, {0x01,0xAC,0x02,0x42}},
-        {"Mat", zr::Mat_read, {0x02,0x03,1,2,3,4,5,6}},
-        {"OptSpan", zr::OptSpan_read, {0x01,0xAA,0xBB,0x61,0x62,0x63}},
-        {"TyByte", zr::TyByte_read, {0x2A}},
-        {"TyRule", zr::TyRule_read, {0x07,0x08}},
-        {"OptTop", zr::OptTop_read, {0x2A}},
-        {"NestGrp", zr::NestGrp_read, {0x02,0xAA,0xBB}},
-        {"NestArr", zr::NestArr_read, {0x02, 0x01,0x11, 0x02,0x22,0x33}},
-        {"FComp", zr::FComp_read, {0xC8}},
-    };
-    return c;
-}
+// The shared table (test/zcow_cases.h). This used to be a second copy that called
+// itself the coverage claim while nothing checked it — and it was missing every
+// variant arm and every optional-absent path that the gates later found.
+const std::vector<Case>& cases() { return zcow_fixture::cases(); }
 
 // A parse and the arena its nodes live in, kept together so a document outlives the
 // handles into it.

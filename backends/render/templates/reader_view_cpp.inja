@@ -1,9 +1,9 @@
-{# BBQ C++ ZCow (view) reader — the compiled CEK that BUILDS the index. Each spine
+{# BBQ C++ ZCow (view) reader — the compiled CEK that BUILDS the document. Each spine
    kont is a stencil that advances the cursor and records a span into the
-   bbq::reader's CaptureBuilder, then calls its successor. Same burg op-records as
+   bbq::reader's zcow::builder, then calls its successor. Same burg op-records as
    the C-owning reader; the spelling (record-span vs copy-into-struct) is the only
-   difference. The result is the same FieldCapture index the CEK builds and the
-   generated handle classes read. #}
+   difference. The result is the same document the CEK builds and the generated
+   handle classes read. #}
 #pragma once
 
 #include <cstdint>

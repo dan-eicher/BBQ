@@ -934,7 +934,7 @@ std::string capture_expr_c_json(const json& p) {
            ", " + bs + ", " + ns + ")";
 }
 
-// C++ cpp-zcow (view) reader: records spans into the FieldCapture index. Same Emitter
+// C++ cpp-zcow (view) reader: records spans into the document. Same Emitter
 // base/loop as OwningCReader, overriding the spelling for decode-on-access + the view
 // template/mappers, plus the extern forward-decl list (the view ABI) as backend data.
 struct ZCowReader : Emitter {

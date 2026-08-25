@@ -1,6 +1,6 @@
 // render_view_parser_test — the cpp-zcow (view) parser builds the SAME index the
 // CEK builds. The generated view reader (ZcowReaderReader.h, the burg view profile
-// over the kont IR) parses bytes into a FieldCapture index; this asserts that index
+// over the kont IR) parses bytes into a document; this asserts that document
 // decodes identically to the CEK's for the same bytes, and reads correctly through
 // the generated handle classes. Grows with the fixture as the view profile does.
 #include <gtest/gtest.h>

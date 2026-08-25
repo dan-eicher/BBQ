@@ -322,10 +322,10 @@ class TestNodeProperties:
 
 
 # ── ZCow mutation (copy-on-write through the Python face) ─────────────────────
-# `result.field = v` / `node.field = v` detaches that field to Owned in the
-# shared overlay (the same one the C++ handles use); reads see the override,
-# siblings stay borrowed. emit() then enforces the grammar over the edited
-# overlay before serializing — see TestLensLaws for the laws that pin that down.
+# `result.field = v` / `node.field = v` owns that field, so it carries its own value
+# instead of the span it was parsed from; everything off the path keeps its span and
+# is still shared. emit() settles the dependent fields the edit invalidated before
+# serializing — see TestLensLaws for the laws that pin that down.
 
 class TestZCowMutation:
     def test_scalar_set(self):
@@ -429,7 +429,7 @@ class TestZCowMutation:
 
     def test_splice_element_bytes(self):
         # arr[i] = b"..." replaces a composite element with raw bytes (the ZCow splice /
-        # set_node op): path-copy, re-serialize on emit, neighbors intact.
+        # splice): path-copy, re-serialize on emit, neighbors intact.
         ss = bbq.compile_string(
             "It = struct { v: uint8, w: uint8 }\nT = struct { n: uint8, items: array<It>[n] }")
         r = ss.parse(bytes([2, 1, 2, 3, 4]), rule="T")     # items = [{1,2}, {3,4}]
@@ -440,8 +440,8 @@ class TestZCowMutation:
         assert int(r2.items[1].v) == 3 and int(r2.items[1].w) == 4   # neighbor preserved
 
     def test_splice_compose_with_remove_and_append(self):
-        # splice + remove + append compose — the overlay's baseline→node map stays
-        # consistent (a removed element's whole subtree leaves the map; no dangling).
+        # splice + remove + append compose — each is a write into the one tree, so the
+        # length, the contents and what serializes all stay in step with each other.
         ss = bbq.compile_string(
             "It = struct { v: uint8, w: uint8 }\nT = struct { n: uint8, items: array<It>[n] }")
         r = ss.parse(bytes([3, 1, 2, 3, 4, 5, 6]), rule="T")   # [{1,2},{3,4},{5,6}]
@@ -469,8 +469,8 @@ class TestZCowMutation:
 # ── Lens laws ────────────────────────────────────────────────────────────────
 # parse/emit is a lens (Foster et al., TOPLAS 2007): get = parse (bytes -> capture
 # view), put = emit (edited view x ORIGINAL bytes -> new bytes). `put` takes the
-# original because `get` discards information — which is exactly what the ZCow
-# overlay retains. Two laws:
+# original because `get` discards information — which is exactly what the spans a
+# document keeps are. Two laws:
 #
 #   GetPut   put(get(c), c) = c      an unedited re-emit is byte-identical
 #   PutGet   get(put(a, c)) = a      re-parsing an edit yields the edit you made
@@ -1317,8 +1317,8 @@ class TestFailedResult:
                 result.tag
 
     def test_emit_on_failure(self):
-        # A failed parse produced no document, so there is no grammar to enforce over
-        # it — emit() is the raw serialization of the (untouched) overlay: the input.
+        # A failed parse produced no document, so there is nothing to serialize and
+        # nothing to settle — emit() gives back the input, unchanged.
         spec = bbq.compile_string(MULTI_FIELD_SPEC)
         data = b"\x01"
         result = spec.parse(data)
@@ -1557,7 +1557,7 @@ ZCOW_READER_BBQ = os.path.join(os.path.dirname(__file__), "fixtures", "zcow_read
 
 class TestReadParity:
     """The parser must surface EVERY grammar feature into a navigable ZCow container.
-    Inputs + asserted shapes mirror the C++ reader's FieldCapture (cross_backend_test)."""
+    Inputs + asserted shapes mirror the C++ reader's document (cross_backend_test)."""
 
     @classmethod
     def setup_class(cls):

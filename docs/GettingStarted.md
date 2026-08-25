@@ -325,19 +325,18 @@ Options:
 | `-prefix <name>` | from input filename | Generated file prefix |
 | `-namespace <ns>` | none | C++ namespace for generated code |
 
-The generated headers depend only on the C++ view runtime in
-`backends/cpp/runtime/` (`bbq_node.h`, `bbq_reader.h`, `bbq_writer.h` and the index/
-decode headers they include: `Capture.h`, `CaptureDecode.h`, `CaptureCow.h`,
-`ParseArena.h`, `bbq_machine.h`). Compile against that one include dir and link
+The generated headers depend only on the C++ document runtime in
+`backends/cpp/runtime/` (`bbq_node.h`, `bbq_reader.h` and the headers they include:
+`Capture.h`, `CaptureDecode.h`, `CaptureCow.h`, `ParseArena.h`, `bbq_machine.h`).
+Compile against that one include dir and link
 `backends/cpp/runtime/CaptureDecode.cpp`; nothing else is needed (no `bbq::cek`).
 
-Minimal usage — `<Rule>_read` builds the index, a handle is a typed view over it,
-and `<Rule>_write` serializes the (optionally edited) overlay back to bytes:
+Minimal usage — `<Rule>_read` builds the document, a handle is a typed view over it,
+and serializing it back to bytes is the document's own `serialize()`:
 
 ```cpp
 #include "headerTypes.h"     // typed handles (hdr::Header)
 #include "headerReader.h"    // hdr::Header_read
-#include "headerWriter.h"    // hdr::Header_write
 #include <cstdio>
 #include <vector>
 
@@ -345,18 +344,18 @@ int main() {
     const uint8_t data[] = {0x89, 'P', 'N', 'G', 0x03, 0x00,
                             0x01, 0x0a, 0x00, 0x00, 0x00};
     bbq::ParseArena arena;
-    auto vm = hdr::Header_read(data, sizeof data, arena);   // zero-copy parse → index
-    if (!vm.success) return 1;
+    auto r = hdr::Header_read(data, sizeof data, arena);   // zero-copy parse → document
+    if (!r.success) return 1;
 
-    hdr::Header h(vm.root, data, nullptr);   // typed view over `data` (no edits)
+    hdr::Header h = hdr::Header_of(r.doc);                 // a typed view; reads only
     printf("magic: 0x%08x\n", h.magic());
     printf("version: %d\n", h.version());
 
-    // Mutate through a copy-on-write overlay, then write the edited bytes back.
-    bbq::zcow zc;
-    hdr::Header edit(vm.root, data, &zc);
-    edit.set_version(2);
-    std::vector<uint8_t> out = hdr::Header_write(vm.root, data, sizeof data, &zc);
+    // Editing takes a transient. The document `r.doc` is untouched by anything done
+    // to it, and committing yields the next version.
+    bbq::zcow::transient t = r.doc.begin_edit();
+    hdr::Header_of(t).set_version(2);
+    std::vector<uint8_t> out = std::move(t).commit().serialize();
 }
 ```
 
@@ -365,8 +364,9 @@ g++ -std=c++17 -I gen -I backends/cpp/runtime \
     main.cpp backends/cpp/runtime/CaptureDecode.cpp -o demo
 ```
 
-The view borrows `data`, so the input buffer must outlive the handles and any
-`*_write` call.
+An unedited document serializes byte-identical to its input, and an edit that resizes
+nothing patches in place — so bytes no field covers survive it. The document's spans
+point into `data`, so the input buffer must outlive it.
 
 ## Real-World Examples
 

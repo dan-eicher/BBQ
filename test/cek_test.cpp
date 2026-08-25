@@ -11,7 +11,7 @@
 #include "Frame.h"
 #include "Machine.h"
 
-using namespace bbq;        // index runtime: ParseArena, FieldCapture, CaptureType, ...
+using namespace bbq;        // document runtime: ParseArena, CaptureType, zcow, ...
 using namespace bbq::cek;   // machine IR: Value, CEKMachine, ...
 
 // Test helper: wrap an integer in an IntValue allocated in `arena`.
@@ -228,53 +228,6 @@ TEST(CEKEnvironment, Shadowing) {
     ASSERT_NE(found, nullptr);
     EXPECT_EQ(static_cast<bbq::cek::IntValue*>(found->value)->v, 2);
 }
-
-// ── CaptureBuilder ─────────────────────────────────────────
-// Re-enabled with iv() wrapping for the typed Value* in computed_value
-// (was int64_t pre-rebuild).
-
-TEST(CEKCaptureBuilder, AddField) {
-    ParseArena arena;
-    CaptureBuilder builder;
-    builder.add_field(nullptr, 0, 1, CaptureType::UInt8, cv(arena, 42));
-    builder.add_field(nullptr, 1, 3, CaptureType::UInt16LE, cv(arena, 0x0201));
-    EXPECT_EQ(builder.fields().size(), 2u);
-    EXPECT_EQ(builder.fields()[0].computed_value->i, 42);
-    EXPECT_EQ(builder.fields()[1].computed_value->i, 0x0201);
-}
-
-TEST(CEKCaptureBuilder, MarkRestore) {
-    ParseArena arena;
-    CaptureBuilder builder;
-    builder.add_field(nullptr, 0, 1, CaptureType::UInt8, cv(arena, 1));
-    auto m = builder.mark();
-    builder.add_field(nullptr, 1, 2, CaptureType::UInt8, cv(arena, 2));
-    builder.add_field(nullptr, 2, 3, CaptureType::UInt8, cv(arena, 3));
-    EXPECT_EQ(builder.fields().size(), 3u);
-
-    builder.restore(m);
-    EXPECT_EQ(builder.fields().size(), 1u);
-    EXPECT_EQ(builder.fields()[0].computed_value->i, 1);
-}
-
-TEST(CEKCaptureBuilder, AddComputed) {
-    ParseArena arena;
-    StringPool pool;
-    CaptureBuilder builder;
-    const char* nm = pool.intern("derived");
-    builder.add_computed(nm, cv(arena, 0xABCD), /*pos=*/8);
-    ASSERT_EQ(builder.fields().size(), 1u);
-    const auto& f = builder.fields()[0];
-    EXPECT_EQ(f.name, nm);
-    EXPECT_EQ(f.type, CaptureType::Computed);
-    EXPECT_EQ(f.start_offset, 8u);
-    EXPECT_EQ(f.end_offset, 8u);   // zero-width at pos
-    ASSERT_NE(f.computed_value, nullptr);
-    EXPECT_EQ(f.computed_value->i, 0xABCD);
-    EXPECT_EQ(f.children, nullptr);
-    EXPECT_EQ(f.child_count, 0);
-}
-
 
 // ─────────────────────────────────────────────────────────────────────
 //  Layer 1 invariant tests for the rebuilt CEK IR.

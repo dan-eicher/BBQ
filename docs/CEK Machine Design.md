@@ -57,9 +57,11 @@ the static C++ code generator. Both backends share the same frontend
 
 **Input.** Validated, topologically sorted BBQ AST + byte buffer.
 
-**Output.** `CaptureMetadata` — a hierarchical zero-copy file index recording
-`[start, end)` offsets into the original buffer plus typed computed values.
-No bytes are copied; the metadata IS the parse result.
+**Output.** `bbq::zcow::parse_result` — the document, plus how the parse went. The
+document is one tree whose nodes either name a `[start, end)` span of the input
+(nothing is copied) or carry a value the grammar computed. It is the same document
+the generated readers build and the same one an edit produces a new version of;
+there is no separate index.
 
 **Toolchain at a glance.** The compiler and IR are themselves generated from
 declarative inputs:
@@ -310,7 +312,8 @@ layouts. Their roles:
   the `LoopFrame`; in standard mode there is no `Savepoint` for the
   array.
 
-**Capture metadata.** The output structure.
+**The document.** The output structure, and the same one every backend produces —
+`bbq::zcow::node` (`backends/cpp/runtime/CaptureCow.h`).
 
 ```cpp
 enum class CaptureType : uint8_t {
@@ -320,28 +323,17 @@ enum class CaptureType : uint8_t {
     Bool, Bytes, String,
     Struct, Array, Computed, External
 };
-
-struct FieldCapture {
-    const char* name;           // Interned
-    size_t start_offset;
-    size_t end_offset;
-    CaptureType type;
-    FieldCapture* children;     // Nested captures (Struct, Array)
-    int child_count;
-    Value* computed_value;      // Typed value for Computed fields
-};
-
-struct CaptureMetadata {
-    bool success;
-    size_t bytes_consumed;
-    FieldCapture* root;
-    const char* error_message;
-    size_t error_offset;
-};
 ```
 
-The capture builder accumulates this tree during parsing and supports
-mark/restore for backtracking.
+A node's storage is either the span it was parsed from — `parsed == true`, the bytes
+at `[start_offset, end_offset)` *are* the content — or a value it owns. Children are
+pointers, which is what makes copy-on-write work. Alongside that the parser records
+what only it knows, so that nothing downstream re-derives the grammar: which arm a
+variant took (`variant_tag`), a bitfield entry's place in its run, a varint's encoding,
+and which field a container's count or `@rest` size determines.
+
+`zcow::builder` accumulates the tree during the parse and supports mark/restore for
+backtracking.
 
 **String interning.** All identifier strings (field names, rule names) are
 interned in `CompiledGrammar::strings`. Identifier comparison is interned-
@@ -427,11 +419,11 @@ dispatched data records allocated from the per-parse arena.
 | `FloatValue` | `double` | f32/f64 fields, float literals, float arithmetic |
 | `StringValue` | interned pointer | string fields, string literals (equality via pointer) |
 | `BoolValue` | `bool` | comparison results, constraint outcomes, true/false literals |
-| `FieldCaptureValue` | `FieldCapture*` | path-nav intermediate; converted to a typed scalar by `CaptureValueApplyKont` before leaving the path sub-chain |
+| `FieldCaptureValue` | `zcow::node*` | path-nav intermediate; converted to a typed scalar by `CaptureValueApplyKont` before leaving the path sub-chain |
 
-`ac` holds `Value*`. Env bindings hold `Value*`. FieldCapture's
-`computed_value` is `Value*`. The same Value type flows everywhere typed
-data lives.
+`ac` holds `Value*`. Env bindings hold `Value*`. A node's `computed_value` is a
+neutral `ComputedValue`, which the machine lowers its `Value` into at the capture
+boundary — the document runtime does not depend on the machine's Value IR.
 
 ### 4.5 Reference
 
@@ -767,38 +759,36 @@ the savepoint to the new `pos` so the next failure recovers from
 
 ---
 
-## 8. Zero-Copy Capture Output
+## 8. Zero-Copy Document Output
 
-The capture metadata IS the parse result. After a successful parse, the
-caller receives a `CaptureMetadata` tree mapping the hierarchical
-structure of the format specification onto byte ranges in the original
-input buffer. No bytes are copied during or after parsing.
+The document IS the parse result. After a successful parse the caller receives a
+tree mapping the format's structure onto byte ranges in the input buffer. No bytes
+are copied during or after parsing, and serializing an unedited document is one
+blit back out.
 
 ```cpp
-ParseResult result = vm.execute(grammar, "PNGFile", buffer, length);
+bbq::zcow::parse_result r = vm.execute(grammar, "PNGFile", buffer, length);
 
-FieldCapture* header = result.root->child("header");
-FieldCapture* magic  = header->child("magic");
+const bbq::zcow::node* header = bbq::zcow::child_named(r.doc.root(), "header");
+const bbq::zcow::node* magic  = bbq::zcow::child_named(header, "magic");
 // magic->start_offset == 0, magic->end_offset == 4
 // magic->type == CaptureType::UInt32BE
 
-// Read the actual value lazily from the input buffer:
-uint32_t magic_val = read_uint32be(buffer + magic->start_offset);
+int64_t magic_val = bbq::zcow::read_int(magic, r.doc.src());   // decoded on access
 
-FieldCapture* chunks = result.root->child("chunks");
-for (int i = 0; i < chunks->child_count; i++) {
-    FieldCapture* chunk = &chunks->children[i];
+const bbq::zcow::node* chunks = bbq::zcow::child_named(r.doc.root(), "chunks");
+for (size_t i = 0; i < bbq::zcow::size_of(chunks); i++) {
+    const bbq::zcow::node* chunk = bbq::zcow::child_at(chunks, i);
     // …
 }
 ```
 
-Computed fields (from `compute(name : T = expr)`) hold a typed `Value*`
-in `computed_value` rather than referencing buffer bytes. The user sees
-the actual typed value (Int, Float, String, Bool) directly.
+Computed fields (from `compute(name : T = expr)`) carry a typed `ComputedValue`
+rather than referencing buffer bytes, so the caller sees the value directly.
 
-The capture tree is arena-allocated; the caller must keep the
-`ParseArena` alive for as long as they access captures, or copy data out
-before releasing.
+A node's `computed_value` is arena-allocated, so the `ParseArena` has to outlive
+the document. The bytes the spans name are held by the document itself — `source`
+carries a keepalive — so those cannot go out from under it.
 
 ---
 
@@ -903,7 +893,7 @@ parse error at offset 42:
 
 - `CEKMachine` and all mutable state
 - `ParseArena` (per-parse allocations including dynamic_kont nodes)
-- `CaptureBuilder`, `Environment` chain
+- `zcow::builder`, `Environment` chain
 
 Pattern: compile once globally, each thread parses independently with
 its own machine + arena.

@@ -41,9 +41,9 @@ std::string render_writer_c(const CompilerCtx& ctx, const std::string& template_
 std::string render_writer_decls(const CompilerCtx& ctx);
 
 // Render the cpp-zcow (view) readers: the SAME burg lowering driven through the
-// view profile + C++ view template, producing `bbq::CaptureMetadata X_read(...)`
-// functions that build the FieldCapture index. The second profile, not a new
-// generator. `ns` is the C++ namespace (matches the types header).
+// view profile + C++ view template, producing `bbq::zcow::parse_result X_read(...)`
+// functions that build the document. The second profile, not a new generator.
+// `ns` is the C++ namespace (matches the types header).
 std::string render_reader_view(const CompilerCtx& ctx, const std::string& template_path,
                                const std::string& ns);
 

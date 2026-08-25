@@ -6,9 +6,9 @@
 // reader and writer stencils are the two refunctionalizations of that graph. Both ride
 // the SAME machine state — the endian register and the array-loop stack — so it lives
 // here once. The reader (bbq::reader) adds an input cursor + interval CONFINEMENT + the
-// CaptureBuilder; the writer (bbq::writer) adds an output cursor + interval size-BACKPATCH
-// + the graph cursor. Those are genuinely dual (not shared); this base is only what is
-// identical between them.
+// document builder. There is no writer stencil: writing is the document's own, and a
+// dependent field is settled from what the parser recorded rather than replayed through
+// a second traversal of the graph.
 //
 #include <cstdint>
 #include <vector>

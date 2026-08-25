@@ -2,12 +2,12 @@
 //
 // bbq_reader — the C++ parse context for the ZCow (view) reader.
 //
-// The generated C++ view parser is the compiled CEK that BUILDS the index: each
+// The generated C++ view parser is the compiled CEK that BUILDS the document: each
 // kont becomes a step that advances the cursor and records a span into the
-// CaptureBuilder (the same FieldCapture index the CEK machine builds and the
-// generated handle classes read). This context is the self-contained analogue of
+// zcow::builder (the same document the CEK machine builds and the generated handle
+// classes read). This context is the self-contained analogue of
 // the C `bbq_ctx` / the CEK machine's parse state — cursor + interval window +
-// endian register + the capture builder — living entirely in the C++ index
+// endian register + the document builder — living entirely in the C++ index
 // runtime so the view parser depends only on backends/cpp/runtime (no C runtime,
 // no bbq::cek). It grows per feature (loops/checkpoints land with arrays/optional).
 //

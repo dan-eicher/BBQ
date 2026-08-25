@@ -599,7 +599,7 @@ std::function<std::string(const json&)> make_cpp_type() {
     return *self;
 }
 
-// Decode the node reached by `c` (a `const FieldCapture*` C++ expression) as `n` —
+// Decode the node reached by `c` (a `const zcow::node*` C++ expression) as `n` —
 // the read expression for a tagged arm (switch case / union variant), where the
 // accessor name and the index child differ. Union variants capture under their
 // variant name; switch arms under the field name; a top-level switch rule's arm is
@@ -680,7 +680,7 @@ std::string render_types_cpp(const CompilerCtx& ctx,
     for (auto& d : neutral["defs"]) {
         std::string kind = d.value("kind", std::string());
         // A bitfield rule is structurally a struct of computed entries: each entry
-        // is a Computed capture in the index, so it renders as a node_computed_int
+        // is a Computed node in the document, so it renders as a node_computed_int
         // accessor — identical to the "computed" field branch. Synthesize one
         // computed field per entry, storage width rounded up to a C++ integer.
         if (kind == "bitfield") {

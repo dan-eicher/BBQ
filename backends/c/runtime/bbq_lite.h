@@ -77,8 +77,9 @@ typedef struct {
     int variant_tag;
 } bbq_capture_scope;
 
-/* The index builder: append-ordered fields_, a scope stack, and a child_buf_ that
- * closed scopes' children are packed into (the C++ CaptureBuilder, field for field). */
+/* The index builder: append-ordered fields, a scope stack, and a child buffer that
+ * closed scopes' children are packed into. This backend owns its own index — the C++
+ * side builds a bbq::zcow document instead, and the two do not share a structure. */
 typedef struct {
     bbq_field_capture* fields;     /* bbq_vec */
     bbq_capture_scope* scopes;     /* bbq_vec */
@@ -118,7 +119,7 @@ void bbq_view_ctx_init(bbq_view_ctx_t* c, const uint8_t* data, size_t len, bbq_a
 void bbq_view_build_free(bbq_view_ctx_t* c);
 bbq_capture_metadata bbq_view_finish(bbq_view_ctx_t* c, bool ok);
 
-/* ── builder scope/field ops (the bbq::CaptureBuilder API, C-spelled) ── */
+/* ── builder scope/field ops ── */
 void bbq_cap_begin_struct(bbq_capture_builder* b, const char* name, size_t pos);
 void bbq_cap_end_struct(bbq_capture_builder* b, size_t pos);
 void bbq_cap_begin_array(bbq_capture_builder* b, const char* name, size_t pos);

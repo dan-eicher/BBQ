@@ -1,18 +1,15 @@
 #pragma once
 //
-// bbq_node — the C++ view runtime over the shared zero-copy index.
+// bbq_node — the spellings the generated parser emits for reading back its own captures.
 //
-// A parsed value is a node in the FieldCapture index (offsets into the input
-// buffer — the same index the CEK Machine builds; the index runtime is the
-// shared lib in this directory, depended on by the machine and generated code
-// alike). The generated typed handle classes are a typed face over that index:
-// each field accessor finds its child node and decodes it lazily through the
-// shared decoders (CaptureDecode.h). Read-only / Borrowed for now; the Owned +
-// copy-on-write + emit() faces land with their consumers.
+// A parsed value is a node in the document (CaptureCow.h), and the accessors here are
+// thin names over that: the generated reader looks up an array's count before its
+// elements, mid-parse, and this keeps what it emits the same shape as what a consumer
+// would write by hand. There is one node type and one place a value comes from.
 //
-#include "Capture.h"        // bbq::FieldCapture / CaptureType — the index
+#include "Capture.h"        // bbq::CaptureType
 #include "CaptureDecode.h"  // inline endian atoms (bbq_rd_u32le, ...)
-#include "CaptureCow.h"     // bbq::zcow — the shared copy-on-write overlay
+#include "CaptureCow.h"     // bbq::zcow — the document
 
 #include <cstddef>
 #include <cstdint>
@@ -28,29 +25,10 @@ struct bytes_view {
     size_t size = 0;
 };
 
-// Find a struct child by field name. Names in the index are interned C strings;
-// generated accessors pass string literals, so compare by content.
-inline const FieldCapture* node_child(const FieldCapture* n, const char* name) {
-    if (!n || !n->children) return nullptr;
-    for (int i = 0; i < n->child_count; i++) {
-        const char* cn = n->children[i].name;
-        if (cn && std::string_view(cn) == name) return &n->children[i];
-    }
-    return nullptr;
-}
-
-// Computed-field value (compute(...)/leb/bitfield): the parser stored a typed
-// Value on the Computed capture; read it as an integer.
-inline int64_t node_computed_int(const FieldCapture* c) {
-    int64_t bits = 0; bool sgn = false;
-    decode_int(c, nullptr, &bits, &sgn);  // Computed path ignores the buffer
-    return bits;
-}
-
 // Read a computed value at its REAL stored kind, converted to T — so a float/bool
 // compute isn't flattened through the int path (the dual of reader::add_computed_val).
 template <class T>
-inline T node_computed_val(const FieldCapture* c) {
+inline T node_computed_val(const zcow::node* c) {
     const ComputedValue* cv = c ? c->computed_value : nullptr;
     if (!cv) return T{};
     switch (cv->kind) {
@@ -60,22 +38,9 @@ inline T node_computed_val(const FieldCapture* c) {
     }
 }
 
-// Decode a scalar field through its RECORDED capture type (not a static atom), so
-// it follows a runtime-resolved endian (e.g. an unsuffixed prim after a mid-struct
-// `@endian` switch) — the same decode the CEK/seq use.
-inline int64_t node_int(const FieldCapture* c, const uint8_t* buf) {
-    int64_t bits = 0; bool sgn = false;
-    decode_int(c, buf, &bits, &sgn);
-    return bits;
-}
-inline double node_float(const FieldCapture* c, const uint8_t* buf) {
-    double d = 0; decode_float(c, buf, &d);
-    return d;
-}
-
-// The same three over a document node. The generated parser reads back its own
-// captures mid-parse — an array's count before its elements — and what it holds by
-// then is a zcow::node, so these keep the emitted spelling the same either side.
+// Decode a scalar through its RECORDED type (not a static atom), so it follows a
+// runtime-resolved endian — e.g. an unsuffixed prim after a mid-struct `@endian`
+// switch. The same decode the CEK does.
 inline const zcow::node* node_child(const zcow::node* n, const char* name) {
     return n ? zcow::child_named(n, name) : nullptr;
 }
@@ -100,10 +65,5 @@ inline double node_float(const zcow::node* c, const uint8_t* buf) {
     zcow::decode_float(c, buf, &d);
     return d;
 }
-
-// The typed containers now live in CaptureCow.h, over a cursor rather than over
-// (node, buffer, overlay). Keeping a second set here that read size() from one place
-// and elements from another is what let a view report contents it would never
-// serialize.
 
 }  // namespace bbq

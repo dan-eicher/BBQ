@@ -8,10 +8,10 @@ stressor here vacuous — so this refuses to run unless the GIL is actually off
 
 Each stressor targets one piece of state that is shared across threads:
 
-  S1  PyBBQSpec::wops      the lazily lowered writer op-list, one per Spec
+  S1  one Spec, many parses  a compiled grammar is read-only; parses must not collide
   S2  the extern registry  register_extern reallocs the array a parse is reading
-  S3  PyBBQResult::zcow    the overlay, lazily created and then mutated
-  S4  bbq.build containers in-place list mutation on a shared Struct/Array
+  S3  PyBBQResult::edit   one document, edited from several threads at once
+  S4  bbq.build containers in-place mutation of a shared Struct/Array's children
   S5  independent parses   the case that must simply be correct AND parallel
 
 A failure is a crash, an interpreter-level corruption, or a value that no
@@ -122,7 +122,7 @@ def s3_document():
                 r.x = (i * 7 + n) & 0xFF
                 r.y = (i * 11 + n) & 0xFF
                 out = r.emit()
-                assert len(out) == 3, f"overlay produced {len(out)} bytes, want 3"
+                assert len(out) == 3, f"document produced {len(out)} bytes, want 3"
 
         _run(work, threads=4)
         # z was never written, so it must still read as authored no matter how

@@ -9,7 +9,7 @@
 //   (2) the Twofer — the C++ ZCow reader decodes the writer's bytes identically to the
 //       CEK: a different reader (compiled stencils) agrees with the machine (interpreter)
 //       on the C writer's output. Real bytes cross every backend boundary.
-// Comparison is a generic recursive walk of the FieldCapture index, so it covers every
+// Comparison is a generic recursive walk of the document, so it covers every
 // field/element/arm/computed/span — not a hand-picked scalar or two.
 #include <gtest/gtest.h>
 #include "Parser.h"
@@ -231,7 +231,7 @@ std::vector<uint8_t> c_roundtrip(const std::string& bin, const char* rule,
     return out;
 }
 
-// Generic recursive comparison of two FieldCapture index trees, each decoded through its
+// Generic recursive comparison of two document trees, each decoded through its
 // OWN buffer (the writer may place bytes differently — e.g. interval zero-fill — so it is
 // the decoded VALUES, structure, arm tags, computed values and span contents that must
 // match, not the offsets). Covers every node shape: a writer that drops a field, picks the
@@ -389,10 +389,10 @@ const CRoundtrip& shared_rt() {
 // against the CEK like the cpp view reader: a canonical preorder dump of {path, type,
 // variant_tag, child_count, decoded value / computed / span} must match the CEK's. The
 // dump schema is shared by the C harness (over bbq_field_capture) and the C++ dumper
-// below (over bbq::FieldCapture) so the two faces of the same index can't drift. Run as
+// below (over bbq::zcow::node) so the two faces of the same document can't drift. Run as
 // an ASan/UBSan subprocess (hostile input is the headline property) like the C-owning gate.
 
-// C++ dump of a CEK FieldCapture tree — byte-identical format to the C harness's dump_node.
+// C++ dump of a CEK document tree — byte-identical format to the C harness's dump_node.
 void dump_cek_node(const std::string& path, const bbq::zcow::node* nd,
                    const uint8_t* buf, std::ostream& o) {
     using CT = bbq::CaptureType;
@@ -829,9 +829,9 @@ TEST(CrossBackend, BothProducersRecordTheSameGrammarKnowledge) {
     }
 }
 
-// ── The MUTATE axis — the whole point of ZCow. Parse → graph → CoW-edit via the zcow
-// overlay → ZCow writer re-emits → the bytes decode (CEK oracle) to the EDITED value tree,
-// derived fields (counts) consistent. Value edit, array remove, array append.
+// ── The MUTATE axis — the whole point of ZCow. Parse → copy-on-write edit → serialize →
+// the bytes decode (CEK oracle) to the EDITED value tree, derived fields (counts)
+// consistent. Value edit, array remove, array append.
 TEST(CrossBackend, CppWriterMutateRoundTrip) {
     const CRoundtrip& rt = shared_rt();
     ASSERT_TRUE(rt.ok) << rt.err;

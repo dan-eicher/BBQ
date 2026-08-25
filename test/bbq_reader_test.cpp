@@ -1,11 +1,11 @@
 // bbq_reader_test — the C++ ZCow parse context (bbq::reader).
 //
 // The view parser (step 5) is the compiled CEK that BUILDS the index: it advances
-// the cursor and records spans into a CaptureBuilder. bbq::reader is its parse
+// the cursor and records spans into a zcow::builder. bbq::reader is its parse
 // context — the self-contained C++ analogue of the C bbq_ctx / CEK parse state,
 // depending only on backends/cpp/runtime. These tests pin its cursor/interval
 // bounds and prove a hand-built index (what the generated parser will emit) is a
-// correct, decodable FieldCapture tree — the same shape the CEK builds and the
+// correct, decodable document tree — the same shape the CEK builds and the
 // generated handle classes read.
 #include <gtest/gtest.h>
 #include "bbq_reader.h"
@@ -45,7 +45,7 @@ TEST(BbqReader, IntervalBoundsConfine) {
 
 TEST(BbqReader, BuildsDecodableStructIndex) {
     // What a flat-struct view parser for `S = struct { x: uint8, y: uint16le }`
-    // emits: advance + record span per field. The result must be a FieldCapture
+    // emits: advance + record span per field. The result must be a document
     // tree the shared decoders read — the same index the CEK builds.
     const uint8_t buf[3] = {0x12, 0x34, 0x12};  // x=0x12, y(le)=0x1234
     ParseArena arena;

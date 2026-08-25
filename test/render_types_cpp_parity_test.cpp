@@ -4,7 +4,7 @@
 // compile-only render_types_cpp_test). It is: for the same grammar + bytes, the
 // generated C++ handle decodes the IDENTICAL value the CEK index holds. The CEK
 // is the reference; the C++ handle classes are the typed face over the SAME
-// FieldCapture index. This is the prototype-in-Python → compile-to-C++ "zero
+// document. This is the prototype-in-Python → compile-to-C++ "zero
 // drama" guarantee, mechanized.
 //
 // Mechanism: compile the fixture grammar, run the CEK on test bytes to build the
@@ -543,9 +543,8 @@ TEST(RenderTypesCppParity, TopLevelOptionalRule) {
 }
 
 // ── Writer (ZCow emit) matrix ──────────────────────────────────────────────
-// The writer is exercised end-to-end through the Python binding; these lock the
-// C++ emit() decision logic + encoders directly, plus the overlay invariant the
-// path-copy depends on (no dangling baseline→node entries after a remove).
+// Serializing is exercised end-to-end through the Python binding; these lock the C++
+// emit() decision logic and encoders directly, and what a structural edit leaves behind.
 
 TEST(RenderTypesCppParity, EmitUnmutatedIsIdentity) {
     Parsed p = cek_parse(kFixture, "Flat", kBytes);
@@ -591,12 +590,8 @@ TEST(RenderTypesCppParity, EmitLebWidthChangeReserializes) {
 }
 
 TEST(RenderTypesCppParity, WritingThenRemovingAnElementLeavesNothingBehind) {
-    // This used to assert that removing an element dropped its whole subtree from the
-    // index→overlay map, because a descendant left behind would dangle once the
-    // element's node was freed. There is no such map now — the document is one tree
-    // and a position is a path — so the failure it guarded cannot be expressed. What
-    // is still worth pinning is the behaviour: write into an element, drop it, and
-    // neither the value nor the element survives.
+    // Writing into an element and then dropping it leaves neither the value nor the
+    // element: a removed subtree goes in one piece, and nothing it held can reappear.
     Parsed p = cek_parse(kFixture, "Flat", kBytes);
     ASSERT_TRUE(p.meta.success);
     const bbq::zcow::node* items = bbq::node_child(p.meta.doc.root(), "items");

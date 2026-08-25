@@ -1,11 +1,10 @@
 #pragma once
 //
-// CaptureDecode — the Borrowed-leaf decoders: offsets + buffer -> a C++ scalar.
+// CaptureDecode — the byte-level atoms: an offset in a buffer -> a C++ scalar, and back.
 //
-// The single home for the offset→value logic over the zero-copy index
-// (FieldCapture). Both the Python binding and (later) the generated C++
-// accessors decode through this, so the dynamic and compiled faces of the same
-// index can't drift. Python-agnostic: it returns C++ values; callers wrap.
+// The single home for the endian/width logic. Everything above it — the document's own
+// decoders (CaptureCow.h), the generated readers, the C runtime's twin — goes through
+// these, so no two faces of the same bytes can drift.
 //
 #include "Capture.h"
 #include <cstddef>
@@ -87,17 +86,5 @@ inline void encode_float(uint8_t* buf, size_t off, CaptureType type, double v) {
 }
 
 // ── Borrowed-leaf decode dispatch (the dynamic face) ──
-
-// Decode an integer-typed leaf. Handles every integer CaptureType and Computed
-// (reads computed_value). Fills `*bits` with the value reinterpreted into 64
-// bits and `*is_signed` with how to widen it (signed types and Computed are
-// signed; unsigned types are not). Returns false if the type isn't
-// integer-convertible (the caller raises).
-bool decode_int(const FieldCapture* cap, const uint8_t* buf,
-                int64_t* bits, bool* is_signed);
-
-// Decode a float-typed leaf (Float32/64 LE/BE) into `*out`. Returns false if the
-// type isn't a float.
-bool decode_float(const FieldCapture* cap, const uint8_t* buf, double* out);
 
 }  // namespace bbq

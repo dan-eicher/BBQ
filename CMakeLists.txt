@@ -40,7 +40,7 @@ target_include_directories(bbq_ctypes PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/backends/c/runtime)
 target_link_libraries(bbq_ctypes PUBLIC bbq_frontend)
 
-# --- shared C++ index runtime (zero-copy FieldCapture index + decoders + CoW) ---
+# --- shared C++ document runtime (bbq::zcow: zero-copy spans + copy-on-write) ---
 # The neutral runtime that BOTH the CEK machine and generated C++ parsers depend
 # on. It has NO dependency on the machine IR (KontNode.h) — generated code names
 # only bbq::, never bbq::cek::. This is the C++ analogue of backends/c/runtime.
@@ -212,9 +212,8 @@ set_tests_properties(crt_hmap_oom_tests PROPERTIES TIMEOUT 30)
 # --- Python extension module (optional) ---
 find_package(Python3 COMPONENTS Development)
 if(Python3_FOUND)
-    # Static libs linked into the .so need PIC. bbq_render (and the libs it pulls in) is
-    # here because the module WRITES as well as reads: emit() runs the writer op-list
-    # through WriterInterp, and that list comes from the shared lowering.
+    # Static libs linked into the .so need PIC. The module does not link bbq_render:
+    # writing is the document's own (zcow::transient::serialize), not a lowered op-list.
     set_target_properties(bbq_frontend bbq_cek_backend bbq_index_runtime
                           bbq_render bbq_ctypes bbq_shapegen PROPERTIES
         POSITION_INDEPENDENT_CODE ON)

@@ -348,11 +348,26 @@ void cg_resolver(Ctx* ctx, Resolver* res, std::ostream& out, int indent) {
 // ═══════════════════════════════════════════════════════════════
 
 namespace {
+/* Charset bounds are BYTES — compare as unsigned char with bounds
+ * normalized to 0..255, so a high range ('\x80'..'\xbf') is neither
+ * tautological under a signed char (-Wtype-limits) nor dependent on
+ * the platform's char signedness. Mirrors c_emit. */
 void emit_charset_pred(CharsetExpr* expr, std::ostream& out) {
     if (auto* r = dynamic_cast<Range*>(expr)) {
-        out << "(c >= " << r->from << " && c <= " << r->to << ")";
+        /* A bound at the domain's edge is vacuous — and emitting it
+         * (>= 0 on an unsigned) is its own -Wtype-limits tautology. */
+        int lo = r->from & 0xFF, hi = r->to & 0xFF;
+        if (lo == 0 && hi == 255)
+            out << "true";
+        else if (lo == 0)
+            out << "((unsigned char)c <= " << hi << ")";
+        else if (hi == 255)
+            out << "((unsigned char)c >= " << lo << ")";
+        else
+            out << "((unsigned char)c >= " << lo
+                << " && (unsigned char)c <= " << hi << ")";
     } else if (auto* s = dynamic_cast<Single*>(expr)) {
-        out << "(c == " << s->ch << ")";
+        out << "((unsigned char)c == " << (s->ch & 0xFF) << ")";
     } else if (auto* u = dynamic_cast<Union*>(expr)) {
         out << "(";
         emit_charset_pred(u->left, out);

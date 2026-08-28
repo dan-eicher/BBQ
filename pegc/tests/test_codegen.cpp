@@ -181,9 +181,13 @@ TEST(Codegen, CharsetDefsEmitted) {
     // Each CharsetDef emits a static predicate function
     EXPECT_NE(code.find("static bool is_letter(char c)"), std::string::npos);
     EXPECT_NE(code.find("static bool is_digit(char c)"), std::string::npos);
-    // Body uses the charset predicate inlined
-    EXPECT_NE(code.find("c >= 97 && c <= 122"), std::string::npos);  // 'a'..'z'
-    EXPECT_NE(code.find("c >= 48 && c <= 57"), std::string::npos);   // '0'..'9'
+    // Body compares as unsigned char: a high range ('\x80'..'\xbf')
+    // through plain char is tautological where char is signed, and a
+    // byte comparison should not depend on the platform's signedness.
+    EXPECT_NE(code.find("(unsigned char)c >= 97 && (unsigned char)c <= 122"),
+              std::string::npos);  // 'a'..'z'
+    EXPECT_NE(code.find("(unsigned char)c >= 48 && (unsigned char)c <= 57"),
+              std::string::npos);  // '0'..'9'
 }
 
 TEST(Codegen, TokenWithCharRangeAndPlus) {

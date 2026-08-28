@@ -69,6 +69,14 @@ std::string Sig::name() const {
 SClass SigEmitter::classify_final(ValueType ty, const char* mnemonic, const char* param) {
     switch (ty) {
     case ValueType::TyI32:   return SClass::I32;
+    // A sub-word integer is held widened: the stencil hosts keep scalars in
+    // 32/64-bit registers, so a byte or short rides an i32 register and its
+    // width stays in the opcode's semantics (a JCVM sadd wraps to 16 bits),
+    // not in the carrier. The class names where the value LIVES between the
+    // stack and the arithmetic — never the width the arithmetic uses.
+    case ValueType::TyI8:  case ValueType::TyU8:
+    case ValueType::TyI16: case ValueType::TyU16:
+                             return SClass::I32;
     case ValueType::TyI64:   return SClass::I64;
     case ValueType::TyF32:   return SClass::F32;
     case ValueType::TyF64:   return SClass::F64;

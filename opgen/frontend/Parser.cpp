@@ -13,15 +13,15 @@ bool Parser::parse() {
 }
 
 static bool is_letter(char c) {
-    return (((c >= 97 && c <= 122) || (c >= 65 && c <= 90)) || (c == 95));
+    return ((((unsigned char)c >= 97 && (unsigned char)c <= 122) || ((unsigned char)c >= 65 && (unsigned char)c <= 90)) || ((unsigned char)c == 95));
 }
 
 static bool is_digit(char c) {
-    return (c >= 48 && c <= 57);
+    return ((unsigned char)c >= 48 && (unsigned char)c <= 57);
 }
 
 static bool is_hex_digit(char c) {
-    return ((is_digit(c) || (c >= 97 && c <= 102)) || (c >= 65 && c <= 70));
+    return ((is_digit(c) || ((unsigned char)c >= 97 && (unsigned char)c <= 102)) || ((unsigned char)c >= 65 && (unsigned char)c <= 70));
 }
 
 static bool is_ident_continue(char c) {
@@ -30,7 +30,7 @@ static bool is_ident_continue(char c) {
 
 void Parser::setup_skip() {
     set_whitespace([](char c) -> bool {
-        return ((((c == 13) || (c == 10)) || (c == 9)) || (c == 32));
+        return (((((unsigned char)c == 13) || ((unsigned char)c == 10)) || ((unsigned char)c == 9)) || ((unsigned char)c == 32));
     });
     set_comments({{"#", "\n", false, false}});
 }

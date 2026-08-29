@@ -50,7 +50,20 @@ fi
 grep -q "not assigned on every path" "$OUT/half.log" \
     || die "refusal does not name the unassigned output"
 
-# ── 3. the effect-free liar is metered ─────────────────────────────────
+# ── 3. control-guarded partial operators prove total ───────────────────
+# The divisions in vc_guarded_div.def are protected by ternary arms,
+# short-circuit &&, and if/else — path conditions, not `error:` guards.
+mkdir -p "$OUT/pathdiv" || die "mkdir"
+"$OPGEN" -i "$SRC/test/data/vc_guarded_div.def" -prefix pathdiv -o "$OUT/pathdiv" \
+    > "$OUT/pathdiv.log" 2>&1 || die "opgen refused vc_guarded_div.def"
+"$RUN" "$OUT/pathdiv/pathdiv_vc_manifest.txt" > "$OUT/pathdiv_run.log" 2>&1 \
+    || die "path-guarded divisions REFUTED — see $OUT/pathdiv/pathdiv_vc_results.txt"
+for mn in terndiv anddiv ifdiv; do
+    grep -q "^PROVED .* $mn totality" "$OUT/pathdiv/pathdiv_vc_results.txt" \
+        || die "$mn totality not PROVED"
+done
+
+# ── 4. the effect-free liar is metered ─────────────────────────────────
 mkdir -p "$OUT/sneaky" || die "mkdir"
 "$OPGEN" -i "$SRC/test/data/vc_liar_effectfree.def" -prefix sneaky -o "$OUT/sneaky" \
     > "$OUT/sneaky.log" 2>&1 || die "opgen refused vc_liar_effectfree.def"

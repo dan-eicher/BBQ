@@ -160,12 +160,19 @@ public:
             return Term{std::string("(") + fn + " " + p.s + ")", p.w, p.sgn};
         }
         case SemExprTag::STernary: {
+            // The arms translate under their PATH conditions, so a partial
+            // operator a ternary arm protects is weighed as protected — the
+            // C only evaluates the taken arm.
             auto* tn = static_cast<const STernary*>(e);
             Term c = xexpr(tn->cond, rt);
+            std::string cb = tobool(c);
+            path_.push_back(cb);
             Term l = xexpr(tn->then_, rt);
+            path_.back() = "(not " + cb + ")";
             Term r = xexpr(tn->else_, rt);
+            path_.pop_back();
             usual(l, r);
-            return Term{"(ite " + tobool(c) + " " + l.s + " " + r.s + ")", l.w, l.sgn};
+            return Term{"(ite " + cb + " " + l.s + " " + r.s + ")", l.w, l.sgn};
         }
         case SemExprTag::SCast: {
             auto* ca = static_cast<const SCast*>(e);
@@ -225,10 +232,14 @@ public:
             Term c = xexpr(i->cond, ValueType::TyI32);
             std::string cb = tobool(c);
             std::vector<Binding> saved = env_;
-            if (!exec_stmt(i->then_, err)) return false;
+            path_.push_back(cb);
+            if (!exec_stmt(i->then_, err)) { path_.pop_back(); return false; }
             std::vector<Binding> then_env = env_;
             env_ = saved;
-            if (i->else_.has_value() && !exec_stmt(*i->else_, err)) return false;
+            path_.back() = "(not " + cb + ")";
+            bool else_ok = !i->else_.has_value() || exec_stmt(*i->else_, err);
+            path_.pop_back();
+            if (!else_ok) return false;
             // Merge: a binding differing between the arms becomes an ite; it
             // is definitely-assigned only when BOTH arms assigned it (or it
             // already was). Branch-local declarations die with their arm.
@@ -288,9 +299,15 @@ private:
     Term xbinop(const SBinOp* b, ValueType rt) {
         const char* bop = b->op;
         if (!strcmp(bop, "&&") || !strcmp(bop, "||")) {
-            Term l = xexpr(b->left, rt), r = xexpr(b->right, rt);
+            // C short-circuits: the right operand only evaluates when the
+            // left admits it, so it translates under that path condition.
+            Term l = xexpr(b->left, rt);
+            std::string lb = tobool(l);
+            path_.push_back(bop[0] == '&' ? lb : "(not " + lb + ")");
+            Term r = xexpr(b->right, rt);
+            path_.pop_back();
             const char* fn = bop[0] == '&' ? "and" : "or";
-            return boolterm(std::string("(") + fn + " " + tobool(l) + " " + tobool(r) + ")");
+            return boolterm(std::string("(") + fn + " " + lb + " " + tobool(r) + ")");
         }
         if (!strcmp(bop, "==") || !strcmp(bop, "!=") ||
             !strcmp(bop, "<") || !strcmp(bop, "<=") ||
@@ -336,12 +353,15 @@ private:
         usual(l, r);
         if (!strcmp(bop, "/") || !strcmp(bop, "%")) {
             // The C-defined domain: divisor nonzero, and for SIGNED division
-            // not (min / -1). Collected as an undefined-condition; the
-            // totality obligation asserts their disjunction under the guards.
+            // not (min / -1). Collected as an undefined-condition CONJOINED
+            // with the path that reaches this operator; the totality
+            // obligation asserts their disjunction under the guards.
             std::string u = "(= " + r.s + " " + bvlit(0, r.w) + ")";
             if (l.sgn)
                 u = "(or " + u + " (and (= " + l.s + " " + bvlit(1ULL << (l.w - 1), l.w) +
                     ") (= " + r.s + " " + bvlit(~0ULL, r.w) + ")))";
+            for (auto it = path_.rbegin(); it != path_.rend(); ++it)
+                u = "(and " + *it + " " + u + ")";
             undef_.push_back(u);
             const char* fn = bop[0] == '/' ? (l.sgn ? "bvsdiv" : "bvudiv")
                                            : (l.sgn ? "bvsrem" : "bvurem");
@@ -358,6 +378,9 @@ private:
     const Opcode*     op_;
     std::vector<Binding>     env_;
     std::vector<std::string> undef_;
+    // The conjunction of control conditions guarding the expression being
+    // translated (ternary arms, short-circuit right operands, if branches).
+    std::vector<std::string> path_;
 };
 
 // ── VC-layer eligibility beyond RefEmitter's (loops, intrinsics) ────────────

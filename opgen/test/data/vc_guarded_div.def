@@ -1,0 +1,17 @@
+# Path-condition fixture: every partial operator here is protected by the
+# CONTROL around it, not by an `error:` guard — the ternary arm, the
+# short-circuit right operand, the if/else branch. The totality obligation
+# must weigh each division under its path condition and prove all three
+# ops total; an unconditional collection would refute every one of them.
+
+type i32 s4 u4 1 i
+
+terndiv 0x01 (i32 a, i32 b -- i32 r)
+    (. r = (b == 0) ? 0 : ((a == int_min() && b == -1) ? a : a / b); .)
+
+anddiv 0x02 (i32 a, i32 b -- i32 r)
+    (. r = (b != 0 && !(a == int_min() && b == -1) && a / b > 2) ? 1 : 0; .)
+
+ifdiv 0x03 (i32 a, i32 b -- i32 r)
+    (. if (b == 0 || (a == int_min() && b == -1)) { r = 0; }
+       else { r = a / b; } .)

@@ -52,7 +52,9 @@ add_library(opgen_core STATIC
     src/semlower.cpp
     src/vmemit.cpp
     src/tablesemit.cpp
-    src/sigemit.cpp)
+    src/sigemit.cpp
+    src/refemit.cpp
+    src/vcemit.cpp)
 target_include_directories(opgen_core PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(opgen_core PUBLIC opgen_frontend)
@@ -71,7 +73,9 @@ add_executable(opgen_tests
     test/semlower_test.cpp
     test/vmemit_test.cpp
     test/sigemit_test.cpp
-    test/bbq_emit_test.cpp)
+    test/bbq_emit_test.cpp
+    test/refemit_test.cpp
+    test/vcemit_test.cpp)
 target_include_directories(opgen_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/runtime)
 target_link_libraries(opgen_tests PRIVATE opgen_core GTest::GTest GTest::Main)
 target_compile_definitions(opgen_tests PRIVATE
@@ -90,6 +94,7 @@ if(OPGEN_CLANG)
     add_custom_command(
         OUTPUT ${CALC_OUT}/gen_interp.c ${CALC_OUT}/gen_interp.h
                ${CALC_OUT}/opcodes.h ${CALC_OUT}/runtime_api.h
+               ${CALC_OUT}/calc_ref.h
         COMMAND ${CMAKE_COMMAND} -E make_directory ${CALC_OUT}
         COMMAND $<TARGET_FILE:opgen> -i ${CALC_DEF} -prefix calc -o ${CALC_OUT}
         DEPENDS opgen ${CALC_DEF}
@@ -109,4 +114,16 @@ if(OPGEN_CLANG)
 
     add_custom_target(opgen_interp_e2e_build ALL DEPENDS ${CALC_OUT}/opgen_interp_e2e)
     add_test(NAME opgen_interp_e2e COMMAND ${CALC_OUT}/opgen_interp_e2e)
+endif()
+
+# --- The VC gate: calc certification + the seeded-liar reds, discharged
+#     through z3 by verify/run_vcs. Proves the pipeline can go red before
+#     any PROVED row is believed. ---
+find_program(OPGEN_Z3 z3)
+if(OPGEN_Z3)
+    add_test(NAME opgen_vc_gate
+             COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/test/vc_gate.sh
+                     $<TARGET_FILE:opgen>
+                     ${CMAKE_CURRENT_SOURCE_DIR}
+                     ${CMAKE_CURRENT_BINARY_DIR}/vc_gate)
 endif()

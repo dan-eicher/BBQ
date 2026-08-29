@@ -95,6 +95,7 @@ public:
                         uint64_t vals[OP_CONST_HOLES]) const;
     void collect_natives_expr(const SemExpr* e, const char** names, int* n) const;
     void collect_natives_stmt(const SemStmt* s, const char** names, int* n) const;
+    static bool is_intrinsic(const char* n);
     int  stmt_returns(const Opcode* op, const SemStmt* s) const;
     int  body_tail_returns(const Opcode* op) const;
     static int  op_has_flag(const Opcode* op, const char* f);
@@ -127,7 +128,6 @@ private:
     void emit_arg(const SemExpr* a, const Opcode* op, ValueType at);
     ValueType arg_type(const SemExpr* e, const Opcode* op, ValueType rt) const;
     const char* slot_index_tag_array(const SemExpr* e) const;
-    static bool is_intrinsic(const char* n);
     static bool is_slot_index(const SemExpr* e);
     static const char* slot_val_arr(const SemExpr* e);
     static const char* slot_tag_arr(const SemExpr* e);

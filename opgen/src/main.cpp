@@ -12,6 +12,8 @@
 #include <string>
 
 #include "Parser.h"
+#include "refemit.h"
+#include "vcemit.h"
 #include "sigemit.h"
 #include "spec.h"
 #include "vmemit.h"
@@ -96,6 +98,8 @@ static int run(int argc, char** argv) {
     VmEmitter vm(m, prefix, tier2_n);
     TablesEmitter tables(spec);
     SigEmitter sig(m, prefix);
+    RefEmitter ref(m, prefix);
+    VcEmitter vc(m, prefix);
 
     int rc = 0;
     rc |= write_file(out_dir, "opcodes.h",            [&](FILE* o){ tables.emit_opcodes_h(o); });
@@ -110,6 +114,8 @@ static int run(int argc, char** argv) {
     rc |= write_file(out_dir, (std::string(prefix) + "_jit_symbols.h").c_str(), [&](FILE* o){ vm.emit_jit_symbols(o); });
     rc |= write_file(out_dir, (std::string(prefix) + "_sigtab.h").c_str(),     [&](FILE* o){ sig.emit_sigtab_h(o); });
     rc |= write_file(out_dir, (std::string(prefix) + "_ttree.asdl").c_str(),   [&](FILE* o){ sig.emit_ttree_asdl(o); });
+    rc |= write_file(out_dir, (std::string(prefix) + "_ref.h").c_str(),        [&](FILE* o){ ref.emit_ref_h(o); });
+    rc |= vc.emit_all(out_dir);   // per-obligation .smt2 files + the VC manifest
 
     return rc;
 }

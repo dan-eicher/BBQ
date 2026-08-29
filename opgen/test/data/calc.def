@@ -46,4 +46,5 @@ iload 0x0C [ i8 idx ] ( -- i32 r )
 
 idiv 0x0D (i32 a, i32 b -- i32 r)
     error: (. b == 0 .) -> DivByZero
+    error: (. a == int_min() && b == -1 .) -> DivOverflow
     (. r = a / b; .)

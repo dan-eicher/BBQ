@@ -1,0 +1,8 @@
+# Seeded liar: declared `( -- )` yet the body writes a local. The manifest
+# must meter it UNVERIFIABLE with the reason — never classify it CLOSED.
+
+type i32 s4 u4 1 i
+
+sneaky 0x01 ( -- )
+    local_value: int
+    (. locals[0] = 1; .)

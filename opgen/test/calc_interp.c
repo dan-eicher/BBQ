@@ -10,6 +10,7 @@
  */
 #include "gen_interp.h"   /* the dispatch-table accessor (pulls in runtime_api.h) */
 #include "opcodes.h"      /* OP_* constants */
+#include "calc_ref.h"     /* the pure reference kernels — the differential leg */
 #include <stdio.h>
 #include <string.h>
 
@@ -57,6 +58,22 @@ static s4 bin(u1 opcode, s4 a, s4 b) {
     prog_t p = {0}; iconst(&p, a); iconst(&p, b); op(&p, opcode); return run(&p);
 }
 
+/* Differential leg: the generated interpreter and the pure reference kernel
+ * are two consumers of the same spec body — on shared inputs they must agree.
+ * Disagreement means one lowering path diverged from the other, which is
+ * exactly what this leg exists to catch. */
+typedef int (*ref2_t)(s4, s4, s4*);
+static void diff2(const char* name, u1 opcode, ref2_t ref, s4 a, s4 b) {
+    s4 want = 0;
+    int st = ref(a, b, &want);
+    if (st != CALC_REF_OK) return;   /* guarded input: no result to compare */
+    s4 got = bin(opcode, a, b);
+    char msg[96];
+    snprintf(msg, sizeof msg, "ref/interp agree: %s(%ld, %ld)",
+             name, (long)a, (long)b);
+    CHECK(got == want, msg);
+}
+
 int main(void) {
     /* arithmetic */
     CHECK(bin(OP_IADD, 5, 7) == 12,            "iadd 5+7 = 12");
@@ -93,6 +110,50 @@ int main(void) {
       op(&p, OP_ILOAD); u8op(&p, 2);     /* push local 2 (22) */
       op(&p, OP_IADD);
       CHECK(run(&p) == 33 && final_sp() == 1, "local1(11) + local2(22) = 33"); }
+
+    /* ── Differential leg: interpreter vs the reference kernels ──────────
+     * Every kernel-eligible binop over a shared adversarial value sweep.
+     * Guarded inputs (idiv by zero, idiv INT32_MIN/-1) compare nothing:
+     * the kernel codes the error and diff2 skips — the guard itself is
+     * checked below. */
+    {
+        static const struct { s4 a, b; } sweep[] = {
+            {5, 7}, {0, 0}, {-1, 1}, {2147483647, 1}, {(s4)0x80000000, 1},
+            {123456, -789}, {1, 31}, {1, 33}, {-8, 1}, {0x0F0F, 0x3C3C},
+        };
+        static const struct { const char* name; u1 opcode; ref2_t ref; } ops2[] = {
+            {"iadd",  OP_IADD,  calc_ref_iadd},
+            {"isub",  OP_ISUB,  calc_ref_isub},
+            {"imul",  OP_IMUL,  calc_ref_imul},
+            {"iand",  OP_IAND,  calc_ref_iand},
+            {"ior",   OP_IOR,   calc_ref_ior},
+            {"ishl",  OP_ISHL,  calc_ref_ishl},
+            {"ishr",  OP_ISHR,  calc_ref_ishr},
+            {"iushr", OP_IUSHR, calc_ref_iushr},
+            {"idiv",  OP_IDIV,  calc_ref_idiv},
+        };
+        for (unsigned i = 0; i < sizeof ops2 / sizeof ops2[0]; i++)
+            for (unsigned j = 0; j < sizeof sweep / sizeof sweep[0]; j++)
+                diff2(ops2[i].name, ops2[i].opcode, ops2[i].ref,
+                      sweep[j].a, sweep[j].b);
+        /* ineg is unary; sweep the same values */
+        for (unsigned j = 0; j < sizeof sweep / sizeof sweep[0]; j++) {
+            s4 want = 0;
+            if (calc_ref_ineg(sweep[j].a, &want) != CALC_REF_OK) continue;
+            prog_t p = {0}; iconst(&p, sweep[j].a); op(&p, OP_INEG);
+            CHECK(run(&p) == want, "ref/interp agree: ineg");
+        }
+        /* iconst carries its operand through untouched */
+        { s4 want = 0;
+          CHECK(calc_ref_iconst(0x1234ABCD, &want) == CALC_REF_OK
+                && want == 0x1234ABCD, "ref: iconst is the identity"); }
+        /* the guard leg: the kernel CODES the error the interpreter traps on */
+        { s4 want = 0;
+          CHECK(calc_ref_idiv(5, 0, &want) == CALC_REF_ERR_DivByZero,
+                "ref: idiv(5, 0) codes DivByZero");
+          CHECK(calc_ref_idiv((s4)0x80000000, -1, &want) == CALC_REF_ERR_DivOverflow,
+                "ref: idiv(INT32_MIN, -1) codes DivOverflow"); }
+    }
 
     if (failures == 0) { printf("\nopgen interp e2e: all checks passed\n"); return 0; }
     printf("\nopgen interp e2e: %d FAILED\n", failures);

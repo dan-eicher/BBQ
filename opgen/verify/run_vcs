@@ -1,0 +1,87 @@
+#!/bin/sh
+# run_vcs — discharge an opgen VC manifest through z3.
+#
+# usage: run_vcs <manifest> [-t <soft-ms>] [-o <results-file>]
+#
+# Reads the `<prefix>_vc_manifest.txt` vcemit wrote next to its .smt2 files
+# and runs z3 on every OB row with a per-obligation budget (default 100 ms
+# soft, 2 s hard). Verdicts, one row per manifest row:
+#
+#   PROVED   <id> <mnemonic> <kind>            solver result == expected
+#   REFUTED  <id> <mnemonic> <kind> <model...> opposite result; the model is
+#                                              the concrete counterexample
+#                                              when the refutation is `sat`
+#   TIMEOUT  <id> <mnemonic> <kind>            unknown/timeout: not judged
+#   UNVERIFIABLE <mnemonic> <reason...>        copied from the manifest
+#   CLOSED   <mnemonic>                        copied from the manifest
+#
+# Exit status: 1 iff any REFUTED, else 0. TIMEOUT rows do not fail the run —
+# they stay visible in the results file, which is the report's job.
+
+usage() { echo "usage: run_vcs <manifest> [-t <soft-ms>] [-o <results>]" >&2; exit 2; }
+
+MANIFEST=$1
+[ -n "$MANIFEST" ] || usage
+[ -f "$MANIFEST" ] || { echo "run_vcs: no manifest: $MANIFEST" >&2; exit 2; }
+shift
+
+SOFT_MS=100
+RESULTS=$(printf '%s' "$MANIFEST" | sed 's/_manifest\.txt$/_results.txt/')
+while [ $# -gt 0 ]; do
+    case $1 in
+        -t) SOFT_MS=$2; shift 2 ;;
+        -o) RESULTS=$2; shift 2 ;;
+        *) usage ;;
+    esac
+done
+[ "$RESULTS" = "$MANIFEST" ] && RESULTS="$MANIFEST.results"
+
+DIR=$(dirname "$MANIFEST")
+Z3=${Z3:-z3}
+command -v "$Z3" >/dev/null 2>&1 || { echo "run_vcs: z3 not found" >&2; exit 2; }
+
+: > "$RESULTS"
+refuted=0 proved=0 timeout=0 unver=0 closed=0
+
+while IFS= read -r line || [ -n "$line" ]; do
+    case $line in
+        '#'*|'') continue ;;
+    esac
+    set -- $line
+    tag=$1
+    case $tag in
+        OB)
+            id=$2 mn=$3 kind=$4 expect=$5 file=$6
+            out=$("$Z3" -t:"$SOFT_MS" -T:2 "$DIR/$file" 2>&1)
+            first=$(printf '%s\n' "$out" | head -n 1)
+            case $first in
+                sat|unsat)
+                    if [ "$first" = "$expect" ]; then
+                        printf 'PROVED %s %s %s\n' "$id" "$mn" "$kind" >> "$RESULTS"
+                        proved=$((proved + 1))
+                    else
+                        model=
+                        [ "$first" = sat ] && model=$(printf '%s\n' "$out" \
+                            | tail -n +2 | tr '\n' ' ' | cut -c 1-400)
+                        printf 'REFUTED %s %s %s %s\n' "$id" "$mn" "$kind" "$model" >> "$RESULTS"
+                        refuted=$((refuted + 1))
+                    fi ;;
+                *)
+                    printf 'TIMEOUT %s %s %s\n' "$id" "$mn" "$kind" >> "$RESULTS"
+                    timeout=$((timeout + 1)) ;;
+            esac ;;
+        UNVERIFIABLE)
+            printf '%s\n' "$line" >> "$RESULTS"
+            unver=$((unver + 1)) ;;
+        CLOSED)
+            printf '%s\n' "$line" >> "$RESULTS"
+            closed=$((closed + 1)) ;;
+        *)
+            echo "run_vcs: unrecognized manifest row: $line" >&2
+            exit 2 ;;
+    esac
+done < "$MANIFEST"
+
+echo "run_vcs: $proved proved, $refuted refuted, $timeout timeout," \
+     "$unver unverifiable, $closed closed (no obligations) -> $RESULTS"
+[ "$refuted" -eq 0 ]

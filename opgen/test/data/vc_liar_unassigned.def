@@ -1,0 +1,8 @@
+# Seeded def bug: the output is assigned on only one path. vcemit must
+# REFUSE the spec (nonzero exit) — emitting a weaker obligation instead
+# would launder the bug into a PROVED row.
+
+type i32 s4 u4 1 i
+
+halfout 0x01 (i32 a -- i32 r)
+    (. if (a == 0) { r = 1; } .)

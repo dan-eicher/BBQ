@@ -1049,6 +1049,41 @@ Struct* Sema::resolve_to_struct(TypeExpr* type) {
     return nullptr;
 }
 
+// The alternatives of a biased choice, each resolved to the struct that binds its
+// names. Empty when the type is not a choice. `union` is a choice whose arms are
+// named, and a variant's own name selects it; `|` alternatives are anonymous, so
+// what a reference through one can name is decided by def(A) below.
+std::vector<Struct*> Sema::choice_arms(TypeExpr* type) {
+    std::vector<Struct*> arms;
+    if (auto* rr = dynamic_cast<RuleRef*>(type)) {
+        if (auto* rule = lookup_rule(rr->name)) return choice_arms(rule->body);
+        return arms;
+    }
+    if (auto* alts = dynamic_cast<Alternatives*>(type)) {
+        for (auto* a : alts->alts) {
+            // An arm that is not a struct binds no names, so def(A) over it is
+            // empty and the intersection with it is empty too.
+            arms.push_back(resolve_to_struct(a));
+        }
+    }
+    return arms;
+}
+
+// IPG §3.2: "def(A) is the set of attributes that are defined in all alternatives."
+// A name only some arms bind is not an attribute of A — reaching for it would read
+// a value that exists on some inputs and not others, which is exactly the
+// discrepancy the paper is written to eliminate.
+bool Sema::field_in_every_arm(const std::vector<Struct*>& arms,
+                              const std::string& name, int& arms_binding) {
+    arms_binding = 0;
+    for (auto* arm : arms) {
+        if (!arm) continue;
+        for (auto* f : arm->fields)
+            if (f->name == name) { arms_binding++; break; }
+    }
+    return arms_binding == static_cast<int>(arms.size());
+}
+
 // Structural resolution: follow to get array element type
 
 TypeExpr* Sema::resolve_to_array_element(TypeExpr* type) {
@@ -1182,6 +1217,37 @@ ExprType Sema::type_of_ref_path(RefPath* path, const TypeCheckScope& scope) {
         }
 
         if (base_body) {
+            // A biased choice binds only what all of its arms bind (IPG §3.2).
+            // Checked before the struct case, since a choice resolves to no single
+            // struct and would otherwise fall through to the permissive answer.
+            auto arms = choice_arms(base_body);
+            if (!arms.empty()) {
+                int binding = 0;
+                if (field_in_every_arm(arms, fa->field, binding)) {
+                    // def(A) makes this reference legal IPG, and BBQ does not take
+                    // it: a choice is a tagged union in the generated types, so
+                    // reaching a field "of the choice" means dispatching on the tag
+                    // at every use. A name every arm binds is a field the format
+                    // has in common, and it belongs in front of the choice, where
+                    // it is one field rather than one per arm.
+                    errors_.error(fa->loc,
+                        "'%s' is bound by every alternative, so it is common to "
+                        "them — lift it out in front of the choice and read it "
+                        "there, rather than through the choice",
+                        fa->field.c_str());
+                } else if (binding > 0) {
+                    errors_.error(fa->loc,
+                        "'%s' is bound by %d of %d alternatives, so it is not a "
+                        "field of the choice; which one matched is the input's to "
+                        "decide",
+                        fa->field.c_str(), binding, (int)arms.size());
+                } else {
+                    errors_.error(fa->loc,
+                        "no alternative binds a field '%s'", fa->field.c_str());
+                }
+                return ExprType::Unknown;
+            }
+
             // Walk any intermediate FieldAcc chain (for a.b.c, recurse)
             // For simple base, resolve directly
             auto* st = resolve_to_struct(base_body);

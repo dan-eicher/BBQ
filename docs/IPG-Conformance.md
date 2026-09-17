@@ -68,9 +68,19 @@ by `sema_test.cpp` and `CEKLayer2*`.
 |---|---|---|
 | Property 1: every reference names a defined attribute | holds | `IpgAttrCheck.AReferenceToANameNoRuleDefinesIsRejected`, `…AnUndefinedNameInAnIntervalIsRejected`, `…AnUndefinedNameInAComputeIsRejected`, `Sema.ReferenceToANameNoRuleBindsIsRejected` |
 | A name not bound locally may come from a calling rule's scope | holds | `Sema.CrossRuleRefAllowed`, `IpgLocal.ANestedRuleSeesTheEnclosingScope` |
-| `def(A)` is the intersection over alternatives | **gap** — see Open gaps | — |
+| `def(A)` is the intersection over alternatives — a name only some arms bind is not an attribute of the rule | holds | `IpgAttrCheck.DefIsTheIntersectionOverAlternatives`, `…ANameNoAlternativeBindsIsRejected` |
+| …and a name every arm binds is | **differs** | `IpgAttrCheck.ANameEveryAlternativeBindsIsRefusedWithTheLift`, `…TheLiftedFieldReadsWhicheverArmMatched` |
 | Property 2: no circular definitions | holds, at rule granularity | `IpgAttrCheck.ACycleAmongRulesIsRejected`, `Sema.CircularDependency` |
 | Terms are reordered into the dependency graph's topological order | **differs** | `IpgAttrCheck.TermsAreNotReorderedAForwardReferenceIsAnError` |
+
+**Why the intersection's positive half differs.** `def(A)` being the intersection
+makes `Inner.p` legal when every alternative binds `p`. BBQ refuses it. A choice
+is a tagged union in the generated types, so a field *of the choice* would have to
+dispatch on the variant tag at every use, in every emitter — and a name every arm
+binds is a field the format has in common, which belongs in front of the choice
+where it is one field rather than one per arm. The diagnostic says so. The
+negative half — a name only *some* arms bind — is refused for the paper's reason,
+because which arm matched is the input's to decide.
 
 **Why the reordering differs.** The paper rewrites `B1[0, B2.a] B2[a1, EOI]
 {a1=2}` into `{a1=2} B2[a1, EOI] B1[0, B2.a]`, because in a grammar over an
@@ -87,6 +97,7 @@ which is what intervals are for.
 | G-NT | A nonterminal parses by its rule | holds | `CEKLayer3.MinimalStruct`, `…MultiRuleCrossReference` |
 | R-AltSucc | The first alternative that succeeds is the result; order is observable | holds | `IpgAlt.TheFirstSuccessWinsAndOrderIsObservable` |
 | R-AltFail | A failing alternative falls through to the next | holds | `IpgAlt.AFailingAlternativeFallsThroughToTheNext` |
+| R-AltFail + A-Seq1 | …and the enclosing parse carries on afterwards, whichever arm won | holds | `IpgAlt.TheEnclosingParseContinuesAfterALaterArmWins`, `…AfterALaterUnionVariantWins` |
 | R-Emp | No alternatives left ⇒ Fail | holds | `IpgAlt.WhenEveryAlternativeFailsTheRuleFails` |
 | R-Alt\* | Each alternative starts from a fresh environment and an empty tree list | holds | `IpgAlt.AFailedArmLeavesNoBindingsBehind` |
 | A-Seq1/2 | Terms thread left to right; later terms see earlier bindings | holds | `IpgSeq.LaterTermsSeeEarlierBindings` |
@@ -206,22 +217,6 @@ measure that decreases, exactly as the paper's `for` loop is.
 validation pass. BBQ's `where` predicates and `@header`/`@source` code blocks are
 where such a pass would attach, and checksums are the everyday case
 (`CBackendE2E.IPv4ChecksumWhere`). Nothing here claims to decide them.
-
-## Open gaps
-
-A gap is a law BBQ means to keep and does not. It has no test, because there is
-nothing correct to pin yet.
-
-**`def(A)` is not the intersection over alternatives (§3.2, property 1).** For
-`Inner = struct { p: uint8 } | struct { q: uint8 }`, the paper's `def(Inner)` is
-`{}` — a name defined in one arm and not the other is not an attribute of `Inner`
-— so `Inner.p` is a static error. BBQ accepts `i.p`, and accepts `i.zzz` too: a
-dotted reference whose base resolves to an alternation is not checked at all, and
-the reference fails at parse time on whichever input takes the wrong arm.
-`Sema::type_of_ref_path` cannot resolve an `Alternatives` body to a struct and
-returns `Unknown`, which is the permissive answer everywhere else. The bare-name
-half of property 1 is checked (`validate_ref_path`); the dotted half through a
-choice is not.
 
 ## Reading this file
 

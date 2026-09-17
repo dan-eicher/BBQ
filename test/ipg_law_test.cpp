@@ -151,6 +151,52 @@ TEST(IpgAttrCheck, AnUndefinedNameInAComputeIsRejected) {
     EXPECT_TRUE(d.says("nosuchfield")) << d.text;
 }
 
+// `def(A)` is "the set of attributes that are defined in all alternatives". A name
+// one arm binds and another does not is not an attribute of the rule, and reaching
+// for it is a static error — not a parse that succeeds or fails depending on which
+// arm the input took.
+TEST(IpgAttrCheck, DefIsTheIntersectionOverAlternatives) {
+    auto d = diagnose("Inner = struct { p: uint8 } | struct { q: uint8 }\n"
+                      "Top   = struct { i: Inner, k: compute(i.p : uint8) }");
+    ASSERT_TRUE(d.parsed);
+    EXPECT_FALSE(d.ok) << d.text;
+    EXPECT_TRUE(d.says("alternative")) << d.text;
+}
+
+TEST(IpgAttrCheck, ANameNoAlternativeBindsIsRejected) {
+    auto d = diagnose("Inner = struct { p: uint8 } | struct { q: uint8 }\n"
+                      "Top   = struct { i: Inner, k: compute(i.zzz : uint8) }");
+    ASSERT_TRUE(d.parsed);
+    EXPECT_FALSE(d.ok) << d.text;
+}
+
+// The intersection itself — a name EVERY arm binds — is a legal reference in the
+// paper and BBQ does not take it either: a choice is a tagged union in the
+// generated types, so a field "of the choice" would need a tag dispatch at every
+// use. A name common to every arm is a field the format has in common, and BBQ
+// says to put it where it belongs, in front of the choice.
+TEST(IpgAttrCheck, ANameEveryAlternativeBindsIsRefusedWithTheLift) {
+    auto d = diagnose("Inner = struct { tag: uint8 where tag == 1, p: uint8 }\n"
+                      "      | struct { tag: uint8, p: uint8 }\n"
+                      "Top   = struct { i: Inner, k: compute(i.p : uint8) }");
+    ASSERT_TRUE(d.parsed);
+    EXPECT_FALSE(d.ok) << d.text;
+    EXPECT_TRUE(d.says("lift it out")) << d.text;
+}
+
+// Lifted, it reads the same value whichever arm matched — which is the shape the
+// diagnostic asks for, so the suite has to show it works.
+TEST(IpgAttrCheck, TheLiftedFieldReadsWhicheverArmMatched) {
+    const char* g = "Body = struct { a: uint8 where a == 1 } | struct { b: uint8 }\n"
+                    "Top  = struct { p: uint8, body: Body, k: compute(p : uint8) }";
+    for (auto bytes : {std::vector<uint8_t>{0x42, 1}, std::vector<uint8_t>{0x37, 9}}) {
+        auto r = run(g, "Top", bytes);
+        ASSERT_TRUE(r.compiled) << r.error;
+        ASSERT_TRUE(r.success) << r.error;
+        EXPECT_EQ(computed(kid(r.root(), "k")), bytes[0]);
+    }
+}
+
 // The loop variable is `@index`. A bare `i` is a field reference (Grammar §7.3)
 // and, naming no field, is caught by the same check.
 TEST(IpgAttrCheck, BareIInAnElementIntervalIsNotTheLoopVariable) {
@@ -211,6 +257,36 @@ TEST(IpgAlt, AFailingAlternativeFallsThroughToTheNext) {
     ASSERT_TRUE(r.compiled) << r.error;
     ASSERT_TRUE(r.success) << r.error;
     EXPECT_NE(kid(r.root(), "alt_1"), nullptr);   // the second arm produced the tree
+}
+
+// R-AltFail again, with the choice nested rather than at the top: the enclosing
+// parse carries on afterwards. A-Seq1 threads the terms after it whichever
+// alternative won, so the last arm winning is not a special case.
+TEST(IpgAlt, TheEnclosingParseContinuesAfterALaterArmWins) {
+    const char* g = "Inner = struct { t: uint8 where t == 1 }\n"
+                    "      | struct { t: uint8 }\n"
+                    "Top   = struct { i: Inner, z: uint8 }";
+    for (uint8_t tag : {uint8_t{1}, uint8_t{9}}) {
+        auto r = run(g, "Top", {tag, 0x55});
+        ASSERT_TRUE(r.compiled) << r.error;
+        ASSERT_TRUE(r.success) << r.error;
+        EXPECT_EQ(r.meta.bytes_consumed, 2u) << "tag " << (int)tag;
+        ASSERT_NE(r.root(), nullptr) << "tag " << (int)tag;
+        ASSERT_NE(kid(r.root(), "z"), nullptr) << "tag " << (int)tag;
+    }
+}
+
+TEST(IpgAlt, TheEnclosingParseContinuesAfterALaterUnionVariantWins) {
+    const char* g = "A = struct { t: uint8 where t == 1 }\n"
+                    "B = struct { t: uint8 }\n"
+                    "U = union { asA: A, asB: B }\n"
+                    "Top = struct { u: U, z: uint8 }";
+    auto r = run(g, "Top", {9, 0x55});
+    ASSERT_TRUE(r.compiled) << r.error;
+    ASSERT_TRUE(r.success) << r.error;
+    EXPECT_EQ(r.meta.bytes_consumed, 2u);
+    ASSERT_NE(r.root(), nullptr);
+    EXPECT_NE(kid(r.root(), "z"), nullptr);
 }
 
 // R-Emp: when the alternatives run out, the result is Fail.

@@ -155,6 +155,12 @@ private:
     // Structural resolution for field/array access
     BBQ::Struct* resolve_to_struct(BBQ::TypeExpr* type);
     BBQ::TypeExpr* resolve_to_array_element(BBQ::TypeExpr* type);
+    // The arms of a biased choice, or empty when the type is not one.
+    std::vector<BBQ::Struct*> choice_arms(BBQ::TypeExpr* type);
+    // IPG §3.2's def(A): is `name` bound by every arm? `arms_binding` reports how
+    // many do, so the diagnostic can tell "some" from "none".
+    static bool field_in_every_arm(const std::vector<BBQ::Struct*>& arms,
+                                   const std::string& name, int& arms_binding);
 
     // Type compatibility helpers
     static ExprType join(ExprType a, ExprType b);

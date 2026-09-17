@@ -1120,13 +1120,12 @@ PRIVATE (.
     }
 
     // Build the backtracking choice spine over named arms (the shared core of
-    // unions and alternatives). Each non-last arm's success threads through
-    // CommitChoice (pops the Savepoint, chains to Lnext); the last arm chains
-    // to Lnext directly — the "exhausted" OnFailKont pops the Savepoint and
-    // fails if it too fails. Arms compile right-to-left so each OnFailKont link
-    // knows the next arm's entry; the same link is both the runtime
-    // Savepoint.on_fail_target (byte-fails) and the static in_alt.next_arm
-    // (where-fails via on_false).
+    // unions and alternatives). Every arm's success threads through CommitChoice,
+    // which pops the Savepoint and chains to Lnext; the "exhausted" OnFailKont
+    // pops it instead when the last arm fails too. Arms compile right-to-left so
+    // each OnFailKont link knows the next arm's entry; the same link is both the
+    // runtime Savepoint.on_fail_target (byte-fails) and the static
+    // in_alt.next_arm (where-fails via on_false).
     bbq::cek::StaticKont*
     compile_choice(std::vector<std::string> names,
                    std::vector<BBQ::TypeExpr*> bodies,
@@ -1140,8 +1139,13 @@ PRIVATE (.
         bbq::cek::StaticKont* exhausted =
             make_on_fail(nullptr, nullptr, /*pop_frame=*/true);
         int last = static_cast<int>(bodies.size()) - 1;
+        // The last arm commits like every other one. It is ENTERED with the
+        // Savepoint still on the stack — the link that dispatched to it has
+        // pop_frame=false, and `exhausted` only runs if this arm fails too — so
+        // succeeding without committing leaves that Savepoint standing over the
+        // rest of the parse, and the enclosing construct never finishes.
         bbq::cek::StaticKont* last_entry =
-            build_variant_arm(names[last], bodies[last], last, r, Lnext);
+            build_variant_arm(names[last], bodies[last], last, r, commit);
         bbq::cek::StaticKont* next_link = exhausted;
         bbq::cek::StaticKont* next_target = last_entry;
         for (int i = last - 1; i >= 1; --i) {

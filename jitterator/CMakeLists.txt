@@ -237,13 +237,26 @@ set(CALC_VM_INCS
     -I${CMAKE_SOURCE_DIR}/pegc/runtime
     -I${CMAKE_CURRENT_BINARY_DIR})
 
+# The calc VM compiles against BBQ's C runtime headers and embeds bbq_ctx_t BY
+# VALUE (calc_backend.h: `bbq_ctx_t code` — the bytecode cursor IS a bbq cursor),
+# so a field added to that struct changes this object's layout. These objects are
+# built by custom commands, which track only what DEPENDS lists: without the
+# headers here a runtime change leaves a stale object that links fine against
+# freshly compiled translation units and segfaults at run time.
+file(GLOB CALC_VM_RUNTIME_HDRS
+     ${CMAKE_SOURCE_DIR}/backends/c/runtime/*.h
+     ${CMAKE_SOURCE_DIR}/crt/*.h
+     ${CMAKE_SOURCE_DIR}/opgen/runtime/*.h
+     ${CMAKE_SOURCE_DIR}/pegc/runtime/*.h
+     ${CMAKE_CURRENT_SOURCE_DIR}/runtime/*.h)
+
 # Tier 0 — the threaded interpreter object (clang: musttail).
 set(CALC_INTERP_O ${CALC_VM_DIR}/gen_interp.o)
 add_custom_command(
     OUTPUT ${CALC_INTERP_O}
     COMMAND ${CLANG_C_COMPILER} -std=c11 -O2 ${CALC_VM_INCS}
             -c ${CALC_VM_DIR}/gen_interp.c -o ${CALC_INTERP_O}
-    DEPENDS ${CALC_VM_GEN}
+    DEPENDS ${CALC_VM_GEN} ${CALC_VM_RUNTIME_HDRS}
     COMMENT "clang: calc interpreter (gen_interp.c)"
     VERBATIM
 )
@@ -256,7 +269,7 @@ add_custom_command(
     OUTPUT ${CALC_OPTAB_O}
     COMMAND ${CLANG_C_COMPILER} -std=c11 -O2 ${CALC_VM_INCS}
             -c ${CALC_VM_DIR}/opcode_tables.c -o ${CALC_OPTAB_O}
-    DEPENDS ${CALC_VM_GEN}
+    DEPENDS ${CALC_VM_GEN} ${CALC_VM_RUNTIME_HDRS}
     COMMENT "clang: calc opcode tables (opcode_tables.c)"
     VERBATIM
 )
@@ -268,7 +281,7 @@ add_custom_command(
     COMMAND ${CLANG_C_COMPILER} -std=c11 -O2 -fno-stack-protector
             -fno-asynchronous-unwind-tables ${CALC_VM_INCS}
             -c ${CALC_VM_DIR}/calc_stencils.c -o ${CALC_VM_STENCILS_O}
-    DEPENDS ${CALC_VM_GEN}
+    DEPENDS ${CALC_VM_GEN} ${CALC_VM_RUNTIME_HDRS}
     COMMENT "clang: calc VM stencils (calc_stencils.c)"
     VERBATIM
 )
@@ -290,7 +303,7 @@ add_custom_command(
             ${CMAKE_CURRENT_SOURCE_DIR}/example/test/calc_e2e_test.cpp
             $<TARGET_FILE:calc_runner> ${CALC_INTERP_O}
             ${CALC_OPTAB_O} -lm -o ${CALC_VM_E2E}
-    DEPENDS ${CALC_INTERP_O} ${CALC_OPTAB_O} calc_runner ${CALC_REWRITE_H}
+    DEPENDS ${CALC_INTERP_O} ${CALC_OPTAB_O} calc_runner ${CALC_REWRITE_H} ${CALC_VM_RUNTIME_HDRS}
             ${CMAKE_CURRENT_SOURCE_DIR}/example/test/calc_e2e_test.cpp
     COMMENT "clang: calc VM e2e (parse -> ddcg -> IR -> bytecode -> interp)"
     VERBATIM
@@ -311,7 +324,7 @@ add_custom_command(
             ${CMAKE_CURRENT_SOURCE_DIR}/example/frontend/Parser.cpp
             ${CALC_INTERP_O} ${CALC_OPTAB_O} -lm
             -o ${CALC_VM_E2E_NOREWRITE}
-    DEPENDS ${CALC_INTERP_O} ${CALC_OPTAB_O} calc_runner ${CALC_REWRITE_H}
+    DEPENDS ${CALC_INTERP_O} ${CALC_OPTAB_O} calc_runner ${CALC_REWRITE_H} ${CALC_VM_RUNTIME_HDRS}
             ${CMAKE_CURRENT_SOURCE_DIR}/example/test/calc_e2e_test.cpp
             ${CMAKE_CURRENT_SOURCE_DIR}/example/calc_runner.cpp
     COMMENT "clang: calc e2e with the rewrite pass compiled out (falsifier)"

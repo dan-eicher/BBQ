@@ -13,6 +13,7 @@
 #include <functional>
 #include <map>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <set>
 
@@ -297,6 +298,17 @@ void Emitter::fold_owning_paths(json& functions) const {
         std::vector<std::string> scope, sscope, array_stack;  // pushed/popped together
         int loop_level = 0;
         json kept = json::array();
+        // A begin without its end (or the reverse) is a malformed kont graph, and
+        // reading past the end of the scope stack would emit a parser built from
+        // whatever was next in memory. Say so instead — bbqc reports a thrown gate
+        // error, and a generator that aborts on an assertion tells nobody anything.
+        auto unwind = [&](const char* what) {
+            if (scope.empty() || sscope.empty())
+                throw std::runtime_error(std::string("emit: ") + what +
+                    " with no matching begin (unbalanced kont graph)");
+            prefix = scope.back(); scope.pop_back();
+            struct_prefix = sscope.back(); sscope.pop_back();
+        };
         for (auto& op : fn["ops"]) {
             std::string k = op.value("op", std::string());
             if (k == "begin_struct") {
@@ -317,13 +329,13 @@ void Emitter::fold_owning_paths(json& functions) const {
                 continue;  // boundary: drop
             }
             if (k == "end_struct") {
-                prefix = scope.back(); scope.pop_back();
-                struct_prefix = sscope.back(); sscope.pop_back();
+                unwind("end_struct");
                 continue;
             }
             if (k == "end_array") {
-                prefix = scope.back(); scope.pop_back();
-                struct_prefix = sscope.back(); sscope.pop_back();
+                unwind("end_array");
+                if (array_stack.empty())
+                    throw std::runtime_error("emit: end_array with no matching array_begin");
                 loop_level--; array_stack.pop_back();
                 continue;
             }
@@ -347,6 +359,8 @@ void Emitter::fold_owning_paths(json& functions) const {
             // qualified field the begin op got — counted and uncounted alike, now that
             // the counted store accumulates instead of being sized from the count.
             if (k == "array_next_grow" || k == "array_next" || k == "array_next_count") {
+                if (array_stack.empty())
+                    throw std::runtime_error("emit: " + k + " outside any array");
                 op["field"] = array_stack.back(); kept.push_back(op); continue;
             }
             if (k == "invoke") {

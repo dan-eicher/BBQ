@@ -23,6 +23,7 @@
    #include <cassert>
    #include <cstring>
    #include <cstdio>
+   #include <stdexcept>
    #include <unordered_map>
    #include <utility>
    #include <vector>
@@ -648,8 +649,10 @@ private:
         if (n == "remaining") return make_remaining();
         if (n == "index")     return make_loop_var();
         if (n == "buffer")    return make_buffer();
-        // Sema rejects unknown @names before compile; defensive fallback.
-        return make_pos();
+        // Sema rejects unknown @names, so reaching here means the two lists have
+        // drifted apart. Compiling it as @pos would put a plausible wrong number
+        // in the parser; say which name has no lowering instead.
+        throw std::runtime_error("no lowering for builtin @" + n);
     }
     bbq::cek::StaticKont* make_eoi()       { return arena_->alloc<bbq::cek::EOIKont>(); }
     bbq::cek::StaticKont* make_loop_var()  { return arena_->alloc<bbq::cek::LoopVarKont>(); }

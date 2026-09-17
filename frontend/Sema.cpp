@@ -1084,6 +1084,33 @@ bool Sema::field_in_every_arm(const std::vector<Struct*>& arms,
     return arms_binding == static_cast<int>(arms.size());
 }
 
+// The declared body a reference path names, or null when it cannot be resolved
+// here. Null is the permissive answer and stays permissive: a name this rule does
+// not bind may come from a calling rule's scope, and an extern or a choice has no
+// single body to walk into. What it must NOT do is stop walking early — a base
+// resolved one dot in and abandoned is why `a.b.nosuch` used to be accepted while
+// `a.nosuch` was not.
+TypeExpr* Sema::resolve_path_body(RefPath* path, const TypeCheckScope& scope) {
+    if (auto* simple = dynamic_cast<Simple*>(path)) {
+        auto it = scope.bodies.find(simple->name);
+        return it != scope.bodies.end() ? it->second : nullptr;
+    }
+    if (auto* fa = dynamic_cast<FieldAcc*>(path)) {
+        TypeExpr* base = resolve_path_body(fa->base, scope);
+        if (!base) return nullptr;
+        auto* st = resolve_to_struct(base);
+        if (!st) return nullptr;              // a choice/extern — handled by the caller
+        for (auto* f : st->fields)
+            if (f->name == fa->field) return f->body;
+        return nullptr;
+    }
+    if (auto* ia = dynamic_cast<IndexAcc*>(path)) {
+        TypeExpr* base = resolve_path_body(ia->base, scope);
+        return base ? resolve_to_array_element(base) : nullptr;
+    }
+    return nullptr;
+}
+
 // Structural resolution: follow to get array element type
 
 TypeExpr* Sema::resolve_to_array_element(TypeExpr* type) {
@@ -1207,14 +1234,15 @@ ExprType Sema::type_of_ref_path(RefPath* path, const TypeCheckScope& scope) {
     }
 
     if (auto* fa = dynamic_cast<FieldAcc*>(path)) {
-        // Resolve base to its TypeExpr body, then find the field
-        // First, get the root name
-        auto* base_simple = dynamic_cast<Simple*>(fa->base);
-        TypeExpr* base_body = nullptr;
-        if (base_simple) {
-            auto it = scope.bodies.find(base_simple->name);
-            if (it != scope.bodies.end()) base_body = it->second;
-        }
+        // Type-check the base for its own sake first: a subscript inside it has to
+        // be reported whether or not the path as a whole resolves.
+        type_of_ref_path(fa->base, scope);
+
+        // Then the base's declared body, at whatever depth: `a` from the scope,
+        // and `a.b` / `a[i]` by walking. A base that resolves is one whose fields
+        // are known, so naming a field it does not have is an error there — at the
+        // third dot as much as the first.
+        TypeExpr* base_body = resolve_path_body(fa->base, scope);
 
         if (base_body) {
             // A biased choice binds only what all of its arms bind (IPG §3.2).
@@ -1266,12 +1294,9 @@ ExprType Sema::type_of_ref_path(RefPath* path, const TypeCheckScope& scope) {
             }
         }
 
-        // For deeper paths (a.b.c), resolve step by step
-        if (!base_simple) {
-            auto base_type = type_of_ref_path(fa->base, scope);
-            // Can't resolve further without structural info — permissive
-            (void)base_type;
-        }
+        // The base resolved to nothing this rule can see — a name from a calling
+        // rule's scope, an extern, a type with no fields to name. Permissive: the
+        // reference is checked wherever it can be.
         return ExprType::Unknown;
     }
 

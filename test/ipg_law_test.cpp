@@ -219,6 +219,48 @@ TEST(IpgAttrCheck, AnUndefinedNameInAComputeIsRejected) {
     EXPECT_TRUE(d.says("nosuchfield")) << d.text;
 }
 
+// Property 1 holds at every depth, not just the first dot. A path resolved one
+// step and then abandoned is how `a.nosuch` gets caught while `a.b.nosuch` sails
+// through to a parse-time failure.
+TEST(IpgAttrCheck, ADeepPathIsCheckedAtEveryStep) {
+    const char* rules = "C = struct { v: uint8 }\n"
+                        "B = struct { c: C }\n"
+                        "A = struct { b: B }\n";
+    auto good = diagnose(std::string(rules) +
+                         "Top = struct { a: A, k: compute(a.b.c.v : uint8) }");
+    EXPECT_TRUE(good.ok) << good.text;
+
+    for (const char* bad : {"a.nosuch", "a.b.nosuch", "a.b.c.nosuch"}) {
+        auto d = diagnose(std::string(rules) + "Top = struct { a: A, k: compute(" +
+                          bad + " : uint8) }");
+        ASSERT_TRUE(d.parsed);
+        EXPECT_FALSE(d.ok) << bad << ": " << d.text;
+        EXPECT_TRUE(d.says("nosuch")) << bad << ": " << d.text;
+    }
+}
+
+// …and through a subscript, which is the paper's `A(e).id` reaching into a
+// struct element.
+TEST(IpgAttrCheck, APathThroughASubscriptIsChecked) {
+    auto good = diagnose("C = struct { v: uint8 }\n"
+                         "Top = struct { xs: array<C>[2], k: compute(xs[0].v : uint8) }");
+    EXPECT_TRUE(good.ok) << good.text;
+
+    auto bad = diagnose("C = struct { v: uint8 }\n"
+                        "Top = struct { xs: array<C>[2], k: compute(xs[0].nosuch : uint8) }");
+    ASSERT_TRUE(bad.parsed);
+    EXPECT_FALSE(bad.ok) << bad.text;
+}
+
+// The permissive half has to stay permissive: a name this rule does not bind may
+// come from the scope of a rule that calls it, and refusing that would make a
+// helper rule unusable.
+TEST(IpgAttrCheck, ACrossRuleNameIsStillAccepted) {
+    auto d = diagnose("Inner = struct { x: uint8, k: compute(outer_field : uint8) }\n"
+                      "Outer = struct { outer_field: uint8, i: Inner }");
+    EXPECT_TRUE(d.ok) << d.text;
+}
+
 // `def(A)` is "the set of attributes that are defined in all alternatives". A name
 // one arm binds and another does not is not an attribute of the rule, and reaching
 // for it is a static error — not a parse that succeeds or fails depending on which

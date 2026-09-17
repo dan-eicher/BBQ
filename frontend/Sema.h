@@ -153,6 +153,10 @@ private:
     ExprType type_of_ref_path(BBQ::RefPath* path, const TypeCheckScope& scope);
 
     // Structural resolution for field/array access
+    // The declared body a reference path names, walked to any depth; null when it
+    // cannot be resolved here (a cross-rule name, a choice, an extern), which is
+    // the permissive answer.
+    BBQ::TypeExpr* resolve_path_body(BBQ::RefPath* path, const TypeCheckScope& scope);
     BBQ::Struct* resolve_to_struct(BBQ::TypeExpr* type);
     BBQ::TypeExpr* resolve_to_array_element(BBQ::TypeExpr* type);
     // The arms of a biased choice, or empty when the type is not one.

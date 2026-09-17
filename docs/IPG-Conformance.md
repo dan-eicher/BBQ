@@ -84,6 +84,8 @@ by `sema_test.cpp` and `CEKLayer2*`.
 | Law | Verdict | Test |
 |---|---|---|
 | Property 1: every reference names a defined attribute | holds | `IpgAttrCheck.AReferenceToANameNoRuleDefinesIsRejected`, `…AnUndefinedNameInAnIntervalIsRejected`, `…AnUndefinedNameInAComputeIsRejected`, `Sema.ReferenceToANameNoRuleBindsIsRejected` |
+| …at every step of a dotted path, and through a subscript | holds | `IpgAttrCheck.ADeepPathIsCheckedAtEveryStep`, `…APathThroughASubscriptIsChecked` |
+| …while a name from a calling rule's scope stays permissive | holds | `IpgAttrCheck.ACrossRuleNameIsStillAccepted`, `Sema.CrossRuleRefAllowed` |
 | A name not bound locally may come from a calling rule's scope | holds | `Sema.CrossRuleRefAllowed`, `IpgLocal.ANestedRuleSeesTheEnclosingScope` |
 | `def(A)` is the intersection over alternatives — a name only some arms bind is not an attribute of the rule | holds | `IpgAttrCheck.DefIsTheIntersectionOverAlternatives`, `…ANameNoAlternativeBindsIsRejected` |
 | …and a name every arm binds is | **differs** | `IpgAttrCheck.ANameEveryAlternativeBindsIsRefusedWithTheLift`, `…TheLiftedFieldReadsWhicheverArmMatched` |
@@ -234,6 +236,25 @@ measure that decreases, exactly as the paper's `for` loop is.
 validation pass. BBQ's `where` predicates and `@header`/`@source` code blocks are
 where such a pass would attach, and checksums are the everyday case
 (`CBackendE2E.IPv4ChecksumWhere`). Nothing here claims to decide them.
+
+## Noticed, not addressed
+
+**Overlapping switch ranges draw no diagnostic.** `switch(t) { 0 .. 5: X; 3 .. 9:
+Y; … }` compiles silently; only an exactly duplicated case value is reported
+(`Sema.SwitchDuplicateCaseValues`). First-match-wins makes the overlap
+well-defined, and the law that it is first-match is tested
+(`IpgSwitch.TheFirstMatchingCaseWinsAndLaterOnesAreSkipped`), so nothing here is
+wrong. But a range silently shadowed by an earlier one is the shape of §1's
+opening complaint — two readers of the same spec disagreeing about what it says —
+and a warning would cost nothing. Left alone because it is a new diagnostic rather
+than a law this file is auditing.
+
+**The write side has no laws here.** The paper is about parsing, and so is this
+file. BBQ also serializes, recomputes dependent fields, and claims round-trip
+properties; those are lens laws (GetPut/PutGet) rather than IPG ones, and they are
+kept by `CEKLaw.*`, `CppLaw.*` and `ZCowLaw.*`. No IPG rule is missing from here
+because of it, but "IPG conformance" should not be read as "the whole of BBQ is
+audited".
 
 ## Reading this file
 

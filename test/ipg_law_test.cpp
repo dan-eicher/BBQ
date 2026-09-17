@@ -50,10 +50,11 @@ int64_t computed(const bbq::zcow::node* n) {
 // ══════════════════════════════════════════════════════════════════════
 
 // Term `A[e_l, e_r]`: a nonterminal carries an interval that says which slice of
-// the input its rule describes.
+// the input its rule describes. The value is what says so — an offset alone would
+// still be there if the rule had read the wrong bytes.
 TEST(IpgTerm, NonterminalCarriesAnInterval) {
     auto r = run("Sub = struct { v: uint8 }\n"
-                 "Top = struct { s: Sub[3, 4] }",
+                 "Top = struct { s: Sub[3, 4], k: compute(s.v : uint8) }",
                  "Top", {0x10, 0x11, 0x12, 0x99});
     ASSERT_TRUE(r.compiled) << r.error;
     ASSERT_TRUE(r.success) << r.error;
@@ -61,6 +62,24 @@ TEST(IpgTerm, NonterminalCarriesAnInterval) {
     ASSERT_NE(s, nullptr);
     EXPECT_EQ(s->start_offset, 3u);   // it described byte 3, not byte 0
     EXPECT_EQ(s->end_offset, 4u);
+    EXPECT_EQ(computed(kid(r.root(), "k")), 0x99) << "byte 3, not byte 0";
+}
+
+// Moving the interval moves what the rule reads, and nothing else about the spec
+// changes. Without this, the test above passes on a parser that ignores intervals
+// and happens to be pointed at the right byte.
+TEST(IpgTerm, MovingTheIntervalMovesWhatIsRead) {
+    for (auto at : {std::pair<const char*, int>{"[0, 1]", 0x10},
+                    std::pair<const char*, int>{"[1, 2]", 0x11},
+                    std::pair<const char*, int>{"[3, 4]", 0x99}}) {
+        std::string g = std::string("Sub = struct { v: uint8 }\n"
+                                    "Top = struct { s: Sub") + at.first +
+                        ", k: compute(s.v : uint8) }";
+        auto r = run(g, "Top", {0x10, 0x11, 0x12, 0x99});
+        ASSERT_TRUE(r.compiled) << r.error;
+        ASSERT_TRUE(r.success) << r.error;
+        EXPECT_EQ(computed(kid(r.root(), "k")), at.second) << "at " << at.first;
+    }
 }
 
 // Term `s[e_l, e_r]`: a terminal string over a slice. BBQ writes a terminal as a
@@ -98,7 +117,9 @@ TEST(IpgTerm, PredicateGatesTheParse) {
 // interval that may mention the loop variable. BBQ spells the loop variable
 // `@index` — a bare identifier is always a field reference (Grammar §7.3).
 TEST(IpgTerm, ArrayPlacesEachElementByItsOwnInterval) {
-    auto r = run("E   = struct { v: uint8 }\n"
+    // The bytes in between are 0x00, so reading sequentially instead of by the
+    // stride would give 0xAA,0x00,0xBB rather than 0xAA,0xBB,0xCC.
+    auto r = run("E   = struct { v: uint8, k: compute(v : uint8) }\n"
                  "Top = struct { base: uint8, n: uint8,\n"
                  "               xs: array<E>[n] @ [base + @index * 2, base + @index * 2 + 1] }",
                  "Top", {2, 3, 0xAA, 0x00, 0xBB, 0x00, 0xCC});
@@ -107,29 +128,66 @@ TEST(IpgTerm, ArrayPlacesEachElementByItsOwnInterval) {
     auto* xs = kid(r.root(), "xs");
     ASSERT_NE(xs, nullptr);
     ASSERT_EQ(xs->kids.size(), 3u);
-    EXPECT_EQ(xs->kids[0]->start_offset, 2u);
-    EXPECT_EQ(xs->kids[1]->start_offset, 4u);
-    EXPECT_EQ(xs->kids[2]->start_offset, 6u);
+    const int want[] = {0xAA, 0xBB, 0xCC};
+    const size_t at[] = {2u, 4u, 6u};
+    for (int i = 0; i < 3; i++) {
+        EXPECT_EQ(xs->kids[i]->start_offset, at[i]) << "element " << i;
+        EXPECT_EQ(computed(kid(xs->kids[i].get(), "k")), want[i]) << "element " << i;
+    }
+}
+
+// The same confinement as any interval: an element placed outside the input is a
+// parse failure, not a short array.
+TEST(IpgTerm, AnElementIntervalThatEscapesTheInputFails) {
+    auto r = run("E   = struct { v: uint8 }\n"
+                 "Top = struct { base: uint8,\n"
+                 "               xs: array<E>[3] @ [base + @index, base + @index + 1] }",
+                 "Top", {2, 0xAA, 0xBB});   // element 2 wants [4,5) of a 3-byte input
+    ASSERT_TRUE(r.compiled) << r.error;
+    EXPECT_FALSE(r.success);
 }
 
 // Reference `A(e).id` (Figure 5): the attribute of an array element. This is how
 // the paper's ELF rule reaches a section's offset — `SH(i).ofs` — so it has to
 // work in an interval, not only in a predicate.
 TEST(IpgTerm, ArrayElementAttributeIsReachable) {
-    auto r = run("Top = struct { xs: array<uint8>[2], pick: compute(xs[1] : uint8) }",
-                 "Top", {0x41, 0x42});
+    auto r = run("Top = struct { xs: array<uint8>[3],\n"
+                 "               a: compute(xs[0] : uint8),\n"
+                 "               b: compute(xs[1] : uint8),\n"
+                 "               c: compute(xs[2] : uint8) }",
+                 "Top", {0x41, 0x42, 0x43});
     ASSERT_TRUE(r.compiled) << r.error;
     ASSERT_TRUE(r.success) << r.error;
-    EXPECT_EQ(computed(kid(r.root(), "pick")), 0x42);
+    // Three indices, three values: a subscript that always read element 0 — or
+    // always the last — passes a single-index test.
+    EXPECT_EQ(computed(kid(r.root(), "a")), 0x41);
+    EXPECT_EQ(computed(kid(r.root(), "b")), 0x42);
+    EXPECT_EQ(computed(kid(r.root(), "c")), 0x43);
 }
 
 TEST(IpgTerm, ArrayElementAttributeOfAStructElement) {
     auto r = run("SH  = struct { ofs: uint8, sz: uint8 }\n"
-                 "Top = struct { shs: array<SH>[2], pick: compute(shs[1].ofs : uint8) }",
+                 "Top = struct { shs: array<SH>[2],\n"
+                 "               a: compute(shs[0].ofs : uint8),\n"
+                 "               b: compute(shs[0].sz : uint8),\n"
+                 "               c: compute(shs[1].ofs : uint8),\n"
+                 "               d: compute(shs[1].sz : uint8) }",
                  "Top", {1, 2, 3, 4});
     ASSERT_TRUE(r.compiled) << r.error;
     ASSERT_TRUE(r.success) << r.error;
-    EXPECT_EQ(computed(kid(r.root(), "pick")), 3);
+    // Each index and each member reaches a different byte: an implementation that
+    // collapsed the subscript, or the member, would collide here.
+    EXPECT_EQ(computed(kid(r.root(), "a")), 1);
+    EXPECT_EQ(computed(kid(r.root(), "b")), 2);
+    EXPECT_EQ(computed(kid(r.root(), "c")), 3);
+    EXPECT_EQ(computed(kid(r.root(), "d")), 4);
+}
+
+TEST(IpgTerm, AnArrayIndexPastTheEndFails) {
+    auto r = run("Top = struct { xs: array<uint8>[2], pick: compute(xs[5] : uint8) }",
+                 "Top", {0x41, 0x42});
+    ASSERT_TRUE(r.compiled) << r.error;
+    EXPECT_FALSE(r.success);
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -363,13 +421,27 @@ TEST(IpgAlt, AFailedArmLeavesNoBindingsBehind) {
 }
 
 // A-Seq1/A-Seq2: terms are threaded left to right, and a later term sees what
-// earlier terms bound.
+// earlier terms bound. Varying the binding has to move the terms after it —
+// a fixed-width read would satisfy any single case.
 TEST(IpgSeq, LaterTermsSeeEarlierBindings) {
-    auto r = run("Top = struct { n: uint8, data: bytes[n], tail: uint8 }",
-                 "Top", {2, 0xAA, 0xBB, 0x7F});
-    ASSERT_TRUE(r.compiled) << r.error;
-    ASSERT_TRUE(r.success) << r.error;
-    EXPECT_EQ(r.meta.bytes_consumed, 4u);
+    const char* g = "Top = struct { n: uint8, data: bytes[n], tail: uint8,\n"
+                    "               k: compute(tail : uint8) }";
+    struct Case { std::vector<uint8_t> bytes; size_t consumed; size_t tail_at; };
+    for (auto& c : {Case{{0, 0x7F}, 2u, 1u},
+                    Case{{1, 0xAA, 0x7F}, 3u, 2u},
+                    Case{{3, 0xAA, 0xBB, 0xCC, 0x7F}, 5u, 4u}}) {
+        auto r = run(g, "Top", c.bytes);
+        ASSERT_TRUE(r.compiled) << r.error;
+        ASSERT_TRUE(r.success) << r.error;
+        EXPECT_EQ(r.meta.bytes_consumed, c.consumed) << "n = " << (int)c.bytes[0];
+        EXPECT_EQ(kid(r.root(), "tail")->start_offset, c.tail_at);
+        EXPECT_EQ(computed(kid(r.root(), "k")), 0x7F);
+    }
+
+    // A binding that overruns the input fails; it is not clamped to what is left.
+    auto over = run(g, "Top", {9, 0xAA, 0xBB});
+    ASSERT_TRUE(over.compiled) << over.error;
+    EXPECT_FALSE(over.success);
 }
 
 // A-Fail: one term failing fails the whole alternative — the terms before it do
@@ -387,25 +459,43 @@ TEST(IpgSeq, OneFailingTermFailsTheWholeAlternative) {
 // shape that depends on it.
 TEST(IpgInterval, AnEmptyIntervalIsValid) {
     auto r = run("Sec = struct { body: bytes[@remaining] }\n"
-                 "Top = struct { a: uint8, s: Sec[2, 2], z: uint8 }",
+                 "Top = struct { a: uint8, s: Sec[2, 2], z: uint8, k: compute(z : uint8) }",
                  "Top", {1, 2, 3, 4});
     ASSERT_TRUE(r.compiled) << r.error;
     ASSERT_TRUE(r.success) << r.error;
     auto* s = kid(r.root(), "s");
     ASSERT_NE(s, nullptr);
     EXPECT_EQ(s->start_offset, s->end_offset);
+    // Empty means empty: it read nothing, and the field after it is where the
+    // window left the cursor rather than a byte further on.
+    auto* body = kid(s, "body");
+    ASSERT_NE(body, nullptr);
+    EXPECT_EQ(body->end_offset, body->start_offset);
+    EXPECT_EQ(kid(r.root(), "z")->start_offset, 2u);
+    EXPECT_EQ(computed(kid(r.root(), "k")), 3);
 }
 
+// The same window, with the length coming from the input: zero reads nothing and
+// carries on, non-zero reads exactly that much. One case alone cannot tell an
+// empty window from a window that was ignored.
 TEST(IpgInterval, AnEmptyIntervalComputedFromDataIsValid) {
-    auto r = run("Sec = struct { body: bytes[@remaining] }\n"
-                 "Top = struct { off: uint8, len: uint8, s: Sec[off, off + len], z: uint8 }",
-                 "Top", {2, 0, 9, 9});
-    ASSERT_TRUE(r.compiled) << r.error;
-    ASSERT_TRUE(r.success) << r.error;
-    auto* body = kid(kid(r.root(), "s"), "body");
-    ASSERT_NE(body, nullptr);
-    EXPECT_EQ(body->end_offset, body->start_offset)
+    const char* g = "Sec = struct { body: bytes[@remaining] }\n"
+                    "Top = struct { off: uint8, len: uint8, s: Sec[off, off + len] }";
+
+    auto empty = run(g, "Top", {2, 0, 9, 9});
+    ASSERT_TRUE(empty.compiled) << empty.error;
+    ASSERT_TRUE(empty.success) << empty.error;
+    auto* eb = kid(kid(empty.root(), "s"), "body");
+    ASSERT_NE(eb, nullptr);
+    EXPECT_EQ(eb->end_offset - eb->start_offset, 0u)
         << "an empty window yields an empty read, not a failure";
+
+    auto two = run(g, "Top", {2, 2, 9, 9});
+    ASSERT_TRUE(two.success) << two.error;
+    auto* tb = kid(kid(two.root(), "s"), "body");
+    ASSERT_NE(tb, nullptr);
+    EXPECT_EQ(tb->start_offset, 2u);
+    EXPECT_EQ(tb->end_offset - tb->start_offset, 2u);
 }
 
 // The same side condition, violated: start after end.
@@ -659,15 +749,31 @@ TEST(IpgSwitch, ARejectDefaultFailsClosed) {
 // Blackbox parsers: "by using an interval, the parser can control what can be
 // seen by an external parser." The extern is handed its window and nothing else.
 TEST(IpgBlackbox, AnExternSeesOnlyItsInterval) {
+    const char* g = "Top = struct { a: uint8, e: extern(\"readit\", \"int\")[1, 3], z: uint8 }";
+
     ipg::ExternWitness::consume = 2;
-    auto r = run("Top = struct { a: uint8, e: extern(\"readit\", \"int\")[1, 3], z: uint8 }",
-                 "Top", {0x10, 0x11, 0x12, 0x13});
+    auto r = run(g, "Top", {0x10, 0x11, 0x12, 0x13});
     ASSERT_TRUE(r.compiled) << r.error;
     ASSERT_TRUE(r.success) << r.error;
-    ASSERT_EQ(ipg::ExternWitness::seen.size(), 2u);
+    ASSERT_EQ(ipg::ExternWitness::seen.size(), 2u) << "the window, not the rest of the input";
     EXPECT_EQ(ipg::ExternWitness::seen[0], 0x11);
     EXPECT_EQ(ipg::ExternWitness::seen[1], 0x12);
+
+    // Move the window and the blackbox is handed different bytes — which is how a
+    // GIF parser hands a decompressor exactly the code area and nothing else.
+    auto moved = run("Top = struct { a: uint8, e: extern(\"readit\", \"int\")[2, 4], z: uint8 }",
+                     "Top", {0x10, 0x11, 0x12, 0x13, 0x14});
+    ASSERT_TRUE(moved.success) << moved.error;
+    ASSERT_EQ(ipg::ExternWitness::seen.size(), 2u);
+    EXPECT_EQ(ipg::ExternWitness::seen[0], 0x12);
+    EXPECT_EQ(ipg::ExternWitness::seen[1], 0x13);
+
+    // A blackbox that cannot satisfy itself from what the window holds fails the
+    // parse — it is a term like any other (T-NTFail).
     ipg::ExternWitness::consume = 4;
+    auto starved = run(g, "Top", {0x10, 0x11, 0x12, 0x13});
+    ASSERT_TRUE(starved.compiled) << starved.error;
+    EXPECT_FALSE(starved.success) << "asked for 4 bytes inside a 2-byte window";
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -714,38 +820,89 @@ TEST(IpgExpressive, RecursionGuardedByAnArrayIsAccepted) {
 // §4.1 ELF, and Figure 2: a header holds an offset and a length, and the data
 // lives wherever the header says — including behind the cursor.
 TEST(IpgCaseStudy, RandomAccessFromAParsedOffset) {
-    auto r = run("Data = struct { body: bytes[@remaining] }\n"
-                 "Hdr  = struct { off: uint8, len: uint8 }\n"
-                 "Top  = struct { pad: bytes[4], h: Hdr[0, 2],\n"
-                 "                d: Data[h.off, h.off + h.len] }",
-                 "Top", {1, 2, 0xAA, 0xBB, 0xCC, 0xDD});
+    // The header is read at [0,2) after the cursor has already passed it, and the
+    // data at an offset the header gave — behind the cursor. Reading the values
+    // back is what says the parse went there, rather than staying where it was.
+    const char* g = "Data = struct { a: uint8, b: uint8 }\n"
+                    "Hdr  = struct { off: uint8, len: uint8 }\n"
+                    "Top  = struct { pad: bytes[4], h: Hdr[0, 2],\n"
+                    "                d: Data[h.off, h.off + h.len],\n"
+                    "                ka: compute(d.a : uint8), kb: compute(d.b : uint8) }";
+    auto r = run(g, "Top", {1, 2, 0xAA, 0xBB, 0xCC, 0xDD});
     ASSERT_TRUE(r.compiled) << r.error;
     ASSERT_TRUE(r.success) << r.error;
     auto* d = kid(r.root(), "d");
     ASSERT_NE(d, nullptr);
     EXPECT_EQ(d->start_offset, 1u) << "the section starts behind the cursor";
-    EXPECT_EQ(d->end_offset, 3u);
+    EXPECT_EQ(computed(kid(r.root(), "ka")), 2);      // input[1]
+    EXPECT_EQ(computed(kid(r.root(), "kb")), 0xAA);   // input[2]
+
+    // Move the offset the header carries, and the data moves with it.
+    auto moved = run(g, "Top", {3, 2, 0xAA, 0xBB, 0xCC, 0xDD});
+    ASSERT_TRUE(moved.success) << moved.error;
+    EXPECT_EQ(computed(kid(moved.root(), "ka")), 0xBB);   // input[3]
+    EXPECT_EQ(computed(kid(moved.root(), "kb")), 0xCC);   // input[4]
+
+    // An offset past the input is a parse failure, not a clamp.
+    auto over = run(g, "Top", {9, 2, 0xAA, 0xBB, 0xCC, 0xDD});
+    ASSERT_TRUE(over.compiled) << over.error;
+    EXPECT_FALSE(over.success);
 }
 
 // §4.1, Figure 9b line 3: sections are placed by the offsets and sizes held in
 // a previously parsed table of section headers —
 //   for i=0 to H.num do Sec[SH(i).ofs, SH(i).ofs + SH(i).sz]
 TEST(IpgCaseStudy, TheSectionTablePlacesSectionsByItsOwnEntries) {
-    auto r = run("SH  = struct { ofs: uint8, sz: uint8 }\n"
-                 "Sec = struct { body: bytes[@remaining] }\n"
-                 "Top = struct {\n"
-                 "  n:    uint8,\n"
-                 "  shs:  array<SH>[n],\n"
-                 "  secs: array<Sec>[n] @ [shs[@index].ofs, shs[@index].ofs + shs[@index].sz]\n"
-                 "}",
-                 "Top", {2, 5, 1, 6, 1, 0xAA, 0xBB});
+    // Sections of DIFFERENT sizes, listed out of order, so neither a fixed stride
+    // nor a sequential walk produces this result. Entry 0 says [6,8), entry 1 says
+    // [5,6): the first section is two bytes and comes after the second.
+    const char* g = "SH  = struct { ofs: uint8, sz: uint8 }\n"
+                    "Sec = struct { body: bytes[@remaining] }\n"
+                    "Top = struct {\n"
+                    "  n:    uint8,\n"
+                    "  shs:  array<SH>[n],\n"
+                    "  secs: array<Sec>[n] @ [shs[@index].ofs, shs[@index].ofs + shs[@index].sz]\n"
+                    "}";
+    auto r = run(g, "Top", {2, 6, 2, 5, 1, 0xAA, 0xBB, 0xCC});
     ASSERT_TRUE(r.compiled) << r.error;
     ASSERT_TRUE(r.success) << r.error;
     auto* secs = kid(r.root(), "secs");
     ASSERT_NE(secs, nullptr);
     ASSERT_EQ(secs->kids.size(), 2u);
-    EXPECT_EQ(secs->kids[0]->start_offset, 5u);
-    EXPECT_EQ(secs->kids[1]->start_offset, 6u);
+
+    auto* b0 = kid(secs->kids[0].get(), "body");
+    auto* b1 = kid(secs->kids[1].get(), "body");
+    ASSERT_NE(b0, nullptr);
+    ASSERT_NE(b1, nullptr);
+    EXPECT_EQ(b0->start_offset, 6u);
+    EXPECT_EQ(b0->end_offset - b0->start_offset, 2u);   // 0xBB 0xCC
+    EXPECT_EQ(b1->start_offset, 5u);
+    EXPECT_EQ(b1->end_offset - b1->start_offset, 1u);   // 0xAA
+
+    // A table entry pointing outside the file fails the parse — a section header
+    // is a claim about the file, and an unmet one is malformed input.
+    auto bad = run(g, "Top", {2, 6, 2, 99, 1, 0xAA, 0xBB, 0xCC});
+    ASSERT_TRUE(bad.compiled) << bad.error;
+    EXPECT_FALSE(bad.success);
+}
+
+// The same random access through the generated C reader. The CEK resolves a path
+// against the capture; the C reader resolves it against a struct it is building,
+// which is a different mechanism and could agree on shape while disagreeing on
+// which bytes it went to.
+TEST(IpgCaseStudy, TheCReaderTakesTheSameRandomAccess) {
+    const char* g = "Data = struct { a: uint8, b: uint8 }\n"
+                    "Hdr  = struct { off: uint8, len: uint8 }\n"
+                    "Top  = struct { pad: bytes[4], h: Hdr[0, 2],\n"
+                    "                d: Data[h.off, h.off + h.len] }";
+    std::string err;
+    EXPECT_TRUE(c_run(g, "top_t", "top_read", {1, 2, 0xAA, 0xBB, 0xCC, 0xDD},
+                      "out.h.off == 1 && out.d.a == 2 && out.d.b == 0xAA",
+                      true, &err)) << err;
+    EXPECT_TRUE(c_run(g, "top_t", "top_read", {3, 2, 0xAA, 0xBB, 0xCC, 0xDD},
+                      "out.d.a == 0xBB && out.d.b == 0xCC", true, &err)) << err;
+    EXPECT_TRUE(c_run(g, "top_t", "top_read", {9, 2, 0xAA, 0xBB, 0xCC, 0xDD},
+                      "", false, &err)) << err;
 }
 
 // §4.2 GIF, and §2: the type-length-value pattern — a type picks the subparser,
@@ -771,29 +928,51 @@ TEST(IpgCaseStudy, TypeLengthValue) {
 // §4.3 PDF: backward parsing. The offset table is found by reading from the end
 // of the file, which an interval anchored at EOI expresses directly.
 TEST(IpgCaseStudy, BackwardParsingFromTheEndOfInput) {
-    auto r = run("Tail = struct { off: uint8 }\n"
-                 "Body = struct { b: bytes[@remaining] }\n"
-                 "Top  = struct { t: Tail[EOI - 1, EOI], d: Body[t.off, EOI - 1] }",
-                 "Top", {0xAA, 0xBB, 0xCC, 1});
-    ASSERT_TRUE(r.compiled) << r.error;
-    ASSERT_TRUE(r.success) << r.error;
-    auto* d = kid(r.root(), "d");
-    ASSERT_NE(d, nullptr);
-    EXPECT_EQ(d->start_offset, 1u);
-    EXPECT_EQ(d->end_offset, 3u);
+    // The trailer is read first, at the very end, and points back into the file.
+    // Both the trailer's value and where it sends the parse are checked, and the
+    // offset is varied so a parser that ignored it could not pass both cases.
+    const char* g = "Tail = struct { off: uint8 }\n"
+                    "Body = struct { b: bytes[@remaining] }\n"
+                    "Top  = struct { t: Tail[EOI - 1, EOI], d: Body[t.off, EOI - 1],\n"
+                    "                k: compute(t.off : uint8) }";
+    struct Case { uint8_t off; size_t at, len; };
+    for (auto& c : {Case{1, 1u, 2u}, Case{0, 0u, 3u}, Case{3, 3u, 0u}}) {
+        auto r = run(g, "Top", {0xAA, 0xBB, 0xCC, c.off});
+        ASSERT_TRUE(r.compiled) << r.error;
+        ASSERT_TRUE(r.success) << r.error;
+        EXPECT_EQ(computed(kid(r.root(), "k")), c.off);
+        auto* b = kid(kid(r.root(), "d"), "b");
+        ASSERT_NE(b, nullptr) << "off " << (int)c.off;
+        EXPECT_EQ(b->start_offset, c.at) << "off " << (int)c.off;
+        EXPECT_EQ(b->end_offset - b->start_offset, c.len) << "off " << (int)c.off;
+    }
+
+    // A trailer pointing past where the body must end is malformed.
+    auto bad = run(g, "Top", {0xAA, 0xBB, 0xCC, 9});
+    ASSERT_TRUE(bad.compiled) << bad.error;
+    EXPECT_FALSE(bad.success);
 }
 
 // §4.3 PDF: two-pass parsing. "Intervals can overlap with each other to let the
 // parser parse the same area more than once."
 TEST(IpgCaseStudy, OverlappingIntervalsParseTheSameBytesTwice) {
+    // Both windows are [0,2). The point is not that they overlap but that the two
+    // passes read the same bytes DIFFERENTLY — one 16-bit value, two 8-bit ones —
+    // so the values are what the test is about.
     auto r = run("Wide   = struct { x: uint16le }\n"
                  "Narrow = struct { hi: uint8, lo: uint8 }\n"
-                 "Top    = struct { w: Wide[0, 2], n: Narrow[0, 2] }",
+                 "Top    = struct { w: Wide[0, 2], n: Narrow[0, 2],\n"
+                 "                  kx: compute(w.x : uint16),\n"
+                 "                  khi: compute(n.hi : uint8),\n"
+                 "                  klo: compute(n.lo : uint8) }",
                  "Top", {0x34, 0x12});
     ASSERT_TRUE(r.compiled) << r.error;
     ASSERT_TRUE(r.success) << r.error;
     EXPECT_EQ(kid(r.root(), "w")->start_offset, 0u);
     EXPECT_EQ(kid(r.root(), "n")->start_offset, 0u);
+    EXPECT_EQ(computed(kid(r.root(), "kx")), 0x1234);
+    EXPECT_EQ(computed(kid(r.root(), "khi")), 0x34);
+    EXPECT_EQ(computed(kid(r.root(), "klo")), 0x12);
 }
 
 // ══════════════════════════════════════════════════════════════════════

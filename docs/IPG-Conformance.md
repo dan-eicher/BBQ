@@ -13,6 +13,23 @@ Every entry carries a test. `ipg_law_tests` (`test/ipg_law_test.cpp`) is the sui
 that holds the laws themselves; where an existing suite already pins one, that is
 the anchor named. A law with no test is a law nobody is keeping.
 
+A law needs a case that would fail if the law did not hold, which for a parser is
+usually a *value* and not a span: a test that checks where a field landed passes
+on a parser that went to the right place and read the wrong thing. So the laws
+here read values back, vary the input so a constant cannot satisfy two cases, and
+state the malformed input the law rejects alongside the one it accepts. A
+construct that selects among branches — a choice, a switch — also has to say which
+branch ran, because arms that leave the same tree witness nothing.
+
+The laws are stated against the CEK because it is the semantics the generators are
+generated against, with a backend arm wherever the mechanism differs enough that
+the two could agree on shape and disagree on bytes (path resolution, whole-
+construct predicates, unbounded loops). Backend agreement in the large is not this
+file's job: `render_view_parser_test` checks the C++ view parser against the CEK
+construct by construct, `render_c_test` and `c_backend_e2e_test` do the same for
+the C reader and writer, and `cross_backend_test` runs the fixture grammar between
+them.
+
 Three verdicts appear:
 
 - **holds** — BBQ implements the law and a test pins it.
@@ -168,7 +185,7 @@ is refused rather than accepted-and-maybe-looping.
 
 | Pattern | Verdict | Test |
 |---|---|---|
-| §4.1 / Fig. 2 — random access: data lives where a parsed offset says, including behind the cursor | holds | `IpgCaseStudy.RandomAccessFromAParsedOffset` |
+| §4.1 / Fig. 2 — random access: data lives where a parsed offset says, including behind the cursor | holds | `IpgCaseStudy.RandomAccessFromAParsedOffset`, `…TheCReaderTakesTheSameRandomAccess` |
 | §4.1 / Fig. 9b — sections placed by the section-header table's own entries | holds | `IpgCaseStudy.TheSectionTablePlacesSectionsByItsOwnEntries` |
 | §4.2 — type-length-value: the type picks the subparser, the length bounds it | holds | `IpgCaseStudy.TypeLengthValue` |
 | §4.3 — backward parsing from the end of the file | holds | `IpgCaseStudy.BackwardParsingFromTheEndOfInput` |

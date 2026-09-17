@@ -26,6 +26,16 @@ using ipg::run;
 
 namespace {
 
+// The arm a choice-valued field recorded: the wrapper under it carrying the
+// variant tag. Null when the field is not a choice, or is not there.
+const bbq::zcow::node* arm_of(const bbq::zcow::node* parent, const char* field) {
+    const bbq::zcow::node* f = kid(parent, field);
+    if (!f) return nullptr;
+    for (auto& k : f->kids)
+        if (k->variant_tag >= 0) return k.get();
+    return nullptr;
+}
+
 // The integer a `compute` field recorded.
 int64_t computed(const bbq::zcow::node* n) {
     EXPECT_NE(n, nullptr);
@@ -262,31 +272,66 @@ TEST(IpgAlt, AFailingAlternativeFallsThroughToTheNext) {
 // R-AltFail again, with the choice nested rather than at the top: the enclosing
 // parse carries on afterwards. A-Seq1 threads the terms after it whichever
 // alternative won, so the last arm winning is not a special case.
+//
+// The arms read different numbers of bytes on purpose. A choice whose arms leave
+// the same tree cannot witness WHICH arm ran, and which arm ran is the whole
+// content of biased choice — so each case checks the variant the parse recorded
+// and where the field after the choice landed.
 TEST(IpgAlt, TheEnclosingParseContinuesAfterALaterArmWins) {
-    const char* g = "Inner = struct { t: uint8 where t == 1 }\n"
+    const char* g = "Inner = struct { t: uint8 where t == 1, extra: uint8 }\n"
                     "      | struct { t: uint8 }\n"
                     "Top   = struct { i: Inner, z: uint8 }";
-    for (uint8_t tag : {uint8_t{1}, uint8_t{9}}) {
-        auto r = run(g, "Top", {tag, 0x55});
-        ASSERT_TRUE(r.compiled) << r.error;
-        ASSERT_TRUE(r.success) << r.error;
-        EXPECT_EQ(r.meta.bytes_consumed, 2u) << "tag " << (int)tag;
-        ASSERT_NE(r.root(), nullptr) << "tag " << (int)tag;
-        ASSERT_NE(kid(r.root(), "z"), nullptr) << "tag " << (int)tag;
-    }
+
+    // t == 1: the first arm takes two bytes, so `z` is the third.
+    auto first = run(g, "Top", {1, 0xEE, 0x55});
+    ASSERT_TRUE(first.compiled) << first.error;
+    ASSERT_TRUE(first.success) << first.error;
+    EXPECT_EQ(first.meta.bytes_consumed, 3u);
+    ASSERT_NE(arm_of(first.root(), "i"), nullptr);
+    EXPECT_STREQ(arm_of(first.root(), "i")->name, "alt_0");
+    EXPECT_EQ(arm_of(first.root(), "i")->variant_tag, 0);
+    ASSERT_NE(kid(first.root(), "z"), nullptr);
+    EXPECT_EQ(kid(first.root(), "z")->start_offset, 2u);
+
+    // t != 1: the first arm's `where` fails, the second takes one byte, `z` is
+    // the second — and the first arm's `extra` is nowhere in the tree.
+    auto second = run(g, "Top", {9, 0x55});
+    ASSERT_TRUE(second.compiled) << second.error;
+    ASSERT_TRUE(second.success) << second.error;
+    EXPECT_EQ(second.meta.bytes_consumed, 2u);
+    const bbq::zcow::node* arm = arm_of(second.root(), "i");
+    ASSERT_NE(arm, nullptr);
+    EXPECT_STREQ(arm->name, "alt_1");
+    EXPECT_EQ(arm->variant_tag, 1);
+    ASSERT_EQ(arm->kids.size(), 1u);
+    EXPECT_EQ(kid(arm->kids[0].get(), "extra"), nullptr);
+    ASSERT_NE(kid(second.root(), "z"), nullptr);
+    EXPECT_EQ(kid(second.root(), "z")->start_offset, 1u);
 }
 
 TEST(IpgAlt, TheEnclosingParseContinuesAfterALaterUnionVariantWins) {
-    const char* g = "A = struct { t: uint8 where t == 1 }\n"
-                    "B = struct { t: uint8 }\n"
-                    "U = union { asA: A, asB: B }\n"
+    const char* g = "A   = struct { t: uint8 where t == 1, extra: uint8 }\n"
+                    "B   = struct { t: uint8 }\n"
+                    "U   = union { asA: A, asB: B }\n"
                     "Top = struct { u: U, z: uint8 }";
-    auto r = run(g, "Top", {9, 0x55});
-    ASSERT_TRUE(r.compiled) << r.error;
-    ASSERT_TRUE(r.success) << r.error;
-    EXPECT_EQ(r.meta.bytes_consumed, 2u);
-    ASSERT_NE(r.root(), nullptr);
-    EXPECT_NE(kid(r.root(), "z"), nullptr);
+
+    auto first = run(g, "Top", {1, 0xEE, 0x55});
+    ASSERT_TRUE(first.compiled) << first.error;
+    ASSERT_TRUE(first.success) << first.error;
+    EXPECT_EQ(first.meta.bytes_consumed, 3u);
+    ASSERT_NE(arm_of(first.root(), "u"), nullptr);
+    EXPECT_STREQ(arm_of(first.root(), "u")->name, "asA");
+    EXPECT_EQ(arm_of(first.root(), "u")->variant_tag, 0);
+
+    auto second = run(g, "Top", {9, 0x55});
+    ASSERT_TRUE(second.compiled) << second.error;
+    ASSERT_TRUE(second.success) << second.error;
+    EXPECT_EQ(second.meta.bytes_consumed, 2u);
+    ASSERT_NE(arm_of(second.root(), "u"), nullptr);
+    EXPECT_STREQ(arm_of(second.root(), "u")->name, "asB");
+    EXPECT_EQ(arm_of(second.root(), "u")->variant_tag, 1);
+    ASSERT_NE(kid(second.root(), "z"), nullptr);
+    EXPECT_EQ(kid(second.root(), "z")->start_offset, 1u);
 }
 
 // R-Emp: when the alternatives run out, the result is Fail.
@@ -565,6 +610,8 @@ TEST(IpgLocal, ANestedRuleSeesTheEnclosingScope) {
 // conditions succeeds, then the corresponding nonterminal is used… and the
 // remaining choices are skipped."
 TEST(IpgSwitch, TheFirstMatchingCaseWinsAndLaterOnesAreSkipped) {
+    // 4 is in both ranges. The arms are a byte and two bytes wide, and the parse
+    // records which one it took, so the winner is witnessed twice over.
     auto r = run("X = struct { v: uint8 }\n"
                  "Y = struct { v: uint16le }\n"
                  "Top = struct { t: uint8, body: switch(t) { 0 .. 5: X; 3 .. 9: Y; default: reject; } }",
@@ -572,6 +619,8 @@ TEST(IpgSwitch, TheFirstMatchingCaseWinsAndLaterOnesAreSkipped) {
     ASSERT_TRUE(r.compiled) << r.error;
     ASSERT_TRUE(r.success) << r.error;
     EXPECT_EQ(r.meta.bytes_consumed, 2u) << "X (one byte) won, not Y (two)";
+    ASSERT_NE(kid(r.root(), "body"), nullptr);
+    EXPECT_EQ(kid(r.root(), "body")->variant_tag, 0) << "the first case, not the second";
 }
 
 // "If all conditions fail, the default choice is used."
@@ -583,6 +632,18 @@ TEST(IpgSwitch, TheDefaultIsTakenWhenNoCaseMatches) {
     ASSERT_TRUE(r.compiled) << r.error;
     ASSERT_TRUE(r.success) << r.error;
     EXPECT_EQ(r.meta.bytes_consumed, 3u);
+    ASSERT_NE(kid(r.root(), "body"), nullptr);
+    EXPECT_NE(kid(r.root(), "body")->variant_tag, 0) << "the default, not case 1";
+
+    // The listed case, for the same reason the arms are different widths: a test
+    // that only ever sees the default cannot tell dispatch from a constant.
+    auto listed = run("X = struct { v: uint8 }\n"
+                      "D = struct { v: uint16le }\n"
+                      "Top = struct { t: uint8, body: switch(t) { 1: X; default: D; } }",
+                      "Top", {1, 7});
+    ASSERT_TRUE(listed.success) << listed.error;
+    EXPECT_EQ(listed.meta.bytes_consumed, 2u);
+    EXPECT_EQ(kid(listed.root(), "body")->variant_tag, 0);
 }
 
 // "The default branch must fail because of its always-invalid interval" — the

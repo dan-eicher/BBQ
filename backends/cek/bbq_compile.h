@@ -157,7 +157,7 @@ public:
                 // Top-level structs inline their fields directly (no BeginStruct
                 // wrapper). A struct-level `where` still applies: it runs after the
                 // fields, before ReturnRule. (struct_def handles the nested case.)
-                bbq::cek::StaticKont* tail = wrap_struct_where(st->constraint, rho, exit_static);
+                bbq::cek::StaticKont* tail = wrap_where(st->constraint, rho, exit_static);
                 body_head = compile_fields(st->fields, rho, tail);
             } else if (auto* bf = dynamic_cast<BBQ::Bitfield*>(rule->body)) {
                 // Top-level bitfields inline their members directly into the rule
@@ -377,6 +377,15 @@ private:
         if (auto* e  = dynamic_cast<BBQ::Extern*>(node))
             return e->interval.has_value() ? e->interval.value() : nullptr;
         return nullptr;
+    }
+
+    // `bytes`/`string`: the only types whose own width an interval length states,
+    // rather than bounding a window around something that knows its own.
+    bool is_byte_run(BBQ::TypeExpr* node) {
+        auto* p = dynamic_cast<BBQ::Primitive*>(node);
+        if (!p) return false;
+        return dynamic_cast<BBQ::BytesKind*>(p->kind) != nullptr ||
+               dynamic_cast<BBQ::StringKind*>(p->kind) != nullptr;
     }
     bbq::cek::StaticKont* make_eval_constraint(bbq::cek::StaticKont* e,
                                                bbq::cek::StaticKont* on_false,
@@ -999,11 +1008,10 @@ private:
                 }
             }
             if (length_expr == nullptr) {
-                // No interval / not Length — emit a literal 0-length;
-                // runtime will produce an empty bytes capture. Sema
-                // catches missing-length-on-bytes earlier so this is
-                // a defensive default.
-                length_expr = make_int_lit(0);
+                // `bytes[l, r]`: the window has already been sought and pushed,
+                // so the run is what the window holds — @remaining. Sema requires
+                // one of the two interval forms on a run, so this is the other one.
+                length_expr = make_remaining();
             }
             std::string bnm = intern_field_or_anon(r);
             return make_match_bytes(length_expr, is_string, field_dest(bnm, tail));
@@ -1112,14 +1120,16 @@ private:
         return out;
     }
 
-    // Wrap `Lnext` with a struct-level `where` check, if present. The check runs
-    // after all fields are parsed (after EndStruct), so it sees every field in the
-    // environment — e.g. a header checksum. Mirrors compile_primitive's constraint
-    // handling: failure routes to the ρ-resolved backtrack target, or AbortRule at
-    // the rule boundary when no backtrackable frame is in scope.
+    // Wrap `Lnext` with a whole-construct `where` check, if present. The check
+    // runs once the construct is complete — a struct after EndStruct, an array
+    // after EndArray — so it sees everything the construct bound, e.g. a header
+    // checksum or a constraint over the elements just read. Mirrors
+    // compile_primitive's constraint handling: failure routes to the ρ-resolved
+    // backtrack target, or AbortRule at the rule boundary when no backtrackable
+    // frame is in scope.
     bbq::cek::StaticKont*
-    wrap_struct_where(std::optional<BBQ::Expr*> constraint,
-                      ::bbq::rho_t r, bbq::cek::StaticKont* Lnext) {
+    wrap_where(std::optional<BBQ::Expr*> constraint,
+               ::bbq::rho_t r, bbq::cek::StaticKont* Lnext) {
         if (!(constraint.has_value() && constraint.value()))
             return Lnext;
         auto* expr_ir = compile_expr(constraint.value(), r,
@@ -1157,13 +1167,15 @@ private:
             }
             // The interval may be on the field (struct/union body) or on the body
             // node (Primitive/RuleRef/Array @[...]). A body-node Length on a
-            // bytes/string primitive is sized by compile_primitive, so only wrap a
-            // body-node interval when it's a StartEnd random access.
+            // bytes/string primitive IS that run's width, sized by
+            // compile_primitive; on anything else a lone expression is the
+            // window's length (IPG §3.4) and wraps the body like any interval.
             BBQ::Interval* iv = nullptr;
             if (f->interval.has_value() && f->interval.value()) {
                 iv = f->interval.value();
             } else if (auto* bi = interval_of(f->body)) {
-                if (dynamic_cast<BBQ::StartEnd*>(bi)) iv = bi;
+                if (dynamic_cast<BBQ::StartEnd*>(bi) || !is_byte_run(f->body))
+                    iv = bi;
             }
             if (iv) {
                 // seek+bound around the body, popping when the body completes.
@@ -1262,14 +1274,19 @@ private:
     // call wraps with CaptureValue when then_capture is true.
     bbq::cek::StaticKont*
     compile_ref_path(BBQ::RefPath* path, const std::string& field, bool then_capture) {
+        // An empty `field` means "stop at the node this path names" — the caller
+        // is about to index it, or it is the whole reference. Navigating a step
+        // named "" finds no child, so the step is simply not emitted.
+        auto step_into = [&](bbq::cek::StaticKont* base) {
+            return field.empty() ? base : make_field_access(field, base);
+        };
         if (auto* simple = dynamic_cast<BBQ::Simple*>(path)) {
-            auto* base = make_path_start(simple->name);
-            auto* fa = make_field_access(field, base);
-            return then_capture ? make_capture_value(fa) : fa;
+            auto* node = step_into(make_path_start(simple->name));
+            return then_capture ? make_capture_value(node) : node;
         }
         if (auto* fa = dynamic_cast<BBQ::FieldAcc*>(path)) {
             auto* base = compile_ref_path(fa->base, fa->field, false);
-            auto* step = make_field_access(field, base);
+            auto* step = step_into(base);
             return then_capture ? make_capture_value(step) : step;
         }
         if (auto* ia = dynamic_cast<BBQ::IndexAcc*>(path)) {
@@ -1279,9 +1296,8 @@ private:
             auto* idx = compile_expr(ia->index, r, ::bbq::ac(),
                                      ::bbq::jump(nullptr), nullptr);
             auto* base = compile_ref_path(ia->base, "", false);
-            auto* step = make_index_access(idx, base);
-            auto* fa_step = make_field_access(field, step);
-            return then_capture ? make_capture_value(fa_step) : fa_step;
+            auto* step = step_into(make_index_access(idx, base));
+            return then_capture ? make_capture_value(step) : step;
         }
         return nullptr;
     }
@@ -1609,7 +1625,7 @@ private:
             auto fs = _n0->fields;
             auto cn = _n0->constraint.has_value() ? *_n0->constraint : nullptr;
             bbq_ir::StaticKont* end_kont = make_end_struct(Lnext);
-            bbq_ir::StaticKont* checked = wrap_struct_where(cn, rho, end_kont);
+            bbq_ir::StaticKont* checked = wrap_where(cn, rho, end_kont);
             bbq_ir::StaticKont* fields_chain = compile_fields(fs, rho, checked);
             return cg_deliver(make_begin_struct(intern_field_or_anon(rho), fields_chain), delta, gamma, Lnext);
         }
@@ -1674,9 +1690,11 @@ private:
         if (auto* _n0 = dynamic_cast<BBQ::Array*>(node)) {
             auto e = _n0->element;
             auto s = _n0->spec;
+            auto cn = _n0->constraint.has_value() ? *_n0->constraint : nullptr;
             auto ei = _n0->element_interval.has_value() ? *_n0->element_interval : nullptr;
             auto rs = _n0->resync;
-            return cg_deliver(compile_array(e, s, ei, rs, rho, Lnext), delta, gamma, Lnext);
+            bbq_ir::StaticKont* checked = wrap_where(cn, rho, Lnext);
+            return cg_deliver(compile_array(e, s, ei, rs, rho, checked), delta, gamma, Lnext);
         }
         return {};
     }

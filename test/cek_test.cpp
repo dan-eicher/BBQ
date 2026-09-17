@@ -1625,9 +1625,9 @@ TEST(CEKLayer3, StructLevelWhere) {
     EXPECT_FALSE(fbad.success);                    // field where rejection
     delete fbad.grammar;
 
-    // Probe: a struct where on a builtin (pos), no field refs.
+    // Probe: a struct where on a builtin (@pos), no field refs.
     auto pbad = layer3_compile_and_run(
-        "M3 = struct { a: uint8, b: uint8 } where pos > 100", "M3", {0x01, 0x02});
+        "M3 = struct { a: uint8, b: uint8 } where @pos > 100", "M3", {0x01, 0x02});
     ASSERT_TRUE(pbad.compiled) << pbad.error;
     EXPECT_FALSE(pbad.success);                    // pos==2, not >100
     delete pbad.grammar;

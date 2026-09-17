@@ -184,16 +184,29 @@ Colors = array<uint8>[3]
 ```bbq
 Items   = array<Entry>(none, eof)                # read until end of input
 Records = array<Record>(Comma, count(num_recs))  # with separator, counted
-Packets = array<Packet>(none, until(remaining < 4))
+Packets = array<Packet>(none, until(@remaining < 4))
 Chunks  = array<Chunk>(none, PNGEnd)             # stop on type match
 ```
 
+An array with no count — `eof` or `until` — stops only when the input runs out,
+so its element must **always** read: an element that reads nothing on some path
+never gets there. The element's width has to be settled by its shape, not by the
+data, or the spec is rejected. A fixed-width field anywhere in the element is
+enough (`struct { len: uint8, body: bytes[len] }` is fine); an element that is
+*only* `bytes[n]`, or a choice with one zero-width arm, or a bare `extern`, is
+not. Counted arrays are unaffected — the count is what runs out.
+
 **Per-element intervals** (only on counted arrays) position each element at a
-computed byte range using the loop variable `i`:
+computed byte range using the loop index `@index` (§7.3 — a bare identifier is
+always a field reference, so the loop index carries the `@` sigil like every other
+piece of parse state):
 
 ```bbq
-entries: array<Entry>[num] @ [off + i * sz, off + (i + 1) * sz]
+entries: array<Entry>[num] @ [off + @index * sz, off + (@index + 1) * sz]
 ```
+
+The range may run backward or overlap: the elements of a table are wherever the
+table says they are.
 
 **Resync mode** lets the array recover from a per-element parse failure by
 advancing one byte and retrying the same element type. Useful for forensic
@@ -429,7 +442,17 @@ rest     = integer_field "@rest"
 ```
 
 - `[start, end]` — seek to `start`, parse until `end` (absolute positions)
-- `[length]` — read `length` bytes from current position (for `bytes` and `string`)
+- `[length]` — the same window, measured from the current position: `[@pos, @pos + length]`
+
+`start == end` is a valid, empty window — a zero-length section in a table of
+sections is the everyday case. `start > end`, or an `end` past the enclosing
+window, is a parse failure; when both are literals it is a compile error.
+
+`bytes` and `string` have no width of their own, so one of the two forms is
+required on them (a bare `bytes` is a compile error). The interval *is* the run:
+`bytes[n]` reads `n` bytes from the cursor, and `bytes[start, end]` reads the
+whole window. On every other type the interval bounds a window around something
+that already knows its own width, and reading past the window fails.
 
 ```bbq
 File = struct {
@@ -443,7 +466,16 @@ Record = struct {
     data: bytes[len],
     tag:  string[4]
 }
+
+Chunk = struct {
+    body: Payload[12]      # Payload, confined to the next 12 bytes
+}
 ```
+
+`EOI` is the end of the **whole input**, not of the enclosing window — it is an
+absolute offset like every other, which is what a format's own documentation
+means by a file offset. The active window is `@start` / `@end` / `@remaining`
+(§7.3).
 
 ### 6.1 `@rest` — size-prefixed windows
 
@@ -661,7 +693,7 @@ FileWithTable = struct {
     table_off:  uint32le,
     entry_sz:   uint32le,
     entries:    array<Entry>[num_entries]
-                @ [table_off + i * entry_sz, table_off + (i + 1) * entry_sz]
+                @ [table_off + @index * entry_sz, table_off + (@index + 1) * entry_sz]
 }
 ```
 

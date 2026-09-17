@@ -193,6 +193,15 @@ target_link_libraries(cek_tests PRIVATE bbq_cek_backend bbq_ctypes GTest::GTest 
 target_compile_definitions(cek_tests PRIVATE SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
 add_test(NAME cek_tests COMMAND cek_tests)
 
+# IPG conformance — the law suite enumerated from the paper (docs/IPG-Conformance.md).
+# Its own binary because the §5 laws are about nontermination: a broken one presents
+# as a hang, so the timeout is the assertion.
+add_executable(ipg_law_tests test/ipg_law_test.cpp)
+target_link_libraries(ipg_law_tests PRIVATE bbq_ctypes bbq_cek_backend bbq_render GTest::GTest GTest::Main)
+target_compile_definitions(ipg_law_tests PRIVATE SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+add_test(NAME ipg_law_tests COMMAND ipg_law_tests)
+set_tests_properties(ipg_law_tests PROPERTIES TIMEOUT 120)
+
 add_executable(lib_tests lib/tests/test_worklist.cpp)
 target_include_directories(lib_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/lib)
 target_link_libraries(lib_tests PRIVATE GTest::GTest GTest::Main)

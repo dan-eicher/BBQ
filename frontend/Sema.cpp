@@ -127,12 +127,51 @@ void Sema::register_inline_structs(const std::string& base, BBQ::Struct* st) {
 // --- Phase 1: collect rule names ---
 
 void Sema::collect_rules(Grammar* grammar) {
+    // `_` is bound by the lowering, not by the source: an array separator is
+    // compiled under that name so its own `where` can see the byte it matched
+    // (`uint8 where _ == 0x2C`) without the separator landing in the array.
+    bound_names_.insert("_");
     for (auto* rule : grammar->rules) {
         auto [it, inserted] = rule_map_.emplace(rule->name, rule);
         if (!inserted) {
             errors_.error(rule->loc, "duplicate rule '%s'", rule->name.c_str());
         }
         deps_[rule->name]; // ensure entry exists
+        bound_names_.insert(rule->name);
+        collect_bound_names(rule->body);
+    }
+}
+
+void Sema::collect_bound_names(TypeExpr* type) {
+    if (!type) return;
+    if (auto* st = dynamic_cast<Struct*>(type)) {
+        for (auto* f : st->fields) {
+            bound_names_.insert(f->name);
+            collect_bound_names(f->body);
+        }
+    } else if (auto* u = dynamic_cast<Union*>(type)) {
+        for (auto* v : u->variants) {
+            bound_names_.insert(v->name);
+            collect_bound_names(v->body);
+        }
+    } else if (auto* alts = dynamic_cast<Alternatives*>(type)) {
+        for (auto* a : alts->alts) collect_bound_names(a);
+    } else if (auto* arr = dynamic_cast<Array*>(type)) {
+        collect_bound_names(arr->element);
+        if (auto* sp = dynamic_cast<SepTerm*>(arr->spec)) {
+            if (auto* ts = dynamic_cast<TypeSep*>(sp->sep))
+                collect_bound_names(ts->sep_type);
+            if (auto* tt = dynamic_cast<BBQ::TypeTerm*>(sp->term))
+                collect_bound_names(tt->term_type);
+        }
+    } else if (auto* opt = dynamic_cast<Optional*>(type)) {
+        collect_bound_names(opt->element);
+    } else if (auto* sw = dynamic_cast<Switch*>(type)) {
+        for (auto* c : sw->cases) collect_bound_names(c->target);
+        if (sw->default_ && (*sw->default_)->target.has_value())
+            collect_bound_names(*(*sw->default_)->target);
+    } else if (auto* bf = dynamic_cast<Bitfield*>(type)) {
+        for (auto* e : bf->entries) bound_names_.insert(e->name);
     }
 }
 
@@ -153,12 +192,25 @@ void Sema::validate_rule(Rule* rule) {
     validate_type(rule->body, rule->name);
 }
 
+// The expressions an interval is written from are references like any other.
+void Sema::validate_interval(Interval* iv, const std::string& ctx) {
+    if (!iv) return;
+    if (auto* se = dynamic_cast<StartEnd*>(iv)) {
+        validate_expr(se->start, ctx);
+        validate_expr(se->end, ctx);
+    } else if (auto* len = dynamic_cast<Length*>(iv)) {
+        validate_expr(len->length, ctx);
+    }
+}
+
 void Sema::validate_type(TypeExpr* type, const std::string& ctx, bool guarded) {
     if (auto* st = dynamic_cast<Struct*>(type)) {
         for (auto* field : st->fields) {
             validate_type(field->body, ctx, guarded);
             if (field->constraint)
                 validate_expr(*field->constraint, ctx);
+            if (field->interval.has_value())
+                validate_interval(*field->interval, ctx);
         }
         // A struct-level `where` runs after all fields are parsed, so it may
         // reference any of them (e.g. a checksum over the whole header).
@@ -179,6 +231,24 @@ void Sema::validate_type(TypeExpr* type, const std::string& ctx, bool guarded) {
         } else if (auto* st = dynamic_cast<SepTerm*>(arr->spec)) {
             if (auto* ts = dynamic_cast<TypeSep*>(st->sep))
                 validate_type(ts->sep_type, ctx, guarded);
+            // An `eof`/`until` array is bounded only by the input it consumes, so
+            // its element has to consume some — on every path, not just the ones
+            // this input happens to take (IPG §5, Fig. 11c). A separator that always
+            // reads makes the iteration productive on its own.
+            bool unbounded = dynamic_cast<EofTerm*>(st->term) != nullptr ||
+                             dynamic_cast<UntilTerm*>(st->term) != nullptr;
+            if (unbounded) {
+                std::unordered_set<std::string> visiting;
+                bool sep_reads = false;
+                if (auto* ts = dynamic_cast<TypeSep*>(st->sep))
+                    sep_reads = !may_read_nothing(ts->sep_type, visiting);
+                if (!sep_reads && may_read_nothing(arr->element, visiting)) {
+                    errors_.error(arr->loc,
+                        "array has no count and an element that need not read any "
+                        "input, so the parse need never reach the end; give it a "
+                        "count, or an element that always reads");
+                }
+            }
             if (auto* ct = dynamic_cast<CountTerm*>(st->term))
                 validate_expr(ct->count, ctx);
             else if (auto* ut = dynamic_cast<UntilTerm*>(st->term)) {
@@ -196,12 +266,11 @@ void Sema::validate_type(TypeExpr* type, const std::string& ctx, bool guarded) {
         }
         if (arr->constraint)
             validate_expr(*arr->constraint, ctx);
+        if (arr->interval.has_value())
+            validate_interval(*arr->interval, ctx);
         if (arr->element_interval) {
             auto* eiv = *arr->element_interval;
-            if (auto* se = dynamic_cast<StartEnd*>(eiv)) {
-                validate_expr(se->start, ctx);
-                validate_expr(se->end, ctx);
-            }
+            validate_interval(eiv, ctx);
             // element_interval only valid on counted arrays
             bool is_counted = dynamic_cast<FixedCount*>(arr->spec) != nullptr;
             if (!is_counted) {
@@ -258,6 +327,8 @@ void Sema::validate_type(TypeExpr* type, const std::string& ctx, bool guarded) {
         }
         if (rr->constraint)
             validate_expr(*rr->constraint, ctx);
+        if (rr->interval.has_value())
+            validate_interval(*rr->interval, ctx);
     } else if (auto* alts = dynamic_cast<Alternatives*>(type)) {
         for (auto* alt : alts->alts) {
             validate_type(alt, ctx, guarded);
@@ -265,6 +336,18 @@ void Sema::validate_type(TypeExpr* type, const std::string& ctx, bool guarded) {
     } else if (auto* prim = dynamic_cast<Primitive*>(type)) {
         if (prim->constraint)
             validate_expr(*prim->constraint, ctx);
+        // A byte run has no width of its own: the interval is what says how far
+        // it reaches. Without one there is nothing to read, and a run that
+        // silently reads nothing is a format the parser quietly stops checking.
+        bool is_run = dynamic_cast<BytesKind*>(prim->kind) != nullptr ||
+                      dynamic_cast<StringKind*>(prim->kind) != nullptr;
+        if (is_run && !(prim->interval.has_value() && prim->interval.value())) {
+            errors_.error(prim->loc,
+                "'%s' needs a length '[n]' or a window '[start, end]'",
+                dynamic_cast<StringKind*>(prim->kind) ? "string" : "bytes");
+        }
+        if (prim->interval.has_value())
+            validate_interval(*prim->interval, ctx);
     } else if (auto* ext = dynamic_cast<Extern*>(type)) {
         if (ext->func_name.empty())
             errors_.error(ext->loc, "extern function name must not be empty");
@@ -275,6 +358,8 @@ void Sema::validate_type(TypeExpr* type, const std::string& ctx, bool guarded) {
             errors_.error(ext->loc, "extern type must not be empty");
         if (ext->constraint)
             validate_expr(*ext->constraint, ctx);
+        if (ext->interval.has_value())
+            validate_interval(*ext->interval, ctx);
     } else if (auto* es = dynamic_cast<EndianSwitch*>(type)) {
         validate_expr(es->endian_expr, ctx);
     } else if (auto* bf = dynamic_cast<Bitfield*>(type)) {
@@ -344,8 +429,31 @@ void Sema::validate_ref_path(RefPath* path, const std::string& ctx) {
     } else if (auto* ia = dynamic_cast<IndexAcc*>(path)) {
         validate_ref_path(ia->base, ctx);
         validate_expr(ia->index, ctx);
+    } else if (auto* simple = dynamic_cast<Simple*>(path)) {
+        // IPG §3.2, property 1: every reference names something the grammar
+        // defines. A name that is not local is allowed — it may come from a
+        // calling rule's scope, which is what makes a helper rule reusable — but a
+        // name bound in no rule at all resolves nowhere, and the parse fails on
+        // whichever input first reaches it rather than at compile time. The loop
+        // variable is `@index`, so a bare `i` lands here too.
+        if (!bound_names_.count(simple->name)) {
+            std::string suggestion;
+            int best = static_cast<int>(simple->name.size()) / 2 + 1;
+            for (const auto& n : bound_names_) {
+                int d = edit_distance(simple->name, n);
+                if (d < best) { best = d; suggestion = n; }
+            }
+            if (!suggestion.empty())
+                errors_.error(simple->loc,
+                    "unknown reference '%s' in %s; did you mean '%s'?",
+                    simple->name.c_str(), ctx.c_str(), suggestion.c_str());
+            else
+                errors_.error(simple->loc, "unknown reference '%s' in %s",
+                              simple->name.c_str(), ctx.c_str());
+        }
     }
-    // Simple: validated during forward ref check
+    // Forward references (a name bound later in the same struct) are the
+    // forward-ref check's job, not this one.
 }
 
 // --- Phase 4: topological sort + cycle detection ---
@@ -815,6 +923,84 @@ std::string Sema::find_closest_field(const std::string& name,
     return best;
 }
 
+// IPG §5. The paper enumerates the cycles a grammar can loop on and asks an SMT
+// solver whether their intervals decrease, with one syntactic extension: a rule
+// that consumes at least one terminal cannot repeat on an unchanged position.
+// BBQ has no interval-shrinking recursion to enumerate — recursion must pass
+// through a construct that can stop — so what is left to check is that extension.
+// A repeat with no count has nothing but the input to run out of, and only an
+// element that always consumes gets it there.
+//
+// The answer is "might read nothing", not "always reads nothing", and the check is
+// refusal, not a runtime watchdog: the grammar whose element MIGHT read nothing is
+// the one that might not terminate, and Theorem 5.1 admits only the grammars whose
+// termination is established up front. So one arm of a choice that reads nothing is
+// enough, and a width that only the data decides is not established.
+bool Sema::may_read_nothing(TypeExpr* type,
+                            std::unordered_set<std::string>& visiting) {
+    if (auto* st = dynamic_cast<Struct*>(type)) {
+        // A struct reads nothing only if every one of its fields might.
+        for (auto* f : st->fields)
+            if (!may_read_nothing(f->body, visiting)) return false;
+        return true;
+    }
+    // A choice reads nothing as soon as ONE arm might: biased choice can take it.
+    if (auto* u = dynamic_cast<Union*>(type)) {
+        for (auto* v : u->variants)
+            if (may_read_nothing(v->body, visiting)) return true;
+        return false;
+    }
+    if (auto* alts = dynamic_cast<Alternatives*>(type)) {
+        for (auto* a : alts->alts)
+            if (may_read_nothing(a, visiting)) return true;
+        return false;
+    }
+    if (auto* sw = dynamic_cast<Switch*>(type)) {
+        for (auto* c : sw->cases)
+            if (may_read_nothing(c->target, visiting)) return true;
+        // A `reject` default fails rather than falling through, so it is not a
+        // path that repeats; a type default is.
+        if (sw->default_ && (*sw->default_)->target.has_value())
+            if (may_read_nothing(*(*sw->default_)->target, visiting)) return true;
+        return false;
+    }
+    if (auto* arr = dynamic_cast<Array*>(type)) {
+        // A count that is not a positive literal might be zero, and any number of
+        // repeats of nothing is nothing.
+        if (auto* fc = dynamic_cast<FixedCount*>(arr->spec)) {
+            auto* lit = dynamic_cast<IntLit*>(fc->count);
+            if (!lit || lit->value <= 0) return true;
+            return may_read_nothing(arr->element, visiting);
+        }
+        return true;   // eof/until/count(e): the element count is the input's to decide
+    }
+    if (auto* rr = dynamic_cast<RuleRef*>(type)) {
+        auto it = rule_map_.find(rr->name);
+        if (it == rule_map_.end()) return true;
+        // A cycle back to a rule already on the stack establishes nothing; the rule
+        // cycle check owns that shape.
+        if (!visiting.insert(rr->name).second) return true;
+        bool nothing = may_read_nothing(it->second->body, visiting);
+        visiting.erase(rr->name);
+        return nothing;
+    }
+    if (auto* prim = dynamic_cast<Primitive*>(type)) {
+        bool is_run = dynamic_cast<BytesKind*>(prim->kind) != nullptr ||
+                      dynamic_cast<StringKind*>(prim->kind) != nullptr;
+        if (!is_run) return false;                 // every scalar has a width
+        if (!prim->interval.has_value() || !prim->interval.value()) return true;
+        if (auto* len = dynamic_cast<Length*>(*prim->interval))
+            if (auto* lit = dynamic_cast<IntLit*>(len->length))
+                return lit->value <= 0;
+        return true;                               // a width only the data decides
+    }
+    // A bitfield reads its container. Everything else — compute, an @endian switch,
+    // an optional that may be absent, a blackbox that reports its own width — either
+    // binds without reading or reads an amount nothing here can establish.
+    if (dynamic_cast<Bitfield*>(type)) return false;
+    return true;
+}
+
 bool Sema::body_has_constraint(TypeExpr* body) {
     if (auto* prim = dynamic_cast<Primitive*>(body))
         return prim->constraint.has_value();
@@ -1075,8 +1261,11 @@ void Sema::check_interval_types(Interval* iv, const TypeCheckScope& scope,
             errors_.error(se->start->loc, "interval start must be non-negative");
         if (eval && *eval < 0)
             errors_.error(se->end->loc, "interval end must be non-negative");
-        if (sval && eval && *sval >= *eval)
-            errors_.error(se->loc, "interval start must be less than end");
+        // `[n, n]` is a valid empty interval — a zero-length section in a table
+        // of sections is the shape that needs it (IPG §3.3 fn. 1). Only an
+        // inverted interval is malformed.
+        if (sval && eval && *sval > *eval)
+            errors_.error(se->loc, "interval start must not be greater than end");
     } else if (auto* len = dynamic_cast<Length*>(iv)) {
         auto lt = type_of_expr(len->length, scope);
         if (!is_integer(lt))

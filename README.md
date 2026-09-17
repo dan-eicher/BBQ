@@ -159,6 +159,7 @@ jitterator/         Copy-and-patch JIT stencil extractor and runtime
 | [Grammar Reference](docs/Grammar.md) | Complete BBQ language syntax and semantics |
 | [Python Module](docs/PyModule.md) | Python API reference (Spec, ParseResult, Node) |
 | [CEK Machine Design](docs/CEK%20Machine%20Design.md) | Internals of the interpretive VM backend |
+| [IPG Conformance](docs/IPG-Conformance.md) | Law-by-law against the Interval Parsing Grammars paper, with the test that keeps each one |
 
 ## Running Tests
 

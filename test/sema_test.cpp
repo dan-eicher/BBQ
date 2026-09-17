@@ -328,7 +328,7 @@ TEST(Sema, ElementIntervalValid) {
         "    num: uint32le,\n"
         "    off: uint32le,\n"
         "    sz: uint32le,\n"
-        "    entries: array<Entry>[num] @ [off + i * sz, off + (i + 1) * sz]\n"
+        "    entries: array<Entry>[num] @ [off + @index * sz, off + (@index + 1) * sz]\n"
         "}");
     ASSERT_NE(g, nullptr);
     ErrorReporter errors;
@@ -428,7 +428,7 @@ TEST(Sema, ConstraintMustBeBoolean) {
     // String type is not boolean-compatible
     auto* g = parse(
         "H = struct {\n"
-        "    s: string,\n"
+        "    s: string[2],\n"
         "    y: uint8 where s\n"
         "}");
     ASSERT_NE(g, nullptr);
@@ -478,7 +478,7 @@ TEST(Sema, IntegerArithmeticValid) {
 TEST(Sema, BuiltinRemainingIsInteger) {
     auto* g = parse(
         "H = struct {\n"
-        "    data: bytes[remaining]\n"
+        "    data: bytes[@remaining]\n"
         "}");
     ASSERT_NE(g, nullptr);
     ErrorReporter errors;
@@ -515,7 +515,7 @@ TEST(Sema, ExternFieldPermissive) {
 TEST(Sema, StringArithmeticErrors) {
     auto* g = parse(
         "H = struct {\n"
-        "    s: string,\n"
+        "    s: string[2],\n"
         "    x: uint8 where s + 1 > 0\n"
         "}");
     ASSERT_NE(g, nullptr);
@@ -562,7 +562,7 @@ TEST(Sema, StaticIntervalStartGEEnd) {
     ErrorReporter errors;
     Sema sema(errors);
     EXPECT_FALSE(sema.analyze(g));
-    EXPECT_TRUE(has_error_containing(errors, "interval start must be less than end"));
+    EXPECT_TRUE(has_error_containing(errors, "interval start must not be greater than end"));
 }
 
 TEST(Sema, StaticIntervalNegativeStart) {
@@ -772,7 +772,7 @@ TEST(Sema, SelfReferenceValid) {
 TEST(Sema, ComputeStringToIntMismatch) {
     auto* g = parse(
         "H = struct {\n"
-        "    s: string,\n"
+        "    s: string[2],\n"
         "    x: compute(s : uint8)\n"
         "}");
     ASSERT_NE(g, nullptr);
@@ -1248,18 +1248,36 @@ TEST(Sema, LoopVarInElementIntervalValid) {
 // === Cross-rule scope resolution ===
 
 TEST(Sema, CrossRuleRefAllowed) {
-    // Compute referencing a name that doesn't exist locally → allowed (cross-rule)
+    // Compute referencing a name that doesn't exist locally → allowed: it comes
+    // from the calling rule's scope, which is what makes Inner reusable.
     auto* g = parse(
         "Inner = struct {\n"
         "    raw_status: uint8,\n"
         "    effective: compute(raw_status != 0 ? raw_status : parent_field : uint8)\n"
-        "}");
+        "}\n"
+        "Outer = struct { parent_field: uint8, i: Inner }");
     ASSERT_NE(g, nullptr);
     ErrorReporter errors;
     Sema sema(errors);
     // 'parent_field' is not in Inner's scope but that's OK — it's a cross-rule ref
     EXPECT_TRUE(sema.analyze(g));
     EXPECT_FALSE(has_error_containing(errors, "forward reference"));
+}
+
+TEST(Sema, ReferenceToANameNoRuleBindsIsRejected) {
+    // The other side of the cross-rule allowance: a name bound by no rule at all
+    // can never resolve, so it is a static error rather than a parse that fails on
+    // whichever input first reaches it (IPG §3.2, property 1).
+    auto* g = parse(
+        "Inner = struct {\n"
+        "    raw_status: uint8,\n"
+        "    effective: compute(raw_status != 0 ? raw_status : nowhere_field : uint8)\n"
+        "}");
+    ASSERT_NE(g, nullptr);
+    ErrorReporter errors;
+    Sema sema(errors);
+    EXPECT_FALSE(sema.analyze(g));
+    EXPECT_TRUE(has_error_containing(errors, "unknown reference 'nowhere_field'"));
 }
 
 TEST(Sema, ForwardRefStillErrors) {
@@ -1277,17 +1295,18 @@ TEST(Sema, ForwardRefStillErrors) {
 }
 
 TEST(Sema, LoopVarInCrossRuleCompute) {
-    // 'i' in compute expression is valid — resolved via ctx.loop_index()
+    // `@index` in a compute is valid — the rule may be an array element, and the
+    // index comes from the loop the caller is in (resolved via ctx.loop_index()).
     auto* g = parse(
         "MidiEvent = struct {\n"
         "    raw_status: uint8,\n"
-        "    effective: compute(i > 0 ? raw_status : 0 : uint8)\n"
+        "    effective: compute(@index > 0 ? raw_status : 0 : uint8)\n"
         "}");
     ASSERT_NE(g, nullptr);
     ErrorReporter errors;
     Sema sema(errors);
     EXPECT_TRUE(sema.analyze(g));
-    EXPECT_FALSE(has_error_containing(errors, "loop index 'i' referenced outside"));
+    EXPECT_FALSE(has_error_containing(errors, "@index referenced outside"));
 }
 
 TEST(Sema, PeekTypeIsInteger) {

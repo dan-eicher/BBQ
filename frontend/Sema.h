@@ -94,6 +94,12 @@ public:
 private:
     // Phase 1: collect rule names, detect duplicates
     void collect_rules(BBQ::Grammar* grammar);
+    // Every name the grammar binds, anywhere: rule names and the field / variant /
+    // bitfield-entry names of every rule. A bare identifier is a reference to one
+    // of these; a name in none of them is defined nowhere and can never resolve
+    // (IPG §3.2, property 1). Collected across the whole grammar rather than per
+    // rule because a name may legitimately come from a calling rule's scope.
+    void collect_bound_names(BBQ::TypeExpr* type);
 
     // Phase 2: resolve @endian, rewrite Default endianness
     void resolve_endian(BBQ::Grammar* grammar);
@@ -108,6 +114,7 @@ private:
     void validate_type(BBQ::TypeExpr* type, const std::string& ctx,
                         bool guarded = false);
     void validate_expr(BBQ::Expr* expr, const std::string& ctx);
+    void validate_interval(BBQ::Interval* iv, const std::string& ctx);
     void validate_ref_path(BBQ::RefPath* path, const std::string& ctx);
 
     // Phase 4: cycle detection + topological sort
@@ -166,6 +173,14 @@ private:
     // Constraint helpers
     static bool body_has_constraint(BBQ::TypeExpr* body);
 
+    // The paper's syntactic termination check (§5): is there any path through this
+    // type that reads no input? An unbounded array whose element has one would be
+    // read forever, so the grammar is refused. Conservative by construction — a
+    // width only the data decides is not an established one — which is the posture
+    // Theorem 5.1 takes: admit the grammars whose termination is settled up front.
+    bool may_read_nothing(BBQ::TypeExpr* type,
+                          std::unordered_set<std::string>& visiting);
+
     // Inline-struct registration (shape side-data): synthesize nested-struct
     // names in declaration order, innermost first. `base` is the accumulated
     // Rule_field path (NOT the CLI prefix — the C namer applies that).
@@ -189,6 +204,7 @@ private:
     std::unordered_map<BBQ::Struct*, std::string> inline_struct_name_;     // Struct* -> base name
     std::unordered_map<BBQ::Switch*, std::vector<SwitchCaseLabel>> switch_labels_;  // case labels (shape side-data)
     std::unordered_map<std::string, std::unordered_set<std::string>> deps_;
+    std::unordered_set<std::string> bound_names_;   // every name the grammar binds
     std::vector<BBQ::Rule*> sorted_;
     BBQ::Endianness default_endian_ = BBQ::Endianness::Little;
 };

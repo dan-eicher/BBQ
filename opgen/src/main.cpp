@@ -52,9 +52,13 @@ static bool slurp(const char* path, std::string& out) {
 
 static void usage(const char* prog) {
     fprintf(stderr,
-        "Usage: %s -i <opcodes.def> -o <out_dir> -prefix <name>\n"
+        "Usage: %s -i <opcodes.def> -o <out_dir> -prefix <name> [-tier2 <n>]\n"
         "  Emits the interpreter, JIT stencils, opcode/type tables, and runtime headers.\n"
-        "  -prefix names the emitted symbols/files (e.g. -prefix jav -> jav_jit_meta.h).\n",
+        "  -prefix names the emitted symbols/files (e.g. -prefix jav -> jav_jit_meta.h).\n"
+        "  -tier2  Ertl stack-cache size: how many top-of-stack values ride in\n"
+        "          registers. Default 0 (tier-1 only, one stencil per opcode). At n>0\n"
+        "          opgen emits a variant family per opcode, gen_st_<op>__s<K>[m] for\n"
+        "          entry state K in 0..n. The driver must tile for the SAME n.\n",
         prog);
 }
 

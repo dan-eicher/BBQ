@@ -56,6 +56,23 @@ ASDL-defined AST (`grammar/opgen.asdl`), and its emitters are C++.
 : Output directory for the generated VM. Required. opgen writes the
   full set of files listed under GENERATED OUTPUTS into it.
 
+**-tier2** *n*
+: Ertl's stack-cache size for the JIT tier: how many top-of-stack values ride in
+  registers instead of memory. Default 0 — tier-1 only, one plain stencil per
+  opcode.
+
+  At *n* > 0 the cache slots become `cache_slot_t _r0.._r<n-1>` arguments in
+  `CACHE_ARGS`, which `preserve_none` keeps in registers across a stencil's tail
+  call, and opgen emits a variant family per opcode instead of a single stencil:
+  `gen_st_<op>__s<K>` for entry state *K* (0..*n*), and `gen_st_<op>__s<K>m` for
+  the same state spilling its result rather than caching it. The plain
+  `gen_st_<op>` remains as the no-cache form.
+
+  It is ONE number for the whole tier. The driver tiles the bytecode by state and
+  stamps the matching variant, so a driver that tiles for a different *n* than the
+  one the family was generated at will select a state whose stencil does not
+  exist. Generate and tile with the same number.
+
 ## THE `.def` LANGUAGE
 
 A spec is an optional leading C-header block, a set of directives, the

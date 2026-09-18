@@ -6,6 +6,13 @@ patched. A consumer stamps those bytes into an executable buffer at run time and
 fills the holes — compilation as `memcpy` plus fixups, no code generator at run
 time. The technique is Xu & Kjolstad's *Copy-and-Patch Compilation* (OOPSLA 2021).
 
+**No dependency, deliberately.** The whole tool is an ELF reader — generated from
+`extract/elf64.bbq` by BBQ's own C++ backend — plus a symbol table, a relocation
+table, and a template. Other copy-and-patch implementations reach for LLVM to
+build their stencils; this one reads the `.o` a plain `clang -c` already produced.
+That is the design, not a stage on the way to something bigger: see *Where the
+field has moved*.
+
 ```sh
 jitterator stencils.o -o stencil_table.h     # or to stdout with no -o
 ```
@@ -100,19 +107,48 @@ tier 1 (this JIT), plus a falsifier build with the rewrite pass compiled out.
 The 2021 paper is the floor, not the ceiling. Worth knowing before extending this:
 
 - **[Deegen](https://arxiv.org/abs/2411.11469)** (Xu & Kjolstad, OOPSLA 2026)
-  generates a whole two-tier VM from bytecode semantics written as C++, and
-  extracts stencils from **LLVM IR rather than from a linked object**. That is the
-  structural answer to the `.rodata` constant limitation above: at IR level the
-  constant is visible and can be hoisted, instead of being discovered as a
-  relocation and refused. It also buys hot/cold splitting and inline-cache
-  lowering, neither of which is expressible here.
+  extracts stencils from **LLVM IR** instead of from a linked object, which lets
+  it see a compiler-invented constant and hoist it rather than discovering it as a
+  relocation and refusing it — and buys hot/cold splitting and inline-cache
+  lowering besides.
+
+  **jitterator does not want that, and the reason is the point of the tool.**
+  Reading the object file is what keeps this an afternoon's worth of code with no
+  dependency: an ELF reader generated from `extract/elf64.bbq` by BBQ's own
+  backend, a symbol table, a relocation table, a header. Taking the IR route means
+  linking LLVM and tracking its API — a whole other system to extract stencils
+  with. Within the down-and-dirty design the constant problem already has an
+  answer: hoist it into a hole yourself, which is what the calc stencils do with
+  `_HOLE_k41e0000000000000` and friends, and what jitterator's error message tells
+  you to do. Deegen is listed because it is the state of the art, not because this
+  should become it.
 - **CPython's JIT** (3.13+) is copy-and-patch in production. Its engineering is
   the reference for the parts jitterator does not do: **trampolines** for targets
   out of branch range (which is what makes AArch64 viable, where the range is
-  ±128 MB, not ±2 GB), and reusing one trampoline per symbol.
-- **Stencil variants and superinstructions** — selecting a specialised stencil
-  (operand already in a register, a fused pair) rather than one per operation.
-  This is where most of the remaining performance is; jitterator emits exactly one
-  stencil per named function.
+  ±128 MB, not ±2 GB), and reusing one trampoline per symbol. Note that CPython
+  needs them because it branches to native code; jitterator's constant-pool
+  indirection means it does not — a cheaper answer to the same problem.
+- **Superinstructions** — one stencil for a fused pair, so the pair's dispatch and
+  its round trip through the stack both disappear. opgen has no fusion pass;
+  this is the variant axis it does not have.
 - **AArch64** is unimplemented. `reloc_to_patch_type` is x86-64 relocation types
   and the patch kinds are x86-64 field widths.
+
+Two of the paper's ideas are **already here**, in opgen rather than in jitterator,
+and it is worth knowing where before reaching for them again:
+
+- **Stencil variants and register allocation** are opgen's `-tier2 N`: Ertl-style
+  stack caching, where the top *N* values live in registers. They are the
+  `cache_slot_t _r0.._rN` arguments in `CACHE_ARGS`, which `preserve_none` puts in
+  registers, and opgen emits a variant family per opcode — `gen_st_<op>__s<K>` for
+  each entry state *K*, and `__s<K>m` for the same state spilling its result
+  instead of caching it. The driver tiles the bytecode by state and stamps the
+  matching variant. javelina ships `TIER2_N = 8`.
+- The **constant-pool indirection** for natives, described above, is what lets a
+  stencil reach any address without the trampolines CPython needs.
+
+**The calc does not exercise any of that.** It invokes opgen without `-tier2`, so
+it generates 48 plain stencils and no variants at all — the variant family, the
+most intricate part of the JIT, is covered only by javelina, in another repository.
+Closing it means giving the calc's JIT driver the state tracking javelina's has:
+choosing a variant per point and emitting the transitions between states.

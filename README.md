@@ -32,7 +32,7 @@ True
 ## Features
 
 - **Types**: struct, union, array, optional, switch, compute, extern, bitfield
-- **Integers**: fixed-width (`uint32be`, …) and LEB128 varints (`uleb128`/`sleb128`/`uleb64`/`sleb64`), strict on read (max width enforced), canonical on write
+- **Integers**: fixed-width (`uint32be`, …) and LEB128 varints (`uleb128`/`sleb128`/`uleb64`/`sleb64`), strict on read (max width enforced — a non-minimal encoding within that width is valid and round-trips as written), canonical when the writer serializes a value rather than replaying a parsed span
 - **Constraints**: `where` clauses validated during parsing — on a field, or on a whole struct (`} where check(…)`), including calls to user predicate functions returning bool
 - **Switch**: integer, range (`0x00 .. 0x0B:`), string and enum cases; `reject` arms for fail-closed grammars
 - **Intervals**: `[length]` and `[start, end]` windows; `@rest` fields that scope the remainder (confined: a window must fit its parent and be consumed exactly; the writer recomputes `uleb` `@rest` sizes on serialize)
@@ -103,8 +103,10 @@ python -c "import bbq; print('ok')"
 `import bbq` — compile specs and parse binary data interactively. Zero-copy
 mmap for large files, lazy materialization, full Python protocols for
 navigating parsed structures. Parsed documents are editable: an unedited `emit()`
-returns the input byte for byte, and `emit()` recomputes the fields the grammar
-derives (array counts, `@rest` window sizes) from the edited document.
+returns what was parsed byte for byte — including the bytes no field names — and
+`emit()` recomputes the fields the grammar derives (array counts, `@rest` window
+sizes) from the edited document. `emit()` is the document, so a grammar that
+stops short of the end of its input does not get the trailing bytes back.
 
 See [Getting Started](docs/GettingStarted.md) for a walkthrough, and
 [PyModule.md](docs/PyModule.md) for the full API reference.
@@ -159,7 +161,7 @@ jitterator/         Copy-and-patch JIT stencil extractor and runtime
 | [Grammar Reference](docs/Grammar.md) | Complete BBQ language syntax and semantics |
 | [Python Module](docs/PyModule.md) | Python API reference (Spec, ParseResult, Node) |
 | [CEK Machine Design](docs/CEK%20Machine%20Design.md) | Internals of the interpretive VM backend |
-| [IPG Conformance](docs/IPG-Conformance.md) | Law-by-law against the Interval Parsing Grammars paper, with the test that keeps each one |
+| [Laws](docs/Laws.md) | The published designs BBQ is built on — interval parsing, lenses, dependent fields, transients, bit-level types — law by law, with the test that keeps each one |
 
 ## Running Tests
 

@@ -5,7 +5,8 @@
 // Figures 5/7/8, per check in §3.2, per full-language feature in §3.4, per case
 // study in §4, and per clause of the termination argument in §5. Where BBQ
 // deliberately parts company with the paper the test pins BBQ's rule and names
-// the paper rule it replaces; docs/IPG-Conformance.md carries the full matrix.
+// the paper rule it replaces; docs/Laws.md carries the full matrix, for this
+// source and for the others BBQ is built on.
 //
 // The CEK is the reference semantics, so a law is stated against it. A law that
 // a code generator could silently drop is stated against the generated C reader

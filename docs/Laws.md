@@ -1,17 +1,26 @@
-# IPG Conformance
+# The Laws BBQ Is Built On
 
-BBQ against *Interval Parsing Grammars for File Format Parsing* (Zhang, Morrisett,
-Tan; PLDI 2023, `doi:10.1145/3591264`).
+BBQ is assembled out of published designs. This file lists their laws, enumerated
+from each source, and marks each one against what BBQ does. It is written that way
+round on purpose: a list drawn from what BBQ implements cannot show what BBQ is
+missing, which is the whole reason for having it — a test suite grown from "what
+occurred to someone" tests what occurred to someone.
 
-The list below is enumerated from the paper — one entry per rule in Figures 5, 7
-and 8, per check in §3.2, per full-language feature in §3.4, per case study in §4,
-and per clause of the termination argument in §5 — and then marked against BBQ.
-It is written that way round on purpose: a list drawn from what BBQ implements
-cannot show what BBQ is missing.
+| | Source | Covers |
+|---|---|---|
+| **[IPG]** | Zhang, Morrisett & Tan. *Interval Parsing Grammars for File Format Parsing.* PLDI 2023. | the read side: intervals, biased choice, attributes, termination |
+| **[LENS]** | Foster, Greenwald, Moore, Pierce & Schmitt. *Combinators for Bidirectional Tree Transformations.* TOPLAS 29(3), 2007. | `get`/`put`, GetPut / PutGet / PutPut |
+| **[NAIL]** | Bangert & Zeldovich. *Nail: A Practical Tool for Parsing and Generating Data Formats.* OSDI 2014. | dependent fields — counts, lengths, offsets |
+| **[EVERPARSE]** | Delignat-Lavaud, Fournet, Ramananandro et al. *EverParse.* USENIX Security 2019. | correct / exact / non-malleable / complete |
+| **[RRB]** | L'orange. *Improving RRB-Tree Performance through Transience.* 2014. | structural sharing, transients, ownership |
+| **[FTYPES]** | Diatchki & Jones. *Ftypes: Structured foreign types.* | bit-level fields: reading, writing, signedness, order |
 
-Every entry carries a test. `ipg_law_tests` (`test/ipg_law_test.cpp`) is the suite
-that holds the laws themselves; where an existing suite already pins one, that is
-the anchor named. A law with no test is a law nobody is keeping.
+Every entry carries a test. `law_tests` (`test/ipg_law_test.cpp` for the read side,
+`test/write_law_test.cpp` for the write side) holds the laws that have no other
+home; where an existing suite already pins one, that is the anchor named. A law
+with no test is a law nobody is keeping — and a law BBQ deliberately does NOT hold
+needs one too, because an unclaimed law with no test is indistinguishable from an
+untested one.
 
 A law needs a case that would fail if the law did not hold, which for a parser is
 usually a *value* and not a span: a test that checks where a field landed passes
@@ -37,6 +46,8 @@ Three verdicts appear:
   says how, and the test pins BBQ's answer, not the paper's.
 - **not claimed** — BBQ does not have the feature. The entry says what stands in
   its place, if anything.
+
+# [IPG] — the read side
 
 ## Vocabulary
 
@@ -71,7 +82,7 @@ spec may name a field `pos`, `buffer` or `i` freely.
 | `{id=e}` binds a value | holds | `IpgTerm.AttributeDefinitionBindsAValue` |
 | `⟨e⟩` gates the parse | holds | `IpgTerm.PredicateGatesTheParse` |
 | An array places each element by an interval that may mention the loop variable | holds | `IpgTerm.ArrayPlacesEachElementByItsOwnInterval` |
-| `A(e).id` — the attribute of an array element — is reachable | holds | `IpgTerm.ArrayElementAttributeIsReachable`, `…OfAStructElement` |
+| `A(e).id` — the attribute of an array element — is reachable | holds | `IpgTerm.ArrayElementAttributeIsReachable`, `IpgTerm.ArrayElementAttributeOfAStructElement` |
 | Expressions: literals, `+ - * / = > < ∧ ∨`, ternary | holds | `Sema.IntegerArithmeticValid`, `CEKLayer2Binop.*`, `CEKLayer2Ternary.*` |
 | `EOI`, `A.start`, `A.end` | differs — see §3.3 | `IpgInterval.EoiIsTheWholeInputAndTheWindowIsNamedByAtEnd` |
 
@@ -116,7 +127,7 @@ which is what intervals are for.
 | G-NT | A nonterminal parses by its rule | holds | `CEKLayer3.MinimalStruct`, `…MultiRuleCrossReference` |
 | R-AltSucc | The first alternative that succeeds is the result; order is observable | holds | `IpgAlt.TheFirstSuccessWinsAndOrderIsObservable` |
 | R-AltFail | A failing alternative falls through to the next | holds | `IpgAlt.AFailingAlternativeFallsThroughToTheNext` |
-| R-AltFail + A-Seq1 | …and the enclosing parse carries on afterwards, whichever arm won | holds | `IpgAlt.TheEnclosingParseContinuesAfterALaterArmWins`, `…AfterALaterUnionVariantWins` |
+| R-AltFail + A-Seq1 | …and the enclosing parse carries on afterwards, whichever arm won | holds | `IpgAlt.TheEnclosingParseContinuesAfterALaterArmWins`, `IpgAlt.TheEnclosingParseContinuesAfterALaterUnionVariantWins` |
 | R-Emp | No alternatives left ⇒ Fail | holds | `IpgAlt.WhenEveryAlternativeFailsTheRuleFails` |
 | R-Alt\* | Each alternative starts from a fresh environment and an empty tree list | holds | `IpgAlt.AFailedArmLeavesNoBindingsBehind` |
 | A-Seq1/2 | Terms thread left to right; later terms see earlier bindings | holds | `IpgSeq.LaterTermsSeeEarlierBindings` |
@@ -237,6 +248,102 @@ validation pass. BBQ's `where` predicates and `@header`/`@source` code blocks ar
 where such a pass would attach, and checksums are the everyday case
 (`CBackendE2E.IPv4ChecksumWhere`). Nothing here claims to decide them.
 
+# [LENS] — the write side
+
+A lens between concrete `C` (bytes) and abstract `A` (the document) is a pair of
+partial functions, `get : C ⇀ A` and `put : A × C ⇀ C` [LENS Def 3.1]. `put` takes
+the original bytes because `get` discards information — which is exactly why
+`bbq::zcow` is an overlay on a retained baseline rather than a value tree: the
+spans a parse did not name are the discarded information, kept so `put` can put it
+back.
+
+| Law | Statement | Verdict | Test |
+|---|---|---|---|
+| **GetPut** | `put(get(c), c) ⊑ c` — an unedited re-emit is byte-identical | holds | `CEKLaw.GetPutOverEveryRule`, `CppLaw.GetPutOverEveryRule`, `ZCowLaw.GetPutIsIdentity`, `CEKMatrix.EveryRuleRoundTripsByteIdentical`, `CrossBackend.CppWriterToCReaderFullFixture` |
+| …including bytes no field covers | the gap between two interval-placed fields survives | holds | `LensLaw.GetPutKeepsBytesNoFieldCovers`, `ZCowLaw.BytesNoFieldCoversSurviveAnEdit` |
+| **PutGet** | `get(put(a, c)) ⊑ a` — re-parsing an edit yields the edit | holds | `ZCowLaw.GetAfterPut`, `CEKRoundTrip.AnEditReParsesToTheValueWritten`, `CEKMatrix.EveryRuleReParsesToTheSameShape`, `CrossBackend.CppWriterMutateRoundTrip` |
+| **PutPut** | `put(a', put(a, c)) ⊑ put(a', c)` — "very well behaved" [§3.2] | **not claimed** | `LensLaw.PutPutIsNotClaimedForArrayEdits` |
+| An edit never disturbs the document it came from | persistence | holds | `CEKLaw.EditingNeverDisturbsTheDocumentItCameFrom`, `CppLaw.EditingNeverDisturbsTheDocumentItCameFrom`, `ZCowLaw.PersistenceAndIsolation` |
+
+**PutPut.** A second write composes with the first rather than replacing it, so
+appending twice is not appending once. Foster et al. report the same of their own
+`map`, `flatten`, `merge` and conditional combinators, "for reasons that seem
+pragmatically unavoidable". BBQ is well behaved; it is not very well behaved. The
+test pins the failure, so nobody has to infer it from silence.
+
+# [NAIL] — dependent fields
+
+A dependent field [NAIL §3.3] is a count, length or offset: parsing depends on it,
+and writing makes its value depend on the rest of the document. Nail's rule is that
+such a field is "not exposed in the data model, but instead transparently
+computed", so the developer never has to keep it consistent by hand.
+
+| Law | Verdict | Test |
+|---|---|---|
+| An array's count follows what the array holds | holds | `ZCowDerived.AppendingUpdatesTheCountWithoutBeingAsked`, `…RemovingUpdatesTheCount`, `…ACountOverAnArrayThatWasEmptiedGoesToZero`, `CEKLaw.AppendingToACountedArrayUpdatesItsCount`, `CppLaw.AppendingToACountedArrayUpdatesItsCount` |
+| A `@rest` window's size follows its content | holds | `ZCowDerived.ARestWindowSizeIsRecomputedWhenItsContentResizes`, `CEKLaw.ResizingARestWindowUpdatesItsSize`, `CrossBackend.RestSizeRecomputedOnModify` |
+| Nested and deep dependents settle innermost first | holds | `ZCowDerived.NestedCountsAreFixedInnermostFirst`, `…ACountInANestedStructIsStillFound`, `CrossBackend.PathCountRecomputedOnModify` |
+| A dependent nothing changed stays span-backed | holds | `ZCowDerived.ACountThatDidNotChangeStaysSpanBacked`, `…AnEditElsewhereLeavesAnUntouchedSubtreesCountAlone` |
+| Both producers record the same dependents | holds | `CrossBackend.DerivedFieldsAreIdentifiable`, `…BothProducersRecordTheSameGrammarKnowledge` |
+
+Nail defers a dependent field with a reserve-then-overwrite pass over a stream.
+BBQ does not stream: the overlay holds the whole edited document with random
+access, so a window's length is *measured* by reserializing it and the owning C
+writer back-patches a hole. The trade is streaming for random access — a streaming
+BBQ writer would need something like DFDL's suspensions, and there is none.
+
+# [EVERPARSE] — where the pair sits in the lattice
+
+EverParse grades a parser/serializer pair: **correct** (serialize then parse is the
+identity), **exact** (parse then serialize is too), **non-malleable** (one abstract
+value has exactly one concrete form) and **complete**.
+
+| Property | Verdict | Test |
+|---|---|---|
+| correct | holds — this is PutGet | see [LENS] above |
+| exact | holds — this is GetPut | see [LENS] above |
+| complete: a document built from nothing serializes and re-parses | holds | `CEKRoundTrip.ConstructedDocumentSerializesAndReParses`, `…ConstructedArrayReParses`, `ZCow.AConstructedVarintEmitsEvenThoughItHasNoSpan` |
+| **non-malleable** | **not claimed** | `EverParseLattice.InputsDifferingPastTheParseAreOneDocument`, `…ANonMinimalVarintIsAcceptedAndKept` |
+| …but padding is bounded: an encoding wider than its carrier is refused | holds | `EverParseLattice.AVarintWiderThanItsCarrierIsRejected`, `CEKLayer3.Leb128Rejected` |
+
+**Malleability is deliberate, and it is two things.** A parse that does not reach
+the end of the input leaves the rest alone, so inputs differing past the parse are
+one document — and `emit()` is the document, which is the consumed prefix, *not*
+the input byte for byte. And a varint longer than it needs to be is still a varint:
+strictness is about the width the carrier allows, not minimality, so `81 00`
+decodes to 1 and re-emits as `81 00`, because re-canonicalising it would break
+GetPut. A format that needs non-malleability has to say so with a `where`.
+
+# [RRB] — the document as a persistent structure
+
+| Law | Verdict | Test |
+|---|---|---|
+| Untouched subtrees are shared by pointer, not copied [§2.4] | holds | `ZCow.UntouchedSubtreesAreSharedByPointer`, `ZCowLaw.NothingOffThePathIsCopied`, `CppLaw.NothingOffTheEditedPathIsCopied` |
+| A write copies the path and only the path | holds | `ZCow.AWriteMarksOnlyThePathAsNoLongerSpanBacked`, `ZCowLaw.AScatteredLayoutKeepsItsOrder` |
+| A transient mutates in place what it already owns [Listing 4.1] | holds | `ZCow.RepeatedWritesDownOnePathCopyItOnce`, `ZCowLaw.RepeatedWritesCopyThePathOnce` |
+| `persistent!` invalidates the transient; every op checks [Def 4.1] | holds | `ZCow.UsingATransientAfterCommitThrows`, `ZCowLaw.EveryOperationRefusesAnInvalidatedTransient` |
+| A transient belongs to one thread [§7.2, §8.1.2] | holds | `ZCow.ATransientIsRefusedOnAnotherThread`, `ZCow.AnAdoptedTransientMovesToTheAdoptingThread` |
+| A transient is single-owner, so move-only | holds | `ZCow.TransientIsMoveOnly`, `ZCow.ADerivedTransientDoesNotDisturbTheOneItCameFrom` |
+| `transient : α → α!` is O(1) [Def 4.5] | holds | `ZCow.APersistentDocumentCopiesInConstantTimeAndSharesEverything` |
+| A transient round-trip with no writes is the identity | holds | `ZCowLaw.TransientRoundTripIsIdentity` |
+
+# [FTYPES] — bit-level fields
+
+An entry in a bit run owns no storage: its value is derived from the container's
+current bytes [FTYPES §3.4], which is why writing one is a read-modify-write of the
+container [§3.10] and why a neighbour's write is visible.
+
+| Law | Verdict | Test |
+|---|---|---|
+| An entry reads from the container's bytes | holds | `ZCowBits.EntriesReadFromTheContainersBytes`, `CEKLaw.ARecordedEntryValueAgreesWithReadingTheRun` |
+| Signedness is per entry, sign-extended from its own width | holds | `ZCowBits.ASignedEntryIsSignExtended`, `…ASignedEntryRoundTripsANegativeValue`, `CppBits.ASignedEntryIsSignExtended`, `CEKLaw.ASignedBitfieldEntryIsSignExtended` |
+| `swap?` — the container's order decides the packing | holds | `ZCowBits.AContainerLaidOutMsbFirstPacksTheOtherWay`, `CEKLayer3.BitfieldBE` |
+| Writing one entry leaves its neighbours alone | holds | `ZCowBits.WritingOneEntryLeavesItsNeighbourAlone`, `CppBits.AnInlineRunLeavesItsNeighboursAlone` |
+| Writing two composes rather than clobbering | holds | `ZCowBits.WritingBothEntriesComposes` |
+| An entry write does not resize, so everything around it survives | holds | `ZCowBits.ABitWriteDoesNotResizeSoEverythingAroundItSurvives` |
+| Putting back what was read is the identity | holds | `ZCowBits.PuttingBackWhatYouReadIsIdentity` |
+| Naming an entry the run does not have is refused | holds | `ZCowBits.NamingAnEntryTheRunDoesNotHaveIsRefused` |
+
 ## Noticed, not addressed
 
 **Overlapping switch ranges draw no diagnostic.** `switch(t) { 0 .. 5: X; 3 .. 9:
@@ -249,15 +356,21 @@ opening complaint — two readers of the same spec disagreeing about what it say
 and a warning would cost nothing. Left alone because it is a new diagnostic rather
 than a law this file is auditing.
 
-**The write side has no laws here.** The paper is about parsing, and so is this
-file. BBQ also serializes, recomputes dependent fields, and claims round-trip
-properties; those are lens laws (GetPut/PutGet) rather than IPG ones, and they are
-kept by `CEKLaw.*`, `CppLaw.*` and `ZCowLaw.*`. No IPG rule is missing from here
-because of it, but "IPG conformance" should not be read as "the whole of BBQ is
-audited".
+**README overclaims the unedited round trip.** It says an unedited `emit()`
+"returns the input byte for byte". It returns the *document*, which is the
+consumed prefix — for a grammar that does not cover the whole input, that is not
+the input (`EverParseLattice.InputsDifferingPastTheParseAreOneDocument`). GetPut as
+Foster et al. state it is `⊑`, not `=`, so the law holds; the sentence is what is
+wrong, and it is a sentence rather than a law.
+
+**"Canonical on write" needs its scope.** README and Grammar §5.1 say LEB128 is
+"canonical on write". True of a varint the writer serializes from a value; not true
+of one it blits back from a span, which keeps whatever non-minimal form it was
+parsed from — and has to, or GetPut fails
+(`EverParseLattice.ANonMinimalVarintIsAcceptedAndKept`).
 
 ## Reading this file
 
-The verdicts are checked by `ctest -R ipg_law_tests`. A **differs** row is a
+The verdicts are checked by `ctest -R law_tests`. A **differs** row is a
 decision, not a gap; a **not claimed** row is a gap with its reason. If a row's
 test is deleted, the row is a claim again rather than a fact.

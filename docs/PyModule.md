@@ -3,9 +3,12 @@
 CPython C API extension wrapping the CEK VM. The workflow is **parse · explore ·
 edit · emit** for prototyping grammars and exploring binary formats: parse a real
 binary, get a zero-copy Python container, poke and edit it, and serialize back to
-bytes. An unedited `emit()` returns the input byte for byte, and `emit()`
-recomputes the fields the grammar **derives** — array counts, `@rest` window
-sizes — from the edited document, so those are never maintained by hand.
+bytes. An unedited `emit()` returns what was parsed byte for byte — including the
+bytes no field names — and `emit()` recomputes the fields the grammar **derives** —
+array counts, `@rest` window sizes — from the edited document, so those are never
+maintained by hand. What comes back is the document, so a grammar that stops short
+of the end of its input does not get the trailing bytes back
+(`r.bytes_consumed` says how far it went).
 
 `emit()` does not validate: it recomputes derived fields and copies everything
 else through. An edit that changes what shape follows it (a switch discriminant,

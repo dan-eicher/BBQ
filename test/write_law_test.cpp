@@ -133,6 +133,101 @@ TEST(EverParseLattice, AVarintWiderThanItsCarrierIsRejected) {
     EXPECT_FALSE(r.success) << "six continuation bytes exceed the 32-bit carrier";
 }
 
+// ── Depth is the input's to choose ───────────────────────────────────────────
+//
+// `Node = struct { n: uint8, kids: array<Node>[n] }` nests once per 0x01 byte, so
+// a 30 KB file is a 30,000-deep document. Every walk over the tree — destroying
+// it, measuring it, patching it, emitting it, settling its dependent fields — used
+// to take one stack frame per level, which made a stack overflow something a file
+// could ask for. They are all iterative now; these hold them that way.
+//
+// The depth is chosen to be well past where each of those used to die (~16k) and
+// no further: the point is the shape, and the suite still has to run.
+namespace {
+constexpr int kDeep = 30000;
+
+// depth-deep chain, then a terminator.
+std::vector<uint8_t> deep_chain(int depth, uint8_t tag = 0x20) {
+    std::vector<uint8_t> v;
+    v.reserve(2 * (depth + 1));
+    for (int i = 0; i < depth; i++) { v.push_back(1); v.push_back(tag); }
+    v.push_back(0); v.push_back(tag);
+    return v;
+}
+const char* kDeepGrammar = "Node = struct { n: uint8, tag: uint8, kids: array<Node>[n] }";
+
+// The node `depth` levels down.
+bbq::zcow::node* descend(bbq::zcow::transient& t, int depth) {
+    bbq::zcow::node* n = t.root_mut();
+    for (int i = 0; i < depth && n; i++) {
+        bbq::zcow::node* kids = t.own_child(n, "kids");
+        if (!kids || kids->kids.empty()) return nullptr;
+        n = t.own_child(kids, size_t{0});
+    }
+    return n;
+}
+}  // namespace
+
+TEST(DeepDocument, ParsingAndDestroyingADeepTreeDoesNotRecursePerLevel) {
+    auto r = run(kDeepGrammar, "Node", deep_chain(kDeep));
+    ASSERT_TRUE(r.compiled) << r.error;
+    ASSERT_TRUE(r.success) << r.error;
+    EXPECT_EQ(r.meta.bytes_consumed, 2u * (kDeep + 1));
+    // Destruction is the other half, and it happens when `r` goes out of scope.
+}
+
+TEST(DeepDocument, AnUneditedDeepTreeEmitsByteIdentical) {
+    auto in = deep_chain(kDeep);
+    auto r = run(kDeepGrammar, "Node", in);
+    ASSERT_TRUE(r.success) << r.error;
+    EXPECT_EQ(emit(r.meta.doc), in);
+}
+
+// The walks that only a DIRTY path reaches: an unedited document emits by one
+// memcpy, so the recursion hid behind the fast path until something was written
+// at the bottom of the tree.
+TEST(DeepDocument, AnEditAtTheBottomEmitsWithoutRecursingPerLevel) {
+    auto in = deep_chain(kDeep);
+    auto r = run(kDeepGrammar, "Node", in);
+    ASSERT_TRUE(r.success) << r.error;
+
+    auto t = r.meta.doc.begin_edit();
+    bbq::zcow::node* deepest = descend(t, kDeep);
+    ASSERT_NE(deepest, nullptr);
+    bbq::zcow::node* tag = t.own_child(deepest, "tag");
+    ASSERT_NE(tag, nullptr);
+    bbq::zcow::set_int(tag, 0x7E);
+
+    // Same width, so this is the patch path: changes_length + patch_node.
+    std::vector<uint8_t> out = emit(std::move(t).commit());
+    ASSERT_EQ(out.size(), in.size());
+    EXPECT_EQ(out.back(), 0x7E);
+    EXPECT_EQ(std::vector<uint8_t>(out.begin(), out.end() - 1),
+              std::vector<uint8_t>(in.begin(), in.end() - 1));
+}
+
+TEST(DeepDocument, AResizeAtTheBottomEmitsWithoutRecursingPerLevel) {
+    auto in = deep_chain(kDeep);
+    auto r = run(kDeepGrammar, "Node", in);
+    ASSERT_TRUE(r.success) << r.error;
+
+    auto t = r.meta.doc.begin_edit();
+    bbq::zcow::node* deepest = descend(t, kDeep);
+    ASSERT_NE(deepest, nullptr);
+    bbq::zcow::node* kids = t.own_child(deepest, "kids");
+    ASSERT_NE(kids, nullptr);
+    // Appending makes the document longer, so emit rebuilds from the tree
+    // (emit_node) instead of patching, and reconcile has to settle the count
+    // 30,000 levels down.
+    bbq::zcow::node* added = t.append(kids, bbq::CaptureType::Struct);
+    bbq::zcow::set_int(t.append(added, bbq::CaptureType::UInt8), 0);
+    bbq::zcow::set_int(t.append(added, bbq::CaptureType::UInt8), 0x55);
+
+    std::vector<uint8_t> out = emit(std::move(t).commit());
+    EXPECT_EQ(out.size(), in.size() + 2) << "the appended node's two bytes";
+    EXPECT_EQ(out.back(), 0x55);
+}
+
 // ── GetPut, where it is easy to think it is weaker than it is ────────────────
 //
 // The reason `put` takes the original bytes [LENS Def 3.1] is that `get` throws

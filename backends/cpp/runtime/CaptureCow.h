@@ -133,6 +133,37 @@ struct node {
     bool container() const {
         return type == CaptureType::Struct || type == CaptureType::Array;
     }
+
+    node() = default;
+    node(const node&) = default;             // path copying clones a node by value
+    node& operator=(const node&) = default;
+
+    // How deep a document is, is the INPUT's to choose: `Node = struct { n: uint8,
+    // kids: array<Node>[n] }` nests once per 0x01 byte. The default destructor
+    // would recurse once per level — ~vector<node_ptr> → ~shared_ptr → ~node — so a
+    // 20 KB file of 0x01 overflows the stack of whoever holds the document, which
+    // is a crash a file can ask for. Unlink iteratively instead: take the children
+    // this node is the last owner of onto a worklist, empty their vectors, and let
+    // them die with nothing left to recurse into. A child something else still
+    // references is left alone — dropping our pointer does not destroy it, so there
+    // is nothing to flatten (and stealing its children would break the structural
+    // sharing that makes a copy O(1)).
+    ~node() {
+        if (kids.empty()) return;
+        std::vector<node_ptr> pending = std::move(kids);
+        while (!pending.empty()) {
+            node_ptr n = std::move(pending.back());
+            pending.pop_back();
+            if (n && n.use_count() == 1 && !n->kids.empty()) {
+                // No reserve(): it allocates exactly what is asked, so calling it
+                // per level reallocates an O(depth) worklist O(depth) times.
+                // push_back grows geometrically, which is what makes this linear.
+                for (auto& k : n->kids) pending.push_back(std::move(k));
+                n->kids.clear();
+            }
+            // n dies here with an empty child vector: no recursion.
+        }
+    }
 };
 
 inline bool is_container_type(CaptureType t) {
@@ -305,13 +336,29 @@ struct sink {
                             else encode_sleb128(*this, v); }
 };
 
-inline void emit_node(const node& n, const source& src, const std::string& at, sink& out) {
+// Concatenation is ordered, so unlike patch_node this keeps a work stack that
+// preserves child order — children are pushed in reverse and popped, which visits
+// them left to right. Iterative for the same reason as the others: how deep a
+// document nests is the input's to choose. `at` names a node in an error message
+// and nothing else, so each frame carries the path its recursive argument was.
+inline void emit_node(const node& top, const source& src, const std::string& top_at,
+                      sink& out) {
+    struct Frame { const node* n; std::string at; };
+    std::vector<Frame> pending;
+    pending.push_back(Frame{&top, top_at});
+
+    while (!pending.empty()) {
+        Frame f = std::move(pending.back());
+        pending.pop_back();
+        const node& n = *f.n;
+        const std::string& at = f.at;
+
     // Untouched: its bytes are still exactly what it was parsed from. One blit,
     // however large the subtree — this is the zero-copy payoff.
     if (n.parsed) {
         if (src.buf && n.end_offset > n.start_offset)
             out.raw(src.buf + n.start_offset, n.end_offset - n.start_offset);
-        return;
+        continue;
     }
     if (n.type == CaptureType::Computed) {
         // A compute() occupies no bytes. A varint does — its value is decoded rather
@@ -321,34 +368,35 @@ inline void emit_node(const node& n, const source& src, const std::string& at, s
         // reading that as "occupies no bytes" would emit it as nothing.
         if (n.enc == Enc::Uleb) out.uleb((uint64_t)n.ival);
         else if (n.enc == Enc::Sleb) out.sleb(n.ival);
-        return;
+        continue;
     }
     if (is_container_type(n.type)) {
         // A bitfield run owns the bytes its entries are read out of; the entries
         // themselves contribute none, so concatenating them would emit nothing.
-        if (!n.bval.empty()) { out.raw(n.bval.data(), n.bval.size()); return; }
-        for (size_t i = 0; i < n.kids.size(); i++) {
+        if (!n.bval.empty()) { out.raw(n.bval.data(), n.bval.size()); continue; }
+        for (size_t i = n.kids.size(); i-- > 0; ) {
             const node& k = *n.kids[i];
             const char* nm = k.name;
-            emit_node(k, src,
-                      (nm && *nm) ? (at.empty() ? std::string(nm) : at + "." + nm)
-                                  : at + "[" + std::to_string(i) + "]",
-                      out);
+            pending.push_back(Frame{
+                &k,
+                (nm && *nm) ? (at.empty() ? std::string(nm) : at + "." + nm)
+                            : at + "[" + std::to_string(i) + "]"});
         }
-        return;
+        continue;
     }
     if (n.type == CaptureType::Bytes || n.type == CaptureType::String) {
         out.raw(n.bval.data(), n.bval.size());
-        return;
+        continue;
     }
-    if (n.enc == Enc::Uleb) { out.uleb((uint64_t)n.ival); return; }
-    if (n.enc == Enc::Sleb) { out.sleb(n.ival); return; }
+    if (n.enc == Enc::Uleb) { out.uleb((uint64_t)n.ival); continue; }
+    if (n.enc == Enc::Sleb) { out.sleb(n.ival); continue; }
     size_t w = (n.end_offset > n.start_offset) ? (n.end_offset - n.start_offset)
                                                : leaf_width(n.type);
     if (w == 0)
         throw type_error("zcow emit: '" + (at.empty() ? std::string("<root>") : at) +
                          "' has no width for its type");
     out.fixed(w, n);
+    }
 }
 
 // Collecting the bytes is the common case; measuring is the other one.
@@ -370,43 +418,62 @@ inline size_t emitted_size(const node& n, const source& src) {
 // written over it — which is the only way to keep bytes NO LEAF COVERS: separators,
 // padding, alignment, regions a seek jumped over. Concatenating children would drop
 // every one of them.
+// Iterative: the depth of a document is the input's to choose, and one frame per
+// level is a stack overflow a file can ask for. Which node answers first does not
+// matter — this is an "any".
 inline bool changes_length(const node& n) {
-    if (n.parsed) return false;
-    if (n.resized) return true;
-    if (!n.kids.empty()) {
-        for (const auto& k : n.kids) if (changes_length(*k)) return true;
-        return false;
+    std::vector<const node*> pending{&n};
+    while (!pending.empty()) {
+        const node& c = *pending.back();
+        pending.pop_back();
+        if (c.parsed) continue;
+        if (c.resized) return true;
+        if (!c.kids.empty()) {
+            for (const auto& k : c.kids) pending.push_back(k.get());
+            continue;
+        }
+        // A computed value with no bytes cannot change any length; a varint's
+        // encoded width tracks its value, so writing one can — and which it is, is
+        // the encoding, for the same reason emitting one goes by the encoding.
+        if (c.type == CaptureType::Computed) { if (c.enc != Enc::Fixed) return true; continue; }
+        if (c.end_offset <= c.start_offset) return true;  // no span: content with no origin
+        if (c.enc != Enc::Fixed) return true;             // a varint's width tracks its value
+        if (c.type == CaptureType::Bytes || c.type == CaptureType::String)
+            if (c.bval.size() != (c.end_offset - c.start_offset)) return true;
     }
-    // A computed value with no bytes cannot change any length; a varint's encoded
-    // width tracks its value, so writing one can — and which it is, is the encoding,
-    // for the same reason emitting one goes by the encoding.
-    if (n.type == CaptureType::Computed) return n.enc != Enc::Fixed;
-    if (n.end_offset <= n.start_offset) return true;    // no span: content with no origin
-    if (n.enc != Enc::Fixed) return true;               // a varint's width tracks its value
-    if (n.type == CaptureType::Bytes || n.type == CaptureType::String)
-        return n.bval.size() != (n.end_offset - n.start_offset);
     return false;
 }
 
 // Write each changed leaf at its own offset on a copy of the input. Everything not
 // written keeps the bytes it was parsed from, in place — gaps and scattered layout
 // included.
+// Iterative, for the reason changes_length is: depth comes from the input. Every
+// leaf writes at its own offset and the offsets are disjoint, so the order the
+// worklist happens to produce is immaterial.
 inline void patch_node(const node& n, size_t base, std::vector<uint8_t>& out) {
-    if (n.parsed) return;
-    // A node that owns bytes writes them at its own offset, whatever its shape: a
-    // bitfield run is a container for reading and a run of bytes for writing, and
-    // its entries contribute none of their own.
-    if (!n.bval.empty() && n.end_offset > n.start_offset && is_container_type(n.type)) {
-        std::memcpy(out.data() + (n.start_offset - base), n.bval.data(), n.bval.size());
-        return;
+    std::vector<const node*> pending{&n};
+    while (!pending.empty()) {
+        const node& c = *pending.back();
+        pending.pop_back();
+        if (c.parsed) continue;
+        // A node that owns bytes writes them at its own offset, whatever its shape:
+        // a bitfield run is a container for reading and a run of bytes for writing,
+        // and its entries contribute none of their own.
+        if (!c.bval.empty() && c.end_offset > c.start_offset && is_container_type(c.type)) {
+            std::memcpy(out.data() + (c.start_offset - base), c.bval.data(), c.bval.size());
+            continue;
+        }
+        if (!c.kids.empty()) {
+            for (const auto& k : c.kids) pending.push_back(k.get());
+            continue;
+        }
+        if (c.type == CaptureType::Computed) continue;
+        size_t at = c.start_offset - base;
+        if (c.type == CaptureType::Bytes || c.type == CaptureType::String)
+            std::memcpy(out.data() + at, c.bval.data(), c.bval.size());
+        else if (is_float_type(c.type)) encode_float(out.data(), at, c.type, c.fval);
+        else                            encode_int(out.data(), at, c.type, c.ival);
     }
-    if (!n.kids.empty()) { for (const auto& k : n.kids) patch_node(*k, base, out); return; }
-    if (n.type == CaptureType::Computed) return;
-    size_t at = n.start_offset - base;
-    if (n.type == CaptureType::Bytes || n.type == CaptureType::String)
-        std::memcpy(out.data() + at, n.bval.data(), n.bval.size());
-    else if (is_float_type(n.type)) encode_float(out.data(), at, n.type, n.fval);
-    else                            encode_int(out.data(), at, n.type, n.ival);
 }
 
 // The bytes of one version: identity when untouched, patched in place when nothing
@@ -665,19 +732,45 @@ private:
     // Order matters: descend first, so an inner array's count is right before an
     // outer window measures the bytes it produces; then counts at this level, since
     // a LEB count's own width feeds the window length; then the windows.
+    // Iterative post-order: how deep a document nests is the INPUT's to choose, so
+    // one stack frame per level is a stack overflow a file can ask for. The work
+    // stack is on the heap; the order is exactly the recursive one — every child
+    // settles before its parent, `scope` still holds root-to-here at the moment a
+    // node settles.
     void reconcile(node_ptr& slot, std::vector<node*>& scope) {
-        if (!slot || slot->parsed) return;
-        node* n = own(slot);
-        scope.push_back(n);
+        struct Frame { node* n; size_t kid; };
+        std::vector<Frame> stack;
 
-        for (auto& k : n->kids) {
-            if (k->parsed) continue;
-            // By TYPE, not by emptiness: an array every element was removed from
-            // still determines its count, and still has to be walked to say so.
-            if (is_container_type(k->type)) reconcile(k, scope);
-            else                            restore_if_unchanged(k);
+        auto enter = [&](node_ptr& s) {
+            if (!s || s->parsed) return;
+            node* n = own(s);
+            scope.push_back(n);
+            stack.push_back(Frame{n, 0});
+        };
+
+        enter(slot);
+        while (!stack.empty()) {
+            // By index, never a reference: `enter` pushes, which can reallocate.
+            size_t top = stack.size() - 1;
+            node* n = stack[top].n;
+            if (stack[top].kid < n->kids.size()) {
+                node_ptr& k = n->kids[stack[top].kid++];
+                if (k->parsed) continue;
+                // By TYPE, not by emptiness: an array every element was removed
+                // from still determines its count, and still has to be walked to
+                // say so.
+                if (is_container_type(k->type)) enter(k);
+                else                            restore_if_unchanged(k);
+                continue;
+            }
+            settle_derived(n, scope);
+            scope.pop_back();
+            stack.pop_back();
         }
+    }
 
+    // What a container owes once its children are settled.
+    void settle_derived(node* n, std::vector<node*>& scope) {
         // Inner first: an inner array's count is settled before an outer window
         // measures the bytes it produces.
         if (n->derives == node::Derives::HasCount) {
@@ -701,8 +794,6 @@ private:
                 break;
             }
         }
-
-        scope.pop_back();
     }
 
     // Resolve a dotted path from the innermost scope outward, owning each node on

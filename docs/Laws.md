@@ -344,6 +344,37 @@ container [§3.10] and why a neighbour's write is visible.
 | Putting back what was read is the identity | holds | `ZCowBits.PuttingBackWhatYouReadIsIdentity` |
 | Naming an entry the run does not have is refused | holds | `ZCowBits.NamingAnEntryTheRunDoesNotHaveIsRefused` |
 
+# Robustness
+
+Laws say what a correct input means. These say what BBQ does with the rest of the
+input space, which for a format parser is most of it.
+
+| Property | Verdict | Test |
+|---|---|---|
+| Every prefix of a valid input is accepted or rejected, never crashed — on every backend | holds | `RenderViewParser.TruncationRejectsLikeCek`, `CrossBackend.ViewCReaderRejectsMalformedLikeCek`, `…COwningReaderRejectsMalformedLikeCek` |
+| Every single-byte corruption likewise, and the backends agree with the CEK on which | holds | `RenderViewParser.ByteCorruptionRejectsLikeCek`, the two `CrossBackend` sweeps above |
+| A declared count does not become an allocation | holds | `CBackendE2E.CountedArrayDoesNotAllocateFromCount` |
+| An unbounded array whose element need not read is refused | holds | see [IPG] §5 |
+| Nesting depth — chosen by the input — does not cost stack | holds *for the document* | `DeepDocument.*` |
+
+**Depth.** `Node = struct { n: uint8, kids: array<Node>[n] }` nests once per `0x01`
+byte, so a 30 KB file is a 30,000-deep document. Five walks over the tree used to
+take a stack frame per level — destroying it, `changes_length`, `patch_node`,
+`emit_node`, and `transient::reconcile` — which made a stack overflow something a
+file could ask for, in the parser, in `emit()`, and in the destructor of anything
+holding a document. All five are iterative; `DeepDocument.*` holds them that way at
+a depth well past where each used to die.
+
+**Where that still bites: the generated C and C++ readers.** They are recursive
+descent — the paper's own design, and a rule that calls a rule is a call — so their
+nesting depth is bounded by the C stack, not by the heap. The generated C reader
+handles ~50,000 levels on an 8 MB stack and segfaults somewhere past that, while
+the CEK now handles millions. That is a real divergence between backends on a real
+class of input, and closing it is a choice between two things BBQ has not made: a
+nesting bound in the runtime, which changes what parses, or an iterative emitter,
+which is a different code generator. Until then, a consumer of a generated reader
+that may see hostile input should bound nesting before parsing.
+
 ## Noticed, not addressed
 
 **Overlapping switch ranges draw no diagnostic.** `switch(t) { 0 .. 5: X; 3 .. 9:

@@ -12,6 +12,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <memory>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -62,6 +63,13 @@ struct Run {
     std::string error;                       // sema text, or the parse failure
     bbq::zcow::parse_result meta;
     ::bbq::cek::CompiledGrammar* grammar = nullptr;
+    // The parse BORROWS its input: the document's spans point into these bytes and
+    // serializing blits from them. A `run(g, "R", {1, 2})` would otherwise hand the
+    // document a temporary that dies at the end of the statement, and every later
+    // read of a span would be a use-after-free — which is what happens, silently,
+    // until something looks. The buffer is a member so it outlives the document,
+    // and moving a vector keeps its heap block, so moving a Run is safe.
+    std::shared_ptr<std::vector<uint8_t>> input;
 
     ~Run() { delete grammar; }
     Run() = default;
@@ -69,6 +77,7 @@ struct Run {
     Run& operator=(Run&& o) noexcept {
         compiled = o.compiled; success = o.success; error = std::move(o.error);
         meta = std::move(o.meta); grammar = o.grammar; o.grammar = nullptr;
+        input = std::move(o.input);
         return *this;
     }
     Run(const Run&) = delete;
@@ -89,6 +98,7 @@ inline size_t ExternWitness::consume = 4;
 inline Run run(const std::string& src, const std::string& rule,
                const std::vector<uint8_t>& bytes) {
     Run r;
+    r.input = std::make_shared<std::vector<uint8_t>>(bytes);
     auto* parser = new ::Parser();
     parser->init(src.c_str(), static_cast<int>(src.size()));
     if (!parser->parse() || parser->ast == nullptr) {
@@ -132,7 +142,7 @@ inline Run run(const std::string& src, const std::string& rule,
     m.arena = &r.grammar->arena;
     m.builtins = &r.grammar->builtins;
     m.ext_parsers = &ext_table;
-    r.meta = m.execute_from(entry, bytes.data(), bytes.size(),
+    r.meta = m.execute_from(entry, r.input->data(), r.input->size(),
                             r.grammar->default_little_endian);
     r.success = !m.failed && r.meta.success;
     if (!r.success && m.best_error_msg) r.error = m.best_error_msg;

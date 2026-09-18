@@ -1,8 +1,8 @@
 // ============================================================
-// BBQ AST — Auto-generated from BBQ.asdl
+// {{name}} AST — auto-generated from {{name}}.asdl by asdl, using
+// jitterator/example/grammar/templates/calc_ast.inja.
 //
-// Do not edit by hand. Re-generate with:
-//   ./asdl -i BBQ.asdl -t templates/bbq_ast.inja -o BBQ_AST.h
+// Do not edit by hand; CMake regenerates it whenever the .asdl changes.
 // ============================================================
 #ifndef {{upper(name)}}_AST_H
 #define {{upper(name)}}_AST_H

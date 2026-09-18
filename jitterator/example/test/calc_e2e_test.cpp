@@ -4,42 +4,49 @@
  *
  *   pegc parse → ddcg compile → CPS/ANF IR   (calc_runner::calc_compile)
  *   IR → bytecode (the cg_jump lowering)      (calc::Lower)
- *   bytecode → result                          (opgen-generated interpreter)
+ *   bytecode → result                          BOTH tiers, which must agree
+ *
+ * Both tiers, because the chain is the point. The JIT used to be exercised only
+ * on bytecode written by hand in calc_vm_test.c, so nothing ran a calc PROGRAM
+ * through the stencils — and what a compiler emits is not the opcode mix, operand
+ * encoding or control-flow shape a person picks when writing bytes by hand.
  *
  * The inputs are the calc_tests regression strings; each must produce the
  * specified value through the whole pipeline.
  */
 #include "calc_natives.h"      /* calc_br / calc_call / calc_ret + the VM headers */
+#include "calc_vm_host.h"      /* both tiers, linked from calc_vm_host.c (see there) */
 #include "calc_runner.h"       /* calc_compile + lower (burg cg_jump) */
 #include "opcodes.h"           /* OP_* — the rewrite pins read the emitted bytes */
 #include <cstdio>
 #include <vector>
 
-#define TAIL __attribute__((musttail))
-
-static const opcode_handler_t* g_table;
-extern "C" void calc_next(vm_t* vm) {
-    u1 op; if (!bbq_read_u8(&vm->frame.code, &op)) return;
-    TAIL return g_table[op](vm);
-}
-extern "C" void calc_trap(vm_t* vm) { vm->trapped = 1; }
-
+/* The host seam, the reset and both tiers belong to the example (calc_vm_host.c),
+ * not to this test. This file used to carry its own copy of the seam, whose reset
+ * cleared five of the eleven fields a program can observe — so memory, the
+ * accumulator and the side table carried from one case into the next. */
 static s4 run_bytecode(const std::vector<uint8_t>& code) {
-    static vm_t vm;
-    g_table = gen_interp_dispatch_table();
-    bbq_ctx_init(&vm.frame.code, code.data(), code.size());
-    vm.frame.sp = 0; vm.depth = 0; vm.trapped = 0; vm.result.i = 0; vm.result_type = T_INT;
-    calc_next(&vm);
-    return vm.result.i;
+    vm_t vm;
+    return calc_run_interp(&vm, code.data(), code.size());
 }
 
-// parse → compile → lower → run.
-static bool calc_eval(const char* src, s4* out) {
+/* The same bytecode through tier 1: jitterator's stencils, stamped and run. */
+static s4 jit_bytecode(const std::vector<uint8_t>& code) {
+    vm_t vm;
+    return calc_run_jit(&vm, code.data(), code.size());
+}
+
+// parse → compile → lower → run, on BOTH tiers. They run the same generated
+// opcode bodies, so they must agree; `*jit` reports tier 1's answer so a caller
+// can say which one disagreed.
+static bool calc_eval(const char* src, s4* out, s4* jit = nullptr) {
     int fs = 0;
     calc_ir::Node* ir = calc_runner::calc_compile(src, &fs);
     if (!ir) return false;
     std::vector<uint8_t> code = calc_runner::lower(ir);
     *out = run_bytecode(code);
+    s4 j = jit_bytecode(code);
+    if (jit) *jit = j;
     return true;
 }
 
@@ -107,14 +114,14 @@ int main(void) {
         {"fn ack($m, $n) (if ($m < 1) $n + 1 else (if ($n < 1) ack($m - 1, 1) else ack($m - 1, ack($m, $n - 1)))); ack(2, 3)", 9},
     };
     for (auto& c : cases) {
-        s4 got = 0;
-        bool ok = calc_eval(c.src, &got);
-        if (!ok || got != c.want) {
-            printf("FAIL: %-44s got %d want %lld%s\n", c.src, got, (long long)c.want,
-                   ok ? "" : " (compile failed)");
+        s4 got = 0, jit = 0;
+        bool ok = calc_eval(c.src, &got, &jit);
+        if (!ok || got != c.want || jit != c.want) {
+            printf("FAIL: %-44s interp %d jit %d want %lld%s\n", c.src, got, jit,
+                   (long long)c.want, ok ? "" : " (compile failed)");
             fails++;
         } else {
-            printf("ok:   %-44s = %d\n", c.src, got);
+            printf("ok:   %-44s interp==jit==%d\n", c.src, got);
         }
     }
     // ── The rewrite pass ────────────────────────────────────────────
@@ -208,7 +215,7 @@ int main(void) {
 #endif
     }
 
-    if (!fails) { printf("\ncalc e2e (parse → ddcg → IR → bytecode → opgen VM): all passed\n"); return 0; }
+    if (!fails) { printf("\ncalc e2e (parse → ddcg → IR → bytecode → interpreter AND JIT): all passed\n"); return 0; }
     printf("\ncalc e2e: %d FAILED\n", fails);
     return 1;
 }

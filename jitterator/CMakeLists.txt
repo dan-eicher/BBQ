@@ -62,8 +62,8 @@ endif()
 
 # ASDL JSON sidecars (consumed by ddcgc + burgc) + asdl-generated
 # C++ headers (CalcAST.h, CalcIR.h). The headers are checked into
-# source so calc_jit.cpp can include them directly; CMake regens them
-# whenever the .asdl changes.
+# source so the calc frontend can include them directly; CMake regens
+# them whenever the .asdl changes.
 set(CALC_IR_JSON ${CMAKE_CURRENT_BINARY_DIR}/calc_ir.json)
 set(CALC_IR_HEADER ${CMAKE_CURRENT_SOURCE_DIR}/example/frontend/CalcIR.h)
 add_custom_command(
@@ -242,7 +242,8 @@ endif()
 
 # Shared include flags: the substrate (calc_backend.h), the bbq_ctx
 # cursor (bbq_runtime.h), the generated VM headers, the JIT runtime,
-# the calc frontend (calc_runner.h / calc_lower.h / CalcIR.h).
+# the calc frontend (calc_runner.h / CalcIR.h) and the VM host
+# (calc_vm_host.h / calc_host.h / calc_jit_driver.h).
 set(CALC_VM_INCS
     -I${CALC_VM_DIR}
     -I${CMAKE_CURRENT_SOURCE_DIR}/example
@@ -317,6 +318,26 @@ add_custom_command(
     VERBATIM
 )
 
+# The VM host — the embedder's side of opgen's seam (the dispatcher and the trap
+# sink gen_interp.c tail-calls), the reset, and both tier drivers. Compiled as C
+# because opgen's calc_jit_symbols.h takes `(void*)ceil`, which C++ reads as an
+# unresolved overload set; linking it is what lets the C++ e2e leg reach the JIT
+# at all. Every test links this, so the seam is written once instead of copied
+# into each of them — which is how the two copies had come to differ.
+set(CALC_VM_HOST_O ${CALC_VM_DIR}/calc_vm_host.o)
+add_custom_command(
+    OUTPUT ${CALC_VM_HOST_O}
+    COMMAND ${CLANG_C_COMPILER} -std=c11 -O2 ${CALC_VM_INCS}
+            -c ${CMAKE_CURRENT_SOURCE_DIR}/example/calc_vm_host.c -o ${CALC_VM_HOST_O}
+    DEPENDS ${CALC_VM_GEN} ${CALC_VM_RUNTIME_HDRS} ${CALC_VM_STENCIL_TABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/example/calc_vm_host.c
+            ${CMAKE_CURRENT_SOURCE_DIR}/example/calc_vm_host.h
+            ${CMAKE_CURRENT_SOURCE_DIR}/example/calc_host.h
+            ${CMAKE_CURRENT_SOURCE_DIR}/example/calc_jit_driver.h
+    COMMENT "clang: calc VM host (opgen seam + both tiers)"
+    VERBATIM
+)
+
 # Tier 0 e2e — real parsed programs (calc_compile) → cg_jump lowering
 # → the generated interpreter.
 set(CALC_VM_E2E ${CALC_VM_DIR}/calc_vm_e2e)
@@ -325,10 +346,11 @@ add_custom_command(
     COMMAND ${CLANG_CXX_COMPILER} -std=c++17 -DCALC_EQSAT ${CALC_VM_INCS}
             ${CMAKE_CURRENT_SOURCE_DIR}/example/test/calc_e2e_test.cpp
             $<TARGET_FILE:calc_runner> ${CALC_INTERP_O}
-            ${CALC_OPTAB_O} -lm -o ${CALC_VM_E2E}
+            ${CALC_OPTAB_O} ${CALC_VM_HOST_O} -lm -o ${CALC_VM_E2E}
     DEPENDS ${CALC_INTERP_O} ${CALC_OPTAB_O} calc_runner ${CALC_REWRITE_H} ${CALC_VM_RUNTIME_HDRS}
+            ${CALC_VM_HOST_O}
             ${CMAKE_CURRENT_SOURCE_DIR}/example/test/calc_e2e_test.cpp
-    COMMENT "clang: calc VM e2e (parse -> ddcg -> IR -> bytecode -> interp)"
+    COMMENT "clang: calc VM e2e (parse -> ddcg -> IR -> bytecode -> interp AND jit)"
     VERBATIM
 )
 add_custom_target(calc_vm_e2e_build ALL DEPENDS ${CALC_VM_E2E})
@@ -345,9 +367,10 @@ add_custom_command(
             ${CMAKE_CURRENT_SOURCE_DIR}/example/test/calc_e2e_test.cpp
             ${CMAKE_CURRENT_SOURCE_DIR}/example/calc_runner.cpp
             ${CMAKE_CURRENT_SOURCE_DIR}/example/frontend/Parser.cpp
-            ${CALC_INTERP_O} ${CALC_OPTAB_O} -lm
+            ${CALC_INTERP_O} ${CALC_OPTAB_O} ${CALC_VM_HOST_O} -lm
             -o ${CALC_VM_E2E_NOREWRITE}
     DEPENDS ${CALC_INTERP_O} ${CALC_OPTAB_O} calc_runner ${CALC_REWRITE_H} ${CALC_VM_RUNTIME_HDRS}
+            ${CALC_VM_HOST_O}
             ${CMAKE_CURRENT_SOURCE_DIR}/example/test/calc_e2e_test.cpp
             ${CMAKE_CURRENT_SOURCE_DIR}/example/calc_runner.cpp
     COMMENT "clang: calc e2e with the rewrite pass compiled out (falsifier)"
@@ -362,8 +385,8 @@ add_custom_command(
     OUTPUT ${CALC_VM_JIT}
     COMMAND ${CLANG_C_COMPILER} -std=c11 -O2 ${CALC_VM_INCS}
             ${CMAKE_CURRENT_SOURCE_DIR}/example/test/calc_vm_test.c
-            ${CALC_INTERP_O} -lm -o ${CALC_VM_JIT}
-    DEPENDS ${CALC_INTERP_O} ${CALC_VM_STENCIL_TABLE}
+            ${CALC_INTERP_O} ${CALC_VM_HOST_O} -lm -o ${CALC_VM_JIT}
+    DEPENDS ${CALC_INTERP_O} ${CALC_VM_STENCIL_TABLE} ${CALC_VM_HOST_O}
             ${CMAKE_CURRENT_SOURCE_DIR}/example/test/calc_vm_test.c
     COMMENT "clang: calc VM interp==JIT harness"
     VERBATIM

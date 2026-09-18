@@ -7,220 +7,17 @@
  *   tier 1 — jit_run        (javelina's jit_driver.c, stripped to the calc)
  * interp == JIT by construction: both run the same generated opcode bodies.
  */
-#include "gen_interp.h"            /* dispatch-table accessor + runtime_api.h (vm_t, slot_t) */
 #include "opcodes.h"               /* OP_* */
-#include "bbq_runtime.h"           /* bbq_ctx_t + bbq_read_* */
-#include "calc_stencil_table.h"    /* jitterator: stencil_table[], STENCIL_*, StencilDef, PatchEntry */
-#include "calc_jit_meta.h"         /* opgen: calc_jit_meta[256], jit_operand_kind_t */
-#include "calc_jit_symbols.h"      /* opgen: _HOLE_<native> -> address */
-#include "jit_codebuf.h"           /* jitterator's executable code buffer */
+#include "calc_vm_host.h"          /* both tiers, linked from calc_vm_host.c */
 #include "calc_natives.h"          /* calc_br / calc_call / calc_ret (shared, both tiers) */
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdint.h>
 
-#define TAIL __attribute__((musttail))
-
-/* ── Tier 0: the threaded interpreter. ── */
-static const opcode_handler_t* g_table;
-void calc_next(vm_t* vm) {
-    u1 op;
-    if (!bbq_read_u8(&vm->frame.code, &op)) return;
-    TAIL return g_table[op](vm);
-}
-void calc_trap(vm_t* vm) { vm->trapped = 1; }
-
-/* The side table a br_table program branches through. opgen emitted the entry TYPE and
- * the walk over it; a real consumer's validator fills the entries. The tests below build
- * them by hand, which is the same role played by hand-written bytecode elsewhere here. */
-static const opgen_st_entry_t* g_sidetable = NULL;
-
-static void reset_vm(vm_t* vm, const u1* code, size_t len) {
-    bbq_ctx_init(&vm->frame.code, code, len);
-    vm->frame.sp = 0; vm->depth = 0; vm->trapped = 0;
-    vm->result.i = 0; vm->result_type = T_INT;
-    vm->frame.sidetable = g_sidetable; vm->frame.stp = 0;
-    memset(vm->mem, 0, sizeof vm->mem);
-    vm->cell.l = 0; vm->cell_type = T_VOID; vm->acc = 0;
-}
-
-static s4 interp_run(vm_t* vm, const u1* code, size_t len) {
-    g_table = gen_interp_dispatch_table();
-    reset_vm(vm, code, len);
-    calc_next(vm);
-    return vm->result.i;
-}
-
-/* ── Tier 1: the copy-and-patch JIT driver (ported from javelina jit_driver.c). ── */
-typedef struct { size_t patch_addr; uint64_t value; size_t foff; } data_hole_t;
-
-static size_t emit_stencil(jit_codebuf_t* buf, const StencilDef* s,
-                           const uint64_t* vals, data_hole_t* recs, int* nrec) {
-    size_t base = buf->size;
-    jcb_emit(buf, s->code, s->code_size);
-    for (uint32_t i = 0; i < s->patch_count; i++) {
-        const PatchEntry* p = &s->patches[i];
-        size_t pa = base + p->offset;
-        switch (p->type) {
-        case PATCH_REL_BRANCH: {
-            uint64_t t = vals ? vals[p->hole_index] : 0;
-            /* rel32 reaches +-2 GB. Every branch hole here targets another stencil
-             * in this same buffer, so it always does — the check is what keeps
-             * that true if a stencil ever tail-calls a native instead. */
-            if (t) jcb_patch_rel32(buf, pa, t);
-            break;
-        }
-        case PATCH_REL_DATA:
-            recs[*nrec].patch_addr = pa; recs[*nrec].value = vals ? vals[p->hole_index] : 0; (*nrec)++; break;
-        case PATCH_ABS64:  jcb_patch64(buf, pa, vals ? vals[p->hole_index] : 0); break;
-        case PATCH_ABS32S: jcb_patch32(buf, pa, (int32_t)(vals ? vals[p->hole_index] : 0)); break;
-        }
-    }
-    return base;
-}
-
-static void backpatch(jit_codebuf_t* buf, size_t base, const StencilDef* s, int hi, uint64_t t) {
-    for (uint32_t i = 0; i < s->patch_count; i++) {
-        const PatchEntry* p = &s->patches[i];
-        if ((int)p->hole_index != hi || p->type != PATCH_REL_BRANCH) continue;
-        jcb_patch_rel32(buf, base + p->offset, t);
-    }
-}
-
-static int find_hole(const StencilDef* d, const char* n) {
-    for (int i = 0; i < d->hole_count; i++) if (!strcmp(d->hole_names[i], n)) return i;
-    return -1;
-}
-static void* jit_sym(const char* n) {
-    for (int i = 0; i < calc_jit_symbols_count; i++) if (!strcmp(calc_jit_symbols[i].name, n)) return calc_jit_symbols[i].addr;
-    return NULL;
-}
-static void fill_native_holes(const StencilDef* d, uint64_t* v) {
-    for (int i = 0; i < d->hole_count; i++) { void* a = jit_sym(d->hole_names[i]); if (a) v[i] = (uint64_t)(uintptr_t)a; }
-}
-static uint64_t decode_operand(bbq_ctx_t* c, jit_operand_kind_t k) {
-    switch (k) {
-    case JOP_SLEB32: { int32_t v = 0; bbq_read_sleb128_i32(c, &v); return (uint64_t)(uint32_t)v; }
-    case JOP_SLEB64: { int64_t v = 0; bbq_read_sleb128_i64(c, &v); return (uint64_t)v; }
-    case JOP_ULEB32: { uint32_t v = 0; bbq_read_uleb128_u32(c, &v); return v; }
-    case JOP_ULEB64: { uint64_t v = 0; bbq_read_uleb128_u64(c, &v); return v; }
-    case JOP_U8:     { uint8_t v = 0; bbq_read_u8(c, &v); return v; }
-    /* The stencil's hole is the double's BIT PATTERN, so read the bits, not the value. */
-    case JOP_F64:    { double v = 0; uint64_t b; bbq_read_f64le(c, &v); memcpy(&b, &v, 8); return b; }
-    /* br_table's vec(labelidx) LENGTH. Reading it is what lets the tail walk below
-     * skip the right number of labels, and the stencil bakes it as a hole because the
-     * body clamps the key against it. */
-    case JOP_BRTABLE_COUNT: { uint32_t v = 0; bbq_read_uleb128_u32(c, &v); return v; }
-    default: return 0;
-    }
-}
-
-/* A variable-length trailing immediate: the op's meta says what kind, the walk skips it
- * so the NEXT stencil is placed at the right source offset. br_table's count has already
- * been consumed as a fixed operand, so only the count+1 labels remain. */
-static void skip_tail(bbq_ctx_t* c, jit_tail_kind_t k, uint64_t brtable_count) {
-    if (k != JTAIL_BRTABLE) return;
-    for (uint64_t i = 0; i <= brtable_count; i++) { uint32_t l = 0; bbq_read_uleb128_u32(c, &l); }
-}
-
-typedef void* jit_addr_t;
-typedef struct { jit_codebuf_t buf; size_t entry_off; jit_addr_t* offmap; } jit_func_t;
-
-static jit_func_t* jit_compile(bbq_ctx_t code) {
-    jit_func_t* fn = malloc(sizeof *fn);
-    jit_codebuf_t buf; jcb_init(&buf, 4096);
-    size_t code_len = code.length, cap = code_len + 2;
-    size_t* offs = malloc(cap * sizeof *offs);
-    int*    sids = malloc(cap * sizeof *sids);
-    size_t* boffs = malloc(cap * sizeof *boffs);
-    jit_addr_t* offmap = calloc(code_len + 1, sizeof *offmap);
-    data_hole_t* recs = malloc((cap + 4) * 8 * sizeof *recs);
-    int nrec = 0; size_t n = 0;
-
-    size_t entry_off = emit_stencil(&buf, &stencil_table[STENCIL_ENTRY], NULL, recs, &nrec);
-    const StencilDef* rd = &stencil_table[STENCIL_RESYNC];
-    uint64_t rvals[16] = {0}; int rh;
-    if ((rh = find_hole(rd, "_HOLE_offmap"))  >= 0) rvals[rh] = (uint64_t)(uintptr_t)offmap;
-    if ((rh = find_hole(rd, "_HOLE_codelen")) >= 0) rvals[rh] = code_len;
-    size_t resync_off = emit_stencil(&buf, rd, rvals, recs, &nrec);
-    size_t trap_off   = emit_stencil(&buf, &stencil_table[STENCIL_TRAP], NULL, recs, &nrec);
-
-    bbq_ctx_t cur = code;
-    for (;;) {
-        size_t bpos = cur.pos;
-        uint8_t op;
-        if (!bbq_read_u8(&cur, &op)) {
-            boffs[n] = bpos;
-            offs[n] = emit_stencil(&buf, &stencil_table[STENCIL_GEN_ST_HALT], NULL, recs, &nrec);
-            sids[n] = STENCIL_GEN_ST_HALT; n++;
-            break;
-        }
-        calc_jit_meta_t m = calc_jit_meta[op];
-        const StencilDef* def = &stencil_table[m.stencil];
-        uint64_t vals[16] = {0};
-        uint64_t brtable_count = 0;
-        fill_native_holes(def, vals);
-        for (int k = 0; k < m.operand_count; k++) {
-            uint64_t imm = (m.operands[k].kind == JOP_CONST) ? m.operands[k].value
-                                                            : decode_operand(&cur, m.operands[k].kind);
-            if (m.operands[k].kind == JOP_BRTABLE_COUNT) brtable_count = imm;
-            int h = find_hole(def, m.operands[k].hole);
-            if (h >= 0) vals[h] = imm;
-        }
-        skip_tail(&cur, (jit_tail_kind_t)m.tail, brtable_count);
-        int hip = find_hole(def, "_HOLE_ip");
-        if (hip >= 0) vals[hip] = cur.pos;
-        boffs[n] = bpos;
-        offs[n] = emit_stencil(&buf, def, vals, recs, &nrec);
-        sids[n] = m.stencil; n++;
-    }
-
-    /* Shared footer pool for the rip-relative data loads (operands, consts). */
-    for (int i = 0; i < nrec; i++) {
-        size_t foff = (size_t)-1;
-        for (int j = 0; j < i; j++) if (recs[j].value == recs[i].value) { foff = recs[j].foff; break; }
-        if (foff == (size_t)-1) { foff = buf.size; jcb_emit(&buf, (const uint8_t*)&recs[i].value, 8); }
-        recs[i].foff = foff;
-    }
-    for (int i = 0; i < nrec; i++)
-        jcb_patch32(&buf, recs[i].patch_addr, (int32_t)((long)recs[i].foff - (long)(recs[i].patch_addr + 4)));
-
-    /* Linear fall-through chain + control -> the one resync; guards -> trap. */
-    uint8_t* base = buf.base;
-    const StencilDef* ed = &stencil_table[STENCIL_ENTRY];
-    backpatch(&buf, entry_off, ed, find_hole(ed, "_HOLE_cont"), (uint64_t)(base + offs[0]));
-    for (size_t i = 0; i < n; i++) {
-        const StencilDef* d = &stencil_table[sids[i]];
-        if (i + 1 < n) { int hc = find_hole(d, "_HOLE_cont"); if (hc >= 0) backpatch(&buf, offs[i], d, hc, (uint64_t)(base + offs[i + 1])); }
-        int hr = find_hole(d, "_HOLE_resync"); if (hr >= 0) backpatch(&buf, offs[i], d, hr, (uint64_t)(base + resync_off));
-        int ht = find_hole(d, "_HOLE_trap");   if (ht >= 0) backpatch(&buf, offs[i], d, ht, (uint64_t)(base + trap_off));
-    }
-
-    void* exec = jcb_finalize(&buf);
-    /* Null means something did not fit — a short emit, or a branch out of rel32
-     * range. Running the buffer anyway is running code that was never stamped. */
-    if (!exec) { fprintf(stderr, "jit: code buffer did not come out whole\n"); abort(); }
-    for (size_t i = 0; i < n; i++) if (boffs[i] <= code_len) offmap[boffs[i]] = (jit_addr_t)((uint8_t*)exec + offs[i]);
-    offmap[code_len] = (jit_addr_t)((uint8_t*)exec + offs[n - 1]);   /* halt stamped last */
-
-    free(offs); free(sids); free(boffs); free(recs);
-    fn->buf = buf; fn->entry_off = entry_off; fn->offmap = offmap;
-    return fn;
-}
-
-static void jit_enter(const jit_func_t* fn, vm_t* vm) {
-    ((void (*)(vm_t*))((uint8_t*)fn->buf.base + fn->entry_off))(vm);
-}
-static void jit_free(jit_func_t* fn) { jcb_free(&fn->buf); free(fn->offmap); free(fn); }
-
-static s4 jit_run(vm_t* vm, const u1* code, size_t len) {
-    reset_vm(vm, code, len);
-    jit_func_t* fn = jit_compile(vm->frame.code);
-    jit_enter(fn, vm);
-    jit_free(fn);
-    return vm->result.i;
-}
+/* Short names for the two tiers, since every case below names them once each. */
+#define interp_run   calc_run_interp
+#define jit_run      calc_run_jit
 
 /* ── A tiny program builder. ──
  *
@@ -516,13 +313,13 @@ int main(void) {
             { 3, 0, 0, 0 },   /* case 1    -> 10 */
             { 6, 0, 0, 0 },   /* default   -> 13 */
         };
-        g_sidetable = tbl;
+        calc_set_sidetable(tbl);
         u1 c[] = {0x01,0x00, 0x28,0x02,0x00,0x01,0x02,
                   0x01,0x0A,0x10, 0x01,0x14,0x10, 0x01,0x1E,0x10};
         c[1] = 0; check("br_table key 0", c, sizeof c, 10);
         c[1] = 1; check("br_table key 1", c, sizeof c, 20);
         c[1] = 7; check("br_table key clamps to default", c, sizeof c, 30);
-        g_sidetable = NULL;
+        calc_set_sidetable(NULL);
     }
 
     /* The entry's vals/pop half: a taken branch keeps the top `vals` operands and drops
@@ -530,13 +327,13 @@ int main(void) {
      * 11 + 33; without the drop it would see 22 + 33. */
     {
         static const opgen_st_entry_t tbl[] = { { 0, 0, 1, 1 } };
-        g_sidetable = tbl;
+        calc_set_sidetable(tbl);
         /*  0: const 11  2: const 22  4: const 33  6: const 0(key)
          *  8: br_table cnt=0 [0]     11: add      12: ret */
         static const u1 c[] = {0x01,0x0B, 0x01,0x16, 0x01,0x21, 0x01,0x00,
                                0x28,0x00,0x00, 0x02, 0x10};
         check("br_table entry keeps vals, drops pop", c, sizeof c, 44);
-        g_sidetable = NULL;
+        calc_set_sidetable(NULL);
     }
 
     /* ═══ Running off the end of a function ════════════════════════════════════

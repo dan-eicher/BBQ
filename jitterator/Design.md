@@ -289,8 +289,16 @@ reference the same hole (e.g., the same constant used twice).
   in the `.o` file becomes a stencil. The symbol name becomes the enum
   name (uppercased). Static helpers (STB_LOCAL) are ignored.
 - **Holes**: any relocation in a stencil's code range whose target symbol
-  starts with `_HOLE_`. Other relocations (to libc, to static helpers)
-  are left as-is — they're internal to the stencil.
+  starts with `_HOLE_`. A relocation against anything else is an ERROR, not
+  something left as-is: it is a compiler-invented constant (a float literal in
+  `.rodata`, say) reached RIP-relatively, and that reference dangles the moment
+  the code is copied somewhere else. jitterator names the op and stops.
+- **Relocation types**: `PC32`, `PLT32`, `64` and `32S`, and no others. A
+  GOT-relative type needs a GOT the copied code does not have; a 64-bit
+  PC-relative one does not fit the 32-bit field. Build stencils with
+  `-fno-pic -mcmodel=small`.
+- **Bodies**: a symbol with size 0, or one whose range runs past `.text`, is an
+  error — a stencil that stamps nothing is a JIT that runs off its buffer.
 - **Stencil boundaries**: determined by symbol addresses and sizes from
   the ELF symbol table.
 

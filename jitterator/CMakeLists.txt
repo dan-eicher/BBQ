@@ -33,6 +33,23 @@ target_include_directories(jitterator PRIVATE
     ${CMAKE_SOURCE_DIR}/backends/cpp/runtime     # bbq_node.h + the index runtime
 )
 
+# --- jitterator's own tests ---
+# The extractor reads object files, so its tests build real ones with clang and run
+# the real binary: what is under test is exactly how clang's output is read. Until
+# these existed it was covered only through the calc VM end to end — one object,
+# built one way, with two relocation types in it.
+find_program(CLANG_FOR_TESTS NAMES clang)
+if(CLANG_FOR_TESTS)
+    add_executable(jitterator_tests test/jitterator_test.cpp)
+    target_link_libraries(jitterator_tests PRIVATE GTest::GTest GTest::Main)
+    target_compile_definitions(jitterator_tests PRIVATE
+        JITTERATOR_BIN="$<TARGET_FILE:jitterator>"
+        CLANG_C="${CLANG_FOR_TESTS}")
+    add_dependencies(jitterator_tests jitterator)
+    add_test(NAME jitterator_tests COMMAND jitterator_tests)
+    set_tests_properties(jitterator_tests PROPERTIES TIMEOUT 300)
+endif()
+
 # --- Calculator (full toolchain demo: pegc + asdl + ddcg + burgc + opgen) ---
 # The calc lowers parsed programs through pegc → ddcg → CPS/ANF IR →
 # burgc (cg_jump) → opgen-generated two-tier VM. clang is needed for the
@@ -278,7 +295,13 @@ add_custom_command(
 set(CALC_VM_STENCILS_O ${CALC_VM_DIR}/calc_stencils.o)
 add_custom_command(
     OUTPUT ${CALC_VM_STENCILS_O}
+    # -fno-pic -mcmodel=small is not a preference, it is the stencil contract: PIC
+    # turns `&_HOLE_x` into a GOT-relative load, and a copied stencil has no GOT;
+    # the large model turns it into a 64-bit PC-relative field the patcher cannot
+    # write. jitterator refuses either, so this says it rather than relying on the
+    # toolchain's default (many distributions default to PIE).
     COMMAND ${CLANG_C_COMPILER} -std=c11 -O2 -fno-stack-protector
+            -fno-pic -mcmodel=small
             -fno-asynchronous-unwind-tables ${CALC_VM_INCS}
             -c ${CALC_VM_DIR}/calc_stencils.c -o ${CALC_VM_STENCILS_O}
     DEPENDS ${CALC_VM_GEN} ${CALC_VM_RUNTIME_HDRS}

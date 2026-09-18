@@ -65,7 +65,10 @@ static size_t emit_stencil(jit_codebuf_t* buf, const StencilDef* s,
         switch (p->type) {
         case PATCH_REL_BRANCH: {
             uint64_t t = vals ? vals[p->hole_index] : 0;
-            if (t) { uintptr_t a = (uintptr_t)buf->base + pa; jcb_patch32(buf, pa, (int32_t)(t - (a + 4))); }
+            /* rel32 reaches +-2 GB. Every branch hole here targets another stencil
+             * in this same buffer, so it always does — the check is what keeps
+             * that true if a stencil ever tail-calls a native instead. */
+            if (t) jcb_patch_rel32(buf, pa, t);
             break;
         }
         case PATCH_REL_DATA:
@@ -81,9 +84,7 @@ static void backpatch(jit_codebuf_t* buf, size_t base, const StencilDef* s, int 
     for (uint32_t i = 0; i < s->patch_count; i++) {
         const PatchEntry* p = &s->patches[i];
         if ((int)p->hole_index != hi || p->type != PATCH_REL_BRANCH) continue;
-        size_t pa = base + p->offset;
-        uintptr_t a = (uintptr_t)buf->base + pa;
-        jcb_patch32(buf, pa, (int32_t)(t - (a + 4)));
+        jcb_patch_rel32(buf, base + p->offset, t);
     }
 }
 
@@ -197,6 +198,9 @@ static jit_func_t* jit_compile(bbq_ctx_t code) {
     }
 
     void* exec = jcb_finalize(&buf);
+    /* Null means something did not fit — a short emit, or a branch out of rel32
+     * range. Running the buffer anyway is running code that was never stamped. */
+    if (!exec) { fprintf(stderr, "jit: code buffer did not come out whole\n"); abort(); }
     for (size_t i = 0; i < n; i++) if (boffs[i] <= code_len) offmap[boffs[i]] = (jit_addr_t)((uint8_t*)exec + offs[i]);
     offmap[code_len] = (jit_addr_t)((uint8_t*)exec + offs[n - 1]);   /* halt stamped last */
 

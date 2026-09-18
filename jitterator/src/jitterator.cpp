@@ -221,13 +221,35 @@ static ElfInfo parse_elf(const uint8_t* data, size_t size) {
 
 // ── Stencil extraction ─────────────────────────────────────────
 
-static PatchType reloc_to_patch_type(uint32_t r_type) {
+// The four relocations a stencil may carry, and nothing else. Anything else is
+// not a variation on these — a GOT-relative load goes THROUGH the GOT, and a
+// 64-bit PC-relative one is eight bytes where the patcher writes four — so
+// treating an unknown type as the nearest familiar one emits a stencil that is
+// silently wrong. `-fPIE`, a default on many distributions, is enough to produce
+// one. Returns false for a type with no patch.
+static bool reloc_to_patch_type(uint32_t r_type, PatchType* out) {
     switch (r_type) {
-    case R_X86_64_64:    return PATCH_ABS64;
-    case R_X86_64_32S:   return PATCH_ABS32S;
-    case R_X86_64_PLT32: return PATCH_REL_BRANCH;  // jmp/call targets
-    case R_X86_64_PC32:  return PATCH_REL_DATA;     // RIP-relative data loads
-    default:             return PATCH_REL_DATA;
+    case R_X86_64_64:    *out = PATCH_ABS64;      return true;
+    case R_X86_64_32S:   *out = PATCH_ABS32S;     return true;
+    case R_X86_64_PLT32: *out = PATCH_REL_BRANCH; return true;  // jmp/call targets
+    case R_X86_64_PC32:  *out = PATCH_REL_DATA;   return true;  // RIP-relative data loads
+    default:                                      return false;
+    }
+}
+
+// Names for the ones worth naming in a diagnostic — the rest print as a number.
+static const char* reloc_type_name(uint32_t t) {
+    switch (t) {
+    case 2:  return "R_X86_64_PC32";
+    case 4:  return "R_X86_64_PLT32";
+    case 1:  return "R_X86_64_64";
+    case 11: return "R_X86_64_32S";
+    case 9:  return "R_X86_64_GOTPCREL";
+    case 41: return "R_X86_64_GOTPCRELX";
+    case 42: return "R_X86_64_REX_GOTPCRELX";
+    case 24: return "R_X86_64_PC64";
+    case 10: return "R_X86_64_32";
+    default: return nullptr;
     }
 }
 
@@ -246,14 +268,32 @@ static std::vector<Stencil> extract_stencils(const uint8_t* data, const ElfInfo&
     const uint8_t* text = data + info.text_offset;
     bool had_unnamed = false;
 
+    bool had_bad_reloc = false;
+    bool had_bad_body = false;
+
     for (auto& si : info.stencils) {
         Stencil s;
         s.name = si.name;
 
-        // Copy code bytes
-        if (si.offset + si.size <= info.text_size) {
-            s.code.assign(text + si.offset, text + si.offset + si.size);
+        // A stencil IS its code. A symbol with no size, or one whose range runs off
+        // the end of .text, yields none — and a stencil that stamps nothing is a
+        // JIT that falls off the end of its buffer at run time, which is a much
+        // worse place to find out than here.
+        if (si.size == 0) {
+            fprintf(stderr, "jitterator: stencil '%s': symbol has size 0 — nothing "
+                            "to copy. A stencil needs a body.\n", si.name.c_str());
+            had_bad_body = true;
+            continue;
         }
+        if (si.offset + si.size > info.text_size) {
+            fprintf(stderr, "jitterator: stencil '%s': [%llu, %llu) runs past .text "
+                            "(%zu bytes) — the object is malformed.\n",
+                    si.name.c_str(), (unsigned long long)si.offset,
+                    (unsigned long long)(si.offset + si.size), info.text_size);
+            had_bad_body = true;
+            continue;
+        }
+        s.code.assign(text + si.offset, text + si.offset + si.size);
 
         // Find relocations within this stencil's range that target _HOLE_ symbols
         for (auto& rela : info.text_relas) {
@@ -287,9 +327,26 @@ static std::vector<Stencil> extract_stencils(const uint8_t* data, const ElfInfo&
                 s.hole_names.push_back(rela.sym_name);
             }
 
+            PatchType pt;
+            if (!reloc_to_patch_type(rela.type, &pt)) {
+                const char* tn = reloc_type_name(rela.type);
+                char num[32];
+                if (!tn) { snprintf(num, sizeof num, "type %u", rela.type); tn = num; }
+                fprintf(stderr,
+                    "jitterator: stencil '%s': hole '%s' at offset %u carries %s, "
+                    "which is not a patch this emits. A GOT-relative hole needs a "
+                    "GOT that a copied stencil does not have; a 64-bit PC-relative "
+                    "one does not fit the 32-bit field. Build the stencils with "
+                    "-fno-pic -mcmodel=small.\n",
+                    si.name.c_str(), rela.sym_name.c_str(),
+                    (unsigned)(rela.offset - si.offset), tn);
+                had_bad_reloc = true;
+                continue;
+            }
+
             PatchInfo p;
             p.offset = static_cast<uint32_t>(rela.offset - si.offset);
-            p.type = reloc_to_patch_type(rela.type);
+            p.type = pt;
             p.hole_index = hole_idx;
             s.patches.push_back(p);
         }
@@ -310,9 +367,9 @@ static std::vector<Stencil> extract_stencils(const uint8_t* data, const ElfInfo&
         stencils.push_back(std::move(s));
     }
 
-    if (had_unnamed) {
-        fprintf(stderr, "jitterator: aborting — one or more stencils reference "
-                        "non-_HOLE_ symbols (see above).\n");
+    if (had_unnamed || had_bad_reloc || had_bad_body) {
+        fprintf(stderr, "jitterator: aborting — the object does not describe stencils "
+                        "that can be copy-and-patched (see above).\n");
         exit(1);
     }
     return stencils;

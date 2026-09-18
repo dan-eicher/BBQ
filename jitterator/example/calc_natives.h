@@ -99,15 +99,19 @@ s4 calc_is_bad(vm_t* vm, heap_t* h, f8 x) { (void)vm; (void)h; return x == 13.0;
 
 /* ── The runtime-typed carrier ────────────────────────────────────────────────
  *
- * calc_vpush builds a v128 slot from two 64-bit halves; box/unbox move it through
+ * calc_vmake builds a v128 slot from two 64-bit halves; box/unbox move it through
  * any_t, which is where the high half used to be dropped; calc_vlane reads a lane back
- * out of the carrier. Together they are the round trip a v128 struct field takes. */
-void calc_vpush(vm_t* vm, heap_t* h, s8 lo, s8 hi) {
-    (void)h;
-    frame_t* f = &vm->frame;
-    f->stack[f->sp].v.i64[0] = lo;
-    f->stack[f->sp].v.i64[1] = hi;
-    JV_NPUSH(f, f->stack[f->sp], T_V128);
+ * out of the carrier. Together they are the round trip a v128 struct field takes.
+ *
+ * It RETURNS the value; opgen pushes it, because `vmake`'s result is declared. A
+ * native that pushed for itself would be moving the stack where the signature says
+ * nothing moves, and every consumer of that signature reads the signature. */
+v128_t calc_vmake(vm_t* vm, heap_t* h, s8 lo, s8 hi) {
+    (void)vm; (void)h;
+    v128_t r;
+    r.i64[0] = lo;
+    r.i64[1] = hi;
+    return r;
 }
 void calc_box(vm_t* vm, heap_t* h, any_t v) {
     (void)h;
@@ -128,18 +132,6 @@ s8 calc_vlane(vm_t* vm, heap_t* h, any_t v, s4 i) {
     return i == 0 ? v.bits : v.hi;
 }
 s4 calc_tag(vm_t* vm, heap_t* h, any_t v) { (void)vm; (void)h; return v.kind; }
-
-/* Push a 64-bit value under a CHOSEN tag: the shape a value reconstructed out of an
- * aggregate has, where the tag describes the container rather than the value's declared
- * width. Written through the i64 slot member, so the full 64 bits are present whatever
- * the tag claims — which is exactly the disagreement `addr(...)` exists to ignore. */
-void calc_push_tagged(vm_t* vm, heap_t* h, s8 v, s4 tag) {
-    (void)h;
-    frame_t* f = &vm->frame;
-    f->stack[f->sp].l = v;
-    f->stack_types[f->sp] = (u1)tag;
-    f->sp++;
-}
 
 /* ── Linear memory ────────────────────────────────────────────────────────────
  *

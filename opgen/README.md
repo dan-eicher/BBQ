@@ -73,6 +73,21 @@ ASDL-defined AST (`grammar/opgen.asdl`), and its emitters are C++.
   one the family was generated at will select a state whose stencil does not
   exist. Generate and tile with the same number.
 
+  An opcode gets NO cached variant when its body reaches the operand stack itself
+  — the `push`/`pop` intrinsics, or `sp`. A cache state is precisely the claim that
+  the top *k* values are not at `sp`, so such a body would read and write the wrong
+  slots in every state but 0, and its signature cannot warn about it because the
+  whole reason the intrinsics exist is to express an effect a signature cannot.
+  The rest of the family's admissions are a CONTRACT with a cover-driven consumer:
+  a cached `word` or `any` slot arrives untagged, and the class the tile resolved
+  is what the spill re-tags it from. A consumer without a tile — one reading these
+  tables directly and stamping what they name — must keep every slot whose class
+  the signature does not name outright in memory.
+
+  The spill/fill tables name a transition stencil only for a class this spec
+  declares a type row for, because that is what the emission walks. A spec with no
+  `f32` row has no `gen_st_spill_F32_*` to name.
+
 ## THE `.def` LANGUAGE
 
 A spec is an optional leading C-header block, a set of directives, the

@@ -104,43 +104,81 @@ void VmEmitter::emit_guards(SemLowerer& low, const Opcode* op) {
 
 // ── Name-occurrence + liveness ──────────────────────────────
 
-int VmEmitter::stmt_refs_name(const SemStmt* s, const char* name) {
+int VmEmitter::stmt_refs_name(const SemStmt* s, const char* name, int calls) {
     if (!s) return 0;
     switch (s->tag) {
     case SemStmtTag::SAssign: {
         auto* a = static_cast<const SAssign*>(s);
-        return SemLowerer::expr_refs_name(a->target, name) || SemLowerer::expr_refs_name(a->value, name);
+        return SemLowerer::expr_refs_name(a->target, name, calls) ||
+               SemLowerer::expr_refs_name(a->value, name, calls);
     }
-    case SemStmtTag::SExprStmt: return SemLowerer::expr_refs_name(static_cast<const SExprStmt*>(s)->value, name);
+    case SemStmtTag::SExprStmt: return SemLowerer::expr_refs_name(static_cast<const SExprStmt*>(s)->value, name, calls);
     case SemStmtTag::SLocalDecl: {
         auto* d = static_cast<const SLocalDecl*>(s);
-        return d->init.has_value() ? SemLowerer::expr_refs_name(*d->init, name) : 0;
+        return d->init.has_value() ? SemLowerer::expr_refs_name(*d->init, name, calls) : 0;
     }
     case SemStmtTag::SIf: {
         auto* sif = static_cast<const SIf*>(s);
-        return SemLowerer::expr_refs_name(sif->cond, name) || stmt_refs_name(sif->then_, name) ||
-               (sif->else_.has_value() && stmt_refs_name(*sif->else_, name));
+        return SemLowerer::expr_refs_name(sif->cond, name, calls) || stmt_refs_name(sif->then_, name, calls) ||
+               (sif->else_.has_value() && stmt_refs_name(*sif->else_, name, calls));
     }
     case SemStmtTag::SWhile: {
         auto* w = static_cast<const SWhile*>(s);
-        return SemLowerer::expr_refs_name(w->cond, name) || stmt_refs_name(w->body, name);
+        return SemLowerer::expr_refs_name(w->cond, name, calls) || stmt_refs_name(w->body, name, calls);
     }
     case SemStmtTag::SFor: {
         auto* f = static_cast<const SFor*>(s);
-        return (f->init.has_value() && stmt_refs_name(*f->init, name)) ||
-               (f->cond.has_value() && SemLowerer::expr_refs_name(*f->cond, name)) ||
-               (f->update.has_value() && stmt_refs_name(*f->update, name)) ||
-               stmt_refs_name(f->body, name);
+        return (f->init.has_value() && stmt_refs_name(*f->init, name, calls)) ||
+               (f->cond.has_value() && SemLowerer::expr_refs_name(*f->cond, name, calls)) ||
+               (f->update.has_value() && stmt_refs_name(*f->update, name, calls)) ||
+               stmt_refs_name(f->body, name, calls);
     }
     case SemStmtTag::SBlock: {
         for (auto* st : static_cast<const SBlock*>(s)->stmts)
-            if (stmt_refs_name(st, name)) return 1;
+            if (stmt_refs_name(st, name, calls)) return 1;
         return 0;
     }
     case SemStmtTag::STrap:    return 0;
     }
     return 0;
 }
+
+// Does the opcode's SEMANTICS — body and `error:` conditions alike — mention
+// this name? A guard reads the same operands the body does, so a question about
+// what an instruction touches has to ask both.
+bool VmEmitter::op_refs_name(const Opcode* op, const char* name, int calls) {
+    for (auto* s : op->sem_body)
+        if (stmt_refs_name(s, name, calls)) return true;
+    for (auto* e : op->errors)
+        if (e->condition.has_value() &&
+            SemLowerer::expr_refs_name(*e->condition, name, calls)) return true;
+    return false;
+}
+
+bool VmEmitter::class_emitted(SClass c) const {
+    for (auto* td : mod_->types) {
+        if (!cacheable(td->ty)) continue;
+        if (SigEmitter::classify_final(td->ty, "type row", "cache slot") == c) return true;
+    }
+    return false;
+}
+
+// A body that reaches the operand stack ITSELF, through the `push`/`pop`
+// intrinsics or `sp`. calc.def's `anyroll 0x2F ( -- ) (. push(pop()); .)` is the
+// shape, and its comment says why the intrinsics exist at all: "a signature
+// cannot express this op (it moves a slot without changing the stack height)".
+//
+// A cache state is precisely the claim that the top `state` values are NOT at
+// sp — they are in registers, and sp points below them. So a body that indexes
+// the stack itself reads and writes the wrong slots in every state but 0. The
+// signature cannot warn about it, by construction; the intrinsic is the
+// warning. javelina's br_on_null and its variadic constructors are the same
+// shape, which is why this is refused in the generator and not in one consumer.
+bool VmEmitter::stack_open(const Opcode* op) {
+    return op_refs_name(op, "push", 1) || op_refs_name(op, "pop", 1) ||
+           op_refs_name(op, "sp");
+}
+
 
 int VmEmitter::stack_in_live(const Opcode* op, int k) {
     const char* name = op->stack_in[k]->name;
@@ -424,6 +462,9 @@ int VmEmitter::result_slots(const Opcode* op) const {
 
 bool VmEmitter::results_cached(const Opcode* op, int state) const {
     if (state < 0 || op->stack_out.empty()) return false;
+    // A body that moves the stack itself has already been refused a cached state;
+    // it must not leave anything cached on the way out of state 0 either.
+    if (stack_open(op)) return false;
     int a = operand_slots(op);
     int left = state > a ? state - a : 0;
     if (left + result_slots(op) > tier2_n_) return false;
@@ -502,6 +543,9 @@ int VmEmitter::same_state_as(const Opcode* op, int state) const {
 // the variant table both ask, and a disagreement between them would have the
 // stitcher stamp a stencil that was never generated.
 bool VmEmitter::emits_variant(const Opcode* op, int state) const {
+    // The stack is where this body looks for its values, so the cache must be
+    // empty when it runs. State 0 is that, and it is the only one it has.
+    if (state > 0 && stack_open(op)) return false;
     int a = operand_slots(op);
     int left = state > a ? state - a : 0;
     // A state is a COUNT OF SLOTS cached from the top, and a value rides the
@@ -1441,15 +1485,15 @@ void VmEmitter::emit_jit_meta(FILE* o) {
     // state choices imply, and the stitcher stamps transitions against the same
     // numbers — and it is REPORTED BY THE EMISSION rather than recomputed from
     // the arity, because the arity cannot see a result that went to memory.
-    fprintf(o,
-        "/* The cache state after the variant above, or -1 where there is none.\n"
-        " * Not derivable from pop/push: a `word` result moves the stack exactly\n"
-        " * like an `i32` one and yet leaves nothing cached, having no class to\n"
-        " * cache AS. Read this; do not recompute it. */\n");
     // The memory-result placement, indexed the same way: the form that reads this
     // state's cached operands and pushes its result inline, or -1 where the state
     // has only one placement. At state 0 that form is the PLAIN stencil, which
     // the meta already names, so the row is -1 there too.
+    fprintf(o,
+        "/* The memory-result placement of the variant above: the form that reads\n"
+        " * this state's cached operands and pushes its result INLINE, or -1 where\n"
+        " * the state has only one placement. At state 0 that form is the plain\n"
+        " * stencil, which the meta already names, so the row is -1 there too. */\n");
     fprintf(o, "static const int %s_variant_m[][%s_TIER2_N + 1] = {\n",
             prefix_.c_str(), uprefix_.c_str());
     for (auto* op : mod_->opcodes) {
@@ -1466,6 +1510,11 @@ void VmEmitter::emit_jit_meta(FILE* o) {
     }
     fputs("};\n", o);
 
+    fprintf(o,
+        "/* The cache state after the variant above, or -1 where there is none.\n"
+        " * Not derivable from pop/push: a `word` result moves the stack exactly\n"
+        " * like an `i32` one and yet leaves nothing cached, having no class to\n"
+        " * cache AS. Read this; do not recompute it. */\n");
     fprintf(o, "static const int %s_variant_fs[][%s_TIER2_N + 1] = {\n",
             prefix_.c_str(), uprefix_.c_str());
     for (auto* op : mod_->opcodes) {
@@ -1554,8 +1603,12 @@ void VmEmitter::emit_jit_meta(FILE* o) {
                 const char* nm = sclass_stencil_name((SClass)c);
                 // A value STARTING at slot s needs its whole width to fit, so a
                 // two-slot class has no transition at the last slot — there is no
-                // half of a v128 to move.
-                if (!tier2_n_ || !nm || s + sclass_width((SClass)c) > tier2_n_) {
+                // half of a v128 to move. And a class the spec never declares has
+                // no transition at any slot: the emission above walks the declared
+                // type rows, so naming one here would name a stencil that is not
+                // there. The calc declares no f32 and this row said F32_0..3.
+                if (!tier2_n_ || !nm || !class_emitted((SClass)c) ||
+                    s + sclass_width((SClass)c) > tier2_n_) {
                     fputs(" -1,", o); continue;
                 }
                 fprintf(o, " STENCIL_GEN_ST_%s_%s_%d,", pass ? "FILL" : "SPILL", nm, s);

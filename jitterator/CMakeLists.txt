@@ -154,20 +154,43 @@ add_custom_command(
 # opcodes.h for its OP_* constants, so calc.def is the single declaration of
 # the opcode bytes — the rule actions and the VM cannot disagree.
 set(CALC_VM_DIR ${CMAKE_CURRENT_BINARY_DIR}/calc_vm)
+
+# Ertl's stack-cache size for the calc's JIT tier. opgen emits the variant family
+# for exactly this number and the driver tiles for it, so they cannot differ — a
+# driver tiling for a state whose stencil was never generated selects nothing.
+# Changing it regenerates the VM, which is why it is a cache variable rather than
+# something a test passes: `cmake -B build -DCALC_TIER2_N=0` builds the tier-1-only
+# engine, and the sweep test in example/test runs several sizes in one go.
+#
+# The calc is this repository's integration test, so the default is NOT 0: a
+# default of tier-1-only would mean the variant family, the spill/fill tables and
+# the tiling that uses them were generated and then never executed here.
+set(CALC_TIER2_N "4" CACHE STRING "calc JIT stack-cache size (0 = tier-1 only)")
+set(CALC_TIER2_STAMP ${CALC_VM_DIR}/tier2_n.stamp)
+add_custom_command(
+    OUTPUT ${CALC_TIER2_STAMP}
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${CALC_VM_DIR}
+    COMMAND ${CMAKE_COMMAND} -E echo ${CALC_TIER2_N} > ${CALC_TIER2_STAMP}
+    COMMENT "calc: stack-cache size ${CALC_TIER2_N}"
+    VERBATIM
+)
 set(CALC_VM_GEN
     ${CALC_VM_DIR}/gen_interp.c   ${CALC_VM_DIR}/gen_interp.h
     ${CALC_VM_DIR}/runtime_api.h  ${CALC_VM_DIR}/opcodes.h
     ${CALC_VM_DIR}/opcode_tables.c ${CALC_VM_DIR}/calc_stencils.c
     ${CALC_VM_DIR}/calc_jit_meta.h ${CALC_VM_DIR}/calc_jit_symbols.h
-    ${CALC_VM_DIR}/calc_valtype.h  ${CALC_VM_DIR}/calc_type_meta.h)
+    ${CALC_VM_DIR}/calc_valtype.h  ${CALC_VM_DIR}/calc_type_meta.h
+    ${CALC_VM_DIR}/calc_sigtab.h)
 add_custom_command(
     OUTPUT ${CALC_VM_GEN}
     COMMAND ${CMAKE_COMMAND} -E make_directory ${CALC_VM_DIR}
-    COMMAND opgen -i ${CMAKE_CURRENT_SOURCE_DIR}/example/grammar/calc.def -prefix calc -o ${CALC_VM_DIR}
+    COMMAND opgen -i ${CMAKE_CURRENT_SOURCE_DIR}/example/grammar/calc.def -prefix calc
+                  -tier2 ${CALC_TIER2_N} -o ${CALC_VM_DIR}
     DEPENDS opgen
             ${CMAKE_CURRENT_SOURCE_DIR}/example/grammar/calc.def
             ${CMAKE_CURRENT_SOURCE_DIR}/example/calc_backend.h
-    COMMENT "opgen: calc.def -> two-tier calc VM"
+            ${CALC_TIER2_STAMP}
+    COMMENT "opgen: calc.def -> two-tier calc VM (stack cache ${CALC_TIER2_N})"
     VERBATIM
 )
 
@@ -393,3 +416,30 @@ add_custom_command(
 )
 add_custom_target(calc_vm_jit_build ALL DEPENDS ${CALC_VM_JIT})
 add_test(NAME calc_vm_jit COMMAND ${CALC_VM_JIT})
+
+# Tier 2 — the stack cache. The two harnesses above compare the tiers' ANSWERS,
+# which is exactly what a cache does not change, so neither can tell a tiled run
+# from one that quietly fell back to state 0. This one asks about the tiling: the
+# published tables, the driver's state contract, every program at every cache
+# depth, and the counts that say the cache was used at all.
+#
+# It compiles calc_vm_host.c's includes itself instead of linking the object,
+# because the cache, the state walk and the statistics are file-scope to whichever
+# translation unit includes calc_jit_driver.h — a test that linked the object
+# would be inspecting its own second copy of them.
+set(CALC_VM_TIER2 ${CALC_VM_DIR}/calc_vm_tier2)
+add_custom_command(
+    OUTPUT ${CALC_VM_TIER2}
+    COMMAND ${CLANG_C_COMPILER} -std=c11 -O2 ${CALC_VM_INCS}
+            ${CMAKE_CURRENT_SOURCE_DIR}/example/test/calc_tier2_test.c
+            ${CALC_INTERP_O} -lm -o ${CALC_VM_TIER2}
+    DEPENDS ${CALC_INTERP_O} ${CALC_VM_STENCIL_TABLE} ${CALC_VM_RUNTIME_HDRS}
+            ${CMAKE_CURRENT_SOURCE_DIR}/example/test/calc_tier2_test.c
+            ${CMAKE_CURRENT_SOURCE_DIR}/example/calc_host.h
+            ${CMAKE_CURRENT_SOURCE_DIR}/example/calc_jit_driver.h
+            ${CMAKE_CURRENT_SOURCE_DIR}/example/calc_natives.h
+    COMMENT "clang: calc tier-2 stack-cache harness"
+    VERBATIM
+)
+add_custom_target(calc_vm_tier2_build ALL DEPENDS ${CALC_VM_TIER2})
+add_test(NAME calc_vm_tier2 COMMAND ${CALC_VM_TIER2})

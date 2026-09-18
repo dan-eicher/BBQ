@@ -147,8 +147,29 @@ and it is worth knowing where before reaching for them again:
 - The **constant-pool indirection** for natives, described above, is what lets a
   stencil reach any address without the trampolines CPython needs.
 
-**The calc does not exercise any of that.** It invokes opgen without `-tier2`, so
-it generates 48 plain stencils and no variants at all — the variant family, the
-most intricate part of the JIT, is covered only by javelina, in another repository.
-Closing it means giving the calc's JIT driver the state tracking javelina's has:
-choosing a variant per point and emitting the transitions between states.
+**The calc exercises the variant family.** It invokes opgen at `-tier2 4`
+(`CALC_TIER2_N`, a cache variable: `cmake -B build -DCALC_TIER2_N=0` builds the
+tier-1-only engine and the same suite must pass), and `calc_jit_driver.h` tiles
+the bytecode by cache state — picking a variant per program point, spilling to
+reach a state a family carries, and holding two invariants:
+
+1. every instruction runs at the state the machine is actually in, and the walk
+   spills down until the family carries it. It never fills: state 0 is the plain
+   stencil and always exists, so a descend-only tiler has no reason to. javelina's
+   driver fills because its burg cover asks for operands in registers before they
+   are there — that is what a cover buys and what this walk does without;
+2. control arrives at state 0 and leaves at state 0, because `resync` forwards the
+   cache registers to whatever `offmap[ip]` names and the two ends have to agree.
+   It costs nothing extra in practice, since a branch consumes its condition:
+   `br_if` entered at state 1 leaves at state 0 on both paths.
+
+A value rides a register only where the SIGNATURE names its storage class. `addr`,
+`word` and `any` slots and the variadic group are resolved by a tile, and this walk
+is not one, so they run at state 0 — which is also why `calc_fill` is exercised by
+a hand-stamped chain in the tests rather than by any program the walk compiles.
+
+`calc_tier2_test.c` is where that is asked about: the published tables' internal
+consistency, `calc_state_ok` over every opcode × state × class, every program at
+every cache depth from 0 to `CALC_TIER2_N`, and the counts that say the cache was
+used at all — an answer cannot distinguish a tiled run from one that quietly fell
+back, so the statistics are the claim.

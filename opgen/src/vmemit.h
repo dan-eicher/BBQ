@@ -3,6 +3,7 @@
 
 #include "opgen_ast.h"
 #include "semlower.h"
+#include "sigemit.h"   /* SClass — the storage classes the cache is indexed by */
 #include <cstdio>
 #include <string>
 #include <cctype>
@@ -16,7 +17,8 @@ namespace opgen {
 class VmEmitter {
 public:
     // Does a body mention this name? Public because the emission helpers ask it.
-    static int  stmt_refs_name(const SemStmt* s, const char* name);
+    // `calls` also matches a CALLEE name — see SemLowerer::expr_refs_name.
+    static int  stmt_refs_name(const SemStmt* s, const char* name, int calls = 0);
 
     // `tier2_n` is Ertl's cache size: how many operand-stack slots ride in
     // registers. 0 emits exactly what it always did — the stencil table is then
@@ -67,6 +69,13 @@ private:
     // A class that never enters a slot: a managed reference belongs on the stack,
     // where the collector expects to find it and to be able to relocate it.
     static bool cacheable(ValueType t);
+    // Does the spec declare a type row in this class? The transition stencils are
+    // emitted per declared row — a spec with no f32 has no f32 to spill — so the
+    // spill/fill TABLES must ask the same question, or they name a stencil that
+    // was never emitted and the consumer's translation unit does not compile.
+    bool class_emitted(SClass c) const;
+    static bool op_refs_name(const Opcode* op, const char* name, int calls = 0);
+    static bool stack_open(const Opcode* op);
     // A slot whose storage class the signature does not carry — the tile resolves
     // one. Cacheable as a raw slot; see the note on the definition.
     static bool poly_slot(ValueType t);

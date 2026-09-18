@@ -79,7 +79,10 @@ public:
     // ── Analysis the emitters query ────────────────────────
     int  expr_is_slot_valued(const Opcode* op, const SemExpr* e) const;
     int  const_eval(const SemExpr* e, const char* ct, uint64_t* bits) const;
-    static int  expr_refs_name(const SemExpr* e, const char* name);
+    // Does the expression mention this name? With `calls` set, a CALLEE name
+    // counts too, which is how the tier-2 gate spots the `push`/`pop` stack
+    // intrinsics. One walk for both questions, so they cannot drift apart.
+    static int  expr_refs_name(const SemExpr* e, const char* name, int calls = 0);
     // The type an `error:` condition is lowered at — lives here because both the
     // guard emitter and op_const_holes need it, and it is an expression question.
     static ValueType cond_type(const Opcode* op, const SemExpr* cond);

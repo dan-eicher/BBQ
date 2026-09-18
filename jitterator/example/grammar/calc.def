@@ -70,11 +70,10 @@ native status transfer();
 
 # ── Natives for the generic capabilities the ops below exercise ──
 native int  calc_is_bad(double x);          # named ONLY by a guard (see dcheck)
-native void calc_vpush(long lo, long hi);   # push a v128 slot from its two 64-bit halves
+native v128 calc_vmake(long lo, long hi);   # a v128 slot built from its two 64-bit halves
 native void calc_box(any v);                # stash a runtime-typed value + its tag
 native any  calc_unbox();                   # ...and read it back out
 native long calc_vlane(any v, int i);       # lane i of a v128 carried as any_t
-native void calc_push_tagged(long v, int tag);   # push bits under a CHOSEN tag
 native int  calc_tag(any v);                # the runtime tag a value is carrying
 
 # Linear memory. Two memories with DIFFERENT declared addrtypes (memory 0 is 32-bit,
@@ -196,6 +195,16 @@ refshl  0x2E [ u8 n ] (i64 v -- ref r)   (. r = v << n; .)
 # still reports what the value was.
 anyroll 0x2F ( -- )   (. push(pop()); .)
 
+# `sp` — the operand stack's own depth, read by a body rather than moved by one.
+# It is the other half of what makes a body stack-open, and the observable half:
+# `anyroll` above puts a slot back exactly where it found it, so a tier that
+# handed it the wrong slot would still be an identity and no execution could tell.
+# Reading sp cannot hide that way. Under a stack cache the top values are in
+# registers and sp points BENEATH them, so a body that reads sp reads a depth the
+# abstract machine does not have — which is why opgen gives a stack-open body no
+# cached variant, and why this row exists to prove it does.
+depth 0x30 ( -- i32 r )   (. r = sp; .)
+
 # ── Float constants INSIDE a guard ──────────────────────────
 #
 # A float literal lowers to a C literal, which clang materializes out of the .rodata
@@ -230,7 +239,16 @@ dcheck 0x1C (f64 a -- f64 r)
 # payload it silently drops lanes 2/3 of every v128 crossing it. `vmake` builds one,
 # `box`/`unbox` round-trip it through the carrier, `vlane` reads back the half that
 # would have been lost.
-vmake 0x1D (i64 lo, i64 hi -- )        (. calc_vpush(lo, hi); .)
+#
+# vmake's result is DECLARED, and the native RETURNS it rather than pushing it. A
+# native that pushes behind the signature's back is invisible to every consumer of
+# that signature — the storage-class vocabulary, the variant family, this
+# repository's own JIT walk — and all of them then read `( i64, i64 -- )` as
+# leaving the stack one shorter than it is. Under a stack cache that is not a
+# cosmetic lie: the walk believes the top of the stack is in a register, the
+# native writes at sp underneath it, and the two disagree about which value is on
+# top from there on.
+vmake 0x1D (i64 lo, i64 hi -- v128 r)  (. r = calc_vmake(lo, hi); .)
 box   0x1E (any v -- )                 (. calc_box(v); .)
 unbox 0x1F ( -- any r )                (. r = calc_unbox(); .)
 vlane 0x20 [ u8 i ] (any v -- i64 r)   (. r = calc_vlane(v, i); .)
@@ -264,7 +282,13 @@ store32 0x24 [ u8 m ] (addr(calc_mem_is64(m)) a, i32 v -- )
 # aggregate has, where the tag describes the container and not the value's declared
 # width. A tag-driven addrtype pop truncates this to 32 bits and lands in bounds; a
 # declared-width pop sees the whole address and traps.
-pushtag 0x25 [ u8 t ] (i64 v -- )   (. calc_push_tagged(v, t); .)
+#
+# A `word` result, because that is what "a slot whose tag the body chooses" IS: the
+# value model's field selector writes the bits, `r_wt` writes the tag, and opgen
+# pushes both. Declaring `( i64 v -- )` and pushing from the native instead put the
+# value on the stack where no consumer of the signature knew to look for it.
+pushtag 0x25 [ u8 t ] (i64 v -- word r)
+    (. r = v; r_wt = t; .)
 
 # ── §3(b) variadic operands, the DEFAULT drop-after-body ────
 #

@@ -1102,27 +1102,29 @@ int SemLowerer::expr_has_unary_minus(const SemExpr* e) {
     }
 }
 
-int SemLowerer::expr_refs_name(const SemExpr* e, const char* name) {
+int SemLowerer::expr_refs_name(const SemExpr* e, const char* name, int calls) {
     if (!e) return 0;
     switch (e->tag) {
     case SemExprTag::SBinOp: {
         auto* b = static_cast<const SBinOp*>(e);
-        return expr_refs_name(b->left, name) || expr_refs_name(b->right, name);
+        return expr_refs_name(b->left, name, calls) || expr_refs_name(b->right, name, calls);
     }
-    case SemExprTag::SUnary:   return expr_refs_name(static_cast<const SUnary*>(e)->operand, name);
+    case SemExprTag::SUnary:   return expr_refs_name(static_cast<const SUnary*>(e)->operand, name, calls);
     case SemExprTag::STernary: {
         auto* t = static_cast<const STernary*>(e);
-        return expr_refs_name(t->cond, name) || expr_refs_name(t->then_, name) ||
-               expr_refs_name(t->else_, name);
+        return expr_refs_name(t->cond, name, calls) || expr_refs_name(t->then_, name, calls) ||
+               expr_refs_name(t->else_, name, calls);
     }
-    case SemExprTag::SCast:    return expr_refs_name(static_cast<const SCast*>(e)->operand, name);
+    case SemExprTag::SCast:    return expr_refs_name(static_cast<const SCast*>(e)->operand, name, calls);
     case SemExprTag::SIndex: {
         auto* ix = static_cast<const SIndex*>(e);
-        return expr_refs_name(ix->base, name) || expr_refs_name(ix->index, name);
+        return expr_refs_name(ix->base, name, calls) || expr_refs_name(ix->index, name, calls);
     }
     case SemExprTag::SCall: {
-        for (auto* a : static_cast<const SCall*>(e)->args)
-            if (expr_refs_name(a, name)) return 1;
+        auto* c = static_cast<const SCall*>(e);
+        if (calls && !strcmp(c->name, name)) return 1;
+        for (auto* a : c->args)
+            if (expr_refs_name(a, name, calls)) return 1;
         return 0;
     }
     case SemExprTag::SIdent:   return !strcmp(static_cast<const SIdent*>(e)->name, name);

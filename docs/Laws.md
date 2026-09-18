@@ -371,13 +371,25 @@ file could ask for, in the parser, in `emit()`, and in the destructor of anythin
 holding a document. All five are iterative; `DeepDocument.*` holds them that way at
 a depth well past where each used to die.
 
-**A grammar is not input.** The compiler — the `.bbq` parser, sema, and the CEK
-compiler that lowers the kont graph — recurses over grammar structure, and a spec
-nested about 4,500 levels deep overflows the stack (`Compiler::compile_type_expr`
-↔ `compile_fields`). That is the same bound every recursive-descent compiler has,
-over source its author wrote, and it is left alone on purpose. It does mean
-`bbq.compile_string` on a grammar from somewhere else is not a supported threat
-model: compile grammars you control.
+**A grammar is not input, but it still gets a diagnostic.** Every stage of the
+front half walks grammar structure recursively, and each has its own stack bound:
+the `.bbq` parser goes at roughly 20,000 nested types, and the kont lowering —
+`Compiler::compile_type_expr` ↔ `compile_fields` — at about 4,500. That last one
+is what an author would hit, and hitting it used to be a segfault with nothing to
+read.
+
+Sema refuses a type nested more than **256** deep, which is where there is still a
+line and column to name, and says to split the shape into rules. The most involved
+grammar in the tree (`examples/wasm.bbq`) reaches 16, so the limit is ~16× anything
+real, and it counts *types*, not rules — 300 rules a level deep each is fine, which
+is the fix the message suggests. `Sema.DeeplyNestedTypeIsRejectedWithALocation`,
+`…NestingWellInsideTheLimitIsAccepted`, `…TheDepthLimitCountsTypesNotRules`.
+
+Above the limit only one thing is left: a grammar nested past ~20,000 dies in the
+pegc-generated `.bbq` parser before sema sees it. Reaching that takes a generated
+spec — no one writes it — and closing it means a recursion guard in pegc's emitter,
+which every pegc parser shares (javelina's among them). Worth doing for pegc's own
+sake; not done here.
 
 **Where that still bites: the generated C and C++ readers.** They are recursive
 descent — the paper's own design, and a rule that calls a rule is a call — so their

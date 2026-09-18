@@ -203,10 +203,27 @@ void Sema::validate_interval(Interval* iv, const std::string& ctx) {
     }
 }
 
-void Sema::validate_type(TypeExpr* type, const std::string& ctx, bool guarded) {
+void Sema::validate_type(TypeExpr* type, const std::string& ctx, bool guarded,
+                         int depth) {
+    // Refuse a grammar nested deeper than any stack downstream will carry, while
+    // there is still a line and column to name. Past here the kont lowering walks
+    // the same shape and simply dies, and so does this function — so the check has
+    // to stop the descent, not just record it.
+    if (depth > kMaxNesting) {
+        if (!nesting_reported_) {
+            nesting_reported_ = true;
+            errors_.error(type ? type->loc : SourceLoc{},
+                "type nests more than %d deep in rule '%s'; the compiler walks this "
+                "shape recursively and cannot go further — name an inner part as its "
+                "own rule and refer to it",
+                kMaxNesting, ctx.c_str());
+        }
+        return;
+    }
+    ++depth;
     if (auto* st = dynamic_cast<Struct*>(type)) {
         for (auto* field : st->fields) {
-            validate_type(field->body, ctx, guarded);
+            validate_type(field->body, ctx, guarded, depth);
             if (field->constraint)
                 validate_expr(*field->constraint, ctx);
             if (field->interval.has_value())
@@ -218,19 +235,19 @@ void Sema::validate_type(TypeExpr* type, const std::string& ctx, bool guarded) {
             validate_expr(*st->constraint, ctx);
     } else if (auto* u = dynamic_cast<Union*>(type)) {
         for (auto* variant : u->variants) {
-            validate_type(variant->body, ctx, guarded);
+            validate_type(variant->body, ctx, guarded, depth);
             if (variant->constraint)
                 validate_expr(*variant->constraint, ctx);
         }
     } else if (auto* arr = dynamic_cast<Array*>(type)) {
         // Array element is guarded — count=0 (or until-condition matching
         // immediately) terminates the recursion at runtime.
-        validate_type(arr->element, ctx, true);
+        validate_type(arr->element, ctx, true, depth);
         if (auto* fc = dynamic_cast<FixedCount*>(arr->spec)) {
             validate_expr(fc->count, ctx);
         } else if (auto* st = dynamic_cast<SepTerm*>(arr->spec)) {
             if (auto* ts = dynamic_cast<TypeSep*>(st->sep))
-                validate_type(ts->sep_type, ctx, guarded);
+                validate_type(ts->sep_type, ctx, guarded, depth);
             // An `eof`/`until` array is bounded only by the input it consumes, so
             // its element has to consume some — on every path, not just the ones
             // this input happens to take (IPG §5, Fig. 11c). A separator that always
@@ -262,7 +279,7 @@ void Sema::validate_type(TypeExpr* type, const std::string& ctx, bool guarded) {
                         "semantics");
                 }
             } else if (auto* tt = dynamic_cast<BBQ::TypeTerm*>(st->term))
-                validate_type(tt->term_type, ctx, guarded);
+                validate_type(tt->term_type, ctx, guarded, depth);
         }
         if (arr->constraint)
             validate_expr(*arr->constraint, ctx);
@@ -298,16 +315,16 @@ void Sema::validate_type(TypeExpr* type, const std::string& ctx, bool guarded) {
         // so T's full definition must precede the container: it IS a topo-sort
         // dependency (unguarded). A recursive optional would be an infinite
         // by-value type and is correctly rejected as a cycle.
-        validate_type(opt->element, ctx, false);
+        validate_type(opt->element, ctx, false, depth);
         if (opt->constraint)
             validate_expr(*opt->constraint, ctx);
     } else if (auto* sw = dynamic_cast<Switch*>(type)) {
         validate_expr(sw->discriminator, ctx);
         for (auto* c : sw->cases) {
-            validate_type(c->target, ctx, guarded);
+            validate_type(c->target, ctx, guarded, depth);
         }
         if (sw->default_ && (*sw->default_)->target.has_value())
-            validate_type(*(*sw->default_)->target, ctx, guarded);
+            validate_type(*(*sw->default_)->target, ctx, guarded, depth);
         validate_switch(sw, ctx);
     } else if (auto* comp = dynamic_cast<Compute*>(type)) {
         validate_expr(comp->expression, ctx);
@@ -331,7 +348,7 @@ void Sema::validate_type(TypeExpr* type, const std::string& ctx, bool guarded) {
             validate_interval(*rr->interval, ctx);
     } else if (auto* alts = dynamic_cast<Alternatives*>(type)) {
         for (auto* alt : alts->alts) {
-            validate_type(alt, ctx, guarded);
+            validate_type(alt, ctx, guarded, depth);
         }
     } else if (auto* prim = dynamic_cast<Primitive*>(type)) {
         if (prim->constraint)

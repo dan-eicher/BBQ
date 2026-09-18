@@ -1333,3 +1333,58 @@ TEST(Sema, PeekNoArgs) {
     sema.analyze(g);
     EXPECT_TRUE(has_error_containing(errors, "peek() takes no arguments"));
 }
+
+// --- Nesting depth: a diagnostic, not a segfault ---
+
+static std::string nested_spec(int depth) {
+    std::string s = "Top = ";
+    for (int i = 0; i < depth; i++) s += "struct { f: ";
+    s += "uint8";
+    for (int i = 0; i < depth; i++) s += " }";
+    return s;
+}
+
+TEST(Sema, DeeplyNestedTypeIsRejectedWithALocation) {
+    // Every stage after sema walks this same shape recursively — the kont lowering
+    // runs out of stack at about 4,500 — so a grammar that nests past what the
+    // compiler can carry has to be refused here, where there is still a line and
+    // column to point at.
+    auto src = nested_spec(300);
+    auto* g = parse(src.c_str());
+    ASSERT_NE(g, nullptr);
+    ErrorReporter errors;
+    Sema sema(errors);
+    EXPECT_FALSE(sema.analyze(g));
+    EXPECT_TRUE(has_error_containing(errors, "nests more than"));
+    // Said once, not once per level.
+    int hits = 0;
+    for (auto& e : errors.errors())
+        if (e.message.find("nests more than") != std::string::npos) hits++;
+    EXPECT_EQ(hits, 1);
+}
+
+TEST(Sema, NestingWellInsideTheLimitIsAccepted) {
+    // The most involved grammar in the tree (examples/wasm.bbq) reaches 16.
+    for (int depth : {1, 16, 64, 255}) {
+        auto src = nested_spec(depth);
+        auto* g = parse(src.c_str());
+        ASSERT_NE(g, nullptr) << "depth " << depth;
+        ErrorReporter errors;
+        Sema sema(errors);
+        EXPECT_TRUE(sema.analyze(g)) << "depth " << depth;
+    }
+}
+
+TEST(Sema, TheDepthLimitCountsTypesNotRules) {
+    // Splitting the same shape across rules is the fix the diagnostic suggests, so
+    // it has to actually work: 300 rules, each one level deep.
+    std::string src;
+    for (int i = 0; i < 300; i++)
+        src += "R" + std::to_string(i) + " = struct { f: " +
+               (i + 1 < 300 ? "R" + std::to_string(i + 1) : std::string("uint8")) + " }\n";
+    auto* g = parse(src.c_str());
+    ASSERT_NE(g, nullptr);
+    ErrorReporter errors;
+    Sema sema(errors);
+    EXPECT_TRUE(sema.analyze(g));
+}

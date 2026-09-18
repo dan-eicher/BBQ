@@ -111,8 +111,13 @@ private:
     // (count=0 / absence terminates). RuleRefs reached while guarded
     // do NOT count as topo-sort dependencies — the cycle is legal and
     // the compiler resolves the forward ref via patch_kont.
+    // `depth` is how many type constructors enclose this one. Every stage after
+    // this walks the same shape recursively — sema itself, the kont lowering, the
+    // emitters — so a grammar nested past what a stack can carry has to be refused
+    // HERE, where there is still a source location to point at, rather than
+    // segfaulting a few thousand frames later with nothing to say.
     void validate_type(BBQ::TypeExpr* type, const std::string& ctx,
-                        bool guarded = false);
+                        bool guarded = false, int depth = 0);
     void validate_expr(BBQ::Expr* expr, const std::string& ctx);
     void validate_interval(BBQ::Interval* iv, const std::string& ctx);
     void validate_ref_path(BBQ::RefPath* path, const std::string& ctx);
@@ -215,6 +220,12 @@ private:
     std::unordered_map<BBQ::Switch*, std::vector<SwitchCaseLabel>> switch_labels_;  // case labels (shape side-data)
     std::unordered_map<std::string, std::unordered_set<std::string>> deps_;
     std::unordered_set<std::string> bound_names_;   // every name the grammar binds
+    // The deepest a type may nest. The most involved grammar in the tree
+    // (examples/wasm.bbq) reaches 16, and the first stage to run out of stack —
+    // the kont lowering — goes at about 4,500, so this is generous in both
+    // directions. Reported once: a grammar that trips it trips it everywhere.
+    static constexpr int kMaxNesting = 256;
+    bool nesting_reported_ = false;
     std::vector<BBQ::Rule*> sorted_;
     BBQ::Endianness default_endian_ = BBQ::Endianness::Little;
 };

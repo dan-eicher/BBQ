@@ -349,11 +349,17 @@ container [§3.10] and why a neighbour's write is visible.
 Laws say what a correct input means. These say what BBQ does with the rest of the
 input space, which for a format parser is most of it.
 
+All of it runs under AddressSanitizer and UndefinedBehaviorSanitizer
+(`-DBBQ_SANITIZE=ON`), which is where the malformed-input sweeps below earn their
+keep: "the view reader rejects this like the CEK does" is a weaker statement than
+"and neither of them read a byte they should not have".
+
 | Property | Verdict | Test |
 |---|---|---|
 | Every prefix of a valid input is accepted or rejected, never crashed — on every backend | holds | `RenderViewParser.TruncationRejectsLikeCek`, `CrossBackend.ViewCReaderRejectsMalformedLikeCek`, `…COwningReaderRejectsMalformedLikeCek` |
 | Every single-byte corruption likewise, and the backends agree with the CEK on which | holds | `RenderViewParser.ByteCorruptionRejectsLikeCek`, the two `CrossBackend` sweeps above |
 | A declared count does not become an allocation | holds | `CBackendE2E.CountedArrayDoesNotAllocateFromCount` |
+| A length, offset or count big enough to overflow the bounds arithmetic is refused, not wrapped | holds | `IpgInterval.AnEndPastTheInputFails`, `…StartAfterEndFails`, `RenderViewParser.ByteCorruptionRejectsLikeCek` |
 | An unbounded array whose element need not read is refused | holds | see [IPG] §5 |
 | Nesting depth — chosen by the input — does not cost stack | holds *for the document* | `DeepDocument.*` |
 
@@ -364,6 +370,14 @@ take a stack frame per level — destroying it, `changes_length`, `patch_node`,
 file could ask for, in the parser, in `emit()`, and in the destructor of anything
 holding a document. All five are iterative; `DeepDocument.*` holds them that way at
 a depth well past where each used to die.
+
+**A grammar is not input.** The compiler — the `.bbq` parser, sema, and the CEK
+compiler that lowers the kont graph — recurses over grammar structure, and a spec
+nested about 4,500 levels deep overflows the stack (`Compiler::compile_type_expr`
+↔ `compile_fields`). That is the same bound every recursive-descent compiler has,
+over source its author wrote, and it is left alone on purpose. It does mean
+`bbq.compile_string` on a grammar from somewhere else is not a supported threat
+model: compile grammars you control.
 
 **Where that still bites: the generated C and C++ readers.** They are recursive
 descent — the paper's own design, and a rule that calls a rule is a call — so their

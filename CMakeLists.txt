@@ -4,6 +4,27 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+# --- sanitizers ---
+# A format parser's job is the input it was not given, so the suite needs to be
+# runnable under ASan/UBSan, not only compiled clean. Off by default because the
+# generators run during the build and a sanitized generator is slow.
+#
+#   cmake -B build-san -DBBQ_SANITIZE=ON -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
+#   cmake --build build-san -j && ctest --test-dir build-san --timeout 600
+#
+# clang, because gcc's libasan is not installed everywhere (cross_backend_test
+# says the same about the C it spawns). LeakSanitizer is off: the generators are
+# one-shot arena tools that exit without freeing, by design, and their leaks would
+# fail the build rather than tell anyone anything. The target here is memory
+# errors, which is what malformed input produces.
+option(BBQ_SANITIZE "Build with AddressSanitizer + UndefinedBehaviorSanitizer" OFF)
+if(BBQ_SANITIZE)
+    add_compile_options(-fsanitize=address,undefined -fno-omit-frame-pointer -g)
+    add_link_options(-fsanitize=address,undefined)
+    # Applies to the generators this build runs, and to the tests it runs later.
+    set(ENV{ASAN_OPTIONS} "detect_leaks=0")
+endif()
+
 # --- C runtime library (for generated C code) ---
 add_library(bbq_crt STATIC
     crt/bbq_arena.c

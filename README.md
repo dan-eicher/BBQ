@@ -166,6 +166,13 @@ jitterator/         Copy-and-patch JIT stencil extractor and runtime
 ## Running Tests
 
 ```sh
-# Full suite (C++ via ctest, Python via pytest hook): 866 + 215 tests
+# Full suite (C++ via ctest, Python via pytest hook)
 ctest --test-dir build --output-on-failure
+
+# Under AddressSanitizer + UndefinedBehaviorSanitizer. A format parser's job is
+# the input it was not given, so the malformed-input sweeps (every prefix of
+# every fixture, every single-byte corruption) are worth far more here.
+cmake -B build-san -DBBQ_SANITIZE=ON -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
+cmake --build build-san -j$(nproc)
+ctest --test-dir build-san --timeout 900 --output-on-failure
 ```

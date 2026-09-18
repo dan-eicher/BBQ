@@ -113,6 +113,11 @@ A position in the document, addressed by its container and its slot.
 **Read / navigate:** `.field`, `["field"]`, `[i]` (negative ok), `[a:b]` slices,
 `len()`, `in`, iteration (struct → `(name, node)`, array → nodes), `keys()`/`values()`/`items()`, `dict(node)`, `dir()`.
 
+A container's mapping view is keyed the way indexing it is: a **struct** by field
+name, an **array** by position. So `dict(arr)` is `{0: …, 1: …}`, and
+`for k, v in node.items()` walks a whole document rather than stopping at every
+array.
+
 **Materialize:** `int()`, `float()`, `bool()`, `str()`, `bytes()`, `memoryview()`,
 `.value` (auto), rich comparison (`== 42`, `< 100`), `f"{node:08x}"`, `repr`.
 `hash()` raises (nodes have `__eq__`).

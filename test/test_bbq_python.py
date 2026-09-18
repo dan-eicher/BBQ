@@ -1897,3 +1897,69 @@ class TestBuild:
         r = spec.parse(data, rule="Rec")
         assert r.success and int(r.magic) == 0xCAFEBABE and int(r.n) == 3
         assert [int(x) for x in r.xs] == [10, 20, 30]
+
+
+class TestContainerProtocol:
+    """An array is a container, and the mapping view has to say so.
+
+    `keys`/`values`/`items` used to filter children by NAME, and an array's
+    elements are positional. A primitive element has no name and vanished; a
+    struct element has an empty one and came back under the key "". Either way a
+    generic walk — `for k, v in node.items()` — silently skipped everything every
+    array held, while `len()`, `node[0]` and iteration all reported it.
+    """
+
+    SPEC = "E = struct { v: uint8 }\nTop = struct { n: uint8, xs: array<E>[n], f: uint8 }"
+    PRIM = "Top = struct { n: uint8, xs: array<uint8>[n], f: uint8 }"
+
+    def _arr(self, spec_src):
+        spec = bbq.compile_string(spec_src)
+        r = spec.parse(bytes([2, 0xAA, 0xBB, 0x44]), rule="Top")
+        assert r.success
+        return r, r.root["xs"]
+
+    @pytest.mark.parametrize("spec_src", [SPEC, PRIM])
+    def test_array_mapping_view_is_positional(self, spec_src):
+        r, xs = self._arr(spec_src)
+        # The same keys `xs[k]` accepts, for both element kinds.
+        assert list(xs.keys()) == [0, 1]
+        assert len(list(xs.values())) == 2
+        assert [k for k, _ in xs.items()] == [0, 1]
+        assert sorted(dict(xs).keys()) == [0, 1]
+
+    @pytest.mark.parametrize("spec_src", [SPEC, PRIM])
+    def test_array_views_agree_with_len_and_indexing(self, spec_src):
+        r, xs = self._arr(spec_src)
+        assert len(xs) == len(list(xs.values())) == len(list(xs.items()))
+        # items() must hand back the same nodes indexing does.
+        for k, v in xs.items():
+            assert v.offset == xs[k].offset
+
+    @pytest.mark.parametrize("spec_src", [SPEC, PRIM])
+    def test_a_generic_walk_reaches_array_elements(self, spec_src):
+        """The property the bug broke: walking items() sees the whole document."""
+        r, _ = self._arr(spec_src)
+        seen = []
+
+        def walk(node):
+            kids = list(node.items())
+            if not kids:
+                seen.append(node)
+                return
+            for _, child in kids:
+                walk(child)
+
+        walk(r.root)
+        # n, f, and the two elements' `v` (or the two primitive elements).
+        assert len(seen) == 4
+
+    def test_struct_mapping_view_is_unchanged(self):
+        r, _ = self._arr(self.SPEC)
+        assert [k for k, _ in r.root.items()] == ["n", "xs", "f"]
+        assert list(r.root.keys()) == ["n", "xs", "f"]
+
+    @pytest.mark.parametrize("spec_src", [SPEC, PRIM])
+    def test_dir_does_not_offer_an_array_element_as_an_attribute(self, spec_src):
+        """`dir()` is attribute names; an element has none, and "" is not one."""
+        r, xs = self._arr(spec_src)
+        assert "" not in dir(xs)

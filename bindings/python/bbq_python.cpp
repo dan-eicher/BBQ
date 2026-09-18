@@ -935,12 +935,42 @@ static int append_type_attrs(PyObject* list, PyTypeObject* type) {
 static int append_child_names(PyObject* list, const zc::node* c) {
     if (!c) return 0;
     for (const auto& k : c->kids) {
-        if (!k->name) continue;
+        // An unnamed child — an array element — is not an attribute name.
+        if (!k->name || !*k->name) continue;
         PyObject* s = PyUnicode_FromString(k->name);
         if (!s || PyList_Append(list, s) < 0) { Py_XDECREF(s); return -1; }
         Py_DECREF(s);
     }
     return 0;
+}
+
+// The children a mapping view exposes. A struct's are its named fields; an ARRAY's
+// are positional, so keying them by name drops every one of them — which is what
+// `keys()`/`values()`/`items()` used to do, silently, leaving any generic walk of a
+// document to skip whatever an array held. Worse, it depended on the element type:
+// a primitive element has no name and vanished, a struct element has an empty one
+// and came back under the key "". An array keys by INDEX, which is what `node[0]`
+// already accepts. Slots are collected under the lock and turned into Python
+// objects after it — child_node takes the lock itself.
+static bool child_slots(PyBBQResult* result, PyBBQNode* holder, bool* is_array,
+                        std::vector<std::pair<Py_ssize_t, std::string>>* out) {
+    DocLock g(result);
+    const zc::node* c = node_of(holder);
+    if (!c) return false;
+    *is_array = (c->type == CaptureType::Array);
+    for (size_t i = 0; i < c->kids.size(); i++) {
+        if (*is_array)                          out->emplace_back((Py_ssize_t)i, std::string());
+        else if (c->kids[i]->name && *c->kids[i]->name)
+            out->emplace_back((Py_ssize_t)i, c->kids[i]->name);
+    }
+    return true;
+}
+
+// The key a slot is reached by: its index in an array, its name in a struct.
+static PyObject* slot_key(bool is_array,
+                          const std::pair<Py_ssize_t, std::string>& s) {
+    return is_array ? PyLong_FromSsize_t(s.first)
+                    : PyUnicode_FromString(s.second.c_str());
 }
 
 static PyObject* PyBBQNode_dir(PyBBQNode* self, PyObject*) {
@@ -953,28 +983,23 @@ static PyObject* PyBBQNode_dir(PyBBQNode* self, PyObject*) {
 }
 
 static PyObject* PyBBQNode_keys(PyBBQNode* self, PyObject*) {
+    bool is_array = false;
+    std::vector<std::pair<Py_ssize_t, std::string>> slots;
+    if (!child_slots(self->result, self, &is_array, &slots)) return PyList_New(0);
     PyObject* list = PyList_New(0);
     if (!list) return NULL;
-    DocLock g(self->result);
-    if (append_child_names(list, node_of(self)) < 0) { Py_DECREF(list); return NULL; }
+    for (const auto& s : slots) {
+        PyObject* k = slot_key(is_array, s);
+        if (!k || PyList_Append(list, k) < 0) { Py_XDECREF(k); Py_DECREF(list); return NULL; }
+        Py_DECREF(k);
+    }
     return list;
 }
 
-// The named children, as nodes. Slots are collected under the lock and turned into
-// Python objects after it — child_node takes the lock itself.
-static bool named_slots(PyBBQResult* result, PyBBQNode* holder,
-                        std::vector<std::pair<Py_ssize_t, std::string>>* out) {
-    DocLock g(result);
-    const zc::node* c = node_of(holder);
-    if (!c) return false;
-    for (size_t i = 0; i < c->kids.size(); i++)
-        if (c->kids[i]->name) out->emplace_back((Py_ssize_t)i, c->kids[i]->name);
-    return true;
-}
-
 static PyObject* PyBBQNode_values(PyBBQNode* self, PyObject*) {
+    bool is_array = false;
     std::vector<std::pair<Py_ssize_t, std::string>> slots;
-    if (!named_slots(self->result, self, &slots)) return PyList_New(0);
+    if (!child_slots(self->result, self, &is_array, &slots)) return PyList_New(0);
     PyObject* list = PyList_New(0);
     if (!list) return NULL;
     for (const auto& s : slots) {
@@ -988,12 +1013,13 @@ static PyObject* PyBBQNode_values(PyBBQNode* self, PyObject*) {
 }
 
 static PyObject* PyBBQNode_items(PyBBQNode* self, PyObject*) {
+    bool is_array = false;
     std::vector<std::pair<Py_ssize_t, std::string>> slots;
-    if (!named_slots(self->result, self, &slots)) return PyList_New(0);
+    if (!child_slots(self->result, self, &is_array, &slots)) return PyList_New(0);
     PyObject* list = PyList_New(0);
     if (!list) return NULL;
     for (const auto& s : slots) {
-        PyObject* name = PyUnicode_FromString(s.second.c_str());
+        PyObject* name = slot_key(is_array, s);
         if (!name) { Py_DECREF(list); return NULL; }
         PyObject* node = child_node(self->result, self, s.first);
         if (!node) { Py_DECREF(name); Py_DECREF(list); return NULL; }

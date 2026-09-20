@@ -1290,6 +1290,24 @@ static PyObject* PyBBQNode_get_root(PyBBQNode* self, void*) {
 
 // The steps from the root to here: field names as str, array positions as int.
 // Unambiguous and directly usable — reduce(getitem, steps, root) is this node.
+// ONE spelling of a path, for everything here that names a node.
+//
+// Two walks produce paths and they share the STEP, not the walk: _path ascends a
+// chain of Nodes, the delta scan descends through zc::nodes. They each used to
+// format their own and disagreed — deltas said `pts[1].y` where a node said
+// `$.pts[1].y` — and the delta side decided positional-vs-named by whether the
+// CHILD carried a name, which is the same bug _steps had.
+static void path_append(std::string* path, bool positional, const char* name, size_t index) {
+    if (positional || !name || !*name) {
+        *path += "[";
+        *path += std::to_string(index);
+        *path += "]";
+    } else {
+        *path += ".";
+        *path += name;
+    }
+}
+
 // Which step identifies this node inside its parent: a field NAME under a
 // struct, a POSITION under an array. Decided by the PARENT's type rather than by
 // whether the child carries a name, because an array element carries an empty
@@ -1327,31 +1345,18 @@ static PyObject* PyBBQNode_get_steps(PyBBQNode* self, void*) {
 
 // The same, as something to put in an error message: $.chunks[7].kind
 static PyObject* PyBBQNode_get_path(PyBBQNode* self, void*) {
-    PyObject* steps = PyBBQNode_get_steps(self, NULL);
-    if (!steps) return NULL;
-    PyObject* parts = PyList_New(0);
-    if (!parts) { Py_DECREF(steps); return NULL; }
-    PyObject* dollar = PyUnicode_FromString("$");
-    if (!dollar || PyList_Append(parts, dollar) < 0) {
-        Py_XDECREF(dollar); Py_DECREF(parts); Py_DECREF(steps); return NULL;
+    std::vector<PyBBQNode*> up;
+    for (PyBBQNode* n = self; n->up; n = n->up) up.push_back(n);
+    std::string path = "$";
+    for (size_t i = up.size(); i-- > 0; ) {
+        PyBBQNode* n = up[i];
+        DocLock g(n->result);
+        const zc::node* p = node_of(n->up);
+        const zc::node* c = node_of(n);
+        path_append(&path, !p || p->type == CaptureType::Array,
+                    c ? c->name : nullptr, (size_t)n->slot);
     }
-    Py_DECREF(dollar);
-    for (Py_ssize_t i = 0; i < PyTuple_GET_SIZE(steps); i++) {
-        PyObject* s = PyTuple_GET_ITEM(steps, i);
-        PyObject* piece = PyUnicode_Check(s)
-            ? PyUnicode_FromFormat(".%U", s)
-            : PyUnicode_FromFormat("[%S]", s);
-        if (!piece || PyList_Append(parts, piece) < 0) {
-            Py_XDECREF(piece); Py_DECREF(parts); Py_DECREF(steps); return NULL;
-        }
-        Py_DECREF(piece);
-    }
-    Py_DECREF(steps);
-    PyObject* empty = PyUnicode_FromString("");
-    PyObject* out = empty ? PyUnicode_Join(empty, parts) : NULL;
-    Py_XDECREF(empty);
-    Py_DECREF(parts);
-    return out;
+    return PyUnicode_FromStringAndSize(path.data(), (Py_ssize_t)path.size());
 }
 
 // ── Seeing the document ──────────────────────────────────────────────────────
@@ -2386,12 +2391,11 @@ static void collect_deltas(PyBBQResult* self, const zc::node* n, const std::stri
                            std::vector<std::pair<std::string, const zc::node*>>* out) {
     if (!n || n->parsed) return;
     if (is_container(n->type)) {
+        bool positional = n->type == CaptureType::Array;
         for (size_t i = 0; i < n->kids.size(); i++) {
-            const zc::node& k = *n->kids[i];
-            const char* nm = k.name;
-            collect_deltas(self, &k,
-                (nm && *nm) ? (path.empty() ? std::string(nm) : path + "." + nm)
-                            : path + "[" + std::to_string(i) + "]", out);
+            std::string kid = path;
+            path_append(&kid, positional, n->kids[i]->name, i);
+            collect_deltas(self, n->kids[i].get(), kid, out);
         }
         return;
     }
@@ -2409,7 +2413,7 @@ static PyObject* PyBBQResult_deltas(PyBBQResult* self, PyObject*) {
     {
         DocLock g(self);
         std::vector<std::pair<std::string, const zc::node*>> hits;
-        collect_deltas(self, self->edit->root(), std::string(), &hits);
+        collect_deltas(self, self->edit->root(), std::string("$"), &hits);
         const zc::source& src = self->edit->src();
         for (const auto& h : hits) {
             const zc::node* n = h.second;

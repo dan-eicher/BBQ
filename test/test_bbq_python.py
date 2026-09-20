@@ -362,10 +362,10 @@ class TestZCowMutation:
         r.tag = 99
         r.inner.a = 42
         paths = {d["path"]: (d["old"], d["new"]) for d in r.deltas()}
-        assert paths == {"tag": (7, 99), "inner.a": (1, 42)}
+        assert paths == {"$.tag": (7, 99), "$.inner.a": (1, 42)}
         # offsets are present and point at the changed bytes
         off = {d["path"]: d["offset"] for d in r.deltas()}
-        assert off["tag"] == (0, 1) and off["inner.a"] == (3, 4)
+        assert off["$.tag"] == (0, 1) and off["$.inner.a"] == (3, 4)
 
     def test_set_all_leaf_types(self):
         # node.field = v works for every leaf type, not just ints.
@@ -2722,3 +2722,49 @@ class TestNamesDoNotShadowFields:
     def test_dir_offers_both(self, hostile):
         names = dir(hostile._root)
         assert "name" in names and "_name" in names
+
+
+class TestOnePathSpelling:
+    """Everything that names a node names it the same way.
+
+    Two walks produce paths — `_path` ascends a node's parent chain, `deltas()`
+    descends the tree looking for leaves that stopped being spans — and they each
+    used to format their own. They disagreed (`pts[1].y` against `$.pts[1].y`),
+    and the delta side decided positional-vs-named by whether the CHILD carried a
+    name, which is wrong for the same reason it was wrong in `_steps`: an array
+    element carries an EMPTY name. They share the step formatter now.
+    """
+
+    SPEC = "Pt = struct { x: uint8, y: uint8 }\nT = struct { n: uint8, pts: array<Pt>[n] }"
+
+    @pytest.fixture
+    def edited(self):
+        r = bbq.compile_string(self.SPEC).parse(bytes([2, 1, 2, 3, 4]), rule="T")
+        r._root["pts"][1]["y"] = 9
+        r._root["n"] = 5
+        return r
+
+    def test_deltas_and_nodes_agree(self, edited):
+        from_deltas = sorted(d["path"] for d in edited.deltas())
+        from_nodes = sorted([edited._root["n"]._path,
+                             edited._root["pts"][1]["y"]._path])
+        assert from_deltas == from_nodes == ["$.n", "$.pts[1].y"]
+
+    def test_a_delta_path_is_rooted_like_a_node_path(self, edited):
+        assert all(d["path"].startswith("$") for d in edited.deltas())
+
+    def test_an_array_element_is_positional_on_both_sides(self, edited):
+        """The bug the shared formatter fixes: deciding by the child's name
+        rather than the parent's type."""
+        assert "$.pts[1].y" in [d["path"] for d in edited.deltas()]
+        assert edited._root["pts"][1]["y"]._path == "$.pts[1].y"
+
+    def test_a_delta_path_resolves_back_to_its_node(self, edited):
+        """The property that makes a path an answer and not a label."""
+        import functools, operator
+        for d in edited.deltas():
+            node = [n for n in edited._root[...] if n._path == d["path"]]
+            assert len(node) == 1, d["path"]
+            assert node[0]._offset == d["offset"]
+            assert functools.reduce(operator.getitem, node[0]._steps,
+                                    edited._root)._offset == d["offset"]

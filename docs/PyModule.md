@@ -104,7 +104,7 @@ Container protocols: `result.field`, `result["field"]`, `result[i]`, slices, `le
 | Method | Description |
 |--------|-------------|
 | `emit() -> bytes`, `bytes(r)` | Serialize. The dependent fields (array counts, `@rest` sizes) are recomputed from what the edits produced, then the input is blitted and what changed is patched into it — so an edit that resizes nothing leaves bytes no field covers exactly where they were. Byte-identical to the input if unedited; re-parses to the edit if not. |
-| `deltas() -> list[dict]` | What is no longer the input: `{path, offset, old, new}` for every leaf that stopped being described by its span. A span-backed node cannot have changed, which is what keeps this proportional to the edit rather than the file. |
+| `deltas() -> list[dict]` | What is no longer the input: `{path, offset, old, new}` for every leaf that stopped being described by its span. A span-backed node cannot have changed, which is what keeps this proportional to the edit rather than the file. `path` is spelled exactly as `node._path` is (`$.pts[1].y`), so a delta names a node you can go and get. |
 
 ### Names: the format owns them
 

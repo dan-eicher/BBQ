@@ -152,9 +152,22 @@ back forty nodes all called `kind` and no way to tell them apart — which is th
 work the search was supposed to do. RFC 9535 defines normalized paths (§2.7) for
 the same reason.
 
-**Seeing it:** `node.dump(depth=None)` renders the node and what is under it as a
-tree, with types, values and byte offsets; `result.dump()` is the document's.
-Long values are truncated, so a 4 MB `bytes` field does not become 4 MB of dump.
+**Seeing it:** `node.dump(depth=None, limit=16)` renders the node and what is
+under it as a tree, with types, values and byte offsets; `result.dump()` is the
+document's. It is the *index* rendered, not the bytes: long values truncate, a
+container past `limit` children ends with `... N more`, and an `array` of single
+bytes — how a grammar says "I do not know what this is yet" — collapses to one
+line with a short hex preview rather than a line per byte. Rendering the bytes
+themselves is a hex viewer, which belongs to whatever is displaying them.
+
+**The input:** `result._input` is a read-only `memoryview` of the bytes that were
+parsed, and `result._tail` is `input[bytes_consumed:]` — what the grammar did not
+account for. A grammar that covers only part of a file **succeeds** with
+`bytes_consumed` short of the end, which is the normal state while a format is
+still being worked out, and the remainder is the part worth looking at. The view
+is taken over the source object, so for `parse_file` the mapping cannot be
+released underneath it. `bytes(result)` is the other direction: what `emit()`
+would write.
 
 A container's mapping view is keyed the way indexing it is: a **struct** by field
 name, an **array** by position. So `dict(arr)` is `{0: …, 1: …}`, and

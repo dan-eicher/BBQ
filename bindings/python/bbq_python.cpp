@@ -1365,7 +1365,21 @@ static PyObject* PyBBQNode_get_path(PyBBQNode* self, void*) {
 // you. Every walker in this repo's own test suite — dump_node in
 // cross_backend_test.cpp, the walk in TestContainerProtocol — is this function
 // written again by hand, which is the signal that it belongs here.
-static int dump_into(PyBBQNode* node, PyObject* out, int indent, int depth_left) {
+// An array whose elements are single bytes — which is how a grammar says "I do
+// not know what this is yet". Listing them one per line is 32 lines that say
+// nothing; the shape, the size and where it starts are the whole content.
+static bool is_opaque_bytes(PyBBQNode* node, CaptureType ct, Py_ssize_t count) {
+    if (ct != CaptureType::Array || count == 0) return false;
+    DocLock g(node->result);
+    const zc::node* n = node_of(node);
+    if (!n) return false;
+    for (const auto& k : n->kids)
+        if (k->type != CaptureType::UInt8 && k->type != CaptureType::Int8) return false;
+    return true;
+}
+
+static int dump_into(PyBBQNode* node, PyObject* out, int indent, int depth_left,
+                     int limit) {
     CaptureType ct;
     Py_ssize_t count, start, end;
     const char* nm;
@@ -1392,8 +1406,26 @@ static int dump_into(PyBBQNode* node, PyObject* out, int indent, int depth_left)
     if (!label) return -1;
     (void)nm;
 
+    bool opaque = is_opaque_bytes(node, ct, count);
+
     PyObject* line;
-    if (is_container(ct)) {
+    if (opaque) {
+        // Summarised, not listed: how many bytes, and the first few so the shape
+        // is visible. Anything more is a hex viewer, which is the caller's.
+        PyObject* raw = PyBBQNode_get_raw(node, NULL);
+        if (!raw) { Py_DECREF(label); return -1; }
+        Py_ssize_t n_show = PyBytes_GET_SIZE(raw) < 8 ? PyBytes_GET_SIZE(raw) : 8;
+        PyObject* head = PyObject_CallMethod(raw, "hex", NULL);
+        Py_DECREF(raw);
+        if (!head) { Py_DECREF(label); return -1; }
+        PyObject* cut = PyUnicode_Substring(head, 0, n_show * 2);
+        Py_DECREF(head);
+        if (!cut) { Py_DECREF(label); return -1; }
+        line = PyUnicode_FromFormat("%*s%U: bytes[%zd] = %U%s  @%zd..%zd\n", indent, "",
+                                    label, count, cut, n_show < count ? "..." : "",
+                                    start, end);
+        Py_DECREF(cut);
+    } else if (is_container(ct)) {
         line = PyUnicode_FromFormat("%*s%U: %s(%zd)  @%zd..%zd\n", indent, "",
                                     label, capture_type_name(ct), count, start, end);
     } else {
@@ -1419,28 +1451,36 @@ static int dump_into(PyBBQNode* node, PyObject* out, int indent, int depth_left)
     Py_DECREF(line);
     if (rc < 0) return -1;
 
-    if (!is_container(ct) || depth_left == 0) return 0;
+    if (!is_container(ct) || opaque || depth_left == 0) return 0;
     if (Py_EnterRecursiveCall(" while dumping")) return -1;
     rc = 0;
-    for (Py_ssize_t i = 0; i < count && rc == 0; i++) {
+    // A container with ten thousand elements is ten thousand lines nobody reads.
+    Py_ssize_t shown = (limit > 0 && count > limit) ? limit : count;
+    for (Py_ssize_t i = 0; i < shown && rc == 0; i++) {
         PyObject* kid = child_node(node->result, node, i);
         if (!kid) { rc = -1; break; }
         rc = dump_into((PyBBQNode*)kid, out, indent + 2,
-                       depth_left < 0 ? -1 : depth_left - 1);
+                       depth_left < 0 ? -1 : depth_left - 1, limit);
         Py_DECREF(kid);
+    }
+    if (rc == 0 && shown < count) {
+        PyObject* more = PyUnicode_FromFormat("%*s... %zd more\n", indent + 2, "",
+                                              count - shown);
+        if (!more) rc = -1;
+        else { rc = PyList_Append(out, more); Py_DECREF(more); }
     }
     Py_LeaveRecursiveCall();
     return rc;
 }
 
 static PyObject* PyBBQNode_dump(PyBBQNode* self, PyObject* args, PyObject* kwargs) {
-    int depth = -1;
-    static const char* kwlist[] = {"depth", NULL};
-    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "|i", (char**)kwlist, &depth))
+    int depth = -1, limit = 16;
+    static const char* kwlist[] = {"depth", "limit", NULL};
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "|ii", (char**)kwlist, &depth, &limit))
         return NULL;
     PyObject* lines = PyList_New(0);
     if (!lines) return NULL;
-    if (dump_into(self, lines, 0, depth) < 0) { Py_DECREF(lines); return NULL; }
+    if (dump_into(self, lines, 0, depth, limit) < 0) { Py_DECREF(lines); return NULL; }
     PyObject* empty = PyUnicode_FromString("");
     PyObject* out = empty ? PyUnicode_Join(empty, lines) : NULL;
     Py_XDECREF(empty);
@@ -2341,6 +2381,40 @@ static PyObject* PyBBQResult_get_root(PyBBQResult* self, void*) {
     return (PyObject*)PyBBQNode_New(self, nullptr, -1, nullptr);
 }
 
+// ── The bytes that went in ───────────────────────────────────────────────────
+//
+// A ParseResult holds the input for its whole life — for parse_file that is a
+// live mmap, and the spans in the document name it — so the bytes are right
+// there and there was simply no way to ask for them. That matters most when a
+// grammar covers only part of a file, which is the normal state of affairs while
+// a format is still being worked out: the parse SUCCEEDS with bytes_consumed
+// short of the end, and the interesting part is the remainder.
+//
+// A memoryview over the source object rather than over the raw pointer, so the
+// mapping cannot go away underneath it. Zero-copy, and read-only because the
+// document's spans point into it.
+//
+// `bytes(result)` is the other direction — what emit() would write.
+static PyObject* PyBBQResult_get_input(PyBBQResult* self, void*) {
+    if (!self->view_valid || !self->view.obj) Py_RETURN_NONE;
+    PyObject* mv = PyMemoryView_FromObject(self->view.obj);
+    if (!mv) return NULL;
+    PyObject* ro = PyObject_CallMethod(mv, "toreadonly", NULL);
+    Py_DECREF(mv);
+    return ro;
+}
+
+// What the grammar did not account for: input[bytes_consumed:].
+static PyObject* PyBBQResult_get_tail(PyBBQResult* self, void*) {
+    PyObject* mv = PyBBQResult_get_input(self, NULL);
+    if (!mv || mv == Py_None) return mv;
+    size_t used;
+    { DocLock g(self); used = self->bytes_consumed; }
+    PyObject* sl = PySequence_GetSlice(mv, (Py_ssize_t)used, PY_SSIZE_T_MAX);
+    Py_DECREF(mv);
+    return sl;
+}
+
 #define RESULT_MEMBER(plain, fn, doc) \
     {(char*)plain,     (getter)fn, NULL, (char*)doc, NULL}, \
     {(char*)"_" plain, (getter)fn, NULL, (char*)doc, NULL}
@@ -2351,6 +2425,8 @@ static PyGetSetDef PyBBQResult_getset[] = {
     RESULT_MEMBER("error_message",  PyBBQResult_get_error_message,  "failure message, or None"),
     RESULT_MEMBER("error_offset",   PyBBQResult_get_error_offset,   "offset the parse gave up at"),
     RESULT_MEMBER("root",           PyBBQResult_get_root,           "the root node"),
+    RESULT_MEMBER("input",          PyBBQResult_get_input,          "the bytes that were parsed, as a read-only memoryview"),
+    RESULT_MEMBER("tail",           PyBBQResult_get_tail,           "input[bytes_consumed:] — what the grammar did not account for"),
     {NULL, NULL, NULL, NULL, NULL}
 };
 

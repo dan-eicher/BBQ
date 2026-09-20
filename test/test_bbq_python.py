@@ -2768,3 +2768,111 @@ class TestOnePathSpelling:
             assert node[0]._offset == d["offset"]
             assert functools.reduce(operator.getitem, node[0]._steps,
                                     edited._root)._offset == d["offset"]
+
+
+class TestTheInputIsReachable:
+    """A ParseResult holds its input for its whole life — for parse_file that is
+    a live mmap the document's spans point into — and there was no way to ask
+    for it.
+
+    It matters most when a grammar covers only PART of a file, which is the
+    normal state while a format is still being worked out: the parse succeeds
+    with bytes_consumed short of the end, and the remainder is the interesting
+    bit. `bytes(result)` is the other direction — what emit() would write.
+    """
+
+    SPEC = "Hdr = struct { magic: uint32be, ver: uint8 }"
+    DATA = bytes.fromhex("89504e47") + b"\x03" + bytes(range(0x20))
+
+    def test_a_partial_grammar_succeeds_and_says_how_far_it_got(self):
+        r = bbq.compile_string(self.SPEC).parse(self.DATA)
+        assert r._success
+        assert r._bytes_consumed == 5 < len(self.DATA)
+
+    def test_input_is_the_bytes_that_were_parsed(self):
+        r = bbq.compile_string(self.SPEC).parse(self.DATA)
+        assert bytes(r._input) == self.DATA
+        assert r._input.readonly, "the document's spans point into it"
+
+    def test_tail_is_what_the_grammar_did_not_account_for(self):
+        r = bbq.compile_string(self.SPEC).parse(self.DATA)
+        assert bytes(r._tail) == self.DATA[5:]
+        assert len(r._tail) == len(self.DATA) - r._bytes_consumed
+
+    def test_a_full_parse_has_an_empty_tail(self):
+        spec = bbq.compile_string(self.SPEC)
+        r = spec.parse(self.DATA[:5])
+        assert bytes(r._tail) == b""
+
+    def test_the_same_holds_for_a_file(self, tmp_path):
+        """parse_file mmaps; the view has to be over the source object so the
+        mapping cannot go away underneath the memoryview."""
+        p = tmp_path / "f.bin"
+        p.write_bytes(self.DATA)
+        r = bbq.compile_string(self.SPEC).parse_file(str(p))
+        assert bytes(r._input) == self.DATA
+        assert bytes(r._tail) == self.DATA[5:]
+
+    def test_input_outlives_nothing_it_should_not(self, tmp_path):
+        p = tmp_path / "f.bin"
+        p.write_bytes(self.DATA)
+        r = bbq.compile_string(self.SPEC).parse_file(str(p))
+        tail = r._tail
+        del r
+        gc.collect()
+        assert bytes(tail) == self.DATA[5:], "the mapping must outlive the result"
+
+    def test_input_is_not_emit(self):
+        """Two directions, two spellings: what went in, and what would go out."""
+        spec = bbq.compile_string("Foo = struct { a: uint8 }")
+        r = spec.parse(b"\x01")
+        r._root["a"] = 9
+        assert bytes(r._input) == b"\x01"
+        assert bytes(r) == b"\x09"
+
+
+class TestDumpStaysReadable:
+    """The viewer has to survive the shapes it will actually be pointed at.
+
+    An `array<uint8>` is how a grammar says "I do not know what this is yet",
+    and listing 32 of them one per line is 32 lines that say nothing. Rendering
+    the bytes beyond a short preview would be a hex viewer, which is the
+    caller's job — the shape, the size and the offset are the content here.
+    """
+
+    OPAQUE = "Hdr = struct { magic: uint32be, rest: array<uint8>(none, eof) }"
+
+    def test_an_opaque_byte_array_is_one_line(self):
+        r = bbq.compile_string(self.OPAQUE).parse(b"\xde\xad\xbe\xef" + bytes(range(32)))
+        out = r.dump()
+        assert len(out.splitlines()) == 3           # $, magic, rest
+        line = [l for l in out.splitlines() if "rest" in l][0]
+        assert "bytes[32]" in line and "@4..36" in line
+        assert "000102030405" in line and line.rstrip().endswith("@4..36")
+
+    def test_a_short_byte_array_is_not_elided(self):
+        r = bbq.compile_string(self.OPAQUE).parse(b"\xde\xad\xbe\xef" + b"\x01\x02")
+        line = [l for l in r.dump().splitlines() if "rest" in l][0]
+        assert "bytes[2] = 0102 " in line and "..." not in line
+
+    def test_an_array_of_structs_is_still_walked(self):
+        """Only byte arrays collapse — elements with structure keep it."""
+        spec = bbq.compile_string("E = struct { v: uint16le }\n"
+                                  "T = struct { n: uint8, xs: array<E>[n] }")
+        r = spec.parse(bytes([2, 1, 0, 2, 0]), rule="T")
+        assert "v: uint16le = 1" in r.dump()
+
+    def test_a_long_container_is_capped_with_a_count(self):
+        spec = bbq.compile_string("E = struct { v: uint8 }\n"
+                                  "T = struct { n: uint8, xs: array<E>[n] }")
+        r = spec.parse(bytes([40]) + bytes(40), rule="T")
+        out = r.dump(depth=2)
+        assert "... 24 more" in out
+        assert out.count("]: struct") == 16
+
+    def test_the_cap_is_adjustable(self):
+        spec = bbq.compile_string("E = struct { v: uint8 }\n"
+                                  "T = struct { n: uint8, xs: array<E>[n] }")
+        r = spec.parse(bytes([40]) + bytes(40), rule="T")
+        assert "... 36 more" in r.dump(depth=2, limit=4)
+        assert "more" not in r.dump(depth=2, limit=0), "0 means no cap"

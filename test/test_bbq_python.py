@@ -2521,3 +2521,204 @@ class TestSelectorsAreNotAQueryParser:
         doc.root["pts"][bbq.this.y > 0]
         assert bytes(doc) == before
         assert doc.deltas() == []
+
+
+# ── Where a node is, and what the document looks like ────────────────────────
+
+NAV_SPEC = """\
+Chunk = struct { kind: uint8, len: uint8, data: bytes[len] }
+File  = struct { magic: uint32be, n: uint8, chunks: array<Chunk>[n] }
+"""
+
+NAV_DATA = bytes([0xDE, 0xAD, 0xBE, 0xEF, 2, 1, 2, 0xAA, 0xBB, 7, 1, 0xCC])
+
+
+@pytest.fixture
+def navdoc():
+    r = bbq.compile_string(NAV_SPEC).parse(NAV_DATA, rule="File")
+    assert r._success, r._error_message
+    return r
+
+
+class TestProvenance:
+    """A query result has to be able to say where it came from.
+
+    A descendant search over a real file hands back dozens of nodes with the
+    same name; without a path, telling them apart means having tracked the walk
+    by hand, which is the work the search was supposed to do. This is what RFC
+    9535 defines normalized paths (§2.7) for.
+    """
+
+    def test_a_search_result_knows_its_path(self, navdoc):
+        hits = navdoc._root[..., "kind"]
+        assert [h._path for h in hits] == ["$.chunks[0].kind", "$.chunks[1].kind"]
+
+    def test_steps_are_actionable(self, navdoc):
+        """The path as data: reduce(getitem, steps, root) is the node again."""
+        import functools, operator
+        for hit in navdoc._root[..., "kind"]:
+            back = functools.reduce(operator.getitem, hit._steps, navdoc._root)
+            assert back._offset == hit._offset
+
+    def test_an_array_element_is_identified_by_position(self, navdoc):
+        """Decided by the PARENT's type, not by whether the child has a name:
+        an array element carries an EMPTY name, so keying on that rendered
+        every element as "." and made sibling paths identical."""
+        elem = navdoc._root["chunks"][1]
+        assert elem._steps == ("chunks", 1)
+        assert elem._path == "$.chunks[1]"
+
+    def test_the_root_has_an_empty_path(self, navdoc):
+        assert navdoc._root._steps == ()
+        assert navdoc._root._path == "$"
+
+    def test_a_node_reached_any_way_has_the_same_path(self, navdoc):
+        """Attribute, subscript, iteration and query must agree."""
+        by_attr = navdoc._root.chunks[0].kind
+        by_item = navdoc._root["chunks"][0]["kind"]
+        by_iter = list(navdoc._root["chunks"])[0]["kind"]
+        by_query = navdoc._root[..., "kind"].nodes[0]
+        assert by_attr._path == by_item._path == by_iter._path == by_query._path
+
+
+class TestNavigation:
+    def test_parent_and_root(self, navdoc):
+        data = navdoc._root["chunks"][1]["data"]
+        assert data._parent._path == "$.chunks[1]"
+        assert data._root._path == "$"
+        assert data._root._offset == navdoc._root._offset
+
+    def test_the_root_has_no_parent(self, navdoc):
+        assert navdoc._root._parent is None
+
+    def test_walking_up_reaches_the_root(self, navdoc):
+        node, seen = navdoc._root["chunks"][0]["len"], 0
+        while node._parent is not None:
+            node, seen = node._parent, seen + 1
+        assert seen == 3                      # len -> chunk -> chunks -> root
+        assert node._path == "$"
+
+    def test_going_up_then_down_reaches_a_sibling(self, navdoc):
+        """The thing one-way navigation cannot do: look at a neighbour."""
+        length = navdoc._root["chunks"][0]["len"]
+        assert length._parent["kind"].value == 1
+
+    def test_a_node_keeps_its_ancestors_alive(self, navdoc):
+        """The chain is strong refs, so a node handed out of a function does not
+        leave dangling parents behind it."""
+        def find():
+            return bbq.compile_string(NAV_SPEC).parse(NAV_DATA, rule="File")._root[..., "kind"].nodes[0]
+        hit = find()
+        gc.collect()
+        assert hit._path == "$.chunks[0].kind"
+        assert hit._root._path == "$"
+
+
+class TestDump:
+    """A library whose job is "what is in this file" has to be able to show you.
+
+    Every walker in this repo's own suite — dump_node in cross_backend_test.cpp,
+    the walk in TestContainerProtocol — is this function written again by hand.
+    """
+
+    def test_dump_shows_the_whole_tree(self, navdoc):
+        out = navdoc.dump()
+        assert "$: struct(3)" in out
+        assert "magic: uint32be = 3735928559" in out
+        assert "[0]: struct(3)" in out and "[1]: struct(3)" in out
+        assert out.count("kind: uint8") == 2
+
+    def test_dump_carries_offsets(self, navdoc):
+        assert "@0..4" in navdoc.dump()          # magic
+        assert "@11..12" in navdoc.dump()        # the last chunk's data
+
+    def test_dump_indents_by_depth(self, navdoc):
+        lines = {l.strip().split(":")[0]: len(l) - len(l.lstrip())
+                 for l in navdoc.dump().splitlines()}
+        assert lines["$"] == 0
+        assert lines["magic"] == 2
+        assert lines["[0]"] == 4
+        assert lines["kind"] == 6
+
+    def test_dump_can_be_depth_limited(self, navdoc):
+        shallow = navdoc.dump(depth=1)
+        assert "chunks: array(2)" in shallow
+        assert "kind" not in shallow
+
+    def test_a_node_dumps_its_own_subtree(self, navdoc):
+        out = navdoc._root["chunks"][1].dump()
+        assert out.startswith("[1]: struct(3)")
+        assert "kind: uint8 = 7" in out
+        assert "magic" not in out
+
+    def test_a_long_value_is_truncated(self):
+        spec = bbq.compile_string("Foo = struct { n: uint8, blob: bytes[n] }")
+        r = spec.parse(bytes([200]) + bytes(range(200)))
+        line = [l for l in r.dump().splitlines() if "blob" in l][0]
+        assert "..." in line and len(line) < 120
+
+
+class TestNamesDoNotShadowFields:
+    """A format names its own fields, and real formats have fields called
+    `name`, `value`, `offset`, `length`, `type`, `parent`.
+
+    The rule, which Kaitai Struct answers the same way with _parent/_root/_io
+    and namedtuple with _fields/_replace:
+
+      node["x"]  is ALWAYS the field — never a library member.
+      node._x    is ALWAYS the library member — a field cannot take it.
+      node.x     is the field when there is one, else the library member.
+
+    Before this, .name/.value/.offset/.raw were silently unreachable as fields:
+    a format with a `name` field read the node's own name instead and said
+    nothing about it.
+    """
+
+    SPEC = ("Foo = struct { name: uint8, value: uint8, offset: uint8, raw: uint8, "
+            "parent: uint8, root: uint8, path: uint8, steps: uint8, dump: uint8, "
+            "capture_type: uint8, parsed: uint8, keys: uint8, _value: uint8 }")
+    FIELDS = ["name", "value", "offset", "raw", "parent", "root", "path", "steps",
+              "dump", "capture_type", "parsed", "keys", "_value"]
+
+    @pytest.fixture
+    def hostile(self):
+        r = bbq.compile_string(self.SPEC).parse(bytes(range(1, len(self.FIELDS) + 1)))
+        assert r._success
+        return r
+
+    @pytest.mark.parametrize("field", FIELDS)
+    def test_the_field_wins_attribute_access(self, hostile, field):
+        if field.startswith("_"):
+            pytest.skip("the underscored canon is the library's; see the subscript test")
+        got = getattr(hostile._root, field)
+        assert isinstance(got, bbq.Node), f"node.{field} gave the library, not the field"
+        assert got.value == self.FIELDS.index(field) + 1
+
+    @pytest.mark.parametrize("field", FIELDS)
+    def test_subscript_always_reaches_the_field(self, hostile, field):
+        assert hostile._root[field].value == self.FIELDS.index(field) + 1
+
+    def test_the_underscored_canon_still_works(self, hostile):
+        root = hostile._root
+        assert root._name is None
+        assert root._offset == (0, len(self.FIELDS))
+        assert root._path == "$"
+        assert root._parent is None
+        assert root._capture_type == "struct"
+        assert root._keys() == self.FIELDS
+        assert "name: uint8 = 1" in root._dump()
+
+    def test_the_result_follows_the_same_rule(self, hostile):
+        assert hostile.root.value == self.FIELDS.index("root") + 1   # the field
+        assert hostile._root._capture_type == "struct"               # the document
+        assert hostile._success is True
+
+    def test_a_format_without_those_names_is_unaffected(self, navdoc):
+        """The convenience spelling still works wherever nothing claims it."""
+        assert navdoc._root["chunks"][0].kind.value == 1
+        assert navdoc._root["chunks"][0]["kind"].name == "kind"
+        assert navdoc.root._capture_type == "struct"
+
+    def test_dir_offers_both(self, hostile):
+        names = dir(hostile._root)
+        assert "name" in names and "_name" in names

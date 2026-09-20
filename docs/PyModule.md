@@ -106,12 +106,55 @@ Container protocols: `result.field`, `result["field"]`, `result[i]`, slices, `le
 | `emit() -> bytes`, `bytes(r)` | Serialize. The dependent fields (array counts, `@rest` sizes) are recomputed from what the edits produced, then the input is blitted and what changed is patched into it — so an edit that resizes nothing leaves bytes no field covers exactly where they were. Byte-identical to the input if unedited; re-parses to the edit if not. |
 | `deltas() -> list[dict]` | What is no longer the input: `{path, offset, old, new}` for every leaf that stopped being described by its span. A span-backed node cannot have changed, which is what keeps this proportional to the edit rather than the file. |
 
+### Names: the format owns them
+
+A format names its own fields, and real ones are called `name`, `value`,
+`offset`, `length`, `type`, `parent`. A library that claims those names makes
+those formats unreachable by the spelling their specification uses — you would
+have to rename a field in the grammar to read it, which is the format describing
+the library instead of the other way round.
+
+So there are three spellings, and only the middle one is ambiguous:
+
+| | resolves to |
+|---|---|
+| `node["x"]` | **always the field** — never a library member |
+| `node._x` | **always the library member** — a field cannot take it |
+| `node.x` | the field when there is one, otherwise the library member |
+
+Every member of `Node` and `ParseResult` answers to both spellings, so
+`node.offset` and `node._offset` are the same property unless the format has an
+`offset` field, in which case the plain one is that field. Generic code that must
+work against *any* grammar should use the underscored form; code written against
+a known format can use whichever reads better.
+
+`node["_value"]` reaches a field literally named `_value`. Subscript is the
+escape hatch that always works.
+
+This is the answer Kaitai Struct gives the same problem (`_parent`, `_root`,
+`_io`) and `collections.namedtuple` gives it (`_fields`, `_replace`, `_asdict`).
+
 ### `bbq.Node`
 
 A position in the document, addressed by its container and its slot.
 
 **Read / navigate:** `.field`, `["field"]`, `[i]` (negative ok), `[a:b]` slices,
 `len()`, `in`, iteration (struct → `(name, node)`, array → nodes), `keys()`/`values()`/`items()`, `dict(node)`, `dir()`.
+
+**Where a node is:** `_parent` (the node it was reached through, `None` at the
+root), `_root`, `_steps` (the path as a tuple — field names and array positions,
+so `functools.reduce(operator.getitem, node._steps, root)` is the node again) and
+`_path` (the same for a human: `$.chunks[7].kind`).
+
+A document is a tree of spans with no back edges, so a node carries the chain it
+was reached through. Without it a descendant search over a 500-chunk file hands
+back forty nodes all called `kind` and no way to tell them apart — which is the
+work the search was supposed to do. RFC 9535 defines normalized paths (§2.7) for
+the same reason.
+
+**Seeing it:** `node.dump(depth=None)` renders the node and what is under it as a
+tree, with types, values and byte offsets; `result.dump()` is the document's.
+Long values are truncated, so a 4 MB `bytes` field does not become 4 MB of dump.
 
 A container's mapping view is keyed the way indexing it is: a **struct** by field
 name, an **array** by position. So `dict(arr)` is `{0: …, 1: …}`, and
@@ -144,6 +187,49 @@ Python list. Structural *contents* (the new elements) are read back after
 derives it from the array's effective length, so do not set it yourself — the
 array wins. The same holds for a count reached by a path (`array<uint8>[h.n]`),
 a count nested inside an array element, and an `@rest` window's size.
+
+## Querying — `bbq.NodeList` and `bbq.this`
+
+RFC 9535's selector vocabulary, reached through Python's subscript protocol
+rather than through a query string. **A selector that can only ever match once
+answers with a `Node`; one that can match more answers with a `NodeList`**, and a
+segment applied to a `NodeList` is that segment applied to each of its nodes
+(§2.1.2), which is what lets them chain.
+
+| Python | RFC 9535 | |
+|---|---|---|
+| `node["name"]`, `node[3]` | `$.name`, `$[3]` | one node, strict — `KeyError`/`IndexError` on a miss |
+| `node[1:3:2]`, `node[:]` | `$[1:3:2]`, `$[*]` | slice, wildcard |
+| `node[0, 2]`, `node["a", "b"]` | `$[0,2]` | several selectors in one segment |
+| `node[...]` | the node set `..` iterates over | this node and everything under it |
+| `node[..., "name"]` | `$..name` | descendant segment |
+| `node[bbq.this.x > 1]` | `$[?@.x > 1]` | filter over the node's children |
+
+Inside a multi-valued selector a miss contributes nothing rather than raising
+(§2.3.1.2, "selects nothing if there is no such member"), and a selector over a
+leaf answers with an empty nodelist — otherwise no descendant walk could cross
+one without the caller guarding every step.
+
+**Filters need a placeholder**, and it cannot be `Node`: `Node.__eq__`
+materialises the value and compares it, so `node.x == 1` is a real `bool` — the
+property that makes the rest of the API pleasant is what disqualifies it as an
+expression builder. `bbq.this` is `@`. Combine with `&`, `|`, `~`, because Python
+cannot overload `and`/`or`/`not`; a query raises on `bool()` rather than
+answering, so a stray `and` cannot quietly discard the expression. A bare path is
+an existence test. `bbq.count(path)` and `bbq.length(path)` are values a
+comparison can take, and a path matching no node is *Nothing*, which compares as
+§2.3.5.2 requires.
+
+**Subscripting a `NodeList` reads two ways, decided by the key.** `nl[0]` and
+`nl[1:3]` are positional — it is a Python sequence, and `xs[0:2][0]` has to be
+the first of the two. A name, an `...`, a tuple or a filter *composes*. The
+wildcard would have been the ambiguous one, so it is named rather than punned:
+`nl.children`. `nl.nodes` is the plain list; `nl.values` is each node's value.
+
+This is the RFC's vocabulary, not an implementation of the RFC: there is no query
+string, no `$` literal, and no `match()`/`search()` — those need RFC 9485
+I-Regexp, and a binary format parser has no business owning a regex engine. Use
+Python's `re` on the values a query hands back.
 
 ## `bbq.build` — construction from scratch
 

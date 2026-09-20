@@ -69,7 +69,8 @@ extern PyTypeObject PyBBQNodeIter_Type;
 
 static PyObject* PyBBQParseError;
 
-static PyBBQNode* PyBBQNode_New(PyBBQResult* result, zc::node* parent, Py_ssize_t slot);
+static PyBBQNode* PyBBQNode_New(PyBBQResult* result, zc::node* parent, Py_ssize_t slot,
+                                PyBBQNode* up);
 
 // The multi-valued half of the selector vocabulary — a tuple of selectors, an
 // Ellipsis for the descendant segment, a slice, a filter. Defined beside the
@@ -172,12 +173,20 @@ struct PyBBQNode {
     zc::node* parent;
     Py_ssize_t slot;
     PyBBQResult* result;
+    // The node this one was reached THROUGH, or null at the root. `parent`
+    // above is the ZCow node — enough to read this node's value, and nothing
+    // more; a document is a tree of spans with no back edges, so without this a
+    // node found by a descendant search cannot say which of forty identically
+    // named siblings it is. That is what makes a query result actionable rather
+    // than merely correct, and it is what _path, _root and _parent are built on.
+    PyBBQNode* up;
 };
 
 struct PyBBQNodeIter {
     PyObject_HEAD
     PyBBQResult* result;
     zc::node* container;   // owned, so it stays put while the iteration runs
+    PyBBQNode* owner;      // the container as a Node, so what it yields knows its parent
     Py_ssize_t index;
     bool yield_tuples;     // true for struct → (name, node), false for array → node
 };
@@ -521,13 +530,16 @@ static int write_child(PyBBQResult* result, PyBBQNode* holder,
 
 // ── PyBBQNode ───────────────────────────────────────────────────────────────
 
-static PyBBQNode* PyBBQNode_New(PyBBQResult* result, zc::node* parent, Py_ssize_t slot) {
+static PyBBQNode* PyBBQNode_New(PyBBQResult* result, zc::node* parent, Py_ssize_t slot,
+                                PyBBQNode* up) {
     PyBBQNode* node = PyObject_GC_New(PyBBQNode, &PyBBQNode_Type);
     if (!node) return NULL;
     node->parent = parent;
     node->slot = slot;
     Py_INCREF(result);
     node->result = result;
+    node->up = up;
+    Py_XINCREF(up);          // a node keeps the chain it was reached through alive
     PyObject_GC_Track((PyObject*)node);
     return node;
 }
@@ -535,11 +547,13 @@ static PyBBQNode* PyBBQNode_New(PyBBQResult* result, zc::node* parent, Py_ssize_
 static void PyBBQNode_dealloc(PyBBQNode* self) {
     PyObject_GC_UnTrack((PyObject*)self);
     Py_XDECREF(self->result);
+    Py_XDECREF(self->up);
     PyObject_GC_Del(self);
 }
 
 static int PyBBQNode_traverse(PyBBQNode* self, visitproc visit, void* arg) {
     Py_VISIT(self->result);
+    Py_VISIT(self->up);
     return 0;
 }
 
@@ -562,24 +576,36 @@ static PyObject* child_node(PyBBQResult* result, PyBBQNode* holder, Py_ssize_t s
     }
     zc::node* owned = owned_node_of(holder);
     if (!owned) { PyErr_SetString(PyExc_RuntimeError, "node vanished"); return NULL; }
-    return (PyObject*)PyBBQNode_New(result, owned, slot);
+    return (PyObject*)PyBBQNode_New(result, owned, slot, holder);
 }
 
+// THE FIELD WINS.
+//
+// A format names its own fields, and real ones are called `name`, `value`,
+// `offset`, `length`, `parent`, `type`. A library that claims those names makes
+// those formats unreachable by the spelling their specification uses — you would
+// have to rename the field in the grammar to read it, which is the format
+// describing the library instead of the other way round.
+//
+// So: `node.x` is the field `x` when there is one. Every library member also
+// answers to `node._x`, which a field cannot take away because the underscored
+// forms are the canonical ones. And `node["x"]` is always the field and never a
+// library member, which is the escape hatch that works even for a field named
+// `_value`.
+//
+// (Before this, `.name`, `.value`, `.offset` and `.raw` were silently
+// unreachable as fields — a format with a `name` field read the node's own name
+// instead and said nothing about it.)
 static PyObject* PyBBQNode_getattro(PyBBQNode* self, PyObject* name) {
-    // Try standard attributes first (methods, properties)
-    PyObject* attr = PyObject_GenericGetAttr((PyObject*)self, name);
-    if (attr) return attr;
-    if (!PyErr_ExceptionMatches(PyExc_AttributeError)) return NULL;
-
     const char* key = PyUnicode_AsUTF8(name);
     if (!key) return NULL;
 
-    Py_ssize_t slot;
-    { DocLock g(self->result); slot = child_slot(node_of(self), key); }
-    if (slot < 0) return NULL;   // keep AttributeError
-
-    PyErr_Clear();
-    return child_node(self->result, self, slot);
+    if (key[0] != '_') {                       // dunders and the canon skip this
+        Py_ssize_t slot;
+        { DocLock g(self->result); slot = child_slot(node_of(self), key); }
+        if (slot >= 0) return child_node(self->result, self, slot);
+    }
+    return PyObject_GenericGetAttr((PyObject*)self, name);
 }
 
 // `node.field = v` — own the field and write it.
@@ -949,6 +975,8 @@ static PyObject* make_iter(PyBBQResult* result, PyBBQNode* holder) {
     Py_INCREF(result);
     iter->result = result;
     iter->container = c;
+    Py_INCREF(holder);
+    iter->owner = holder;
     iter->index = 0;
     iter->yield_tuples = tuples;
     PyObject_GC_Track((PyObject*)iter);
@@ -1148,6 +1176,8 @@ static PyObject* PyBBQNode_append(PyBBQNode* self, PyObject* value) {
     Py_RETURN_NONE;
 }
 
+static PyObject* PyBBQNode_dump(PyBBQNode* self, PyObject* args, PyObject* kwargs);
+
 static PyMethodDef PyBBQNode_methods[] = {
     {"__format__", (PyCFunction)PyBBQNode_format, METH_VARARGS,
      "Format node value with format spec."},
@@ -1161,6 +1191,15 @@ static PyMethodDef PyBBQNode_methods[] = {
      "Child nodes (like dict.values)."},
     {"items",      (PyCFunction)PyBBQNode_items,  METH_NOARGS,
      "Child (name, node) pairs (like dict.items)."},
+    {"dump",       (PyCFunction)(void(*)(void))PyBBQNode_dump, METH_VARARGS | METH_KEYWORDS,
+     "dump(depth=None) -> str: this node and what is under it, as a tree."},
+    // The underscored twins — see the note on PyBBQNode_getset.
+    {"_keys",      (PyCFunction)PyBBQNode_keys,   METH_NOARGS,  "Child field names."},
+    {"_values",    (PyCFunction)PyBBQNode_values, METH_NOARGS,  "Child nodes."},
+    {"_items",     (PyCFunction)PyBBQNode_items,  METH_NOARGS,  "Child (name, node) pairs."},
+    {"_append",    (PyCFunction)PyBBQNode_append, METH_O,       "Add an element to an array node."},
+    {"_dump",      (PyCFunction)(void(*)(void))PyBBQNode_dump, METH_VARARGS | METH_KEYWORDS,
+     "dump(depth=None) -> str: this node and what is under it, as a tree."},
     {NULL, NULL, 0, NULL}
 };
 
@@ -1230,21 +1269,206 @@ static PyObject* PyBBQNode_get_parsed(PyBBQNode* self, void*) {
     return PyBool_FromLong(n && n->parsed);
 }
 
+// ── Where a node is ──────────────────────────────────────────────────────────
+//
+// A descendant search over a 500-chunk file hands back forty nodes all called
+// `kind`. Without these, telling them apart means having tracked the walk
+// yourself, which is the work the search was supposed to do. RFC 9535 defines
+// normalized paths (§2.7) for the same reason: a query result that cannot say
+// where it came from is not actionable.
+
+static PyObject* PyBBQNode_get_parent(PyBBQNode* self, void*) {
+    if (!self->up) Py_RETURN_NONE;
+    return Py_NewRef((PyObject*)self->up);
+}
+
+static PyObject* PyBBQNode_get_root(PyBBQNode* self, void*) {
+    PyBBQNode* n = self;
+    while (n->up) n = n->up;
+    return Py_NewRef((PyObject*)n);
+}
+
+// The steps from the root to here: field names as str, array positions as int.
+// Unambiguous and directly usable — reduce(getitem, steps, root) is this node.
+// Which step identifies this node inside its parent: a field NAME under a
+// struct, a POSITION under an array. Decided by the PARENT's type rather than by
+// whether the child carries a name, because an array element carries an empty
+// one — which is why the first cut of this rendered every element as "." and
+// made two paths identical.
+static PyObject* step_of(PyBBQNode* n) {
+    bool positional;
+    const char* nm = nullptr;
+    {
+        DocLock g(n->result);
+        const zc::node* p = node_of(n->up);
+        const zc::node* c = node_of(n);
+        positional = !p || p->type == CaptureType::Array;
+        if (c) nm = c->name;
+    }
+    if (positional || !nm || !*nm) return PyLong_FromSsize_t(n->slot);
+    return PyUnicode_FromString(nm);
+}
+
+static PyObject* PyBBQNode_get_steps(PyBBQNode* self, void*) {
+    PyObject* rev = PyList_New(0);
+    if (!rev) return NULL;
+    for (PyBBQNode* n = self; n->up; n = n->up) {
+        PyObject* step = step_of(n);
+        if (!step || PyList_Append(rev, step) < 0) {
+            Py_XDECREF(step); Py_DECREF(rev); return NULL;
+        }
+        Py_DECREF(step);
+    }
+    if (PyList_Reverse(rev) < 0) { Py_DECREF(rev); return NULL; }
+    PyObject* out = PyList_AsTuple(rev);
+    Py_DECREF(rev);
+    return out;
+}
+
+// The same, as something to put in an error message: $.chunks[7].kind
+static PyObject* PyBBQNode_get_path(PyBBQNode* self, void*) {
+    PyObject* steps = PyBBQNode_get_steps(self, NULL);
+    if (!steps) return NULL;
+    PyObject* parts = PyList_New(0);
+    if (!parts) { Py_DECREF(steps); return NULL; }
+    PyObject* dollar = PyUnicode_FromString("$");
+    if (!dollar || PyList_Append(parts, dollar) < 0) {
+        Py_XDECREF(dollar); Py_DECREF(parts); Py_DECREF(steps); return NULL;
+    }
+    Py_DECREF(dollar);
+    for (Py_ssize_t i = 0; i < PyTuple_GET_SIZE(steps); i++) {
+        PyObject* s = PyTuple_GET_ITEM(steps, i);
+        PyObject* piece = PyUnicode_Check(s)
+            ? PyUnicode_FromFormat(".%U", s)
+            : PyUnicode_FromFormat("[%S]", s);
+        if (!piece || PyList_Append(parts, piece) < 0) {
+            Py_XDECREF(piece); Py_DECREF(parts); Py_DECREF(steps); return NULL;
+        }
+        Py_DECREF(piece);
+    }
+    Py_DECREF(steps);
+    PyObject* empty = PyUnicode_FromString("");
+    PyObject* out = empty ? PyUnicode_Join(empty, parts) : NULL;
+    Py_XDECREF(empty);
+    Py_DECREF(parts);
+    return out;
+}
+
+// ── Seeing the document ──────────────────────────────────────────────────────
+//
+// A library whose job is "what is in this binary file" has to be able to show
+// you. Every walker in this repo's own test suite — dump_node in
+// cross_backend_test.cpp, the walk in TestContainerProtocol — is this function
+// written again by hand, which is the signal that it belongs here.
+static int dump_into(PyBBQNode* node, PyObject* out, int indent, int depth_left) {
+    CaptureType ct;
+    Py_ssize_t count, start, end;
+    const char* nm;
+    {
+        DocLock g(node->result);
+        const zc::node* n = node_of(node);
+        if (!n) return 0;
+        ct = n->type; nm = n->name;
+        start = (Py_ssize_t)n->start_offset; end = (Py_ssize_t)n->end_offset;
+        count = is_container(ct) ? (Py_ssize_t)zc::size_of(n) : 0;
+    }
+
+    // The root is "$"; everything else is named or numbered by its parent.
+    PyObject* label;
+    if (!node->up) {
+        label = PyUnicode_FromString("$");
+    } else {
+        PyObject* step = step_of(node);
+        if (!step) return -1;
+        label = PyUnicode_Check(step) ? Py_NewRef(step)
+                                      : PyUnicode_FromFormat("[%S]", step);
+        Py_DECREF(step);
+    }
+    if (!label) return -1;
+    (void)nm;
+
+    PyObject* line;
+    if (is_container(ct)) {
+        line = PyUnicode_FromFormat("%*s%U: %s(%zd)  @%zd..%zd\n", indent, "",
+                                    label, capture_type_name(ct), count, start, end);
+    } else {
+        PyObject* v = node_value(node->result, node_of(node));
+        if (!v) { Py_DECREF(label); return -1; }
+        PyObject* vs = PyObject_Repr(v);
+        Py_DECREF(v);
+        if (!vs) { Py_DECREF(label); return -1; }
+        // A 4 MB bytes field must not become 4 MB of dump.
+        if (PyUnicode_GET_LENGTH(vs) > 60) {
+            PyObject* cut = PyUnicode_Substring(vs, 0, 57);
+            PyObject* ell = cut ? PyUnicode_FromFormat("%U...", cut) : NULL;
+            Py_XDECREF(cut); Py_DECREF(vs); vs = ell;
+            if (!vs) { Py_DECREF(label); return -1; }
+        }
+        line = PyUnicode_FromFormat("%*s%U: %s = %U  @%zd..%zd\n", indent, "",
+                                    label, capture_type_name(ct), vs, start, end);
+        Py_DECREF(vs);
+    }
+    Py_DECREF(label);
+    if (!line) return -1;
+    int rc = PyList_Append(out, line);
+    Py_DECREF(line);
+    if (rc < 0) return -1;
+
+    if (!is_container(ct) || depth_left == 0) return 0;
+    if (Py_EnterRecursiveCall(" while dumping")) return -1;
+    rc = 0;
+    for (Py_ssize_t i = 0; i < count && rc == 0; i++) {
+        PyObject* kid = child_node(node->result, node, i);
+        if (!kid) { rc = -1; break; }
+        rc = dump_into((PyBBQNode*)kid, out, indent + 2,
+                       depth_left < 0 ? -1 : depth_left - 1);
+        Py_DECREF(kid);
+    }
+    Py_LeaveRecursiveCall();
+    return rc;
+}
+
+static PyObject* PyBBQNode_dump(PyBBQNode* self, PyObject* args, PyObject* kwargs) {
+    int depth = -1;
+    static const char* kwlist[] = {"depth", NULL};
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "|i", (char**)kwlist, &depth))
+        return NULL;
+    PyObject* lines = PyList_New(0);
+    if (!lines) return NULL;
+    if (dump_into(self, lines, 0, depth) < 0) { Py_DECREF(lines); return NULL; }
+    PyObject* empty = PyUnicode_FromString("");
+    PyObject* out = empty ? PyUnicode_Join(empty, lines) : NULL;
+    Py_XDECREF(empty);
+    Py_DECREF(lines);
+    return out;
+}
+
+// Every member is registered TWICE: once plain, once underscored.
+//
+// A binary format names its own fields, and some of them are called `name`,
+// `value`, `offset` or `parent` — a library that claims those names makes those
+// formats unreachable by the spelling their specification uses. So the
+// underscored form is the canonical one and can always be relied on, the plain
+// form is a convenience that YIELDS to a field of the same name (see
+// PyBBQNode_getattro), and node["whatever"] is always the field and never a
+// library member. Kaitai Struct answers the same problem the same way with
+// _parent/_root/_io, and namedtuple with _fields/_replace/_asdict.
+#define NODE_MEMBER(plain, fn, doc) \
+    {(char*)plain,       (getter)fn, NULL, (char*)doc, NULL}, \
+    {(char*)"_" plain,   (getter)fn, NULL, (char*)doc, NULL}
+
 static PyGetSetDef PyBBQNode_getset[] = {
-    {(char*)"offset",       (getter)PyBBQNode_get_offset,       NULL,
-     (char*)"(start, end) byte offset tuple", NULL},
-    {(char*)"raw",          (getter)PyBBQNode_get_raw,          NULL,
-     (char*)"this node's bytes as they stand", NULL},
-    {(char*)"capture_type", (getter)PyBBQNode_get_capture_type, NULL,
-     (char*)"capture type name string", NULL},
-    {(char*)"name",         (getter)PyBBQNode_get_name,         NULL,
-     (char*)"field name or None", NULL},
-    {(char*)"value",        (getter)PyBBQNode_get_value,        NULL,
-     (char*)"auto-materialized Python value", NULL},
-    {(char*)"variant_tag",  (getter)PyBBQNode_get_variant_tag,  NULL,
-     (char*)"union/switch arm ordinal, or None if not a variant", NULL},
-    {(char*)"parsed",       (getter)PyBBQNode_get_parsed,       NULL,
-     (char*)"True while this node still names bytes of the input", NULL},
+    NODE_MEMBER("offset",       PyBBQNode_get_offset,       "(start, end) byte offset tuple"),
+    NODE_MEMBER("raw",          PyBBQNode_get_raw,          "this node's bytes as they stand"),
+    NODE_MEMBER("capture_type", PyBBQNode_get_capture_type, "capture type name string"),
+    NODE_MEMBER("name",         PyBBQNode_get_name,         "field name or None"),
+    NODE_MEMBER("value",        PyBBQNode_get_value,        "auto-materialized Python value"),
+    NODE_MEMBER("variant_tag",  PyBBQNode_get_variant_tag,  "union/switch arm ordinal, or None"),
+    NODE_MEMBER("parsed",       PyBBQNode_get_parsed,       "True while this node still names input bytes"),
+    NODE_MEMBER("parent",       PyBBQNode_get_parent,       "the node this one was reached through, or None"),
+    NODE_MEMBER("root",         PyBBQNode_get_root,         "the document root this node came from"),
+    NODE_MEMBER("path",         PyBBQNode_get_path,         "where this node is: $.chunks[7].kind"),
+    NODE_MEMBER("steps",        PyBBQNode_get_steps,        "the path as a tuple of names and indices"),
     {NULL, NULL, NULL, NULL, NULL}
 };
 
@@ -1289,16 +1513,19 @@ PyTypeObject PyBBQNode_Type = {
 static void PyBBQNodeIter_dealloc(PyBBQNodeIter* self) {
     PyObject_GC_UnTrack((PyObject*)self);
     Py_XDECREF(self->result);
+    Py_XDECREF(self->owner);
     PyObject_GC_Del(self);
 }
 
 static int PyBBQNodeIter_traverse(PyBBQNodeIter* self, visitproc visit, void* arg) {
     Py_VISIT(self->result);
+    Py_VISIT(self->owner);
     return 0;
 }
 
 static int PyBBQNodeIter_clear(PyBBQNodeIter* self) {
     Py_CLEAR(self->result);
+    Py_CLEAR(self->owner);
     return 0;
 }
 
@@ -1317,7 +1544,7 @@ static PyObject* PyBBQNodeIter_iternext(PyBBQNodeIter* self) {
     }
     self->index++;
 
-    PyBBQNode* node = PyBBQNode_New(self->result, self->container, i);
+    PyBBQNode* node = PyBBQNode_New(self->result, self->container, i, self->owner);
     if (!node) return NULL;
 
     if (!self->yield_tuples) return (PyObject*)node;
@@ -2027,27 +2254,27 @@ static PyBBQNode* result_root(PyBBQResult* self) {
           PyErr_SetString(PyExc_AttributeError, "no parse tree");
           return NULL;
       } }
-    return PyBBQNode_New(self, nullptr, -1);
+    return PyBBQNode_New(self, nullptr, -1, nullptr);
 }
 
+// The same rule as Node's: a root field named `success` or `root` has to be
+// reachable as `result.success`, and the library's own is `result._success`.
 static PyObject* PyBBQResult_getattro(PyBBQResult* self, PyObject* name) {
-    PyObject* attr = PyObject_GenericGetAttr((PyObject*)self, name);
-    if (attr) return attr;
-    if (!PyErr_ExceptionMatches(PyExc_AttributeError)) return NULL;
-
     const char* key = PyUnicode_AsUTF8(name);
     if (!key) return NULL;
 
-    Py_ssize_t slot;
-    { DocLock g(self); slot = child_slot(self->edit->root(), key); }
-    if (slot < 0) return NULL;   // keep AttributeError
-
-    PyErr_Clear();
-    PyBBQNode* root = PyBBQNode_New(self, nullptr, -1);
-    if (!root) return NULL;
-    PyObject* child = child_node(self, root, slot);
-    Py_DECREF(root);
-    return child;
+    if (key[0] != '_') {
+        Py_ssize_t slot;
+        { DocLock g(self); slot = child_slot(self->edit->root(), key); }
+        if (slot >= 0) {
+            PyBBQNode* root = PyBBQNode_New(self, nullptr, -1, nullptr);
+            if (!root) return NULL;
+            PyObject* child = child_node(self, root, slot);
+            Py_DECREF(root);
+            return child;
+        }
+    }
+    return PyObject_GenericGetAttr((PyObject*)self, name);
 }
 
 static int PyBBQResult_setattro(PyBBQResult* self, PyObject* name, PyObject* value) {
@@ -2058,7 +2285,7 @@ static int PyBBQResult_setattro(PyBBQResult* self, PyObject* name, PyObject* val
       if (!self->edit->root()) {
           PyErr_SetString(PyExc_AttributeError, "no parse tree"); return -1;
       } }
-    PyBBQNode* root = PyBBQNode_New(self, nullptr, -1);
+    PyBBQNode* root = PyBBQNode_New(self, nullptr, -1, nullptr);
     if (!root) return -1;
     int rc = write_child(self, root, key, -1, value);
     Py_DECREF(root);
@@ -2106,20 +2333,19 @@ static PyObject* PyBBQResult_get_error_offset(PyBBQResult* self, void*) {
 
 static PyObject* PyBBQResult_get_root(PyBBQResult* self, void*) {
     { DocLock g(self); if (!self->edit->root()) Py_RETURN_NONE; }
-    return (PyObject*)PyBBQNode_New(self, nullptr, -1);
+    return (PyObject*)PyBBQNode_New(self, nullptr, -1, nullptr);
 }
 
+#define RESULT_MEMBER(plain, fn, doc) \
+    {(char*)plain,     (getter)fn, NULL, (char*)doc, NULL}, \
+    {(char*)"_" plain, (getter)fn, NULL, (char*)doc, NULL}
+
 static PyGetSetDef PyBBQResult_getset[] = {
-    {(char*)"success",        (getter)PyBBQResult_get_success,        NULL,
-     (char*)"whether the parse succeeded", NULL},
-    {(char*)"bytes_consumed", (getter)PyBBQResult_get_bytes_consumed, NULL,
-     (char*)"how many bytes the parse consumed", NULL},
-    {(char*)"error_message",  (getter)PyBBQResult_get_error_message,  NULL,
-     (char*)"failure message, or None", NULL},
-    {(char*)"error_offset",   (getter)PyBBQResult_get_error_offset,   NULL,
-     (char*)"offset the parse gave up at", NULL},
-    {(char*)"root",           (getter)PyBBQResult_get_root,           NULL,
-     (char*)"the root node", NULL},
+    RESULT_MEMBER("success",        PyBBQResult_get_success,        "whether the parse succeeded"),
+    RESULT_MEMBER("bytes_consumed", PyBBQResult_get_bytes_consumed, "how many bytes the parse consumed"),
+    RESULT_MEMBER("error_message",  PyBBQResult_get_error_message,  "failure message, or None"),
+    RESULT_MEMBER("error_offset",   PyBBQResult_get_error_offset,   "offset the parse gave up at"),
+    RESULT_MEMBER("root",           PyBBQResult_get_root,           "the root node"),
     {NULL, NULL, NULL, NULL, NULL}
 };
 
@@ -2212,6 +2438,14 @@ static PyObject* PyBBQResult_bytes(PyBBQResult* self, PyObject*) {
     return PyBBQResult_emit(self, NULL);
 }
 
+static PyObject* PyBBQResult_dump(PyBBQResult* self, PyObject* args, PyObject* kwargs) {
+    PyBBQNode* root = result_root(self);
+    if (!root) return NULL;
+    PyObject* out = PyBBQNode_dump(root, args, kwargs);
+    Py_DECREF(root);
+    return out;
+}
+
 static PyMethodDef PyBBQResult_methods[] = {
     {"__dir__", (PyCFunction)PyBBQResult_dir, METH_NOARGS,
      "List attributes including parsed field names."},
@@ -2224,6 +2458,12 @@ static PyMethodDef PyBBQResult_methods[] = {
      "bytes(result) — the same as emit()."},
     {"deltas", (PyCFunction)PyBBQResult_deltas, METH_NOARGS,
      "What is no longer the input: list of {path, offset, old, new}."},
+    {"dump", (PyCFunction)(void(*)(void))PyBBQResult_dump, METH_VARARGS | METH_KEYWORDS,
+     "dump(depth=None) -> str: the whole document as a tree."},
+    {"_emit",   (PyCFunction)PyBBQResult_emit,   METH_NOARGS, "Serialize back to bytes."},
+    {"_deltas", (PyCFunction)PyBBQResult_deltas, METH_NOARGS, "What is no longer the input."},
+    {"_dump",   (PyCFunction)(void(*)(void))PyBBQResult_dump, METH_VARARGS | METH_KEYWORDS,
+     "dump(depth=None) -> str: the whole document as a tree."},
     {NULL, NULL, 0, NULL}
 };
 

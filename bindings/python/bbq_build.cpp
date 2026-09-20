@@ -188,9 +188,45 @@ PyGetSetDef Leaf_getset[] = {
     {nullptr, nullptr, nullptr, nullptr, nullptr}
 };
 
+// The ZCow setters refuse a value the leaf cannot hold by throwing, and the
+// frame above these is CPython — so each one translates rather than letting the
+// exception cross. bbq.build reaches the same law by its own road: it mints
+// nodes instead of editing parsed ones, and `u8(999)` used to mean `0xE7`.
+static bool set_guarded(zc::node* n, int64_t v, zc::Enc e) {
+    try { zc::set_int(n, v, e); }
+    catch (const zc::range_error& ex) { PyErr_SetString(PyExc_OverflowError, ex.what()); return false; }
+    catch (const std::exception& ex)  { PyErr_SetString(PyExc_TypeError, ex.what());     return false; }
+    return true;
+}
+static bool set_guarded_u(zc::node* n, uint64_t v, zc::Enc e) {
+    try { zc::set_uint(n, v, e); }
+    catch (const zc::range_error& ex) { PyErr_SetString(PyExc_OverflowError, ex.what()); return false; }
+    catch (const std::exception& ex)  { PyErr_SetString(PyExc_TypeError, ex.what());     return false; }
+    return true;
+}
+
+// A 64-bit unsigned field's top half is past what PyArg's "L" can parse, so the
+// value is taken as an object and converted as unsigned. A negative is refused
+// here rather than wrapping into the top of the range.
+static bool as_u64(PyObject* o, uint64_t* out) {
+    if (!PyLong_Check(o)) {
+        PyErr_Format(PyExc_TypeError, "expected an integer, not %.100s", Py_TYPE(o)->tp_name);
+        return false;
+    }
+    unsigned long long v = PyLong_AsUnsignedLongLong(o);
+    if (v == (unsigned long long)-1 && PyErr_Occurred()) return false;
+    *out = (uint64_t)v;
+    return true;
+}
+
 PyObject* make_int(int64_t v, CaptureType t) {
     zc::node_ptr n = new_node(t);
-    zc::set_int(n.get(), v);
+    if (!set_guarded(n.get(), v, zc::Enc::Fixed)) return nullptr;
+    return make_leaf(std::move(n));
+}
+PyObject* make_uint(uint64_t v, CaptureType t) {
+    zc::node_ptr n = new_node(t);
+    if (!set_guarded_u(n.get(), v, zc::Enc::Fixed)) return nullptr;
     return make_leaf(std::move(n));
 }
 PyObject* make_float(double v, CaptureType t) {
@@ -200,7 +236,12 @@ PyObject* make_float(double v, CaptureType t) {
 }
 PyObject* make_varint(int64_t v, zc::Enc e) {
     zc::node_ptr n = new_node(CaptureType::Computed);
-    zc::set_int(n.get(), v, e);
+    if (!set_guarded(n.get(), v, e)) return nullptr;
+    return make_leaf(std::move(n));
+}
+PyObject* make_uvarint(uint64_t v, zc::Enc e) {
+    zc::node_ptr n = new_node(CaptureType::Computed);
+    if (!set_guarded_u(n.get(), v, e)) return nullptr;
     return make_leaf(std::move(n));
 }
 
@@ -218,6 +259,16 @@ PyObject* make_varint(int64_t v, zc::Enc e) {
         if (!PyArg_ParseTupleAndKeywords(a, kw, "L|s", const_cast<char**>(kwl), &v, &en)) return nullptr; \
         return make_int((int64_t)v, T);                                                  \
     }
+// The unsigned twin of INT_FACTORY, for the one width whose range an int64_t
+// cannot carry.
+#define UINT_FACTORY(fn, LE, BE)                                                         \
+    PyObject* fn(PyObject*, PyObject* a, PyObject* kw) {                                 \
+        PyObject* o; const char* en = "little";                                          \
+        static const char* kwl[] = {"value", "endian", nullptr};                         \
+        if (!PyArg_ParseTupleAndKeywords(a, kw, "O|s", const_cast<char**>(kwl), &o, &en)) return nullptr; \
+        uint64_t v; if (!as_u64(o, &v)) return nullptr;                                  \
+        return make_uint(v, std::strcmp(en, "big") == 0 ? BE : LE);                      \
+    }
 #define FLT_FACTORY(fn, LE, BE)                                                          \
     PyObject* fn(PyObject*, PyObject* a, PyObject* kw) {                                 \
         double v; const char* en = "little";                                            \
@@ -232,14 +283,18 @@ INT_FACTORY(f_u16, CaptureType::UInt16LE, CaptureType::UInt16BE)
 INT_FACTORY(f_i16, CaptureType::Int16LE, CaptureType::Int16BE)
 INT_FACTORY(f_u32, CaptureType::UInt32LE, CaptureType::UInt32BE)
 INT_FACTORY(f_i32, CaptureType::Int32LE, CaptureType::Int32BE)
-INT_FACTORY(f_u64, CaptureType::UInt64LE, CaptureType::UInt64BE)
+UINT_FACTORY(f_u64, CaptureType::UInt64LE, CaptureType::UInt64BE)
 INT_FACTORY(f_i64, CaptureType::Int64LE, CaptureType::Int64BE)
 FLT_FACTORY(f_f32, CaptureType::Float32LE, CaptureType::Float32BE)
 FLT_FACTORY(f_f64, CaptureType::Float64LE, CaptureType::Float64BE)
 
+// A ULEB128 is unsigned by construction and its width follows its value, so it
+// takes the whole 64-bit unsigned range — including the half past INT64_MAX,
+// which "L" could not even parse.
 PyObject* f_leb(PyObject*, PyObject* a) {
-    long long v; if (!PyArg_ParseTuple(a, "L", &v)) return nullptr;
-    return make_varint((int64_t)v, zc::Enc::Uleb);
+    PyObject* o; if (!PyArg_ParseTuple(a, "O", &o)) return nullptr;
+    uint64_t v; if (!as_u64(o, &v)) return nullptr;
+    return make_uvarint(v, zc::Enc::Uleb);
 }
 PyObject* f_sleb(PyObject*, PyObject* a) {
     long long v; if (!PyArg_ParseTuple(a, "L", &v)) return nullptr;

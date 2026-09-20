@@ -1,5 +1,6 @@
 """Tests for the bbq Python extension module."""
 
+import gc
 import os
 import struct
 import sys
@@ -848,11 +849,21 @@ class TestLeafTypeErrors:
         with pytest.raises(TypeError, match="not subscriptable"):
             result.magic[0]
 
-    def test_slice_leaf_raises(self):
+    def test_a_selector_over_a_leaf_selects_nothing(self):
+        """Changed deliberately when the selector vocabulary landed.
+
+        A slice is a SELECTOR, and a selector over something with nothing to
+        select answers with an empty nodelist rather than raising — that is what
+        lets `root[..., "x"]` walk a whole document without the caller guarding
+        every leaf it meets. Asking a leaf for a named field or an index is a
+        different act, and those still raise (above and below).
+        """
         spec = bbq.compile_string(TRIVIAL_SPEC)
         result = spec.parse(b"\x00\x00\x00\x00")
-        with pytest.raises(TypeError, match="not subscriptable"):
-            result.magic[0:1]
+        assert len(result.magic[0:1]) == 0
+        assert len(result.magic[:]) == 0
+        assert len(result.magic[..., "anything"]) == 0
+        assert len(result.magic[...]) == 1, "a leaf is still its own descendant"
 
     def test_string_key_leaf_raises(self):
         spec = bbq.compile_string(TRIVIAL_SPEC)
@@ -1963,3 +1974,550 @@ class TestContainerProtocol:
         """`dir()` is attribute names; an element has none, and "" is not one."""
         r, xs = self._arr(spec_src)
         assert "" not in dir(xs)
+
+
+# ── The integer boundary matrix ──────────────────────────────────────────────
+#
+# Every fixed-width integer leaf the grammar can name. The suite above covers
+# every one of these types — and reads u64 as 0x0102030405060708 and i64 as -1,
+# both inside the signed range, so nothing it asserts can tell a correct decode
+# from one that lost the sign. These rows are the boundaries, which is where the
+# decode and the range check are the only things holding.
+#
+# (grammar spelling, byte width, signed, big-endian)
+INT_TYPES = [
+    ("uint8",    1, False, False), ("int8",     1, True,  False),
+    ("uint16le", 2, False, False), ("uint16be", 2, False, True),
+    ("int16le",  2, True,  False), ("int16be",  2, True,  True),
+    ("uint32le", 4, False, False), ("uint32be", 4, False, True),
+    ("int32le",  4, True,  False), ("int32be",  4, True,  True),
+    ("uint64le", 8, False, False), ("uint64be", 8, False, True),
+    ("int64le",  8, True,  False), ("int64be",  8, True,  True),
+]
+
+INT_IDS = [t[0] for t in INT_TYPES]
+
+
+def int_limits(width, signed):
+    """(min, max) a leaf of this width and signedness can hold."""
+    if signed:
+        return -(1 << (width * 8 - 1)), (1 << (width * 8 - 1)) - 1
+    return 0, (1 << (width * 8)) - 1
+
+
+def int_bytes(value, width, big):
+    """`value`'s two's-complement bytes at this width."""
+    masked = value & ((1 << (width * 8)) - 1)
+    return masked.to_bytes(width, "big" if big else "little")
+
+
+def int_spec(spelling):
+    return bbq.compile_string(f"Foo = struct {{ v: {spelling} }}")
+
+
+@pytest.mark.parametrize("spelling,width,signed,big", INT_TYPES, ids=INT_IDS)
+class TestIntegerBoundaries:
+    """Both extremes of every integer leaf, through every path that reads one.
+
+    A 64-bit UNSIGNED leaf is the case the rest of the suite cannot reach: its
+    value does not fit the int64_t the decode carries it in, so a consumer that
+    does not branch on signedness reports 2**64-1 as -1 — and every conversion
+    (int, float, str, format, ==, <) goes through that one decode.
+    """
+
+    def _node(self, spelling, width, signed, big, value):
+        r = int_spec(spelling).parse(int_bytes(value, width, big))
+        assert r.success, r.error_message
+        return r, r.root["v"]
+
+    def test_min_reads_back(self, spelling, width, signed, big):
+        lo, _ = int_limits(width, signed)
+        _, n = self._node(spelling, width, signed, big, lo)
+        assert n.value == lo
+
+    def test_max_reads_back(self, spelling, width, signed, big):
+        _, hi = int_limits(width, signed)
+        _, n = self._node(spelling, width, signed, big, hi)
+        assert n.value == hi
+
+    def test_every_conversion_agrees_at_the_maximum(self, spelling, width, signed, big):
+        """One decode feeds them all, so one sign bug shows up in every one."""
+        _, hi = int_limits(width, signed)
+        _, n = self._node(spelling, width, signed, big, hi)
+        assert int(n) == hi
+        assert str(n) == str(hi)
+        assert format(n, "d") == format(hi, "d")
+        assert float(n) == float(hi)
+        assert n == hi
+        assert not (n < hi)
+        assert n >= hi
+
+    def test_ordering_holds_at_the_maximum(self, spelling, width, signed, big):
+        """> 0 is false for a u64 max read as -1, which is how the bug hid."""
+        _, hi = int_limits(width, signed)
+        _, n = self._node(spelling, width, signed, big, hi)
+        if hi > 0:
+            assert n > 0
+        assert n > (hi - 1)
+
+    def test_extremes_survive_a_write_and_a_re_parse(self, spelling, width, signed, big):
+        lo, hi = int_limits(width, signed)
+        spec = int_spec(spelling)
+        for value in (lo, hi, 0):
+            r = spec.parse(int_bytes(0, width, big))
+            r.root["v"] = value
+            out = bytes(r)
+            assert len(out) == width
+            again = spec.parse(out)
+            assert again.success
+            assert again.root["v"].value == value, (
+                f"{spelling}: wrote {value}, re-parsed {again.root['v'].value}")
+
+    def test_the_document_agrees_with_its_own_serialization(self, spelling, width, signed, big):
+        """What a node reports and what emit() writes must be one document.
+
+        A written node keeps the value it was given; emit writes leaf_width
+        bytes. Nothing reconciles those two, so an unrepresentable value is
+        reported back verbatim while the file holds it truncated.
+        """
+        lo, hi = int_limits(width, signed)
+        spec = int_spec(spelling)
+        for value in (lo, hi):
+            r = spec.parse(int_bytes(0, width, big))
+            r.root["v"] = value
+            in_memory = r.root["v"].value
+            re_parsed = spec.parse(bytes(r)).root["v"].value
+            assert in_memory == re_parsed, (
+                f"{spelling}: node says {in_memory}, its own bytes say {re_parsed}")
+
+    def test_a_value_the_leaf_cannot_hold_is_refused(self, spelling, width, signed, big):
+        """Truncating it silently makes the document disagree with the file."""
+        lo, hi = int_limits(width, signed)
+        spec = int_spec(spelling)
+        for value in (hi + 1, lo - 1):
+            r = spec.parse(int_bytes(0, width, big))
+            with pytest.raises((OverflowError, ValueError)):
+                r.root["v"] = value
+
+    def test_a_refused_write_leaves_the_document_alone(self, spelling, width, signed, big):
+        lo, hi = int_limits(width, signed)
+        spec = int_spec(spelling)
+        r = spec.parse(int_bytes(hi, width, big))
+        try:
+            r.root["v"] = hi + 1
+        except (OverflowError, ValueError):
+            pass
+        assert r.root["v"].value == hi
+        assert bytes(r) == int_bytes(hi, width, big)
+
+
+# bbq.build is the second consumer of the same law: it mints nodes directly
+# rather than editing parsed ones, and reaches set_int by its own road.
+BUILD_INTS = [
+    ("u8", 1, False), ("i8", 1, True),
+    ("u16", 2, False), ("i16", 2, True),
+    ("u32", 4, False), ("i32", 4, True),
+    ("u64", 8, False), ("i64", 8, True),
+]
+
+
+@pytest.mark.parametrize("factory,width,signed", BUILD_INTS, ids=[b[0] for b in BUILD_INTS])
+class TestBuildIntegerBoundaries:
+    """The same range law, through the builder. Two consumers, one law."""
+
+    def test_extremes_build_to_the_right_bytes(self, factory, width, signed):
+        lo, hi = int_limits(width, signed)
+        for value in (lo, hi, 0):
+            leaf = getattr(bbq.build, factory)(value)
+            assert bytes(bbq.build.Struct(v=leaf)) == int_bytes(value, width, False)
+
+    def test_a_value_the_leaf_cannot_hold_is_refused(self, factory, width, signed):
+        lo, hi = int_limits(width, signed)
+        for value in (hi + 1, lo - 1):
+            with pytest.raises((OverflowError, ValueError)):
+                getattr(bbq.build, factory)(value)
+
+
+class TestVarintsAreNotRangeChecked:
+    """A varint's width follows its value, so the fixed-width law does not apply.
+
+    The range check is about a leaf that has `leaf_width` bytes to put a value
+    in. uleb128/sleb64 encode as many bytes as the value needs, so a bound there
+    would be inventing one — the only limit is the 64 bits the value is carried
+    in. Pinned so the check cannot be widened onto them by accident.
+    """
+
+    def test_a_large_uleb_is_accepted(self):
+        big = (1 << 64) - 1
+        assert bytes(bbq.build.Struct(v=bbq.build.leb(big))) == b"\xff" * 9 + b"\x01"
+
+    def test_a_negative_sleb_is_accepted(self):
+        assert bytes(bbq.build.Struct(v=bbq.build.sleb(-1))) == b"\x7f"
+
+
+class TestLensLawsAtTheBoundary:
+    """The lens harness, fed values that sit exactly on the field's edge.
+
+    TestLensLaws already does the right thing — edit, emit, re-parse, compare —
+    and every edit it makes is a value comfortably inside the field. That is
+    what let a write of 999 into a uint8 pass through it: the harness was never
+    given a value whose representability was in question.
+    """
+
+    SPEC = "Foo = struct { a: uint8, b: uint16le, c: uint32le, d: uint64le, e: int8 }"
+    EDGES = {"a": (0, 255), "b": (0, 65535), "c": (0, 2**32 - 1),
+             "d": (0, 2**64 - 1), "e": (-128, 127)}
+
+    def _fresh(self):
+        spec = bbq.compile_string(self.SPEC)
+        return spec, spec.parse(bytes(16))
+
+    def test_every_field_survives_its_own_extremes(self):
+        spec, _ = self._fresh()
+        for field, (lo, hi) in self.EDGES.items():
+            for value in (lo, hi):
+                r = spec.parse(bytes(16))
+                r.root[field] = value
+                again = spec.parse(bytes(r))
+                assert again.success
+                assert again.root[field].value == value, f"{field} = {value}"
+
+    def test_all_fields_at_their_maximum_at_once(self):
+        """Every byte set: the one shape where a neighbour's truncation shows."""
+        spec, _ = self._fresh()
+        r = spec.parse(bytes(16))
+        for field, (_, hi) in self.EDGES.items():
+            r.root[field] = hi
+        again = spec.parse(bytes(r))
+        assert again.success
+        for field, (_, hi) in self.EDGES.items():
+            assert again.root[field].value == hi, field
+
+    def test_an_overshoot_does_not_disturb_a_neighbour(self):
+        spec, _ = self._fresh()
+        r = spec.parse(bytes(16))
+        r.root["b"] = 4660
+        before = bytes(r)
+        with pytest.raises((OverflowError, ValueError)):
+            r.root["a"] = 256
+        assert bytes(r) == before
+        assert r.root["b"].value == 4660
+
+
+class TestGarbageCollection:
+    """The module's types hold Python objects, so they have to be collectable.
+
+    A Spec keeps STRONG references to the extern callables handed to it, and the
+    natural way to write a stateful extern — a closure, a bound method — refers
+    to the Spec right back. Untracked by the collector that cycle is not just
+    uncollected but invisible: it never reaches gc.garbage, and the Spec's
+    grammar, AST and sema leak for the life of the process.
+    """
+
+    EXTERN = 'Msg = struct { header: uint32, payload: extern("validate", "void") }'
+
+    def test_a_spec_in_a_cycle_with_its_own_extern_is_collected(self):
+        freed = []
+
+        class Sentinel:
+            def __del__(self):
+                freed.append(1)
+
+        def build():
+            spec = bbq.compile_string(self.EXTERN)
+            sentinel = Sentinel()
+            # The closure names the spec, so spec → callable → spec.
+            spec.register_extern("validate", lambda mv, _s=spec, _t=sentinel: 4)
+
+        build()
+        gc.collect()
+        gc.collect()
+        assert freed, "the Spec/extern cycle was never collected"
+        assert not gc.garbage
+
+    def test_a_node_in_a_cycle_with_its_own_result_is_collected(self):
+        freed = []
+
+        class Holder:
+            def __init__(self):
+                self.node = None
+
+            def __del__(self):
+                freed.append(1)
+
+        def build():
+            spec = bbq.compile_string("Foo = struct { v: uint8 }")
+            holder = Holder()
+            holder.node = spec.parse(bytes([1])).root["v"]
+            holder.self_ref = holder      # holder → node → result, holder → holder
+
+        build()
+        gc.collect()
+        assert freed, "the Node/Result cycle was never collected"
+
+    def test_the_types_that_hold_python_objects_are_tracked(self):
+        """What the cycles above rely on, asserted directly."""
+        spec = bbq.compile_string("Foo = struct { v: uint8 }")
+        r = spec.parse(bytes([1]))
+        assert gc.is_tracked(spec), "Spec holds extern callables"
+        assert gc.is_tracked(r), "ParseResult holds the input buffer"
+        assert gc.is_tracked(r.root), "Node holds its ParseResult"
+
+
+# ── The selector surface ─────────────────────────────────────────────────────
+#
+# RFC 9535 defines a string syntax; this is the same VOCABULARY spelled with
+# Python's subscript protocol, which is where a query in this module lives. The
+# mapping, and the rule that decides the return type:
+#
+#   node["name"]        $.name / $['name']   name       → Node      (one, strict)
+#   node[3] / node[-1]  $[3]                 index      → Node      (one, strict)
+#   node[1:3:2]         $[1:3:2]             slice      → NodeList
+#   node[:]             $[*]                 wildcard   → NodeList
+#   node[0, 2]          $[0,2]               several    → NodeList
+#   node[...]           the `..` node set                → NodeList
+#   node[..., "name"]   $..name              descendant → NodeList
+#   node[bbq.this.x>1]  $[?@.x > 1]          filter     → NodeList
+#
+# A selector that can only ever match once answers with a Node; one that can
+# match more answers with a NodeList, and a segment applied to a NodeList is
+# that segment applied to each of its nodes (§2.1.2), which is what lets them
+# chain.
+
+SELECTOR_SPEC = """\
+Pt  = struct { x: uint8, y: uint8 }
+Top = struct { n: uint8, pts: array<Pt>[n], tag: uint8 }
+"""
+
+
+@pytest.fixture
+def doc():
+    spec = bbq.compile_string(SELECTOR_SPEC)
+    r = spec.parse(bytes([3, 1, 9, 5, 2, 7, 7, 0x99]), rule="Top")
+    assert r.success, r.error_message
+    return r
+
+
+def xy(nodelist):
+    return [(p["x"].value, p["y"].value) for p in nodelist]
+
+
+class TestSelectorReturnTypes:
+    """The rule that decides whether you get a Node or a NodeList."""
+
+    def test_a_name_gives_one_node(self, doc):
+        assert isinstance(doc.root["tag"], bbq.Node)
+        assert doc.root["tag"].value == 0x99
+
+    def test_an_index_gives_one_node(self, doc):
+        assert isinstance(doc.root["pts"][0], bbq.Node)
+        assert isinstance(doc.root["pts"][-1], bbq.Node)
+
+    def test_the_multi_valued_selectors_give_a_nodelist(self, doc):
+        root = doc.root
+        for key in (slice(None), (0, 2), Ellipsis, (Ellipsis, "x")):
+            assert isinstance(root[key], bbq.NodeList), key
+
+    def test_a_missing_name_raises_for_one_but_not_for_many(self, doc):
+        """The strict accessor is how you ask for a field and expect it.
+
+        Inside a multi-selector a miss contributes nothing instead, which is
+        §2.3.1.2: "selects nothing if there is no such member".
+        """
+        with pytest.raises(KeyError):
+            doc.root["nope"]
+        assert len(doc.root["nope",]) == 0
+        assert len(doc.root[..., "nope"]) == 0
+
+
+class TestSelectors:
+    def test_wildcard(self, doc):
+        assert doc.root[:].values[0] == 3
+        assert len(doc.root[:]) == 3                      # n, pts, tag
+        assert len(doc.root["pts"][:]) == 3               # three points
+
+    def test_several_selectors_in_one_segment(self, doc):
+        assert doc.root[0, 2].values == [3, 0x99]
+        assert doc.root["n", "tag"].values == [3, 0x99]
+        assert doc.root["tag", "n"].values == [0x99, 3], "order follows the selectors"
+
+    def test_a_repeated_selector_matches_repeatedly(self, doc):
+        """§2.5.1.2: the results are concatenated, duplicates and all."""
+        assert doc.root["n", "n"].values == [3, 3]
+
+    def test_slice_selectors(self, doc):
+        pts = doc.root["pts"]
+        assert xy(pts[0:2]) == [(1, 9), (5, 2)]
+        assert xy(pts[::-1]) == [(7, 7), (5, 2), (1, 9)]
+        assert xy(pts[::2]) == [(1, 9), (7, 7)]
+        assert len(pts[10:20]) == 0
+
+    def test_the_descendant_node_set(self, doc):
+        """`node[...]` is the node itself and everything under it."""
+        everything = doc.root[...]
+        # root, n, pts, 3 points, 6 coordinates, tag
+        assert len(everything) == 1 + 1 + 1 + 3 + 6 + 1
+        assert everything.nodes[0].offset == doc.root.offset
+
+    def test_the_descendant_segment(self, doc):
+        assert doc.root[..., "x"].values == [1, 5, 7]
+        assert doc.root[..., "y"].values == [9, 2, 7]
+        assert doc.root[..., "x", "y"].values == [1, 9, 5, 2, 7, 7]
+
+    def test_a_descendant_search_reaches_through_arrays(self, doc):
+        """The thing a flat accessor cannot do: find a field at any depth."""
+        assert doc.root[..., "tag"].values == [0x99]
+
+    def test_segments_chain_through_a_nodelist(self, doc):
+        assert doc.root["pts"][:]["x"].values == [1, 5, 7]
+        assert doc.root[...]["x"].values == [1, 5, 7]
+
+    def test_a_leaf_selects_nothing_rather_than_raising(self, doc):
+        leaf = doc.root["tag"]
+        assert len(leaf[:]) == 0
+        assert len(leaf[..., "x"]) == 0
+        assert len(leaf[...]) == 1, "a leaf is still its own descendant set"
+
+    def test_a_nodelist_exposes_its_nodes_and_values(self, doc):
+        nl = doc.root[..., "x"]
+        assert [n.value for n in nl] == [1, 5, 7]
+        assert nl.values == [1, 5, 7]
+        assert isinstance(nl.nodes, list) and isinstance(nl.nodes[0], bbq.Node)
+        assert len(nl) == 3
+        assert "NodeList" in repr(nl)
+
+
+class TestFilterSelector:
+    """$[?...] — the one selector that needs an expression object.
+
+    Node.__eq__ materialises the value and compares it, so `node.x == 1` is a
+    real bool and Node cannot double as the expression builder. bbq.this is the
+    placeholder that builds a tree instead, which is how pandas and SQLAlchemy
+    spell the same thing.
+    """
+
+    def test_comparisons(self, doc):
+        pts = doc.root["pts"]
+        assert xy(pts[bbq.this.x > 1]) == [(5, 2), (7, 7)]
+        assert xy(pts[bbq.this.x == 5]) == [(5, 2)]
+        assert xy(pts[bbq.this.x != 5]) == [(1, 9), (7, 7)]
+        assert xy(pts[bbq.this.y <= 2]) == [(5, 2)]
+        assert xy(pts[bbq.this.x >= 5]) == [(5, 2), (7, 7)]
+
+    def test_logical_combinators(self, doc):
+        pts = doc.root["pts"]
+        assert xy(pts[(bbq.this.x > 1) & (bbq.this.y < 5)]) == [(5, 2)]
+        assert xy(pts[(bbq.this.x == 7) | (bbq.this.y == 9)]) == [(1, 9), (7, 7)]
+        assert xy(pts[~(bbq.this.x == 5)]) == [(1, 9), (7, 7)]
+
+    def test_existence_test(self, doc):
+        """A path with no comparison asks whether it matched anything."""
+        pts = doc.root["pts"]
+        assert len(pts[bbq.this.x]) == 3
+        assert len(pts[bbq.this.nope]) == 0
+
+    def test_nothing_compares_only_with_nothing(self, doc):
+        """§2.3.5.2: a query matching no node is Nothing, and orderings on it
+        are false while `== Nothing` is true."""
+        pts = doc.root["pts"]
+        assert len(pts[bbq.this.nope == bbq.this.alsonope]) == 3
+        assert len(pts[bbq.this.nope == 1]) == 0
+        assert len(pts[bbq.this.nope < 1]) == 0
+        assert len(pts[bbq.this.nope != 1]) == 3
+
+    def test_count_and_length(self, doc):
+        pts = doc.root["pts"]
+        assert len(pts[bbq.count(bbq.this[:]) == 2]) == 3   # each Pt has two fields
+        assert len(pts[bbq.count(bbq.this[:]) == 3]) == 0
+        assert len(pts[bbq.length(bbq.this) == 2]) == 3
+
+    def test_a_filter_applies_to_children_not_to_the_node(self, doc):
+        """§2.3.5.2 — the filter selects from among the children."""
+        assert len(doc.root[bbq.this.x > 0]) == 0      # root's children are n/pts/tag
+        assert len(doc.root["pts"][bbq.this.x > 0]) == 3
+
+    def test_a_filter_composes_with_the_other_segments(self, doc):
+        assert xy(doc.root[..., "pts"][bbq.this.x > 4]) == [(5, 2), (7, 7)]
+        assert doc.root["pts"][bbq.this.x > 1]["y"].values == [2, 7]
+
+    def test_a_query_is_not_a_truth_value(self):
+        """`and`/`or`/`not` cannot be overloaded, so they must not look like
+        they worked: Python would evaluate the operand for truthiness and throw
+        the expression away."""
+        with pytest.raises(TypeError):
+            bool(bbq.this.x == 1)
+        with pytest.raises(TypeError):
+            bbq.this.x and bbq.this.y
+        with pytest.raises(TypeError):
+            not bbq.this.x
+
+    def test_a_placeholder_is_reusable_and_never_mutated(self):
+        base = bbq.this.a
+        one, two = base.b, base.c
+        assert repr(base) == "<bbq.query path>"
+        assert one is not two
+
+    def test_navigating_a_finished_expression_is_refused(self):
+        with pytest.raises(TypeError):
+            (bbq.this.x == 1).y
+
+    def test_indexing_and_naming_inside_an_expression(self, doc):
+        pts = doc.root["pts"]
+        assert xy(pts[bbq.this["x"] > 1]) == [(5, 2), (7, 7)]
+        assert xy(pts[bbq.this[0] > 1]) == [(5, 2), (7, 7)]
+
+    def test_an_underscore_field_is_reachable_by_subscript(self):
+        """Attribute access keeps dunders and privates for the object itself, so
+        a field whose name starts with _ is named through the brackets."""
+        spec = bbq.compile_string("E = struct { _v: uint8 }\nT = struct { n: uint8, xs: array<E>[n] }")
+        r = spec.parse(bytes([2, 7, 8]), rule="T")
+        assert r.root["xs"][bbq.this["_v"] > 7].values != []
+
+
+class TestSelectorsAreNotAQueryParser:
+    """What this surface deliberately is not.
+
+    It is RFC 9535's selector vocabulary reached through Python's protocols, not
+    an implementation of the RFC: there is no query string, no `$`, and no
+    match()/search() (those need RFC 9485 I-Regexp). Asserted so the difference
+    is a decision on the record rather than something a reader has to infer.
+    """
+
+    def test_there_is_no_query_string_entry_point(self):
+        assert not hasattr(bbq, "jsonpath")
+        assert not hasattr(bbq, "query_string")
+
+    def test_the_regexp_functions_are_absent(self):
+        assert not hasattr(bbq, "match")
+        assert not hasattr(bbq, "search")
+
+    def test_a_name_selector_still_answers_with_one_node(self):
+        """Duplicate field names: the grammar admits them, keys() shows both,
+        and the name selector answers with the first — which §2.3.1.2 permits
+        ("selects a member value"). The wildcard is how you reach both."""
+        r = bbq.compile_string("Foo = struct { a: uint8, a: uint8 }").parse(bytes([1, 2]))
+        assert list(r.root.keys()) == ["a", "a"]
+        assert r.root["a"].value == 1
+        assert r.root[:].values == [1, 2]
+        assert r.root[..., "a"].values == [1], "the name selector picks one per node"
+
+    def test_an_exhausted_iterator_stays_exhausted(self, doc):
+        it = iter(doc.root["pts"])
+        assert len(list(it)) == 3
+        assert list(it) == []
+
+    def test_a_slice_step_of_zero_is_pythons_error(self, doc):
+        with pytest.raises(ValueError):
+            doc.root["pts"][::0]
+
+    def test_querying_does_not_change_the_document(self, doc):
+        """Navigating claims ownership of the containers it passes through, so a
+        purely READ query must still re-emit byte-identically — otherwise every
+        query is an edit and GetPut only holds for documents nobody looked at.
+        """
+        before = bytes(doc)
+        doc.root[...]                      # the whole tree
+        doc.root[..., "x"].values
+        doc.root["pts"][bbq.this.y > 0]
+        assert bytes(doc) == before
+        assert doc.deltas() == []

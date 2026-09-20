@@ -295,12 +295,16 @@ TEST(ZCowLaw, MeasuringAgreesWithWritingForEveryShape) {
     node* free_bits = t.append(xs, CaptureType::Bytes);
     set_bytes(free_bits, (const uint8_t*)"abcd", 4);
 
-    for (auto e : {Enc::Uleb, Enc::Sleb})
-        for (int64_t v : {(int64_t)0, (int64_t)1, (int64_t)127, (int64_t)128,
-                          (int64_t)-1, (int64_t)300000}) {
-            node* c = t.append(xs, CaptureType::Computed);
-            set_int(c, v, e);
-        }
+    // Each varint door takes its own values: a ULEB encodes an unsigned number
+    // and an SLEB a signed one. -1 through a ULEB used to be accepted and came
+    // back out as 2**64-1 — the width still measured correctly, which is all
+    // this law looks at, so nothing here noticed.
+    for (uint64_t v : {(uint64_t)0, (uint64_t)1, (uint64_t)127, (uint64_t)128,
+                       (uint64_t)300000, UINT64_MAX})
+        set_uint(t.append(xs, CaptureType::Computed), v, Enc::Uleb);
+    for (int64_t v : {(int64_t)0, (int64_t)1, (int64_t)127, (int64_t)128,
+                      (int64_t)-1, (int64_t)300000, INT64_MIN})
+        set_int(t.append(xs, CaptureType::Computed), v, Enc::Sleb);
 
     document v = std::move(t).commit();
     measuring_agrees(*v.root(), v.src());
@@ -715,6 +719,89 @@ TEST(ZCowLaw, TransientRoundTripIsIdentity) {
     }
 }
 
+// ── What a leaf can hold ─────────────────────────────────────────────────────
+//
+// A write lands in a node and emit encodes it at leaf_width bytes. Nothing used
+// to compare the two, so a value too wide for the field was accepted, reported
+// back in full, and written truncated — the document and its own serialization
+// describing different files. The refusal is the only thing that keeps those two
+// answers the same, so it is a law of the model and not a nicety of one consumer.
+
+TEST(ZCowLeafRange, EveryLeafHoldsItsOwnExtremes) {
+    for (const auto& c : leaf_cases()) {
+        if (is_span_valued(c) || is_float_valued(c)) continue;
+        if (c.type == CaptureType::Bool) continue;    // normalised to 0/1 by its writer
+        size_t bits = leaf_width(c.type) * 8;
+        Fixture f = make_leaf_fixture(c);
+        transient t = f.doc.begin_edit();
+        const char* path[] = {"probe"};
+        node* w = t.own_path(path, nullptr, 1);
+        if (is_signed_int_type(c.type)) {
+            int64_t hi = bits >= 64 ? INT64_MAX : (int64_t(1) << (bits - 1)) - 1;
+            EXPECT_NO_THROW(set_int(w, hi)) << c.name;
+            EXPECT_NO_THROW(set_int(w, -hi - 1)) << c.name;
+        } else {
+            uint64_t hi = bits >= 64 ? UINT64_MAX : (uint64_t(1) << bits) - 1;
+            EXPECT_NO_THROW(set_uint(w, hi)) << c.name;
+            EXPECT_NO_THROW(set_uint(w, 0)) << c.name;
+        }
+    }
+}
+
+TEST(ZCowLeafRange, AValueTheLeafCannotHoldIsRefused) {
+    for (const auto& c : leaf_cases()) {
+        if (is_span_valued(c) || is_float_valued(c)) continue;
+        if (c.type == CaptureType::Bool) continue;
+        size_t bits = leaf_width(c.type) * 8;
+        Fixture f = make_leaf_fixture(c);
+        transient t = f.doc.begin_edit();
+        const char* path[] = {"probe"};
+        node* w = t.own_path(path, nullptr, 1);
+        if (is_signed_int_type(c.type)) {
+            if (bits >= 64) continue;                 // nothing wider to overshoot with
+            int64_t hi = (int64_t(1) << (bits - 1)) - 1;
+            EXPECT_THROW(set_int(w, hi + 1), range_error) << c.name;
+            EXPECT_THROW(set_int(w, -hi - 2), range_error) << c.name;
+        } else {
+            EXPECT_THROW(set_int(w, -1), range_error) << c.name;   // unsigned leaf
+            if (bits < 64)
+                EXPECT_THROW(set_uint(w, (uint64_t(1) << bits)), range_error) << c.name;
+        }
+    }
+}
+
+TEST(ZCowLeafRange, OwningALeafIsACommitmentToWriteIt) {
+    // own_child/own_path clear `parsed` on purpose: the node stops describing
+    // its span, so from then on its value is whatever is written into it, and a
+    // leaf owned but not written reads as zero. That is why a refusal has to
+    // happen BEFORE the own — a caller that owns first and validates second has
+    // already changed the document it is declining to change. The Python binding
+    // converts and range-checks in convert_for, ahead of own_child, for exactly
+    // this reason; the law that a refused write changes nothing is stated there,
+    // where it is actually offered.
+    Fixture f = make_leaf_fixture(leaf_cases()[0]);   // uint8, byte 0x11
+    std::vector<uint8_t> before = f.doc.serialize();
+    transient t = f.doc.begin_edit();
+    const char* path[] = {"probe"};
+    node* w = t.own_path(path, nullptr, 1);
+    EXPECT_THROW(set_int(w, 256), range_error);
+    EXPECT_NE(std::move(t).commit().serialize(), before);
+}
+
+TEST(ZCowLeafRange, AVarintTakesWhateverItsWidthCanFollow) {
+    // A varint's width is a property of its value, so the fixed-width bound does
+    // not apply: a uleb128 spans the whole unsigned range and a sleb128 the
+    // signed one. Pinned so the check cannot be widened onto them by accident.
+    Fixture f = make_leaf_fixture(leaf_cases()[0]);
+    transient t = f.doc.begin_edit();
+    const char* path[] = {"probe"};
+    node* w = t.own_path(path, nullptr, 1);
+    w->type = CaptureType::Computed;
+    EXPECT_NO_THROW(set_uint(w, UINT64_MAX, Enc::Uleb));
+    EXPECT_NO_THROW(set_int(w, INT64_MIN, Enc::Sleb));
+    EXPECT_THROW(set_int(w, -1, Enc::Uleb), range_error);   // a ULEB has no negatives
+}
+
 // Foster et al. GetPut — writing back the value you just read changes nothing.
 // BBQ's own law, not the transience paper's.
 TEST(ZCowLaw, GetPutIsIdentity) {
@@ -731,8 +818,14 @@ TEST(ZCowLaw, GetPutIsIdentity) {
             set_bytes(w, b.first, b.second);
         } else if (is_float_valued(c)) {
             set_float(w, read_float(p, f.doc.src()));
-        } else {
+        } else if (is_signed_int_type(c.type)) {
             set_int(w, read_int(p, f.doc.src()));
+        } else {
+            // An unsigned leaf has to be read and written through the unsigned
+            // door. A uint64 whose top bit is set is a value the signed carrier
+            // does not have, so the signed round-trip cannot state this law for
+            // it at all — it reads back as a negative and is rightly refused.
+            set_uint(w, read_uint(p, f.doc.src()));
         }
         EXPECT_EQ(std::move(t).commit().serialize(), before) << c.name;
     }

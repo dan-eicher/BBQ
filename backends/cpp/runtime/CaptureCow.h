@@ -182,6 +182,13 @@ inline uint64_t next_owner_id() {
 struct type_error : std::runtime_error {
     explicit type_error(const std::string& w) : std::runtime_error(w) {}
 };
+// A value that the leaf it is being written to cannot hold. Distinct from
+// type_error because it is about the VALUE, not the kind: the caller picked the
+// right sort of field and overshot it, and a consumer wants to say so
+// differently (Python raises OverflowError for this and TypeError for the other).
+struct range_error : std::runtime_error {
+    explicit range_error(const std::string& w) : std::runtime_error(w) {}
+};
 // Def 4.1: an invalidated transient cannot be used as an argument to any function.
 struct invalidated : std::runtime_error {
     explicit invalidated(const std::string& w) : std::runtime_error(w) {}
@@ -240,6 +247,84 @@ inline size_t leaf_width(CaptureType t) {
     case CaptureType::Float64LE: case CaptureType::Float64BE: return 8;
     default: return 0;
     }
+}
+
+inline bool is_signed_int_type(CaptureType t) {
+    switch (t) {
+    case CaptureType::Int8:
+    case CaptureType::Int16LE: case CaptureType::Int16BE:
+    case CaptureType::Int32LE: case CaptureType::Int32BE:
+    case CaptureType::Int64LE: case CaptureType::Int64BE: return true;
+    default: return false;
+    }
+}
+
+// ── What a leaf can hold ─────────────────────────────────────────────────────
+//
+// A write lands in a node; emit later encodes that node at leaf_width(type)
+// bytes and drops whatever did not fit. Nothing between those two points used to
+// compare the value against the field, so `u8 = 999` was accepted, reported back
+// as 999, and written as 0xE7 — the document and its own serialization
+// describing different files, with no error on either side.
+//
+// The bound is the leaf's width and signedness, and only for Enc::Fixed. A varint
+// encodes as many bytes as its value needs, so the only limit there is the 64
+// bits the value is carried in (and a ULEB is unsigned, so a negative is not
+// representable in one either). A Computed leaf carries its value rather than
+// re-encoding it at a width, and Bool is normalised to 0/1 by its writer.
+inline bool leaf_holds_signed(CaptureType t, Enc e, int64_t v) {
+    if (e == Enc::Sleb) return true;
+    if (e == Enc::Uleb) return v >= 0;    /* a ULEB has no negatives to encode */
+    if (t == CaptureType::Computed || t == CaptureType::Bool) return true;
+    size_t w = leaf_width(t);
+    if (w == 0) return true;                       /* not a fixed-width leaf */
+    if (is_signed_int_type(t)) {
+        if (w >= 8) return true;                   /* any int64_t fits 64 signed bits */
+        int64_t hi = (int64_t(1) << (w * 8 - 1)) - 1;
+        return v >= -hi - 1 && v <= hi;
+    }
+    if (v < 0) return false;                       /* unsigned leaf, signed value */
+    if (w >= 8) return true;
+    return (uint64_t)v <= (uint64_t(1) << (w * 8)) - 1;
+}
+
+inline bool leaf_holds_unsigned(CaptureType t, Enc e, uint64_t v) {
+    if (e == Enc::Uleb) return true;
+    if (e == Enc::Sleb) return v <= (uint64_t)INT64_MAX;
+    if (t == CaptureType::Computed || t == CaptureType::Bool) return true;
+    size_t w = leaf_width(t);
+    if (w == 0) return true;
+    if (is_signed_int_type(t))
+        return w >= 8 ? v <= (uint64_t)INT64_MAX
+                      : v <= (uint64_t)((int64_t(1) << (w * 8 - 1)) - 1);
+    if (w >= 8) return true;
+    return v <= (uint64_t(1) << (w * 8)) - 1;
+}
+
+// How a leaf describes itself in a diagnostic. Width and signedness, because
+// that is what a rejected write overshot — the grammar's own spelling for the
+// type belongs to whoever read the grammar.
+inline std::string leaf_kind_text(CaptureType t, Enc e) {
+    if (e == Enc::Uleb) return "uleb128";
+    if (e == Enc::Sleb) return "sleb128";
+    size_t w = leaf_width(t);
+    if (w == 0) return "integer";
+    return (is_signed_int_type(t) ? "int" : "uint") + std::to_string(w * 8);
+}
+
+// The range a leaf admits, for an error message a caller can act on.
+inline std::string leaf_range_text(CaptureType t, Enc e) {
+    if (e == Enc::Uleb) return "0 .. 18446744073709551615";
+    if (e == Enc::Sleb) return "-9223372036854775808 .. 9223372036854775807";
+    size_t w = leaf_width(t);
+    if (w == 0 || t == CaptureType::Computed || t == CaptureType::Bool) return "any";
+    if (is_signed_int_type(t)) {
+        if (w >= 8) return "-9223372036854775808 .. 9223372036854775807";
+        int64_t hi = (int64_t(1) << (w * 8 - 1)) - 1;
+        return std::to_string(-hi - 1) + " .. " + std::to_string(hi);
+    }
+    if (w >= 8) return "0 .. 18446744073709551615";
+    return "0 .. " + std::to_string((uint64_t(1) << (w * 8)) - 1);
 }
 
 // LEB128 encoders — the inverse of the varint decoders the readers use.
@@ -946,6 +1031,19 @@ inline double read_float(const node* n, const source& src) {
     return (double)v;
 }
 
+// The unsigned twin of read_int, and the other half of set_uint.
+//
+// read_int hands back the bit pattern in an int64_t. That is right for a TYPED
+// consumer — the generated reader casts it to the field's own C++ type, and a
+// uint64_t field gets its value back intact. An UNTYPED one has no declared type
+// to cast to and must take the signedness from the leaf instead, or a uint64
+// holding 2**64-1 reports as -1. It is also the only way to state GetPut for
+// such a leaf: reading it signed and writing it back signed cannot round-trip a
+// value the signed carrier does not have.
+inline uint64_t read_uint(const node* n, const source& src) {
+    return (uint64_t)read_int(n, src);
+}
+
 // The bytes of a leaf: straight out of the mapping when untouched, out of the node
 // when written. Valid while the document that owns them is alive.
 inline std::pair<const uint8_t*, size_t> read_bytes(const node* n, const source& src) {
@@ -966,7 +1064,25 @@ inline std::string_view read_str(const node* n, const source& src) {
 inline void set_int(node* n, int64_t v, Enc e = Enc::Fixed) {
     if (!n) throw type_error("write to a node that does not exist");
     if (is_float_type(n->type)) throw type_error("integer assigned to a float field");
+    if (!leaf_holds_signed(n->type, e, v))
+        throw range_error(std::to_string(v) + " does not fit a " +
+                          leaf_kind_text(n->type, e) + " field (" +
+                          leaf_range_text(n->type, e) + ")");
     n->parsed = false; n->ival = v; n->enc = e; n->bval.clear();
+}
+
+// The same write for a value that does not fit an int64_t — a 64-bit UNSIGNED
+// leaf holds twice what the signed carrier can express, so its top half is only
+// reachable through this door. The node still stores the bit pattern; what reads
+// it back branches on the leaf's signedness, exactly as the decoder does.
+inline void set_uint(node* n, uint64_t v, Enc e = Enc::Fixed) {
+    if (!n) throw type_error("write to a node that does not exist");
+    if (is_float_type(n->type)) throw type_error("integer assigned to a float field");
+    if (!leaf_holds_unsigned(n->type, e, v))
+        throw range_error(std::to_string(v) + " does not fit a " +
+                          leaf_kind_text(n->type, e) + " field (" +
+                          leaf_range_text(n->type, e) + ")");
+    n->parsed = false; n->ival = (int64_t)v; n->enc = e; n->bval.clear();
 }
 
 inline void set_float(node* n, double v) {

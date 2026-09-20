@@ -71,6 +71,12 @@ static PyObject* PyBBQParseError;
 
 static PyBBQNode* PyBBQNode_New(PyBBQResult* result, zc::node* parent, Py_ssize_t slot);
 
+// The multi-valued half of the selector vocabulary — a tuple of selectors, an
+// Ellipsis for the descendant segment, a slice, a filter. Defined beside the
+// NodeList it answers with; declared here because Node's subscript reaches it.
+static bool key_is_multi(PyObject* key);
+static PyObject* node_select(PyBBQNode* node, PyObject* key);
+
 
 // ── Locking ─────────────────────────────────────────────────────────────────
 //
@@ -273,9 +279,17 @@ static PyObject* node_value(PyBBQResult* result, const zc::node* n) {
     const zc::source& src = result->edit->src();
 
     switch (n->type) {
+        // A 64-bit UNSIGNED leaf holds values the int64_t carrier cannot express.
+        // read_int hands back the bit pattern, which is right for a caller that
+        // casts it to the field's declared C++ type — the generated reader does
+        // exactly that. Nothing here has a declared type to cast to, so the
+        // signedness has to come from the capture type, or 2**64-1 reports as -1
+        // through every conversion at once: they all come through this function.
+        case CaptureType::UInt64LE: case CaptureType::UInt64BE:
+            return PyLong_FromUnsignedLongLong(zc::read_uint(n, src));
+
         case CaptureType::UInt8:    case CaptureType::UInt16LE: case CaptureType::UInt16BE:
         case CaptureType::UInt32LE: case CaptureType::UInt32BE:
-        case CaptureType::UInt64LE: case CaptureType::UInt64BE:
         case CaptureType::Int8:     case CaptureType::Int16LE:  case CaptureType::Int16BE:
         case CaptureType::Int32LE:  case CaptureType::Int32BE:
         case CaptureType::Int64LE:  case CaptureType::Int64BE:
@@ -329,14 +343,27 @@ static PyObject* node_value(PyBBQResult* result, const zc::node* n) {
 // PyLong_AsLongLong can all run arbitrary Python (__float__ / __bool__ / __index__), and
 // re-entering this module while holding the lock would deadlock.
 struct PendingWrite {
-    enum class Kind { Int, Float, Bytes } kind;
+    enum class Kind { Int, Uint, Float, Bytes } kind;
     int64_t i = 0;
+    uint64_t u = 0;
     double f = 0;
     std::vector<uint8_t> b;
     bool as_str = false;
 };
 
-static bool convert_for(CaptureType t, PyObject* value, PendingWrite* out) {
+// A leaf whose top half is out of an int64_t's reach. Its values have to be
+// carried, converted and range-checked as unsigned or the upper half of the
+// field is simply unreachable from Python.
+static bool is_wide_unsigned(CaptureType t) {
+    return t == CaptureType::UInt64LE || t == CaptureType::UInt64BE;
+}
+
+// `e` is the leaf's encoding, which decides the range as much as the type does:
+// a varint's width follows its value. The range is checked HERE, before the
+// caller owns the node it is about to write — own_child clones a parsed node
+// into an edited one, and a refusal after that point has already changed the
+// document it was refusing to change.
+static bool convert_for(CaptureType t, zc::Enc e, PyObject* value, PendingWrite* out) {
     if (is_float_type(t)) {
         double d = PyFloat_AsDouble(value);
         if (d == -1.0 && PyErr_Occurred()) return false;
@@ -378,8 +405,33 @@ static bool convert_for(CaptureType t, PyObject* value, PendingWrite* out) {
                      capture_type_name(t));
         return false;
     }
-    int64_t v = PyLong_AsLongLong(value);   // integer leaves, and Computed (leb/compute)
+    // Integer leaves, and Computed (leb/compute). A leaf whose range an int64_t
+    // cannot carry is converted as unsigned, so its top half is reachable at
+    // all; a NEGATIVE handed to one falls through to the signed path below,
+    // where the range check names what it actually failed.
+    if (is_wide_unsigned(t) || e == zc::Enc::Uleb) {
+        unsigned long long uv = PyLong_AsUnsignedLongLong(value);
+        if (uv != (unsigned long long)-1 || !PyErr_Occurred()) {
+            if (!zc::leaf_holds_unsigned(t, e, (uint64_t)uv)) {
+                PyErr_Format(PyExc_OverflowError, "%llu does not fit a %s field (%s)",
+                             uv, zc::leaf_kind_text(t, e).c_str(),
+                             zc::leaf_range_text(t, e).c_str());
+                return false;
+            }
+            out->kind = PendingWrite::Kind::Uint; out->u = (uint64_t)uv;
+            return true;
+        }
+        if (!PyErr_ExceptionMatches(PyExc_OverflowError)) return false;
+        PyErr_Clear();   /* negative, or wider than 64 bits — say which, below */
+    }
+    int64_t v = PyLong_AsLongLong(value);
     if (v == -1 && PyErr_Occurred()) return false;
+    if (!zc::leaf_holds_signed(t, e, v)) {
+        PyErr_Format(PyExc_OverflowError, "%lld does not fit a %s field (%s)",
+                     (long long)v, zc::leaf_kind_text(t, e).c_str(),
+                     zc::leaf_range_text(t, e).c_str());
+        return false;
+    }
     out->kind = PendingWrite::Kind::Int; out->i = v;
     return true;
 }
@@ -407,15 +459,29 @@ static zc::node_ptr as_subtree(PyObject* value, int* is_kind) {
     return nullptr;
 }
 
-static void apply_write(zc::node* n, const PendingWrite& w) {
-    switch (w.kind) {
-        case PendingWrite::Kind::Int:   zc::set_int(n, w.i, n->enc); break;
-        case PendingWrite::Kind::Float: zc::set_float(n, w.f); break;
-        case PendingWrite::Kind::Bytes:
-            if (w.as_str) zc::set_str(n, std::string_view((const char*)w.b.data(), w.b.size()));
-            else          zc::set_bytes(n, w.b.data(), w.b.size());
-            break;
+// The ZCow setters refuse a value the leaf cannot hold by throwing. The frame
+// above this one is CPython, not C++, so the exception has to become a Python
+// error here — letting it cross that boundary terminates the process, which is
+// a worse answer to a bad value than the silent truncation this replaced.
+static bool apply_write(zc::node* n, const PendingWrite& w) {
+    try {
+        switch (w.kind) {
+            case PendingWrite::Kind::Int:   zc::set_int(n, w.i, n->enc); break;
+            case PendingWrite::Kind::Uint:  zc::set_uint(n, w.u, n->enc); break;
+            case PendingWrite::Kind::Float: zc::set_float(n, w.f); break;
+            case PendingWrite::Kind::Bytes:
+                if (w.as_str) zc::set_str(n, std::string_view((const char*)w.b.data(), w.b.size()));
+                else          zc::set_bytes(n, w.b.data(), w.b.size());
+                break;
+        }
+    } catch (const zc::range_error& e) {
+        PyErr_SetString(PyExc_OverflowError, e.what());
+        return false;
+    } catch (const std::exception& e) {
+        PyErr_SetString(PyExc_TypeError, e.what());
+        return false;
     }
+    return true;
 }
 
 // Write `value` into the child of `container` named `key` (or at `index`). This is the
@@ -423,6 +489,7 @@ static void apply_write(zc::node* n, const PendingWrite& w) {
 static int write_child(PyBBQResult* result, PyBBQNode* holder,
                        const char* key, Py_ssize_t index, PyObject* value) {
     CaptureType t;
+    zc::Enc enc;
     Py_ssize_t slot;
     {
         DocLock g(result);
@@ -437,18 +504,18 @@ static int write_child(PyBBQResult* result, PyBBQNode* holder,
             else     PyErr_SetString(PyExc_IndexError, "index out of range");
             return -1;
         }
-        t = c->kids[(size_t)slot]->type;
+        t   = c->kids[(size_t)slot]->type;
+        enc = c->kids[(size_t)slot]->enc;
     }
 
     PendingWrite w;
-    if (!convert_for(t, value, &w)) return -1;   // may run Python — no lock held
+    if (!convert_for(t, enc, value, &w)) return -1;   // may run Python — no lock held
 
     DocLock g(result);
     zc::node* c = owned_node_of(holder);
     zc::node* child = result->edit->own_child(c, (size_t)slot);
     if (!child) { PyErr_SetString(PyExc_RuntimeError, "field vanished"); return -1; }
-    apply_write(child, w);
-    return 0;
+    return apply_write(child, w) ? 0 : -1;
 }
 
 
@@ -622,24 +689,18 @@ static PyObject* PyBBQNode_mp_subscript(PyBBQNode* self, PyObject* key) {
         ct = n->type;
         count = (Py_ssize_t)zc::size_of(n);
     }
+    // A selector that can match more than one thing answers with a NodeList, so
+    // segments compose — and it answers with an EMPTY one over a leaf rather
+    // than raising, because "selects nothing" is what a selector does when there
+    // is nothing to select (§2.3.1.2). Asking a leaf for a named field or an
+    // index is a different act: that is a caller who expects to get one, and it
+    // still raises.
+    if (key_is_multi(key)) return node_select(self, key);
+
     if (!is_container(ct)) {
         PyErr_Format(PyExc_TypeError, "'bbq.Node' (%s) is not subscriptable",
                      capture_type_name(ct));
         return NULL;
-    }
-
-    if (PySlice_Check(key)) {
-        Py_ssize_t start, stop, step, length;
-        if (PySlice_GetIndicesEx(key, count, &start, &stop, &step, &length) < 0)
-            return NULL;
-        PyObject* list = PyList_New(length);
-        if (!list) return NULL;
-        for (Py_ssize_t i = 0, idx = start; i < length; i++, idx += step) {
-            PyObject* node = child_node(self->result, self, idx);
-            if (!node) { Py_DECREF(list); return NULL; }
-            PyList_SET_ITEM(list, i, node);
-        }
-        return list;
     }
 
     if (PyIndex_Check(key)) {
@@ -1062,6 +1123,7 @@ static PyObject* PyBBQNode_append(PyBBQNode* self, PyObject* value) {
     }
 
     CaptureType elem;
+    zc::Enc elem_enc = zc::Enc::Fixed;
     {
         DocLock g(self->result);
         const zc::node* n = node_of(self);
@@ -1071,17 +1133,18 @@ static PyObject* PyBBQNode_append(PyBBQNode* self, PyObject* value) {
                 "(or a bbq.build value), or give the array an element first");
             return NULL;
         }
-        elem = n->kids[0]->type;
+        elem     = n->kids[0]->type;
+        elem_enc = n->kids[0]->enc;
     }
 
     PendingWrite w;
-    if (!convert_for(elem, value, &w)) return NULL;   // may run Python — no lock held
+    if (!convert_for(elem, elem_enc, value, &w)) return NULL;   // may run Python — no lock held
 
     DocLock g(self->result);
     zc::node* c = owned_node_of(self);
     zc::node* e = self->result->edit->append(c, elem);
     if (!e) { PyErr_SetString(PyExc_RuntimeError, "append failed"); return NULL; }
-    apply_write(e, w);
+    if (!apply_write(e, w)) return NULL;
     Py_RETURN_NONE;
 }
 
@@ -1295,6 +1358,633 @@ PyTypeObject PyBBQNodeIter_Type = {
     0,                                      // tp_weaklistoffset
     PyObject_SelfIter,                      // tp_iter
     (iternextfunc)PyBBQNodeIter_iternext,   // tp_iternext
+};
+
+
+// ── PyBBQNodeList ───────────────────────────────────────────────────────────
+//
+// What a selector that can match more than one thing answers with.
+//
+// RFC 9535 §2.1.2: a query is a sequence of SEGMENTS, each applied to the
+// nodelist the previous one produced, and the result of applying a segment to a
+// nodelist is the concatenation of applying it to every node in it. That
+// composition is the whole reason this type exists rather than a plain list:
+// `root["xs"][...]["v"]` is three segments, and each one has to be able to take
+// the one before it.
+//
+// A selector that can only ever match once — a name, an index — keeps returning
+// a Node, so nothing that already worked changes shape. The rule is: a selector
+// that can match more than one thing hands back a NodeList.
+struct PyBBQNodeList {
+    PyObject_HEAD
+    PyObject* items;        // a real list of PyBBQNode, in document order
+};
+
+extern PyTypeObject PyBBQNodeList_Type;
+
+static PyObject* nodelist_steal(PyObject* items) {
+    if (!items) return NULL;
+    PyBBQNodeList* nl = PyObject_GC_New(PyBBQNodeList, &PyBBQNodeList_Type);
+    if (!nl) { Py_DECREF(items); return NULL; }
+    nl->items = items;      // the reference is taken, not borrowed
+    PyObject_GC_Track(nl);
+    return (PyObject*)nl;
+}
+
+static void PyBBQNodeList_dealloc(PyBBQNodeList* self) {
+    PyObject_GC_UnTrack((PyObject*)self);
+    Py_XDECREF(self->items);
+    PyObject_GC_Del(self);
+}
+static int PyBBQNodeList_traverse(PyBBQNodeList* self, visitproc visit, void* arg) {
+    Py_VISIT(self->items);
+    return 0;
+}
+static int PyBBQNodeList_clear(PyBBQNodeList* self) { Py_CLEAR(self->items); return 0; }
+
+static Py_ssize_t PyBBQNodeList_length(PyBBQNodeList* self) {
+    return PyList_GET_SIZE(self->items);
+}
+static PyObject* PyBBQNodeList_iter(PyBBQNodeList* self) {
+    return PyObject_GetIter(self->items);
+}
+static PyObject* PyBBQNodeList_repr(PyBBQNodeList* self) {
+    return PyUnicode_FromFormat("<bbq.NodeList %zd node%s>",
+                                PyList_GET_SIZE(self->items),
+                                PyList_GET_SIZE(self->items) == 1 ? "" : "s");
+}
+
+// `nodes` is the way to the list ITSELF, because subscripting a NodeList means
+// applying a segment to every node in it — `nl[0]` is each node's first child,
+// not the list's first node. The two readings cannot both have the brackets, and
+// the composing one is the reason the type is here.
+static PyObject* PyBBQNodeList_get_nodes(PyBBQNodeList* self, void*) {
+    return PyList_GetSlice(self->items, 0, PyList_GET_SIZE(self->items));
+}
+
+// The values of every node in the list — the common last step of a query.
+static PyObject* PyBBQNodeList_get_values(PyBBQNodeList* self, void*) {
+    Py_ssize_t n = PyList_GET_SIZE(self->items);
+    PyObject* out = PyList_New(n);
+    if (!out) return NULL;
+    for (Py_ssize_t i = 0; i < n; i++) {
+        PyObject* v = PyObject_GetAttrString(PyList_GET_ITEM(self->items, i), "value");
+        if (!v) { Py_DECREF(out); return NULL; }
+        PyList_SET_ITEM(out, i, v);
+    }
+    return out;
+}
+
+// ── Selectors ────────────────────────────────────────────────────────────────
+//
+// The vocabulary, and its RFC 9535 spelling:
+//
+//   node["name"]        $.name          name selector      → Node (one, strict)
+//   node[3] / node[-1]  $[3]            index selector     → Node (one, strict)
+//   node[1:3:2]         $[1:3:2]        array slice        → NodeList
+//   node[0, 2]          $[0,2]          several selectors  → NodeList
+//   node[:]             $[*]            wildcard           → NodeList
+//   node[...]           the node set `..` iterates over    → NodeList
+//   node[..., "name"]   $..name         descendant segment → NodeList
+//
+// A miss inside a multi-selector contributes nothing, per §2.3.1.2 ("selects
+// nothing if there is no such member"). The single accessors keep raising,
+// because they are how a caller asks for one field and expects to get it.
+
+extern PyTypeObject PyBBQQuery_Type;
+static int query_matches(PyBBQNode* node, PyObject* q);
+
+static bool key_is_multi(PyObject* key) {
+    return key == Py_Ellipsis || PyTuple_Check(key) || PySlice_Check(key)
+        || Py_TYPE(key) == &PyBBQQuery_Type;
+}
+
+static int select_into(PyBBQNode* node, PyObject* key, PyObject* out);
+
+// The node itself and every node below it, in document order — what a descendant
+// segment applies its selectors to (§2.5.2.2).
+static int collect_descendants(PyBBQNode* node, PyObject* out) {
+    if (PyList_Append(out, (PyObject*)node) < 0) return -1;
+    Py_ssize_t count = 0;
+    {
+        DocLock g(node->result);
+        const zc::node* c = node_of(node);
+        if (c && is_container(c->type)) count = (Py_ssize_t)zc::size_of(c);
+    }
+    if (count == 0) return 0;
+    // A recursive grammar over input nobody here wrote can nest as deep as the
+    // input likes. Python's own recursion limit is what turns that into a
+    // RecursionError instead of a blown C stack.
+    if (Py_EnterRecursiveCall(" while walking descendants")) return -1;
+    int rc = 0;
+    for (Py_ssize_t i = 0; i < count && rc == 0; i++) {
+        PyObject* kid = child_node(node->result, node, i);
+        if (!kid) { rc = -1; break; }
+        rc = collect_descendants((PyBBQNode*)kid, out);
+        Py_DECREF(kid);
+    }
+    Py_LeaveRecursiveCall();
+    return rc;
+}
+
+// One selector, one node, every match appended in order.
+static int select_into(PyBBQNode* node, PyObject* key, PyObject* out) {
+    CaptureType ct;
+    Py_ssize_t count;
+    {
+        DocLock g(node->result);
+        const zc::node* n = node_of(node);
+        if (!n) { PyErr_SetString(PyExc_RuntimeError, "node vanished"); return -1; }
+        ct = n->type;
+        count = is_container(ct) ? (Py_ssize_t)zc::size_of(n) : 0;
+    }
+
+    if (key == Py_Ellipsis) return collect_descendants(node, out);
+
+    // The filter selector: every CHILD of this node that satisfies the
+    // expression (§2.3.5.2 — a filter applies to the children of the node it is
+    // applied to, not to the node itself).
+    if (Py_TYPE(key) == &PyBBQQuery_Type) {
+        if (!is_container(ct)) return 0;
+        for (Py_ssize_t i = 0; i < count; i++) {
+            PyObject* kid = child_node(node->result, node, i);
+            if (!kid) return -1;
+            int hit = query_matches((PyBBQNode*)kid, key);
+            if (hit < 0) { Py_DECREF(kid); return -1; }
+            int rc = hit ? PyList_Append(out, kid) : 0;
+            Py_DECREF(kid);
+            if (rc < 0) return -1;
+        }
+        return 0;
+    }
+
+    if (PyTuple_Check(key)) {
+        Py_ssize_t k = PyTuple_GET_SIZE(key);
+        // A leading Ellipsis is the descendant segment: the rest of the tuple is
+        // applied to this node AND every node below it.
+        if (k > 0 && PyTuple_GET_ITEM(key, 0) == Py_Ellipsis) {
+            PyObject* scope = PyList_New(0);
+            if (!scope) return -1;
+            if (collect_descendants(node, scope) < 0) { Py_DECREF(scope); return -1; }
+            int rc = 0;
+            for (Py_ssize_t s = 0; s < PyList_GET_SIZE(scope) && rc == 0; s++) {
+                PyBBQNode* d = (PyBBQNode*)PyList_GET_ITEM(scope, s);
+                for (Py_ssize_t j = 1; j < k && rc == 0; j++)
+                    rc = select_into(d, PyTuple_GET_ITEM(key, j), out);
+            }
+            Py_DECREF(scope);
+            return rc;
+        }
+        for (Py_ssize_t j = 0; j < k; j++)
+            if (select_into(node, PyTuple_GET_ITEM(key, j), out) < 0) return -1;
+        return 0;
+    }
+
+    if (PySlice_Check(key)) {
+        if (!is_container(ct)) return 0;        /* nothing to slice: no matches */
+        Py_ssize_t start, stop, step, length;
+        if (PySlice_GetIndicesEx(key, count, &start, &stop, &step, &length) < 0) return -1;
+        for (Py_ssize_t i = 0, idx = start; i < length; i++, idx += step) {
+            PyObject* kid = child_node(node->result, node, idx);
+            if (!kid) return -1;
+            int rc = PyList_Append(out, kid);
+            Py_DECREF(kid);
+            if (rc < 0) return -1;
+        }
+        return 0;
+    }
+
+    if (PyUnicode_Check(key)) {
+        if (!is_container(ct)) return 0;
+        const char* name = PyUnicode_AsUTF8(key);
+        if (!name) return -1;
+        Py_ssize_t slot;
+        { DocLock g(node->result); slot = child_slot(node_of(node), name); }
+        if (slot < 0) return 0;                 /* selects nothing, not an error */
+        PyObject* kid = child_node(node->result, node, slot);
+        if (!kid) return -1;
+        int rc = PyList_Append(out, kid);
+        Py_DECREF(kid);
+        return rc;
+    }
+
+    if (PyIndex_Check(key)) {
+        if (!is_container(ct)) return 0;
+        Py_ssize_t idx = PyNumber_AsSsize_t(key, PyExc_IndexError);
+        if (idx == -1 && PyErr_Occurred()) return -1;
+        if (idx < 0) idx += count;
+        if (idx < 0 || idx >= count) return 0;  /* out of range selects nothing */
+        PyObject* kid = child_node(node->result, node, idx);
+        if (!kid) return -1;
+        int rc = PyList_Append(out, kid);
+        Py_DECREF(kid);
+        return rc;
+    }
+
+    PyErr_Format(PyExc_TypeError, "not a selector: %.200s", Py_TYPE(key)->tp_name);
+    return -1;
+}
+
+static PyObject* node_select(PyBBQNode* node, PyObject* key) {
+    PyObject* items = PyList_New(0);
+    if (!items) return NULL;
+    if (select_into(node, key, items) < 0) { Py_DECREF(items); return NULL; }
+    return nodelist_steal(items);
+}
+
+// Subscripting a NodeList reads one of two ways, and which one is decided by
+// the key, because each kind has exactly one sensible meaning:
+//
+//   nl[0], nl[1:3]      POSITIONAL — the list is a Python sequence, and
+//                       `xs[0:2][0]` has to be the first of the two.
+//   nl["x"], nl[...],   COMPOSITIONAL — a segment applied to every node and
+//   nl[(..., "x")],     concatenated (§2.1.2), which is what makes
+//   nl[bbq.this.x > 1]  root["pts"][:]["x"] mean anything. There is no
+//                       competing positional reading for any of these.
+//
+// The wildcard is the one selector that would have been ambiguous, so it is
+// named instead of punned: `nl.children`.
+static PyObject* PyBBQNodeList_subscript(PyBBQNodeList* self, PyObject* key) {
+    Py_ssize_t n = PyList_GET_SIZE(self->items);
+
+    if (PyIndex_Check(key)) {
+        Py_ssize_t i = PyNumber_AsSsize_t(key, PyExc_IndexError);
+        if (i == -1 && PyErr_Occurred()) return NULL;
+        if (i < 0) i += n;
+        if (i < 0 || i >= n) {
+            PyErr_SetString(PyExc_IndexError, "nodelist index out of range");
+            return NULL;
+        }
+        return Py_NewRef(PyList_GET_ITEM(self->items, i));
+    }
+    if (PySlice_Check(key)) {
+        Py_ssize_t start, stop, step, length;
+        if (PySlice_GetIndicesEx(key, n, &start, &stop, &step, &length) < 0) return NULL;
+        PyObject* items = PyList_New(length);
+        if (!items) return NULL;
+        for (Py_ssize_t i = 0, idx = start; i < length; i++, idx += step)
+            PyList_SET_ITEM(items, i, Py_NewRef(PyList_GET_ITEM(self->items, idx)));
+        return nodelist_steal(items);
+    }
+
+    PyObject* items = PyList_New(0);
+    if (!items) return NULL;
+    for (Py_ssize_t i = 0; i < n; i++) {
+        PyBBQNode* node = (PyBBQNode*)PyList_GET_ITEM(self->items, i);
+        if (select_into(node, key, items) < 0) { Py_DECREF(items); return NULL; }
+    }
+    return nodelist_steal(items);
+}
+
+// The wildcard applied to every node in the list — `$[*]` one level on.
+static PyObject* PyBBQNodeList_get_children(PyBBQNodeList* self, void*) {
+    PyObject* items = PyList_New(0);
+    if (!items) return NULL;
+    PyObject* all = PySlice_New(NULL, NULL, NULL);
+    if (!all) { Py_DECREF(items); return NULL; }
+    for (Py_ssize_t i = 0; i < PyList_GET_SIZE(self->items); i++) {
+        PyBBQNode* node = (PyBBQNode*)PyList_GET_ITEM(self->items, i);
+        if (select_into(node, all, items) < 0) {
+            Py_DECREF(all); Py_DECREF(items); return NULL;
+        }
+    }
+    Py_DECREF(all);
+    return nodelist_steal(items);
+}
+
+static PyMappingMethods PyBBQNodeList_as_mapping = {
+    (lenfunc)      PyBBQNodeList_length,
+    (binaryfunc)   PyBBQNodeList_subscript,
+    (objobjargproc)NULL,
+};
+
+static PyGetSetDef PyBBQNodeList_getset[] = {
+    {(char*)"nodes",  (getter)PyBBQNodeList_get_nodes,  NULL,
+     (char*)"the nodes themselves, as a plain list", NULL},
+    {(char*)"values", (getter)PyBBQNodeList_get_values, NULL,
+     (char*)"each node's value, as a plain list", NULL},
+    {(char*)"children", (getter)PyBBQNodeList_get_children, NULL,
+     (char*)"every child of every node — the wildcard, one level on", NULL},
+    {NULL, NULL, NULL, NULL, NULL}
+};
+
+// ── The filter expression ────────────────────────────────────────────────────
+//
+// RFC 9535 §2.3.5's filter selector, spelled the way pandas and SQLAlchemy spell
+// one: operators on a PLACEHOLDER build a tree instead of computing an answer.
+//
+// It has to be a placeholder and cannot be Node itself. Node's __eq__ already
+// materialises the value and compares it, so `node.kind == 3` is a real bool —
+// which is exactly the property that makes the rest of the API pleasant and
+// exactly why it cannot double as the expression builder. `bbq.this` is `@`.
+//
+//     pts[bbq.this.x > 1]                     $[?@.x > 1]
+//     pts[(bbq.this.x > 1) & (bbq.this.y < 9)]   $[?@.x > 1 && @.y < 9]
+//     pts[~(bbq.this.x == 1)]                 $[?!(@.x == 1)]
+//     pts[bbq.this.x]                         $[?@.x]        (existence)
+//     pts[bbq.count(bbq.this[:]) == 2]        $[?count(@[*]) == 2]
+//
+// & | ~ rather than and/or/not, because Python cannot overload those three.
+
+enum QKind { Q_PATH, Q_CMP, Q_AND, Q_OR, Q_NOT, Q_COUNT, Q_LENGTH };
+
+struct PyBBQQuery {
+    PyObject_HEAD
+    int kind;
+    PyObject* steps;     // Q_PATH: a list of selector keys, applied in order
+    PyObject* left;      // operand, or the operand of count()/length()
+    PyObject* right;     // Q_CMP: the other side — a Query or a plain Python value
+    int op;              // Q_CMP: Py_EQ … Py_GE
+};
+
+static PyObject* query_new(int kind) {
+    PyBBQQuery* q = PyObject_GC_New(PyBBQQuery, &PyBBQQuery_Type);
+    if (!q) return NULL;
+    q->kind = kind; q->steps = NULL; q->left = NULL; q->right = NULL; q->op = 0;
+    PyObject_GC_Track(q);
+    return (PyObject*)q;
+}
+
+static void PyBBQQuery_dealloc(PyBBQQuery* self) {
+    PyObject_GC_UnTrack((PyObject*)self);
+    Py_XDECREF(self->steps); Py_XDECREF(self->left); Py_XDECREF(self->right);
+    PyObject_GC_Del(self);
+}
+static int PyBBQQuery_traverse(PyBBQQuery* self, visitproc visit, void* arg) {
+    Py_VISIT(self->steps); Py_VISIT(self->left); Py_VISIT(self->right);
+    return 0;
+}
+static int PyBBQQuery_clear(PyBBQQuery* self) {
+    Py_CLEAR(self->steps); Py_CLEAR(self->left); Py_CLEAR(self->right);
+    return 0;
+}
+
+// `this.a["b"][0]` — each step is a selector, appended to a fresh path so a
+// placeholder can be reused and branched from without being mutated.
+static PyObject* query_extend(PyBBQQuery* base, PyObject* step) {
+    if (base->kind != Q_PATH) {
+        PyErr_SetString(PyExc_TypeError,
+                        "only a path expression can be navigated further");
+        return NULL;
+    }
+    PyObject* q = query_new(Q_PATH);
+    if (!q) return NULL;
+    PyObject* steps = base->steps ? PySequence_List(base->steps) : PyList_New(0);
+    if (!steps || PyList_Append(steps, step) < 0) {
+        Py_XDECREF(steps); Py_DECREF(q); return NULL;
+    }
+    ((PyBBQQuery*)q)->steps = steps;
+    return q;
+}
+
+static PyObject* PyBBQQuery_getattro(PyBBQQuery* self, PyObject* name) {
+    const char* s = PyUnicode_AsUTF8(name);
+    if (!s) return NULL;
+    // Dunders and privates stay attributes, so repr() and isinstance() work; a
+    // field actually called `_x` is reachable as this["_x"].
+    if (s[0] == '_') return PyObject_GenericGetAttr((PyObject*)self, name);
+    return query_extend(self, name);
+}
+
+static PyObject* PyBBQQuery_subscript(PyBBQQuery* self, PyObject* key) {
+    return query_extend(self, key);
+}
+
+static PyObject* PyBBQQuery_richcompare(PyObject* self, PyObject* other, int op) {
+    PyObject* q = query_new(Q_CMP);
+    if (!q) return NULL;
+    ((PyBBQQuery*)q)->op = op;
+    Py_INCREF(self);  ((PyBBQQuery*)q)->left  = self;
+    Py_INCREF(other); ((PyBBQQuery*)q)->right = other;
+    return q;
+}
+
+static PyObject* query_binop(int kind, PyObject* a, PyObject* b) {
+    if (Py_TYPE(a) != &PyBBQQuery_Type || Py_TYPE(b) != &PyBBQQuery_Type)
+        Py_RETURN_NOTIMPLEMENTED;
+    PyObject* q = query_new(kind);
+    if (!q) return NULL;
+    Py_INCREF(a); ((PyBBQQuery*)q)->left  = a;
+    Py_INCREF(b); ((PyBBQQuery*)q)->right = b;
+    return q;
+}
+static PyObject* PyBBQQuery_and(PyObject* a, PyObject* b) { return query_binop(Q_AND, a, b); }
+static PyObject* PyBBQQuery_or (PyObject* a, PyObject* b) { return query_binop(Q_OR,  a, b); }
+static PyObject* PyBBQQuery_not(PyObject* a) {
+    PyObject* q = query_new(Q_NOT);
+    if (!q) return NULL;
+    Py_INCREF(a); ((PyBBQQuery*)q)->left = a;
+    return q;
+}
+
+// An expression is never a bool by accident: `if this.x == 1` or a stray
+// `and`/`or` would silently take this branch and throw the query away.
+static int PyBBQQuery_bool(PyObject*) {
+    PyErr_SetString(PyExc_TypeError,
+        "a bbq query is not a truth value — combine with & | ~, not and/or/not");
+    return -1;
+}
+
+static PyObject* PyBBQQuery_repr(PyBBQQuery* self) {
+    static const char* names[] = {"path", "cmp", "and", "or", "not", "count", "length"};
+    return PyUnicode_FromFormat("<bbq.query %s>", names[self->kind]);
+}
+
+// ── Evaluating one against a node ────────────────────────────────────────────
+
+// The nodes a path expression reaches from `node` (with `@` bound to it).
+static PyObject* query_path_nodes(PyBBQNode* node, PyBBQQuery* q) {
+    PyObject* items = PyList_New(0);
+    if (!items) return NULL;
+    if (PyList_Append(items, (PyObject*)node) < 0) { Py_DECREF(items); return NULL; }
+    Py_ssize_t nsteps = q->steps ? PyList_GET_SIZE(q->steps) : 0;
+    for (Py_ssize_t s = 0; s < nsteps; s++) {
+        PyObject* next = PyList_New(0);
+        if (!next) { Py_DECREF(items); return NULL; }
+        for (Py_ssize_t i = 0; i < PyList_GET_SIZE(items); i++) {
+            PyBBQNode* cur = (PyBBQNode*)PyList_GET_ITEM(items, i);
+            if (select_into(cur, PyList_GET_ITEM(q->steps, s), next) < 0) {
+                Py_DECREF(next); Py_DECREF(items); return NULL;
+            }
+        }
+        Py_DECREF(items);
+        items = next;
+    }
+    return items;
+}
+
+// One side of a comparison. A query that did not match exactly one node is
+// "Nothing" (§2.3.5.2), which is reported as NULL with no error set.
+static PyObject* query_operand(PyBBQNode* node, PyObject* side, bool* nothing) {
+    *nothing = false;
+    if (Py_TYPE(side) != &PyBBQQuery_Type) { Py_INCREF(side); return side; }
+    PyBBQQuery* q = (PyBBQQuery*)side;
+    if (q->kind == Q_COUNT) {
+        PyObject* nodes = query_path_nodes(node, (PyBBQQuery*)q->left);
+        if (!nodes) return NULL;
+        PyObject* n = PyLong_FromSsize_t(PyList_GET_SIZE(nodes));
+        Py_DECREF(nodes);
+        return n;
+    }
+    if (q->kind == Q_LENGTH || q->kind == Q_PATH) {
+        PyBBQQuery* path = (PyBBQQuery*)(q->kind == Q_LENGTH ? q->left : (PyObject*)q);
+        PyObject* nodes = query_path_nodes(node, path);
+        if (!nodes) return NULL;
+        if (PyList_GET_SIZE(nodes) != 1) { Py_DECREF(nodes); *nothing = true; return NULL; }
+        PyObject* only = PyList_GET_ITEM(nodes, 0);
+        PyObject* out;
+        if (q->kind == Q_LENGTH) {
+            Py_ssize_t len = PyObject_Length(only);
+            if (len < 0) { PyErr_Clear(); Py_DECREF(nodes); *nothing = true; return NULL; }
+            out = PyLong_FromSsize_t(len);
+        } else {
+            out = PyObject_GetAttrString(only, "value");
+        }
+        Py_DECREF(nodes);
+        return out;
+    }
+    PyErr_SetString(PyExc_TypeError, "a logical expression is not a value");
+    return NULL;
+}
+
+static int query_matches(PyBBQNode* node, PyObject* expr) {
+    PyBBQQuery* q = (PyBBQQuery*)expr;
+    switch (q->kind) {
+    case Q_PATH: {                      // existence test
+        PyObject* nodes = query_path_nodes(node, q);
+        if (!nodes) return -1;
+        int hit = PyList_GET_SIZE(nodes) > 0;
+        Py_DECREF(nodes);
+        return hit;
+    }
+    case Q_NOT: {
+        int v = query_matches(node, q->left);
+        return v < 0 ? -1 : !v;
+    }
+    case Q_AND: case Q_OR: {
+        int a = query_matches(node, q->left);
+        if (a < 0) return -1;
+        if (q->kind == Q_AND && !a) return 0;
+        if (q->kind == Q_OR  &&  a) return 1;
+        return query_matches(node, q->right);
+    }
+    case Q_CMP: {
+        bool ln = false, rn = false;
+        PyObject* lv = query_operand(node, q->left, &ln);
+        if (!lv && !ln) return -1;
+        PyObject* rv = query_operand(node, q->right, &rn);
+        if (!rv && !rn) { Py_XDECREF(lv); return -1; }
+        int result;
+        if (ln || rn) {
+            // Nothing equals only Nothing; every ordering against it is false.
+            result = (q->op == Py_EQ) ? (ln && rn)
+                   : (q->op == Py_NE) ? !(ln && rn)
+                   : 0;
+        } else {
+            result = PyObject_RichCompareBool(lv, rv, q->op);
+        }
+        Py_XDECREF(lv); Py_XDECREF(rv);
+        return result;
+    }
+    default:
+        PyErr_SetString(PyExc_TypeError, "count()/length() is a value, not a test");
+        return -1;
+    }
+}
+
+static PyNumberMethods PyBBQQuery_as_number = {
+    NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+    (inquiry)PyBBQQuery_bool,               // nb_bool
+    (unaryfunc)PyBBQQuery_not,              // nb_invert  (~)
+    NULL, NULL,
+    (binaryfunc)PyBBQQuery_and,             // nb_and     (&)
+    NULL,
+    (binaryfunc)PyBBQQuery_or,              // nb_or      (|)
+};
+
+static PyMappingMethods PyBBQQuery_as_mapping = {
+    NULL, (binaryfunc)PyBBQQuery_subscript, NULL,
+};
+
+PyTypeObject PyBBQQuery_Type = {
+    PyVarObject_HEAD_INIT(NULL, 0)
+    "bbq.Query",                             // tp_name
+    sizeof(PyBBQQuery),                      // tp_basicsize
+    0,                                       // tp_itemsize
+    (destructor)PyBBQQuery_dealloc,          // tp_dealloc
+    0,                                       // tp_vectorcall_offset
+    NULL,                                    // tp_getattr
+    NULL,                                    // tp_setattr
+    NULL,                                    // tp_as_async
+    (reprfunc)PyBBQQuery_repr,               // tp_repr
+    &PyBBQQuery_as_number,                   // tp_as_number
+    NULL,                                    // tp_as_sequence
+    &PyBBQQuery_as_mapping,                  // tp_as_mapping
+    NULL,                                    // tp_hash
+    NULL,                                    // tp_call
+    NULL,                                    // tp_str
+    (getattrofunc)PyBBQQuery_getattro,       // tp_getattro
+    NULL,                                    // tp_setattro
+    NULL,                                    // tp_as_buffer
+    Py_TPFLAGS_DEFAULT | Py_TPFLAGS_HAVE_GC, // tp_flags
+    PyDoc_STR("A filter expression over the node being tested."), // tp_doc
+    (traverseproc)PyBBQQuery_traverse,       // tp_traverse
+    (inquiry)PyBBQQuery_clear,               // tp_clear
+    (richcmpfunc)PyBBQQuery_richcompare,     // tp_richcompare
+};
+
+static PyObject* bbq_count(PyObject*, PyObject* arg) {
+    if (Py_TYPE(arg) != &PyBBQQuery_Type || ((PyBBQQuery*)arg)->kind != Q_PATH) {
+        PyErr_SetString(PyExc_TypeError, "count() takes a path expression");
+        return NULL;
+    }
+    PyObject* q = query_new(Q_COUNT);
+    if (!q) return NULL;
+    Py_INCREF(arg); ((PyBBQQuery*)q)->left = arg;
+    return q;
+}
+static PyObject* bbq_length(PyObject*, PyObject* arg) {
+    if (Py_TYPE(arg) != &PyBBQQuery_Type || ((PyBBQQuery*)arg)->kind != Q_PATH) {
+        PyErr_SetString(PyExc_TypeError, "length() takes a path expression");
+        return NULL;
+    }
+    PyObject* q = query_new(Q_LENGTH);
+    if (!q) return NULL;
+    Py_INCREF(arg); ((PyBBQQuery*)q)->left = arg;
+    return q;
+}
+
+PyTypeObject PyBBQNodeList_Type = {
+    PyVarObject_HEAD_INIT(NULL, 0)
+    "bbq.NodeList",                          // tp_name
+    sizeof(PyBBQNodeList),                   // tp_basicsize
+    0,                                       // tp_itemsize
+    (destructor)PyBBQNodeList_dealloc,       // tp_dealloc
+    0,                                       // tp_vectorcall_offset
+    NULL,                                    // tp_getattr
+    NULL,                                    // tp_setattr
+    NULL,                                    // tp_as_async
+    (reprfunc)PyBBQNodeList_repr,            // tp_repr
+    NULL,                                    // tp_as_number
+    NULL,                                    // tp_as_sequence
+    &PyBBQNodeList_as_mapping,               // tp_as_mapping
+    NULL,                                    // tp_hash
+    NULL,                                    // tp_call
+    NULL,                                    // tp_str
+    PyObject_GenericGetAttr,                 // tp_getattro
+    NULL,                                    // tp_setattro
+    NULL,                                    // tp_as_buffer
+    Py_TPFLAGS_DEFAULT | Py_TPFLAGS_HAVE_GC, // tp_flags
+    PyDoc_STR("The nodes a selector matched."), // tp_doc
+    (traverseproc)PyBBQNodeList_traverse,    // tp_traverse
+    (inquiry)PyBBQNodeList_clear,            // tp_clear
+    NULL,                                    // tp_richcompare
+    0,                                       // tp_weaklistoffset
+    (getiterfunc)PyBBQNodeList_iter,         // tp_iter
+    NULL,                                    // tp_iternext
+    NULL,                                    // tp_methods
+    NULL,                                    // tp_members
+    PyBBQNodeList_getset,                    // tp_getset
 };
 
 
@@ -1631,7 +2321,29 @@ PyTypeObject PyBBQResult_Type = {
 
 // ── PyBBQSpec ───────────────────────────────────────────────────────────────
 
+// A Spec holds STRONG references to arbitrary user callables — the externs —
+// so it is the one type here that can sit in a cycle the user built: the
+// natural way to write a stateful extern is a closure or a bound method that
+// reaches the Spec back. Untracked, that cycle is not merely uncollected, it is
+// invisible: it never reaches gc.garbage either, and every Spec so registered
+// leaks its grammar, its AST and its sema for the life of the process.
+static int PyBBQSpec_traverse(PyBBQSpec* self, visitproc visit, void* arg) {
+    for (int i = 0; i < self->ext_count; i++) Py_VISIT(self->ext_callables[i]);
+    return 0;
+}
+
+static int PyBBQSpec_clear(PyBBQSpec* self) {
+    for (int i = 0; i < self->ext_count; i++) Py_CLEAR(self->ext_callables[i]);
+    // The entries point at the callables that just went; nothing may parse
+    // through a spec the collector has decided is unreachable, but the table is
+    // emptied rather than left naming freed objects.
+    self->ext_count = 0;
+    self->ext_table = {};
+    return 0;
+}
+
 static void PyBBQSpec_dealloc(PyBBQSpec* self) {
+    PyObject_GC_UnTrack((PyObject*)self);
     for (int i = 0; i < self->ext_count; i++)
         Py_XDECREF(self->ext_callables[i]);
     PyMem_Free(self->ext_callables);
@@ -1640,7 +2352,7 @@ static void PyBBQSpec_dealloc(PyBBQSpec* self) {
     delete self->sema;      // holds a reference to *errors, so it goes first
     delete self->errors;
     delete self->parser;    // owns the AST
-    Py_TYPE(self)->tp_free((PyObject*)self);
+    PyObject_GC_Del(self);
 }
 
 // ── Extern parser trampoline ──
@@ -1950,10 +2662,10 @@ PyTypeObject PyBBQSpec_Type = {
     NULL,                                   // tp_getattro
     NULL,                                   // tp_setattro
     NULL,                                   // tp_as_buffer
-    Py_TPFLAGS_DEFAULT,                     // tp_flags
+    Py_TPFLAGS_DEFAULT | Py_TPFLAGS_HAVE_GC, // tp_flags
     PyDoc_STR("A compiled BBQ grammar."),   // tp_doc
-    NULL,                                   // tp_traverse
-    NULL,                                   // tp_clear
+    (traverseproc)PyBBQSpec_traverse,       // tp_traverse
+    (inquiry)PyBBQSpec_clear,               // tp_clear
     NULL,                                   // tp_richcompare
     0,                                      // tp_weaklistoffset
     NULL,                                   // tp_iter
@@ -1996,7 +2708,7 @@ static PyObject* compile_source(const char* source, Py_ssize_t length) {
         return NULL;
     }
 
-    PyBBQSpec* spec = PyObject_New(PyBBQSpec, &PyBBQSpec_Type);
+    PyBBQSpec* spec = PyObject_GC_New(PyBBQSpec, &PyBBQSpec_Type);
     if (!spec) { delete grammar; delete sema; delete errors; delete parser; return NULL; }
     spec->grammar = grammar;
     spec->parser = parser;
@@ -2007,7 +2719,10 @@ static PyObject* compile_source(const char* source, Py_ssize_t length) {
     spec->ext_count = 0;
     spec->ext_capacity = 0;
     spec->ext_table = {};
-    spec->lock = BBQ_MUTEX_INIT;    // PyObject_New does not zero
+    spec->lock = BBQ_MUTEX_INIT;    // PyObject_GC_New does not zero
+    // Tracked only now: the collector may walk this object the moment it is
+    // tracked, and tp_traverse reads the fields above.
+    PyObject_GC_Track(spec);
     return (PyObject*)spec;
 }
 
@@ -2046,6 +2761,10 @@ static PyMethodDef bbq_module_methods[] = {
     {"compile_string", (PyCFunction)(void(*)(void))bbq_compile_string,
      METH_VARARGS | METH_KEYWORDS,
      "compile_string(source) -> Spec: compile a grammar from a string."},
+    {"count",  (PyCFunction)bbq_count,  METH_O,
+     "count(path): how many nodes the path matched — a value for a comparison."},
+    {"length", (PyCFunction)bbq_length, METH_O,
+     "length(path): len() of the one node the path matched."},
     {NULL, NULL, 0, NULL}
 };
 
@@ -2111,6 +2830,25 @@ PyInit_bbq(void)
     }
 
     PyModule_AddObject(m, (char*) "NodeIter", (PyObject*) &PyBBQNodeIter_Type);
+
+    if (PyType_Ready(&PyBBQNodeList_Type)) {
+        return NULL;
+    }
+    Py_INCREF(&PyBBQNodeList_Type);
+    PyModule_AddObject(m, (char*) "NodeList", (PyObject*) &PyBBQNodeList_Type);
+
+    if (PyType_Ready(&PyBBQQuery_Type)) {
+        return NULL;
+    }
+    Py_INCREF(&PyBBQQuery_Type);
+    PyModule_AddObject(m, (char*) "Query", (PyObject*) &PyBBQQuery_Type);
+    // `this` is `@`: the node a filter is being asked about. One shared empty
+    // path — every navigation from it builds a new one, so it is never mutated.
+    {
+        PyObject* self_q = query_new(Q_PATH);
+        if (!self_q) return NULL;
+        PyModule_AddObject(m, (char*) "this", self_q);
+    }
 
     /* Register the 'bbq.ParseError' exception */
 

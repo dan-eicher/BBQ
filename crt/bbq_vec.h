@@ -1,104 +1,219 @@
 /*
  * bbq_vec.h — Type-generic growable array for BBQ generated code.
  *
- * A bbq_vec is just a typed pointer (T*) with a hidden header at a negative
- * offset storing length and capacity.  NULL is a valid empty vector.
+ * A bbq_vec is a typed pointer (T*) with a hidden header at a negative offset.
+ * NULL is a valid empty vector.
  *
- * Usage:
  *   int* nums = NULL;
  *   bbq_vec_push(nums, 42);
- *   bbq_vec_push(nums, 99);
- *   for (int i = 0; i < bbq_vec_len(nums); i++)
- *       printf("%d\n", nums[i]);
+ *   for (int i = 0; i < bbq_vec_len(nums); i++) printf("%d\n", nums[i]);
  *   bbq_vec_free(nums);
+ *
+ * ── THE FAILURE CONTRACT ────────────────────────────────────────────────────
+ *
+ * This is linked into compilers and VMs that process input they did not write,
+ * so it never aborts and it never writes out of bounds. When an allocation fails
+ * the vector is POISONED:
+ *
+ *   - growth is refused from then on, permanently;
+ *   - every later push is a no-op — it does not write, and it does not advance
+ *     the length;
+ *   - the elements already there, and `len`, stay valid and readable;
+ *   - bbq_vec_oom(v) reports it.
+ *
+ * `len` is deliberately preserved rather than zeroed. A vector that silently
+ * becomes empty turns a partial result into a confidently wrong one — a method
+ * body that looks complete, a capture list that looks closed — whereas a short
+ * vector plus a set OOM bit is a result a caller can recognise as incomplete.
+ *
+ * A caller that must know whether its data is whole asks bbq_vec_oom() at a
+ * boundary that suits it. A caller that never asks gets a short vector, never a
+ * corrupted heap.
+ *
+ * ── THE ONE THING THIS CONTRACT BREAKS ──────────────────────────────────────
+ *
+ * A loop whose termination depends on a push making progress no longer
+ * terminates:
+ *
+ *     while (bbq_vec_len(v) < need) bbq_vec_push(v, 0);     // HANGS on OOM
+ *
+ * A hang inside a VM is the same denial of service as an abort, so this shape is
+ * a bug and there is no way for the macro to diagnose it. Use bbq_vec_fill, or
+ * bbq_vec_try_reserve and check. The same applies wherever an external counter is
+ * advanced past a push and then used as an index.
+ *
+ * ── ALLOCATORS ──────────────────────────────────────────────────────────────
+ *
+ * A vector captures its allocator at its first successful allocation and keeps it
+ * for its lifetime, so it can never be freed through a different one. Selection
+ * cannot be per-call — these macros receive a bare T* and nothing else — so a new
+ * vector is born with BBQ_VEC_ALLOC(), which is NULL (libc) unless the embedder
+ * defines it to its own function reading its own per-thread or per-interpreter
+ * state. bbq_vec_reserve_a names the allocator explicitly for a vector's first
+ * allocation.
  */
 #ifndef BBQ_VEC_H
 #define BBQ_VEC_H
 
-#include <stdlib.h>
-#include <string.h>
+#include <stddef.h>
+#include <limits.h>
+#include "bbq_alloc.h"
+
+/* sizeof(bbq_vec_hdr) is part of the ABI: an object file compiled against a
+ * different header computes a different element offset and corrupts the heap at
+ * the first access. Consumers that embed a vec by value check this. */
+#define BBQ_VEC_ABI 2
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-typedef struct {
-    int len;
-    int cap;
+/* The allocator a NEW vector is born with. */
+#ifndef BBQ_VEC_ALLOC
+#  define BBQ_VEC_ALLOC() ((bbq_alloc*)0)
+#endif
+
+/* Capacity ceiling. Chosen so that doubling can never overflow `int`, which is
+ * what the old code did at 2^30 — signed overflow, undefined rather than
+ * wrapping, so a guard placed after it may legally be deleted. Past the ceiling
+ * a vector poisons instead. 2^30-1 elements is 8 GB at 8 bytes each. */
+#define BBQ_VEC_MAX_CAP 0x3FFFFFFF
+
+typedef struct bbq_vec_hdr {
+    int        len;
+    int        cap;     /* >= 0 live; < 0 poisoned, real capacity is -1 - cap */
+    bbq_alloc* a;       /* captured at birth; NULL = libc */
 } bbq_vec_hdr;
 
-/* --- Internal helpers (do not call directly) --- */
+/* --- Internal (do not call directly) --- */
 
-#define bbq__vec_hdr(v)  ((bbq_vec_hdr*)((char*)(v) - sizeof(bbq_vec_hdr)))
+#define bbq__vec_hdr(v) ((bbq_vec_hdr*)(void*)((char*)(v) - sizeof(bbq_vec_hdr)))
 
-static inline void* bbq__vec_grow(void* v, size_t elem_size) {
-    int len    = v ? bbq__vec_hdr(v)->len : 0;
-    int newcap = v ? bbq__vec_hdr(v)->cap * 2 : 8;
-    bbq_vec_hdr* h = (bbq_vec_hdr*)realloc(
-        v ? bbq__vec_hdr(v) : NULL,
-        sizeof(bbq_vec_hdr) + (size_t)newcap * elem_size);
-    if (!h) return v; /* allocation failure — leave unchanged */
-    h->len = len;
-    h->cap = newcap;
-    return (char*)h + sizeof(bbq_vec_hdr);
-}
+/* Grow to at least one more than the current length, or to `want` elements.
+ * Both return the pointer to store back: the same block, a new one, or a
+ * poisoned one. Neither ever returns NULL for a vector that had elements. */
+void* bbq__vec_grow  (void* v, size_t elem_size);
+void* bbq__vec_resize(void* v, size_t want, size_t elem_size, bbq_alloc* born_with);
+void  bbq__vec_release(void* v, size_t elem_size);
+
+/* Writes to the header that must not touch the shared poison sentinel. */
+void bbq__vec_setlen  (void* v, int n);        /* clamped to real capacity */
+void bbq__vec_truncate(void* v, int n);        /* shrink only, clamped at 0 */
+int  bbq__vec_popi    (void* v);               /* index to pop; never negative */
+int  bbq__vec_topi    (const void* v);         /* index of the last element    */
+
+/* __typeof__ in both languages, never decltype. `decltype(e)` on an lvalue that
+ * is not a plain identifier yields T&, and the results being cast here are
+ * prvalues — `(T*&)some_void_ptr` is not a valid cast, so a vec reached through
+ * `ctx->stack` rather than a local would not compile. __typeof__ yields the
+ * unreferenced type, which is what both of these want. */
+#define bbq__vec_cast(v) (__typeof__(v))
+#define bbq__vec_elem(v) __typeof__((v)[0])
 
 /* --- Public API --- */
 
-#define bbq_vec_len(v)   ((v) ? bbq__vec_hdr(v)->len : 0)
-#define bbq_vec_cap(v)   ((v) ? bbq__vec_hdr(v)->cap : 0)
+/* Unchanged from the original, byte for byte: this is on every hot loop in every
+ * consumer and its `int` result is compared against `int` counters in hundreds of
+ * places. Widening it would silently turn the common `v[bbq_vec_len(v) - 1]` into
+ * an index near 2^64 with no diagnostic. */
+#define bbq_vec_len(v)  ((v) ? bbq__vec_hdr(v)->len : 0)
 
-#define bbq_vec_free(v)  \
-    do { if (v) { free(bbq__vec_hdr(v)); (v) = NULL; } } while(0)
+/* A poisoned vector reports capacity 0. That is what routes it back through the
+ * grow path on every push — where the sticky refusal lives — at no cost to the
+ * fast path. */
+#define bbq_vec_cap(v)  (((v) && bbq__vec_hdr(v)->cap > 0) ? bbq__vec_hdr(v)->cap : 0)
 
-#define bbq_vec_clear(v) \
-    do { if (v) bbq__vec_hdr(v)->len = 0; } while(0)
+/* Did this vector ever fail to grow? Its contents are still valid; they are just
+ * not all of what was pushed. */
+#define bbq_vec_oom(v)  ((v) ? (bbq__vec_hdr(v)->cap < 0) : 0)
 
-/* Shrink the length to n (n <= current len); keeps capacity. */
-#define bbq_vec_truncate(v, n) \
-    do { if (v) bbq__vec_hdr(v)->len = (int)(n); } while(0)
+#define bbq_vec_free(v) do {                                                  \
+    if (v) { bbq__vec_release((void*)(v), sizeof(*(v))); (v) = NULL; }        \
+} while (0)
 
-/* Cast helper: __typeof__ in C/GCC, decltype in C++ */
-#ifdef __cplusplus
-#define bbq__vec_cast(v) (decltype(v))
-#else
-#define bbq__vec_cast(v) (__typeof__(v))
-#endif
+#define bbq_vec_clear(v)         bbq__vec_truncate((void*)(v), 0)
 
-#define bbq_vec_push(v, val) do {                                     \
-    if (bbq_vec_len(v) >= bbq_vec_cap(v))                             \
-        (v) = bbq__vec_cast(v) bbq__vec_grow((v), sizeof(*(v)));      \
-    (v)[bbq__vec_hdr(v)->len++] = (val);                              \
-} while(0)
+/* Shrink to n. Shrink-only and clamped at zero, so a too-large n can no longer
+ * push len past the allocation and `truncate(v, len(v) - 1)` on an empty vector
+ * can no longer set len to -1. To extend after a reserve, use bbq_vec_setlen. */
+#define bbq_vec_truncate(v, n)   bbq__vec_truncate((void*)(v), (int)(n))
 
-#define bbq_vec_pop(v) ((v)[--bbq__vec_hdr(v)->len])
+/* Set the length explicitly, clamped to the real capacity. This is the checked
+ * replacement for writing bbq__vec_hdr(v)->len by hand after a reserve. */
+#define bbq_vec_setlen(v, n)     bbq__vec_setlen((void*)(v), (int)(n))
 
-#define bbq_vec_last(v) ((v)[bbq__vec_hdr(v)->len - 1])
+/* Append. On allocation failure this stores nothing and the length does not
+ * advance — see the failure contract above. */
+#define bbq_vec_push(v, val) do {                                             \
+    if (bbq_vec_len(v) >= bbq_vec_cap(v))                                     \
+        (v) = bbq__vec_cast(v) bbq__vec_grow((v), sizeof(*(v)));              \
+    if (!bbq_vec_oom(v))                                                      \
+        (v)[bbq__vec_hdr(v)->len++] = (val);                                  \
+} while (0)
 
-/* Reserve space for at least n total elements. */
-#define bbq_vec_reserve(v, n) do {                                    \
-    if (bbq_vec_cap(v) < (int)(n)) {                                  \
-        int _newcap = (int)(n);                                       \
-        bbq_vec_hdr* _h = (bbq_vec_hdr*)realloc(                     \
-            (v) ? bbq__vec_hdr(v) : NULL,                             \
-            sizeof(bbq_vec_hdr) + (size_t)_newcap * sizeof(*(v)));    \
-        if (_h) {                                                     \
-            if (!(v)) _h->len = 0;                                   \
-            _h->cap = _newcap;                                        \
-            (v) = bbq__vec_cast(v)((char*)_h + sizeof(bbq_vec_hdr)); \
-        }                                                             \
-    }                                                                 \
-} while(0)
+/* Append, reporting whether it happened. Use this wherever the next statement
+ * depends on the element being there — an index computed from a separate
+ * counter, or a loop that stops when the length reaches a target.
+ *
+ * A statement expression because bbq_vec_push is a statement and cannot appear
+ * in a comma expression. GNU only, which this header already requires for
+ * __typeof__, and which the gtest build has been compiling as C++ all along. */
+#define bbq_vec_try_push(v, val) __extension__ ({                             \
+    bbq_vec_push((v), (val));                                                 \
+    !bbq_vec_oom(v);                                                          \
+})
 
-/* Reverse a vector in place. */
-#define bbq_vec_reverse(v) do {                                       \
-    int _n = bbq_vec_len(v);                                          \
-    for (int _i = 0, _j = _n - 1; _i < _j; _i++, _j--) {            \
-        __typeof__((v)[0]) _tmp = (v)[_i];                            \
-        (v)[_i] = (v)[_j];                                            \
-        (v)[_j] = _tmp;                                               \
-    }                                                                 \
-} while(0)
+/* Reserve capacity for n elements. Silently does nothing on failure; every
+ * caller that then writes v[i] directly must use bbq_vec_try_reserve instead. */
+#define bbq_vec_reserve(v, n)    bbq_vec_reserve_a((v), (n), BBQ_VEC_ALLOC())
+
+/* `n` is bound once. Callers routinely pass a count derived from the vector
+ * itself — `bbq_vec_cap(v) * 2` is the shape every parse stack uses — and `v` is
+ * reassigned in the middle of this, so re-reading `n` afterwards would measure
+ * the new capacity against a target computed from it. */
+#define bbq_vec_reserve_a(v, n, alloc) do {                                   \
+    int _rn = (int)(n);                                                       \
+    if (bbq_vec_cap(v) < _rn)                                                 \
+        (v) = bbq__vec_cast(v) bbq__vec_resize((v), (size_t)_rn,              \
+                                               sizeof(*(v)), (alloc));        \
+} while (0)
+
+/* Reserve, as an expression: true iff the capacity is now there. */
+#define bbq_vec_try_reserve(v, n) __extension__ ({                            \
+    int _rn = (int)(n);                                                       \
+    if (bbq_vec_cap(v) < _rn)                                                 \
+        (v) = bbq__vec_cast(v) bbq__vec_resize((v), (size_t)_rn,              \
+                                               sizeof(*(v)), BBQ_VEC_ALLOC());\
+    bbq_vec_cap(v) >= _rn;                                                    \
+})
+
+/* Extend to exactly n elements with `val`, or fail and change nothing. This is
+ * the safe form of `while (len < n) push(v, val)`, which does not terminate once
+ * the vector is poisoned. */
+#define bbq_vec_fill(v, n, val) __extension__ ({                              \
+    int _fok = bbq_vec_try_reserve((v), (n));                                 \
+    if (_fok) {                                                               \
+        for (int _fi = bbq_vec_len(v); _fi < (int)(n); _fi++) (v)[_fi] = (val); \
+        if ((int)(n) > bbq_vec_len(v)) bbq_vec_setlen((v), (int)(n));          \
+    }                                                                         \
+    _fok;                                                                     \
+})
+
+/* Precondition: bbq_vec_len(v) > 0. Neither can drive len negative, and neither
+ * writes to a poisoned vector's header when it is empty. */
+#define bbq_vec_pop(v)  ((v)[bbq__vec_popi((void*)(v))])
+#define bbq_vec_last(v) ((v)[bbq__vec_topi((const void*)(v))])
+
+/* Safe on a poisoned vector with no guard of its own: an empty one has len 0, so
+ * the loop body never runs and nothing is written. */
+#define bbq_vec_reverse(v) do {                                               \
+    int _n = bbq_vec_len(v);                                                  \
+    for (int _i = 0, _j = _n - 1; _i < _j; _i++, _j--) {                      \
+        bbq__vec_elem(v) _tmp = (v)[_i];                                      \
+        (v)[_i] = (v)[_j];                                                    \
+        (v)[_j] = _tmp;                                                       \
+    }                                                                         \
+} while (0)
 
 #ifdef __cplusplus
 }

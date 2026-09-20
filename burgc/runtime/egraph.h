@@ -272,7 +272,20 @@ struct egraph {
      * The chain exists because a hash is not an identity: a hit is a
      * candidate to compare, never an answer. */
     void*            hashcons;
+    /* Sticky: some allocation this graph needed was refused. Once set, every
+     * mutation is a no-op and the graph stops growing — it does not abort, and
+     * it does not keep going with a class whose storage was never made. The
+     * caller asks eg_oom() once, when it is done, rather than at every edge.
+     *
+     * This exists because a bbq_vec push that fails is a no-op, so a loop of the
+     * form `while (len < need) push(...)` would otherwise never terminate — a
+     * hang, which inside a VM is the same denial of service as a crash. */
+    bool             oom;
 };
+
+/* Did this graph run out of memory? Its contents are consistent but incomplete;
+ * nothing built from it after the flag was set can be trusted to be whole. */
+bool eg_oom(const egraph* g);
 
 #ifdef __cplusplus
 }

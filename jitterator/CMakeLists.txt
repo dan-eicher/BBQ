@@ -221,6 +221,8 @@ add_library(calc_runner STATIC
     ${CALC_REWRITE_H}
     ${CMAKE_SOURCE_DIR}/burgc/runtime/egraph.c
     ${CMAKE_SOURCE_DIR}/crt/bbq_hmap.c
+    ${CMAKE_SOURCE_DIR}/crt/bbq_vec.c
+    ${CMAKE_SOURCE_DIR}/crt/bbq_alloc.c
     ${CALC_AST_HEADER}
     ${CALC_IR_HEADER}
     ${CALC_COMPILE_H}

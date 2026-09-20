@@ -54,7 +54,7 @@ class CBurgBackend : public BurgBackend {
     void emit_context_struct(std::ostream& out) {
         out << "typedef struct " << ctx_type_ << " {\n";
         out << "    bbq_arena arena;\n";
-        out << "    bbq_htree* state_cache;\n";
+        out << "    bbq_htree state_cache;\n";
         out << "    /* Error sink: first-error-wins. Cleared by burg_rewrite() */\n";
         out << "    const char* burg_error_msg;\n";
         out << "    int burg_error_arg;\n";
@@ -95,15 +95,14 @@ class CBurgBackend : public BurgBackend {
     void emit_ctx_lifecycle(std::ostream& out) {
         out << "void " << ns_prefix_ << "burg_ctx_init(" << ctx_type_ << "* ctx) {\n";
         out << "    bbq_arena_init(&ctx->arena, 4096);\n";
-        out << "    ctx->state_cache = bbq_htree_create();\n";
+        out << "    bbq_htree_init(&ctx->state_cache);\n";
         out << "    ctx->burg_error_msg = NULL;\n";
         out << "    ctx->burg_error_arg = 0;\n";
         out << "}\n\n";
 
         out << "void " << ns_prefix_ << "burg_ctx_free(" << ctx_type_ << "* ctx) {\n";
         out << "    bbq_arena_free(&ctx->arena);\n";
-        out << "    bbq_htree_destroy(ctx->state_cache);\n";
-        out << "    ctx->state_cache = NULL;\n";
+        out << "    bbq_htree_free(&ctx->state_cache);\n";
         out << "}\n\n";
 
         out << "bool " << ns_prefix_ << "burg_has_error(const " << ctx_type_ << "* ctx) {\n";
@@ -135,14 +134,18 @@ class CBurgBackend : public BurgBackend {
         out << "    bbq_arena_reset(&ctx->arena);\n";
         out << "}\n\n";
 
-        out << "static BURG_UNUSED burg_state_t* burg_cache_lookup(uint32_t id, " << ctx_type_ << "* ctx) {\n";
-        out << "    return (burg_state_t*)bbq_htree_search(ctx->state_cache, id);\n";
+        /* The key is a bbq_htree_key (64-bit), so a node identity that IS a
+         * pointer goes in whole. It used to be narrowed to uint32_t here, which
+         * made two nodes whose addresses differ only above bit 31 share one
+         * cache entry — the cached state of one handed to the other. */
+        out << "static BURG_UNUSED burg_state_t* burg_cache_lookup(bbq_htree_key id, " << ctx_type_ << "* ctx) {\n";
+        out << "    return (burg_state_t*)bbq_htree_search(&ctx->state_cache, id);\n";
         out << "}\n\n";
-        out << "static BURG_UNUSED void burg_cache_store(uint32_t id, burg_state_t* state, " << ctx_type_ << "* ctx) {\n";
-        out << "    bbq_htree_insert(ctx->state_cache, id, state);\n";
+        out << "static BURG_UNUSED bool burg_cache_store(bbq_htree_key id, burg_state_t* state, " << ctx_type_ << "* ctx) {\n";
+        out << "    return bbq_htree_insert(&ctx->state_cache, id, state);\n";
         out << "}\n\n";
         out << "static BURG_UNUSED void burg_cache_clear(" << ctx_type_ << "* ctx) {\n";
-        out << "    bbq_htree_clear(ctx->state_cache);\n";
+        out << "    bbq_htree_clear(&ctx->state_cache);\n";
         out << "}\n";
     }
 
@@ -301,7 +304,7 @@ public:
 // ── C-specific overrides ─────────────────────────────────
 
 void CBurgBackend::emit_label_body(std::ostream& out, int indent) {
-    pad(out, indent); out << "uint32_t id = (uint32_t)(uintptr_t)BURG_NODE_ID(node);\n";
+    pad(out, indent); out << "bbq_htree_key id = (bbq_htree_key)(uintptr_t)BURG_NODE_ID(node);\n";
     pad(out, indent); out << "burg_state_t* cached = burg_cache_lookup(id, ctx);\n";
     pad(out, indent); out << "if (cached) return cached;\n\n";
 
@@ -309,7 +312,10 @@ void CBurgBackend::emit_label_body(std::ostream& out, int indent) {
     out << "\n";
 
     pad(out, indent); out << "/* Cache BEFORE DP (back-edge cut-point safety) */\n";
-    pad(out, indent); out << "burg_cache_store(id, p, ctx);\n\n";
+    /* A cache miss is only a slower relabel, but a SILENT one hides that the
+     * run was memory-starved, so the refusal is recorded. */
+    pad(out, indent); out << "if (!burg_cache_store(id, p, ctx)) " << ns_prefix_
+                         << "burg_set_error(\"out of memory\", 0, ctx);\n\n";
 
     pad(out, indent); out << "for (int i = 0; i < arity; i++)\n";
     pad(out, indent + 1); out << "p->children[i] = burg_label(BURG_NODE_CHILD(node, i), ctx);\n\n";
@@ -321,34 +327,40 @@ void CBurgBackend::emit_label_body(std::ostream& out, int indent) {
 void CBurgBackend::emit_rpo_dfs(std::ostream& out, int indent) {
     pad(out, indent); out << "BURG_NODE_TYPE* rpo = NULL;\n";
     pad(out, indent); out << "{\n";
-    pad(out, indent + 1); out << "bbq_htree* visited = bbq_htree_create();\n";
+    /* The visited set is what stops this DFS revisiting, so a dropped insert on
+     * a CYCLIC graph is not a missing optimisation — it is a walk that never
+     * ends. Every insert and every push is checked, and a refusal ends the walk
+     * with an error rather than spinning. */
+    pad(out, indent + 1); out << "bbq_htree visited;\n";
+    pad(out, indent + 1); out << "bbq_htree_init(&visited);\n";
     pad(out, indent + 1); out << "typedef struct { BURG_NODE_TYPE node; int succ; } Frame;\n";
     pad(out, indent + 1); out << "Frame* stack = NULL;\n";
     pad(out, indent + 1); out << "Frame f0;\n";
     pad(out, indent + 1); out << "f0.node = root; f0.succ = 0;\n";
-    pad(out, indent + 1); out << "bbq_vec_push(stack, f0);\n";
-    pad(out, indent + 1); out << "bbq_htree_insert(visited, (uint32_t)(uintptr_t)BURG_NODE_ID(root), (void*)(uintptr_t)1);\n\n";
+    pad(out, indent + 1); out << "bool rpo_oom = !bbq_vec_try_push(stack, f0);\n";
+    pad(out, indent + 1); out << "rpo_oom = rpo_oom || !bbq_htree_insert(&visited, (bbq_htree_key)(uintptr_t)BURG_NODE_ID(root), (void*)(uintptr_t)1);\n\n";
 
-    pad(out, indent + 1); out << "while (bbq_vec_len(stack) > 0) {\n";
+    pad(out, indent + 1); out << "while (!rpo_oom && bbq_vec_len(stack) > 0) {\n";
     pad(out, indent + 2); out << "Frame* f = &stack[bbq_vec_len(stack) - 1];\n";
     pad(out, indent + 2); out << "int sc = BURG_NODE_SUCC_COUNT(f->node);\n";
     pad(out, indent + 2); out << "if (f->succ < sc) {\n";
     pad(out, indent + 3); out << "BURG_NODE_TYPE s = BURG_NODE_SUCC(f->node, f->succ);\n";
     pad(out, indent + 3); out << "f->succ++;\n";
-    pad(out, indent + 3); out << "if (s && !bbq_htree_contains(visited, (uint32_t)(uintptr_t)BURG_NODE_ID(s))) {\n";
-    pad(out, indent + 4); out << "bbq_htree_insert(visited, (uint32_t)(uintptr_t)BURG_NODE_ID(s), (void*)(uintptr_t)1);\n";
+    pad(out, indent + 3); out << "if (s && !bbq_htree_contains(&visited, (bbq_htree_key)(uintptr_t)BURG_NODE_ID(s))) {\n";
     pad(out, indent + 4); out << "Frame fn;\n";
     pad(out, indent + 4); out << "fn.node = s; fn.succ = 0;\n";
-    pad(out, indent + 4); out << "bbq_vec_push(stack, fn);\n";
+    pad(out, indent + 4); out << "if (!bbq_htree_insert(&visited, (bbq_htree_key)(uintptr_t)BURG_NODE_ID(s), (void*)(uintptr_t)1)\n";
+    pad(out, indent + 5); out << "|| !bbq_vec_try_push(stack, fn)) { rpo_oom = true; break; }\n";
     pad(out, indent + 3); out << "}\n";
     pad(out, indent + 2); out << "} else {\n";
-    pad(out, indent + 3); out << "bbq_vec_push(rpo, f->node);\n";
-    pad(out, indent + 3); out << "bbq__vec_hdr(stack)->len--;\n";
+    pad(out, indent + 3); out << "if (!bbq_vec_try_push(rpo, f->node)) { rpo_oom = true; break; }\n";
+    pad(out, indent + 3); out << "bbq_vec_truncate(stack, bbq_vec_len(stack) - 1);\n";
     pad(out, indent + 2); out << "}\n";
     pad(out, indent + 1); out << "}\n";
     pad(out, indent + 1); out << "bbq_vec_reverse(rpo);\n";
     pad(out, indent + 1); out << "bbq_vec_free(stack);\n";
-    pad(out, indent + 1); out << "bbq_htree_destroy(visited);\n";
+    pad(out, indent + 1); out << "bbq_htree_free(&visited);\n";
+    pad(out, indent + 1); out << "if (rpo_oom) { " << ns_prefix_ << "burg_set_error(\"out of memory\", 0, ctx); bbq_vec_free(rpo); return; }\n";
     pad(out, indent); out << "}\n\n";
 }
 
@@ -400,7 +412,7 @@ void CBurgBackend::emit_rewrite_body(std::ostream& out, int indent) {
     pad(out, indent); out << "{\n";
     pad(out, indent + 1); out << "int _i, _n = bbq_vec_len(rpo);\n";
     pad(out, indent + 1); out << "for (_i = 0; _i < _n; _i++) {\n";
-    pad(out, indent + 2); out << "burg_state_t* s = burg_cache_lookup((uint32_t)(uintptr_t)BURG_NODE_ID(rpo[_i]), ctx);\n";
+    pad(out, indent + 2); out << "burg_state_t* s = burg_cache_lookup((bbq_htree_key)(uintptr_t)BURG_NODE_ID(rpo[_i]), ctx);\n";
     pad(out, indent + 2); out << "if (!s || !s->rule[" << start_idx << "])\n";
     // No break: burg_reduce already opens with an error check, so once this fires
     // every later node is a no-op call, and burg_set_error keeps the first message.

@@ -403,9 +403,13 @@ static inline bool bbq_write_string(bbq_write_ctx_t* ctx,
 
 /* Per-rule loop base: the loop depth at the rule's entry, so an array's own index
  * is loop_indices[base + nesting_level] (its own frame, undisturbed by callees). */
-static inline void bbq_w_push_loop_base(bbq_write_ctx_t* ctx, int base) {
-    BBQ__STACK_ENSURE(ctx->loop_bases, ctx->loop_base_depth);
+/* As on the read side, every pusher reports whether the value went on the stack
+ * and leaves the depth alone when it did not — so a caller that discards the
+ * result gets a short stack rather than a write past the end of one. */
+static inline bool bbq_w_push_loop_base(bbq_write_ctx_t* ctx, int base) {
+    if (!BBQ__STACK_ENSURE(ctx->loop_bases, ctx->loop_base_depth)) return false;
     ctx->loop_bases[ctx->loop_base_depth++] = base;
+    return true;
 }
 static inline void bbq_w_pop_loop_base(bbq_write_ctx_t* ctx) {
     if (ctx->loop_base_depth > 0) ctx->loop_base_depth--;
@@ -416,12 +420,13 @@ static inline int bbq_w_cur_loop_base(const bbq_write_ctx_t* ctx) {
 static inline int bbq_w_loop_depth(const bbq_write_ctx_t* ctx) { return ctx->loop_depth; }
 
 /* Counted loop (the writer always knows the count): push with the stored limit. */
-static inline void bbq_w_push_loop_n(bbq_write_ctx_t* ctx, int64_t limit) {
-    BBQ__STACK_ENSURE(ctx->loop_indices, ctx->loop_depth);
-    BBQ__STACK_ENSURE(ctx->loop_limits, ctx->loop_depth);
+static inline bool bbq_w_push_loop_n(bbq_write_ctx_t* ctx, int64_t limit) {
+    if (!BBQ__STACK_ENSURE(ctx->loop_indices, ctx->loop_depth) ||
+        !BBQ__STACK_ENSURE(ctx->loop_limits,  ctx->loop_depth)) return false;
     ctx->loop_indices[ctx->loop_depth] = 0;
     ctx->loop_limits[ctx->loop_depth] = limit;
     ctx->loop_depth++;
+    return true;
 }
 static inline void bbq_w_pop_loop(bbq_write_ctx_t* ctx) {
     if (ctx->loop_depth > 0) ctx->loop_depth--;
@@ -441,9 +446,10 @@ static inline int64_t bbq_w_loop_index_at(const bbq_write_ctx_t* ctx, int depth)
 
 /* Scope stack: an invoke pushes the caller's struct so a sub-rule can resolve a
  * field in the enclosing scope (the dual of the reader's bbq_scope_ptr). */
-static inline void bbq_w_push_scope(bbq_write_ctx_t* ctx, const void* ptr) {
-    BBQ__STACK_ENSURE(ctx->scopes, ctx->scope_depth);
+static inline bool bbq_w_push_scope(bbq_write_ctx_t* ctx, const void* ptr) {
+    if (!BBQ__STACK_ENSURE(ctx->scopes, ctx->scope_depth)) return false;
     ctx->scopes[ctx->scope_depth++] = ptr;
+    return true;
 }
 static inline void bbq_w_pop_scope(bbq_write_ctx_t* ctx) {
     if (ctx->scope_depth > 0) ctx->scope_depth--;
@@ -472,8 +478,8 @@ static inline bool bbq_w_advance(bbq_write_ctx_t* ctx, size_t by) {
 /* Interval window: record [pos, end). pop seeks the cursor to the window end so the
  * outer continues after it (matching the reader, which leaves pos==end on pop). */
 static inline bool bbq_w_push_interval(bbq_write_ctx_t* ctx, size_t end) {
-    BBQ__STACK_ENSURE(ctx->interval_starts, ctx->interval_depth);
-    BBQ__STACK_ENSURE(ctx->interval_ends, ctx->interval_depth);
+    if (!BBQ__STACK_ENSURE(ctx->interval_starts, ctx->interval_depth) ||
+        !BBQ__STACK_ENSURE(ctx->interval_ends,   ctx->interval_depth)) return false;
     ctx->interval_starts[ctx->interval_depth] = ctx->pos;
     ctx->interval_ends[ctx->interval_depth] = end;
     ctx->interval_depth++;
@@ -487,9 +493,10 @@ static inline bool bbq_w_pop_interval(bbq_write_ctx_t* ctx) {
 
 /* @rest: record the offset where the (computed) size prefix will be inserted — the rest
  * is then written starting here, with no size yet. */
-static inline void bbq_w_push_rest(bbq_write_ctx_t* ctx) {
-    BBQ__STACK_ENSURE(ctx->rest_holes, ctx->rest_depth);
+static inline bool bbq_w_push_rest(bbq_write_ctx_t* ctx) {
+    if (!BBQ__STACK_ENSURE(ctx->rest_holes, ctx->rest_depth)) return false;
     ctx->rest_holes[ctx->rest_depth++] = ctx->pos;
+    return true;
 }
 /* A `[n]` / count(n) prefix: reserve a fixed-width placeholder where the count goes (so
  * later fields don't clobber it), recording the hole by id — the writer never serializes
@@ -498,16 +505,24 @@ static inline void bbq_w_push_rest(bbq_write_ctx_t* ctx) {
  * so each count field links to its own array by id, not LIFO order. */
 /* count_holes is a vec indexed by id (not a stack), so grow it to cover `id`, zero-filling
  * the new slots — an unused (0) slot is inert in the patch fixup (0 is never > a hole). */
-static inline void bbq_w__count_holes_ensure(bbq_write_ctx_t* ctx, int id) {
+static inline bool bbq_w__count_holes_ensure(bbq_write_ctx_t* ctx, int id) {
     int oldcap = bbq_vec_cap(ctx->count_holes);
-    if (id < oldcap) return;
-    int nc = oldcap ? oldcap : 8;
-    while (nc <= id) nc *= 2;
-    bbq_vec_reserve(ctx->count_holes, nc);
+    if (id < oldcap) return true;
+    /* `nc` doubles until it covers `id`, in a type that cannot wrap past the vec's
+     * own ceiling — the old `int nc` overflowed to negative for a large id, and a
+     * negative capacity request is how a reserve became an enormous one. */
+    int64_t nc = oldcap ? oldcap : 8;
+    while (nc <= (int64_t)id && nc < (int64_t)BBQ_VEC_MAX_CAP) nc *= 2;
+    if (nc > (int64_t)BBQ_VEC_MAX_CAP || id >= BBQ_VEC_MAX_CAP) return false;
+    if (!bbq_vec_try_reserve(ctx->count_holes, (int)nc)) return false;
     for (int i = oldcap; i < bbq_vec_cap(ctx->count_holes); i++) ctx->count_holes[i] = 0;
+    return true;
 }
 static inline bool bbq_w_reserve_count(bbq_write_ctx_t* ctx, int id, int width, bool is_uleb) {
-    if (id >= 0) { bbq_w__count_holes_ensure(ctx, id); ctx->count_holes[id] = ctx->pos; }
+    if (id >= 0) {
+        if (!bbq_w__count_holes_ensure(ctx, id)) return false;
+        ctx->count_holes[id] = ctx->pos;
+    }
     if (is_uleb) return true;   /* LEB: its width depends on the value, so it is inserted at patch */
     size_t w = (size_t)(width / 8);
     if (!bbq_write_reserve(ctx, w)) return false;

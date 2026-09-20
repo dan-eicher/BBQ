@@ -71,7 +71,8 @@ bool run(const std::string& spec, const std::string& type_name, const std::strin
     std::string rt = std::string(SOURCE_DIR) + "/backends/c/runtime";
     std::string crt = std::string(SOURCE_DIR) + "/crt";
     std::string cc = "cc -Wall -Wextra -Werror -std=c11 -I" + dir + " -I" + rt + " -I" + crt + " " +
-                     dir + "/test.c -o " + dir + "/bin 2>&1";
+                     dir + "/test.c " + crt + "/bbq_vec.c " + crt + "/bbq_alloc.c" +
+                     " -o " + dir + "/bin 2>&1";
     FILE* p = popen(cc.c_str(), "r");
     char buf[8192] = {}; if (p) fread(buf, 1, sizeof buf - 1, p);
     int rc = p ? pclose(p) : -1;

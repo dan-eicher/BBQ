@@ -39,9 +39,12 @@ struct eg_class {
 void eg_init(egraph* g) {
     memset(g, 0, sizeof *g);
     bbq_hmap* m = (bbq_hmap*)calloc(1, sizeof *m);
-    bbq_hmap_init(m, 0);
+    if (!m) { g->oom = true; return; }
+    if (!bbq_hmap_init(m, 0)) g->oom = true;
     g->hashcons = m;
 }
+
+bool eg_oom(const egraph* g) { return g->oom; }
 
 void eg_free(egraph* g) {
     for (int i = 0; i < bbq_vec_len(g->classes); i++)
@@ -78,11 +81,20 @@ void* eg_class_data(egraph* g, eg_id c) {
  * what lets facts be compared with memcmp: two equal facts then have
  * equal bytes, padding included. */
 static void analysis_reserve(egraph* g, eg_id cls) {
-    if (!g->analysis) return;
+    if (!g->analysis || g->oom) return;
     size_t sz = g->analysis->size;
     size_t need = ((size_t)cls + 1) * sz;
-    while ((size_t)bbq_vec_len(g->class_data) < need)
-        bbq_vec_push(g->class_data, (unsigned char)0);
+    /* NOT `while (len < need) push(...)`. A push that cannot grow is a no-op, so
+     * that loop does not terminate once the vector is poisoned, and a hang is the
+     * same denial of service as a crash. bbq_vec_fill either makes the room or
+     * says it could not. */
+    if ((size_t)bbq_vec_len(g->class_data) < need) {
+        if (need > (size_t)BBQ_VEC_MAX_CAP ||
+            !bbq_vec_fill(g->class_data, (int)need, (unsigned char)0)) {
+            g->oom = true;
+            return;
+        }
+    }
     memset(g->class_data + (size_t)cls * sz, 0, sz);
 }
 
@@ -98,16 +110,23 @@ eg_id eg_find(egraph* g, eg_id id) {
     return id;
 }
 
+/* The id is read from the length BEFORE the pushes, so a push that silently did
+ * nothing would hand back an id whose class and parent slot do not exist — and
+ * eg_find reads g->parent[id] immediately. Both pushes are checked, and the
+ * class is only born if both took. */
 static eg_id eg_new_class(egraph* g) {
     eg_id id = (eg_id)bbq_vec_len(g->classes);
     struct eg_class empty; empty.node_idx = NULL;
-    bbq_vec_push(g->classes, empty);
-    bbq_vec_push(g->parent, id);          /* a fresh class is its own root */
+    if (!bbq_vec_try_push(g->classes, empty)) { g->oom = true; return id; }
+    if (!bbq_vec_try_push(g->parent, id)) {     /* a fresh class is its own root */
+        bbq_vec_truncate(g->classes, id);       /* unwind the half-made class */
+        g->oom = true;
+    }
     return id;
 }
 
 static void class_push(egraph* g, eg_id cls, int node_idx) {
-    bbq_vec_push(g->classes[cls].node_idx, node_idx);
+    if (!bbq_vec_try_push(g->classes[cls].node_idx, node_idx)) g->oom = true;
 }
 
 /* ── hashcons ────────────────────────────────────────────────────── */
@@ -149,11 +168,14 @@ static bool node_matches(egraph* g, const struct eg_node* n,
 
 /* Chain the node at `idx` onto its hash bucket. Values are index+1 so that
  * a present entry is distinguishable without a second contains() call. */
+/* A refused put loses a bucket, so two congruent nodes stop deduplicating. That
+ * is a weaker e-graph rather than a wrong one — but it is still not what the
+ * caller asked for, so it is recorded rather than swallowed. */
 static void hashcons_insert(egraph* g, size_t idx, uint64_t h) {
     bbq_hmap* m = (bbq_hmap*)g->hashcons;
     void* head = bbq_hmap_get(m, h);
     g->nodes[idx].next_hash = head ? (int)((intptr_t)head - 1) : -1;
-    bbq_hmap_put(m, h, (void*)(intptr_t)(idx + 1));
+    if (!bbq_hmap_put(m, h, (void*)(intptr_t)(idx + 1))) g->oom = true;
 }
 
 /* The class of a live node congruent to (op, kids), or -1. */
@@ -177,7 +199,14 @@ eg_id eg_add(egraph* g, int op, int64_t data, const eg_id* kids, int nkids) {
      * form. On a hit the appended tail is abandoned (the vec is truncated
      * back), so a shared term costs no storage. */
     size_t off = (size_t)bbq_vec_len(g->kids);
-    for (int i = 0; i < nkids; i++) bbq_vec_push(g->kids, eg_find(g, kids[i]));
+    for (int i = 0; i < nkids; i++)
+        if (!bbq_vec_try_push(g->kids, eg_find(g, kids[i]))) {
+            /* `off` was taken from the length, and kbase below indexes from it.
+             * A short tail would hash the wrong children. */
+            bbq_vec_truncate(g->kids, (int)off);
+            g->oom = true;
+            return 0;
+        }
 
     /* A childless node adds nothing, so `g->kids` may still be NULL —
      * and NULL + 0 is undefined even though nkids == 0 means nothing
@@ -197,7 +226,13 @@ eg_id eg_add(egraph* g, int op, int64_t data, const eg_id* kids, int nkids) {
     n.next_hash = -1;
     n.live = true;
     int idx = bbq_vec_len(g->nodes);
-    bbq_vec_push(g->nodes, n);
+    /* `idx` is the pre-push length and is handed to class_push and the hashcons,
+     * both of which index g->nodes with it. */
+    if (!bbq_vec_try_push(g->nodes, n)) {
+        bbq_vec_truncate(g->kids, (int)off);
+        g->oom = true;
+        return cls;
+    }
     class_push(g, cls, idx);
     hashcons_insert(g, (size_t)idx, h);
 
@@ -226,8 +261,11 @@ eg_id eg_add(egraph* g, int op, int64_t data, const eg_id* kids, int nkids) {
 
 /* ── merge + congruence repair ───────────────────────────────────── */
 
+/* A class that never reaches the worklist is never repaired, so congruence is
+ * left incomplete — a wrong answer, not a crash, which is exactly why it has to
+ * be recorded rather than dropped. */
 static void work_push(egraph* g, eg_id cls) {
-    bbq_vec_push(g->worklist, cls);
+    if (!bbq_vec_try_push(g->worklist, cls)) g->oom = true;
 }
 
 bool eg_merge(egraph* g, eg_id a, eg_id b) {
@@ -337,7 +375,7 @@ void eg_rebuild(egraph* g) {
          * duplicate, which re-arms the worklist and runs this to a fixpoint. */
         bbq_hmap* m = (bbq_hmap*)g->hashcons;
         bbq_hmap_free(m);
-        bbq_hmap_init(m, 0);
+        if (!bbq_hmap_init(m, 0)) { g->oom = true; return; }
 
         for (int i = 0; i < bbq_vec_len(g->nodes); i++) {
             if (!g->nodes[i].live) continue;
@@ -519,7 +557,8 @@ bool eg_extract_from(egraph* g, const eg_extract_plan* plan, eg_id root,
      * and a library never smashes its host's stack over input shape. */
     int nkids_total = 0;
     eg_id* stack = NULL; int sp = 0;
-    bbq_vec_push(stack, root); sp = 1;
+    if (!bbq_vec_try_push(stack, root)) { free(memo); bbq_vec_free(stack); return false; }
+    sp = 1;
     /* iterative post-order over the chosen nodes */
     while (sp > 0) {
         eg_id c = eg_find(g, stack[sp - 1]);
@@ -529,8 +568,14 @@ bool eg_extract_from(egraph* g, const eg_extract_plan* plan, eg_id root,
         for (int i = 0; i < n->nkids; i++) {
             eg_id kc = eg_find(g, node_kids(g, n)[i]);
             if (memo[kc] < 0) {
-                if (sp >= (int)bbq_vec_len(stack)) bbq_vec_push(stack, kc);
-                else stack[sp] = kc;
+                /* `sp` is this walk's own counter, not the vec's length, so a
+                 * push that silently did nothing would leave sp pointing one
+                 * past the storage and the next iteration would read it. */
+                if (sp >= (int)bbq_vec_len(stack)) {
+                    if (!bbq_vec_try_push(stack, kc)) {
+                        free(memo); bbq_vec_free(stack); return false;
+                    }
+                } else stack[sp] = kc;
                 sp++; pending = true;
             }
         }

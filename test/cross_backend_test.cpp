@@ -196,7 +196,9 @@ CRoundtrip build_c_roundtrip(const std::vector<std::string>& rules) {
     rt.sanitized = sanitizer_cc().sanitized;
     std::string cc = sanitizer_cc().cmd + " -I" + dir + " -I" + rtdir +
                      " -I" + std::string(SOURCE_DIR) + "/crt " + dir + "/r.c " +
-                     dir + "/w.c " + dir + "/h.c -o " + dir + "/bin 2>&1";
+                     dir + "/w.c " + dir + "/h.c " +
+                     std::string(SOURCE_DIR) + "/crt/bbq_vec.c " +
+                     std::string(SOURCE_DIR) + "/crt/bbq_alloc.c -o " + dir + "/bin 2>&1";
     FILE* p = popen(cc.c_str(), "r");
     char buf[8192] = {}; if (p) fread(buf, 1, sizeof buf - 1, p);
     int rc = p ? pclose(p) : -1;
@@ -455,7 +457,8 @@ CLite build_clite_index() {
     rt.sanitized = sanitizer_cc().sanitized;
     std::string cc = sanitizer_cc().cmd + " -I" + dir + " -I" + rtdir + " -I" + crtdir + " " +
                      dir + "/clr.c " + dir + "/h.c " + rtdir + "/bbq_lite.c " +
-                     crtdir + "/bbq_arena.c -o " + dir + "/bin 2>&1";
+                     crtdir + "/bbq_arena.c " + crtdir + "/bbq_vec.c " +
+                     crtdir + "/bbq_alloc.c -o " + dir + "/bin 2>&1";
     FILE* p = popen(cc.c_str(), "r");
     char buf[8192] = {}; if (p) fread(buf, 1, sizeof buf - 1, p);
     int rc = p ? pclose(p) : -1;
@@ -1136,7 +1139,9 @@ TEST(CrossBackend, RestSizeRecomputedOnModify) {
     std::string rtdir = std::string(SOURCE_DIR) + "/backends/c/runtime";
     std::string cc = sanitizer_cc().cmd + " -I" + dir + " -I" + rtdir +
                      " -I" + std::string(SOURCE_DIR) + "/crt " + dir + "/r.c " +
-                     dir + "/w.c " + dir + "/h.c -o " + dir + "/bin 2>&1";
+                     dir + "/w.c " + dir + "/h.c " +
+                     std::string(SOURCE_DIR) + "/crt/bbq_vec.c " +
+                     std::string(SOURCE_DIR) + "/crt/bbq_alloc.c -o " + dir + "/bin 2>&1";
     FILE* cp = popen(cc.c_str(), "r");
     char cb[4096] = {}; if (cp) fread(cb, 1, sizeof cb - 1, cp);
     ASSERT_EQ(cp ? pclose(cp) : -1, 0) << "compile failed:\n" << cb;
@@ -1189,7 +1194,9 @@ TEST(CrossBackend, CountPrefixRecomputedOnModify) {
     std::string rtdir = std::string(SOURCE_DIR) + "/backends/c/runtime";
     std::string cc = sanitizer_cc().cmd + " -I" + dir + " -I" + rtdir +
                      " -I" + std::string(SOURCE_DIR) + "/crt " + dir + "/r.c " +
-                     dir + "/w.c " + dir + "/h.c -o " + dir + "/bin 2>&1";
+                     dir + "/w.c " + dir + "/h.c " +
+                     std::string(SOURCE_DIR) + "/crt/bbq_vec.c " +
+                     std::string(SOURCE_DIR) + "/crt/bbq_alloc.c -o " + dir + "/bin 2>&1";
     FILE* cp = popen(cc.c_str(), "r");
     char cb[4096] = {}; if (cp) fread(cb, 1, sizeof cb - 1, cp);
     ASSERT_EQ(cp ? pclose(cp) : -1, 0) << "compile failed:\n" << cb;
@@ -1241,7 +1248,9 @@ TEST(CrossBackend, PathCountRecomputedOnModify) {
     std::string rtdir = std::string(SOURCE_DIR) + "/backends/c/runtime";
     std::string cc = sanitizer_cc().cmd + " -I" + dir + " -I" + rtdir +
                      " -I" + std::string(SOURCE_DIR) + "/crt " + dir + "/r.c " +
-                     dir + "/w.c " + dir + "/h.c -o " + dir + "/bin 2>&1";
+                     dir + "/w.c " + dir + "/h.c " +
+                     std::string(SOURCE_DIR) + "/crt/bbq_vec.c " +
+                     std::string(SOURCE_DIR) + "/crt/bbq_alloc.c -o " + dir + "/bin 2>&1";
     FILE* cp = popen(cc.c_str(), "r");
     char cb[4096] = {}; if (cp) fread(cb, 1, sizeof cb - 1, cp);
     ASSERT_EQ(cp ? pclose(cp) : -1, 0) << "compile failed:\n" << cb;

@@ -96,6 +96,9 @@ static bool run_c_e2e(const char* bbq_spec,
         + tmpdir + "/testReader.c "
         + tmpdir + "/testWriter.c "
         + tmpdir + "/harness.c "
+        /* The reader's parse stacks are bbq_vec, whose growth (and its refusal)
+         * lives in a .c now rather than inline in the header. */
+        + crt_dir + "/bbq_vec.c " + crt_dir + "/bbq_alloc.c "
         "-o " + tmpdir + "/test_bin 2>&1";
     FILE* compile_pipe = popen(compile_cmd.c_str(), "r");
     char compile_out[4096] = {};

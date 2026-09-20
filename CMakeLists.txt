@@ -27,6 +27,8 @@ endif()
 
 # --- C runtime library (for generated C code) ---
 add_library(bbq_crt STATIC
+    crt/bbq_alloc.c
+    crt/bbq_vec.c
     crt/bbq_arena.c
     crt/bbq_buf.c
     crt/bbq_htree.c
@@ -183,7 +185,6 @@ add_executable(bbq_tests
     test/bbq_reader_test.cpp
     test/render_view_parser_test.cpp
     test/cross_backend_test.cpp
-    test/crt_test.cpp
     ${ZCOW_PARITY_TYPES}
     ${ZCOW_READER_HDRS}
 )
@@ -192,6 +193,28 @@ target_include_directories(bbq_tests PRIVATE ${CMAKE_CURRENT_BINARY_DIR})  # gen
 target_compile_definitions(bbq_tests PRIVATE
     SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
 add_test(NAME bbq_tests COMMAND bbq_tests)
+
+# The CRT containers — its own binary, for two reasons it does not share with the
+# omnibus above.
+#
+# It must run with LEAK DETECTION ON. A large part of this suite sweeps every
+# allocation an operation makes and fails each one in turn, and the thing that
+# goes wrong on a failure path is usually a leak — so running it with LSan off,
+# which is what the whole-build BBQ_SANITIZE default does, would be running the
+# tests with their main assertion disabled.
+#
+# It also asks the allocator for sizes that cannot be served (SIZE_MAX-shaped
+# requests, to prove they are refused rather than wrapped). ASan treats an
+# oversized request as fatal by default; allocator_may_return_null=1 makes it
+# answer NULL, which is what malloc does and what the code under test handles.
+# Both settings are inert in an unsanitized build.
+add_executable(crt_tests test/crt_test.cpp)
+target_link_libraries(crt_tests PRIVATE bbq_crt GTest::GTest GTest::Main)
+target_compile_definitions(crt_tests PRIVATE SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+add_test(NAME crt_tests COMMAND crt_tests)
+set_tests_properties(crt_tests PROPERTIES
+    TIMEOUT 300
+    ENVIRONMENT "ASAN_OPTIONS=detect_leaks=1:allocator_may_return_null=1")
 
 # ZCow — the parsed document. The foundation layer, so it builds and tests on its
 # own: no grammar, no parser, no generated code, nothing above it.

@@ -1475,7 +1475,9 @@ TEST(BurgCBackend, EmitsContextStruct) {
     EXPECT_NE(code.find("burg_state_t"), std::string::npos);
     // Uses CRT types instead of STL
     EXPECT_NE(code.find("bbq_arena arena"), std::string::npos);
-    EXPECT_NE(code.find("bbq_htree* state_cache"), std::string::npos);
+    // By value, not a handle: the CRT containers are caller-owned, so the cache
+    // lives in the context rather than in a second allocation beside it.
+    EXPECT_NE(code.find("bbq_htree state_cache"), std::string::npos);
     // Has lifecycle functions
     EXPECT_NE(code.find("burg_ctx_init"), std::string::npos);
     EXPECT_NE(code.find("burg_ctx_free"), std::string::npos);

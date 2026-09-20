@@ -1,366 +1,294 @@
 /*
- * bbq_htree.c — 16-way radix tree implementation.
- * Adapted from hextree by Dan Eicher.
+ * bbq_htree.c — 16-way radix tree with lazy expansion. See bbq_htree.h.
  */
 #include "bbq_htree.h"
-#include <stdlib.h>
+
 #include <string.h>
 
-/* ── Node types ─────────────────────────────────────────── */
-
-typedef struct bbq_htree_node {
-    union {
-        struct bbq_htree_node* children[16];
-        bbq_htree_leaf*        leaf;
-    };
+struct bbq_htree_node {
     bool is_leaf;
-} bbq_htree_node;
-
-struct bbq_htree {
-    bbq_htree_node* root;
+    union {
+        bbq_htree_node* children[16];
+        bbq_htree_leaf  leaf;
+    } u;
 };
 
-/* bbq_htree_iter is defined in the header with void* stack entries.
- * Internally we cast to/from bbq_htree_node*. */
-
-/* ── Helpers ────────────────────────────────────────────── */
-
-static inline uint8_t get_nibble(uint32_t key, int level) {
-    return (key >> (28 - (level * 4))) & 0xF;
+/* Nibble `level` of `key`, counted from the most significant. Levels run
+ * 0..BBQ_HTREE_NIBBLES-1; asking for one past the end would shift by a negative
+ * amount, which is undefined — the old code could not reach that case because
+ * its leaves were all at the bottom, and lazy expansion is exactly what makes it
+ * reachable, so it is asserted by construction here instead. */
+static unsigned nibble(bbq_htree_key key, int level) {
+    return (unsigned)((key >> (60 - level * 4)) & 0xF);
 }
 
-static void free_node(bbq_htree_node* node) {
-    if (!node) return;
-    if (node->is_leaf) {
-        free(node->leaf);
-    } else {
-        for (int i = 0; i < 16; i++)
-            if (node->children[i]) free_node(node->children[i]);
-    }
-    free(node);
+/* The first level at or after `from` where the two keys differ. The caller only
+ * asks about keys it already knows are different, so this always finds one
+ * before running off the end. */
+static int divergence(bbq_htree_key a, bbq_htree_key b, int from) {
+    int d = from;
+    while (d < BBQ_HTREE_NIBBLES && nibble(a, d) == nibble(b, d)) d++;
+    return d;
 }
 
-/* ── Lifecycle ──────────────────────────────────────────── */
+static bbq_htree_node* node_new(bbq_htree* t, bool leaf) {
+    bbq_htree_node* n = (bbq_htree_node*)bbq_mem_zalloc(t->a, sizeof *n);
+    if (!n) { t->oom = true; return NULL; }
+    n->is_leaf = leaf;
+    return n;
+}
 
-bbq_htree* bbq_htree_create(void) {
-    bbq_htree* t = (bbq_htree*)malloc(sizeof(bbq_htree));
-    if (!t) return NULL;
-    t->root = (bbq_htree_node*)calloc(1, sizeof(bbq_htree_node));
-    if (!t->root) { free(t); return NULL; }
+static void node_free_all(bbq_alloc* a, bbq_htree_node* n) {
+    if (!n) return;
+    if (!n->is_leaf)
+        for (int i = 0; i < 16; i++) node_free_all(a, n->u.children[i]);
+    bbq_mem_release(a, n, sizeof *n);
+}
+
+/* ── Lifecycle ────────────────────────────────────────────────────────────── */
+
+void bbq_htree_init(bbq_htree* t) { bbq_htree_init_a(t, NULL); }
+
+void bbq_htree_init_a(bbq_htree* t, bbq_alloc* a) {
+    t->root  = NULL;
+    t->count = 0;
+    t->a     = a;
+    t->oom   = false;
+    t->gen   = 0;
+}
+
+void bbq_htree_free(bbq_htree* t) {
+    node_free_all(t->a, t->root);
+    t->root  = NULL;
+    t->count = 0;
+    t->oom   = false;
+    t->gen++;
+}
+
+bbq_htree* bbq_htree_create(void) { return bbq_htree_create_a(NULL); }
+
+bbq_htree* bbq_htree_create_a(bbq_alloc* a) {
+    bbq_htree* t = (bbq_htree*)bbq_mem_alloc(a, sizeof *t);
+    if (t) bbq_htree_init_a(t, a);
     return t;
 }
 
 void bbq_htree_destroy(bbq_htree* t) {
+    bbq_alloc* a;
     if (!t) return;
-    if (t->root) free_node(t->root);
-    free(t);
-}
-
-/* ── Insertion ──────────────────────────────────────────── */
-
-static bool split_and_insert(bbq_htree_node* node, bbq_htree_leaf* existing,
-                             uint32_t new_key, void* value, int split_level) {
-    uint32_t old_key   = existing->key;
-    void*    old_value = existing->value;
-
-    int divergence = split_level;
-    while (divergence < 8 &&
-           get_nibble(old_key, divergence) == get_nibble(new_key, divergence))
-        divergence++;
-
-    memset(node, 0, sizeof(bbq_htree_node));
-    node->is_leaf = false;
-
-    /* Build common path up to divergence point */
-    bbq_htree_node* cur = node;
-    for (int level = split_level; level < divergence; level++) {
-        uint8_t nib = get_nibble(old_key, level);
-        cur->children[nib] = (bbq_htree_node*)calloc(1, sizeof(bbq_htree_node));
-        if (!cur->children[nib]) return false;
-        cur = cur->children[nib];
-        cur->is_leaf = false;
-    }
-
-    /* Insert old key from divergence onward */
-    uint8_t old_nib = get_nibble(old_key, divergence);
-    cur->children[old_nib] = (bbq_htree_node*)calloc(1, sizeof(bbq_htree_node));
-    if (!cur->children[old_nib]) return false;
-    bbq_htree_node* old_node = cur->children[old_nib];
-    for (int level = divergence + 1; level < 8; level++) {
-        uint8_t nib = get_nibble(old_key, level);
-        old_node->children[nib] = (bbq_htree_node*)calloc(1, sizeof(bbq_htree_node));
-        if (!old_node->children[nib]) return false;
-        if (level == 7) {
-            old_node->children[nib]->is_leaf = true;
-            old_node->children[nib]->leaf = (bbq_htree_leaf*)malloc(sizeof(bbq_htree_leaf));
-            if (!old_node->children[nib]->leaf) return false;
-            old_node->children[nib]->leaf->key   = old_key;
-            old_node->children[nib]->leaf->value  = old_value;
-        } else {
-            old_node = old_node->children[nib];
-            old_node->is_leaf = false;
-        }
-    }
-
-    /* Insert new key from divergence onward */
-    uint8_t new_nib = get_nibble(new_key, divergence);
-    cur->children[new_nib] = (bbq_htree_node*)calloc(1, sizeof(bbq_htree_node));
-    if (!cur->children[new_nib]) return false;
-    bbq_htree_node* new_node = cur->children[new_nib];
-    for (int level = divergence + 1; level < 8; level++) {
-        uint8_t nib = get_nibble(new_key, level);
-        new_node->children[nib] = (bbq_htree_node*)calloc(1, sizeof(bbq_htree_node));
-        if (!new_node->children[nib]) return false;
-        if (level == 7) {
-            new_node->children[nib]->is_leaf = true;
-            new_node->children[nib]->leaf = (bbq_htree_leaf*)malloc(sizeof(bbq_htree_leaf));
-            if (!new_node->children[nib]->leaf) return false;
-            new_node->children[nib]->leaf->key   = new_key;
-            new_node->children[nib]->leaf->value  = value;
-        } else {
-            new_node = new_node->children[nib];
-            new_node->is_leaf = false;
-        }
-    }
-
-    return true;
-}
-
-bool bbq_htree_insert(bbq_htree* t, uint32_t key, void* value) {
-    bbq_htree_node* cur = t->root;
-
-    for (int level = 0; level < 8; level++) {
-        uint8_t nib = get_nibble(key, level);
-
-        if (cur->is_leaf) {
-            if (cur->leaf->key == key) {
-                cur->leaf->value = value;
-                return true;
-            }
-            return split_and_insert(cur, cur->leaf, key, value, level);
-        }
-
-        if (!cur->children[nib]) {
-            cur->children[nib] = (bbq_htree_node*)calloc(1, sizeof(bbq_htree_node));
-            if (!cur->children[nib]) return false;
-
-            if (level == 7) {
-                cur->children[nib]->is_leaf = true;
-                cur->children[nib]->leaf = (bbq_htree_leaf*)malloc(sizeof(bbq_htree_leaf));
-                if (!cur->children[nib]->leaf) {
-                    free(cur->children[nib]);
-                    cur->children[nib] = NULL;
-                    return false;
-                }
-                cur->children[nib]->leaf->key   = key;
-                cur->children[nib]->leaf->value  = value;
-                return true;
-            }
-            cur->children[nib]->is_leaf = false;
-        }
-
-        cur = cur->children[nib];
-
-        if (cur->is_leaf) {
-            if (cur->leaf->key == key) {
-                cur->leaf->value = value;
-                return true;
-            }
-            return split_and_insert(cur, cur->leaf, key, value, level);
-        }
-    }
-
-    return false;
-}
-
-/* ── Deletion ───────────────────────────────────────────── */
-
-void* bbq_htree_delete(bbq_htree* t, uint32_t key) {
-    bbq_htree_node* path[8];
-    uint8_t         nib_path[8];
-    int             depth = 0;
-    bbq_htree_node* cur = t->root;
-    bbq_htree_node* parent = NULL;
-    uint8_t         nib = 0;
-    void*           deleted = NULL;
-
-    for (int level = 0; level < 8; level++) {
-        nib = get_nibble(key, level);
-
-        if (cur->is_leaf) {
-            if (cur->leaf->key == key)
-                deleted = cur->leaf->value;
-            else
-                return NULL;
-            break;
-        }
-
-        if (!cur->children[nib]) return NULL;
-
-        path[depth]     = cur;
-        nib_path[depth] = nib;
-        depth++;
-
-        parent = cur;
-        cur    = cur->children[nib];
-    }
-
-    if (!deleted) {
-        if (cur->is_leaf && cur->leaf->key == key)
-            deleted = cur->leaf->value;
-        else
-            return NULL;
-    }
-
-    free(cur->leaf);
-    free(cur);
-
-    if (depth > 0) {
-        parent = path[depth - 1];
-        parent->children[nib_path[depth - 1]] = NULL;
-    } else {
-        memset(t->root, 0, sizeof(bbq_htree_node));
-        return deleted;
-    }
-
-    /* Collapse empty interior nodes upward */
-    for (int i = depth - 1; i >= 0; i--) {
-        bbq_htree_node* node = path[i];
-        bool has_children = false;
-        for (int j = 0; j < 16; j++) {
-            if (node->children[j]) { has_children = true; break; }
-        }
-        if (!has_children && i > 0) {
-            free(node);
-            path[i - 1]->children[nib_path[i - 1]] = NULL;
-        } else {
-            break;
-        }
-    }
-
-    return deleted;
+    a = t->a;                       /* free() nulls nothing; read it first */
+    bbq_htree_free(t);
+    bbq_mem_release(a, t, sizeof *t);
 }
 
 void bbq_htree_clear(bbq_htree* t) {
-    if (!t || !t->root) return;
-    free_node(t->root);
-    t->root = (bbq_htree_node*)calloc(1, sizeof(bbq_htree_node));
+    node_free_all(t->a, t->root);
+    t->root  = NULL;
+    t->count = 0;
+    t->gen++;
 }
 
-/* ── Search ─────────────────────────────────────────────── */
+bool bbq_htree_oom(const bbq_htree* t)      { return t->oom; }
+size_t bbq_htree_size(const bbq_htree* t)   { return t->count; }
+bool bbq_htree_is_empty(const bbq_htree* t) { return t->count == 0; }
 
-void* bbq_htree_search(const bbq_htree* t, uint32_t key) {
-    bbq_htree_node* cur = t->root;
+/* ── Insert ───────────────────────────────────────────────────────────────── */
 
-    for (int level = 0; level < 8; level++) {
-        uint8_t nib = get_nibble(key, level);
+/* Replace the lone leaf at *slot with a chain of interior nodes down to the
+ * first nibble where the two keys differ, holding both leaves there. Builds the
+ * whole chain into a local first and only publishes it on success, so a refusal
+ * partway leaves the tree exactly as it was. */
+static bool split_leaf(bbq_htree* t, bbq_htree_node** slot, int level,
+                       bbq_htree_key key, void* value) {
+    bbq_htree_node* old  = *slot;
+    bbq_htree_node* head = NULL;
+    bbq_htree_node** tail = &head;
+    int d = divergence(old->u.leaf.key, key, level);
+    bbq_htree_node* fork;
+    bbq_htree_node* fresh;
 
-        if (cur->is_leaf)
-            return (cur->leaf->key == key) ? cur->leaf->value : NULL;
-
-        if (!cur->children[nib]) return NULL;
-        cur = cur->children[nib];
+    /* One interior node per shared nibble, from `level` up to the divergence. */
+    for (int l = level; l < d; l++) {
+        bbq_htree_node* mid = node_new(t, false);
+        if (!mid) { node_free_all(t->a, head); return false; }
+        *tail = mid;
+        tail  = &mid->u.children[nibble(key, l)];
     }
 
-    if (cur->is_leaf && cur->leaf->key == key)
-        return cur->leaf->value;
+    /* At the divergence the two keys take different children. */
+    fork = node_new(t, false);
+    if (!fork) { node_free_all(t->a, head); return false; }
+    fresh = node_new(t, true);
+    if (!fresh) { node_free_all(t->a, head); bbq_mem_release(t->a, fork, sizeof *fork); return false; }
+    fresh->u.leaf.key   = key;
+    fresh->u.leaf.value = value;
 
-    return NULL;
+    fork->u.children[nibble(old->u.leaf.key, d)] = old;
+    fork->u.children[nibble(key, d)]             = fresh;
+
+    *tail = fork;
+    *slot = head ? head : fork;
+    return true;
 }
 
-bool bbq_htree_contains(const bbq_htree* t, uint32_t key) {
-    bbq_htree_node* cur = t->root;
+bool bbq_htree_insert(bbq_htree* t, bbq_htree_key key, void* value) {
+    bbq_htree_node** slot = &t->root;
 
-    for (int level = 0; level < 8; level++) {
-        uint8_t nib = get_nibble(key, level);
-
-        if (cur->is_leaf)
-            return cur->leaf->key == key;
-
-        if (!cur->children[nib]) return false;
-        cur = cur->children[nib];
-    }
-
-    return cur->is_leaf && cur->leaf->key == key;
-}
-
-/* ── Utility ────────────────────────────────────────────── */
-
-int bbq_htree_size(const bbq_htree* t) {
-    int count = 0;
-    bbq_htree_iter it;
-    bbq_htree_iter_init(t, &it);
-    while (bbq_htree_next(&it)) count++;
-    return count;
-}
-
-bool bbq_htree_is_empty(const bbq_htree* t) {
-    bbq_htree_iter it;
-    bbq_htree_iter_init(t, &it);
-    return bbq_htree_next(&it) == NULL;
-}
-
-bbq_htree* bbq_htree_clone(const bbq_htree* src) {
-    bbq_htree* dst = bbq_htree_create();
-    if (!dst) return NULL;
-
-    bbq_htree_iter  it;
-    bbq_htree_leaf* leaf;
-    bbq_htree_iter_init(src, &it);
-
-    while ((leaf = bbq_htree_next(&it))) {
-        if (!bbq_htree_insert(dst, leaf->key, leaf->value)) {
-            bbq_htree_destroy(dst);
-            return NULL;
+    for (int level = 0; ; level++) {
+        if (!*slot) {                          /* free position: a leaf lands here */
+            bbq_htree_node* n = node_new(t, true);
+            if (!n) return false;
+            n->u.leaf.key   = key;
+            n->u.leaf.value = value;
+            *slot = n;
+            t->count++;
+            t->gen++;
+            return true;
         }
+        if ((*slot)->is_leaf) {
+            if ((*slot)->u.leaf.key == key) {  /* same key: replace the value */
+                (*slot)->u.leaf.value = value;
+                t->gen++;
+                return true;
+            }
+            /* Two different keys agreeing on nibbles 0..level-1 must differ
+             * somewhere in level..15, so the split always terminates. */
+            if (!split_leaf(t, slot, level, key, value)) return false;
+            t->count++;
+            t->gen++;
+            return true;
+        }
+        /* An interior node once every nibble is spent cannot exist: 16 nibbles
+         * determine the key completely, so that position holds either this key's
+         * leaf or nothing, both handled above. Refusing rather than descending
+         * keeps nibble() from being asked for a seventeenth nibble, which would
+         * shift by a negative amount. */
+        if (level >= BBQ_HTREE_NIBBLES) return false;
+        slot = &(*slot)->u.children[nibble(key, level)];
     }
-    return dst;
 }
 
-/* ── Iterator ───────────────────────────────────────────── */
+/* ── Search ───────────────────────────────────────────────────────────────── */
 
-bbq_htree_iter* bbq_htree_iter_create(const bbq_htree* t) {
-    bbq_htree_iter* it = (bbq_htree_iter*)malloc(sizeof(bbq_htree_iter));
-    if (it) bbq_htree_iter_init(t, it);
-    return it;
+static const bbq_htree_node* find_leaf(const bbq_htree* t, bbq_htree_key key) {
+    const bbq_htree_node* n = t->root;
+    for (int level = 0; n && level < BBQ_HTREE_NIBBLES; level++) {
+        if (n->is_leaf) return n->u.leaf.key == key ? n : NULL;
+        n = n->u.children[nibble(key, level)];
+    }
+    /* Depth 16 can only hold a leaf (every nibble is spent), and the loop above
+     * already returned for one. Anything else is a malformed tree, not a hit. */
+    return (n && n->is_leaf && n->u.leaf.key == key) ? n : NULL;
 }
 
-void bbq_htree_iter_free(bbq_htree_iter* it) {
-    free(it);
+void* bbq_htree_search(const bbq_htree* t, bbq_htree_key key) {
+    const bbq_htree_node* n = find_leaf(t, key);
+    return n ? n->u.leaf.value : NULL;
 }
+
+bool bbq_htree_contains(const bbq_htree* t, bbq_htree_key key) {
+    return find_leaf(t, key) != NULL;
+}
+
+/* ── Delete ───────────────────────────────────────────────────────────────── */
+
+void* bbq_htree_delete(bbq_htree* t, bbq_htree_key key) {
+    bbq_htree_node** path[BBQ_HTREE_NIBBLES + 1];
+    bbq_htree_node** slot = &t->root;
+    int depth = 0;
+    void* value;
+
+    while (*slot && !(*slot)->is_leaf) {
+        if (depth >= BBQ_HTREE_NIBBLES) return NULL;
+        path[depth] = slot;
+        slot = &(*slot)->u.children[nibble(key, depth)];
+        depth++;
+    }
+    if (!*slot || (*slot)->u.leaf.key != key) return NULL;
+
+    value = (*slot)->u.leaf.value;
+    bbq_mem_release(t->a, *slot, sizeof **slot);
+    *slot = NULL;
+    t->count--;
+    t->gen++;
+
+    /* Walk back up. An interior node with nothing left goes; one with a single
+     * remaining LEAF is replaced by that leaf, which is what keeps a leaf at the
+     * shallowest depth that distinguishes it — the invariant insert relies on to
+     * decide when a split is needed. */
+    while (depth > 0) {
+        bbq_htree_node** pslot = path[--depth];
+        bbq_htree_node*  p     = *pslot;
+        bbq_htree_node*  only  = NULL;
+        int n = 0;
+        for (int i = 0; i < 16 && n < 2; i++)
+            if (p->u.children[i]) { only = p->u.children[i]; n++; }
+
+        if (n == 0) {
+            bbq_mem_release(t->a, p, sizeof *p);
+            *pslot = NULL;
+            continue;
+        }
+        if (n == 1 && only->is_leaf) {
+            bbq_mem_release(t->a, p, sizeof *p);
+            *pslot = only;
+            continue;
+        }
+        break;
+    }
+    return value;
+}
+
+/* ── Iteration ────────────────────────────────────────────────────────────── */
 
 void bbq_htree_iter_init(const bbq_htree* t, bbq_htree_iter* it) {
-    it->stack[0]   = (void*)t->root;
-    it->indices[0] = 0;
-    it->depth      = 0;
+    it->t     = t;
+    it->gen   = t->gen;
+    it->depth = -1;
+    if (t->root) {
+        it->depth      = 0;
+        it->stack[0]   = t->root;
+        it->idx[0]     = 0;
+    }
 }
 
 bbq_htree_leaf* bbq_htree_next(bbq_htree_iter* it) {
     if (it->depth < 0) return NULL;
+    /* The tree changed under us. Stop rather than walk nodes that may have been
+     * freed — the alternative is a use-after-free that only shows up for the
+     * caller who mutates mid-iteration. */
+    if (it->gen != it->t->gen) { it->depth = -1; return NULL; }
 
     while (it->depth >= 0) {
-        bbq_htree_node* cur = (bbq_htree_node*)it->stack[it->depth];
-        int idx = it->indices[it->depth];
+        bbq_htree_node* cur = it->stack[it->depth];
+        unsigned i;
 
         if (cur->is_leaf) {
-            bbq_htree_leaf* result = cur->leaf;
             it->depth--;
-            return result;
+            return &cur->u.leaf;
         }
+        i = it->idx[it->depth];
+        while (i < 16 && !cur->u.children[i]) i++;
+        it->idx[it->depth] = (uint8_t)(i + 1);
 
-        while (idx < 16 && !cur->children[idx])
-            idx++;
-
-        it->indices[it->depth] = (uint8_t)(idx + 1);
-
-        if (idx < 16) {
+        if (i < 16) {
             it->depth++;
-            it->stack[it->depth]   = (void*)cur->children[idx];
-            it->indices[it->depth] = 0;
+            it->stack[it->depth] = cur->u.children[i];
+            it->idx[it->depth]   = 0;
         } else {
             it->depth--;
         }
     }
-
     return NULL;
+}
+
+/* ── Clone ────────────────────────────────────────────────────────────────── */
+
+bool bbq_htree_clone(bbq_htree* dst, const bbq_htree* src) {
+    bbq_htree_iter  it;
+    bbq_htree_leaf* leaf;
+    bbq_htree_iter_init(src, &it);
+    while ((leaf = bbq_htree_next(&it)))
+        if (!bbq_htree_insert(dst, leaf->key, leaf->value)) return false;
+    return true;
 }

@@ -38,10 +38,11 @@
  *
  * NOT thread-safe, in keeping with the rest of the CRT.
  *
- *   bbq_dict* d = bbq_dict_create();
- *   bbq_dict_put(d, "java.lang.String", 16, cls);
- *   void* v = bbq_dict_get(d, name, namelen);
- *   bbq_dict_destroy(d);
+ *   bbq_dict d;
+ *   bbq_dict_init(&d);                   // or _init_a(&d, alloc)
+ *   bbq_dict_put(&d, "java.lang.String", 16, cls);
+ *   void* v = bbq_dict_get(&d, name, namelen);
+ *   bbq_dict_free(&d);
  */
 #ifndef BBQ_DICT_H
 #define BBQ_DICT_H
@@ -49,12 +50,25 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include "bbq_alloc.h"
+#include "bbq_htree.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-typedef struct bbq_dict bbq_dict;
+typedef struct bbq_dict_node bbq_dict_node;
+
+typedef uint64_t (*bbq_dict_hash_fn)(const void* key, size_t len);
+
+typedef struct bbq_dict {
+    bbq_htree        index;   /* hash -> head of the chain sharing that hash */
+    size_t           count;
+    bbq_alloc*       a;
+    bbq_dict_hash_fn hash;
+    bool             oom;
+    uint32_t         gen;     /* bumped by every mutation, for iterator safety */
+} bbq_dict;
 
 /* One entry, as handed to the iterator. `key` is the dict's own copy and stays
  * valid until the entry is deleted or the dict destroyed. */
@@ -64,11 +78,38 @@ typedef struct {
     void*       value;
 } bbq_dict_entry;
 
-/* --- Lifecycle --- */
+/* --- Lifecycle ---
+ *
+ * Caller-owned, like every other container here, so a dict can live inside a
+ * struct without a second allocation for its handle. `a` may be NULL for libc. */
+void bbq_dict_init(bbq_dict* d);
+void bbq_dict_init_a(bbq_dict* d, bbq_alloc* a);
+void bbq_dict_free(bbq_dict* d);
+void bbq_dict_clear(bbq_dict* d);
 
+/* The handle form, as for bbq_htree: one allocation for the handle from the same
+ * allocator, otherwise identical. destroy accepts NULL. */
 bbq_dict* bbq_dict_create(void);
+bbq_dict* bbq_dict_create_a(bbq_alloc* a);
 void      bbq_dict_destroy(bbq_dict* d);
-void      bbq_dict_clear(bbq_dict* d);
+
+/* A dict keyed by a hash of the caller's choosing. Two reasons this exists:
+ *
+ *  - a caller that already holds a digest of its names (a class-file constant
+ *    pool, say) can key on it instead of hashing the bytes a second time;
+ *  - the collision CHAIN — the thing that makes this correct rather than merely
+ *    usually-right — cannot otherwise be reached. With a seeded 64-bit hash,
+ *    finding two colliding keys is a birthday problem over 2^64, so the unlink
+ *    paths would ship untested. A test installs a deliberately weak hash and
+ *    exercises them.
+ *
+ * Whatever is installed, a lookup still compares the FULL key, so a bad hash
+ * costs speed and never correctness. */
+void bbq_dict_init_hashed(bbq_dict* d, bbq_alloc* a, bbq_dict_hash_fn hash);
+
+/* Did any insertion get refused? The entries present are correct and complete
+ * per key; the dict is just missing some of what was put into it. */
+bool bbq_dict_oom(const bbq_dict* d);
 
 /* --- Core operations ---
  *
@@ -93,16 +134,31 @@ size_t bbq_dict_len(const bbq_dict* d);
 
 /* --- Iteration (unspecified order) ---
  *
- * Iterating a dict that is being modified is undefined. */
-typedef struct { const bbq_dict* d; size_t slot; void* cur; } bbq_dict_iter;
+ * A value type that allocates nothing: abandoning an iteration leaks nothing and
+ * there is nothing to free. Mutating the dict mid-iteration ends the iteration —
+ * bbq_dict_next then returns false rather than walking freed entries. */
+typedef struct {
+    const bbq_dict* d;
+    bbq_htree_iter  tit;
+    void*           cur;      /* next entry in the current hash's chain */
+    uint32_t        gen;
+} bbq_dict_iter;
 
 void bbq_dict_iter_init(const bbq_dict* d, bbq_dict_iter* it);
 bool bbq_dict_next(bbq_dict_iter* it, bbq_dict_entry* out);
 
-/* The hash the dict keys its tree on — djb2-33, never 0 (bbq_htree reserves
- * that key). Exposed because a caller that already has the digest can avoid
- * recomputing it, and because a test wants to construct collisions on purpose. */
-uint32_t bbq_dict_hash(const void* key, size_t len);
+/* The hash the dict keys its tree on: SipHash-1-3, seeded per process.
+ *
+ * Seeded because the keys are names from input this library does not control. An
+ * unseeded hash — djb2, which this was — lets an attacker compute keys that all
+ * collide, pile every one of them onto a single chain, and turn every lookup
+ * into a linear scan. That is hash flooding (Klink & Wälde, 28C3 2011), and
+ * SipHash (Aumasson & Bernstein, 2012) is the answer Python, Ruby, Rust and Perl
+ * all adopted for it.
+ *
+ * Exposed so a caller holding the digest can skip recomputing it. Two runs of the
+ * same program give different values for the same key; nothing may persist one. */
+uint64_t bbq_dict_hash(const void* key, size_t len);
 
 #ifdef __cplusplus
 }

@@ -52,7 +52,9 @@ add_executable(burgc_tests
     tests/burgc_test.cpp
     tests/egraph_test.cpp
     runtime/egraph.c
-    ${CMAKE_SOURCE_DIR}/crt/bbq_hmap.c)
+    ${CMAKE_SOURCE_DIR}/crt/bbq_hmap.c
+    ${CMAKE_SOURCE_DIR}/crt/bbq_vec.c
+    ${CMAKE_SOURCE_DIR}/crt/bbq_alloc.c)
 target_include_directories(burgc_tests PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/runtime
     ${CMAKE_SOURCE_DIR}/crt)

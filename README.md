@@ -145,7 +145,8 @@ tools/              bbqc CLI entry point
 test/               C++ tests (GTest) and Python tests (pytest)
 docs/               Language reference, design docs, guides
 examples/           Sample .bbq specs (header, ipv4, tlv, wasm — the WebAssembly module format)
-crt/                Tiny C runtime helpers shared by generated code (bbq_arena, bbq_vec, bbq_buf, bbq_htree, bbq_hmap)
+crt/                C containers shared by generated code and by the tools — see crt/README.md
+                    (bbq_alloc, bbq_vec, bbq_buf, bbq_arena, bbq_hmap, bbq_htree, bbq_dict)
 pegc/               PEG parser generator (in-tree, no external dependency)
 asdl/               ASDL code generator (in-tree)
 burgc/              BURS instruction-selector generator

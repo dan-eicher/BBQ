@@ -38,23 +38,37 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include "bbq_alloc.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 typedef struct {
-    uint64_t* keys;     /* [cap]                                   */
-    void**    vals;     /* [cap]                                   */
-    uint8_t*  used;     /* [cap] — 1 iff the slot holds an entry   */
-    size_t    cap;      /* power of two, or 0 when empty           */
-    size_t    len;      /* entries in use                          */
+    uint64_t*  keys;    /* [cap]                                   */
+    void**     vals;    /* [cap]                                   */
+    uint8_t*   used;    /* [cap] — 1 iff the slot holds an entry   */
+    size_t     cap;     /* power of two, or 0 when empty           */
+    size_t     len;     /* entries in use                          */
+    bbq_alloc* a;       /* captured at init; NULL = libc           */
+    bool       oom;     /* sticky: some put was refused            */
 } bbq_hmap;
 
 /* Initialize. `initial_cap` is rounded up to a power of two; 0 selects a default.
+ * An initial_cap too large to be a power of two is refused rather than looped on.
+ *
  * Returns false if the table could not be allocated, leaving the map empty-but-valid:
- * every other entry point works on it, and the first put retries the allocation. */
+ * every other entry point works on it, and the first put retries the allocation.
+ *
+ * The `_a` form takes the allocator to use for the map's lifetime; anything
+ * keyed on values derived from untrusted input wants it, so that a budget can
+ * bound what that input costs. */
 bool  bbq_hmap_init(bbq_hmap* m, size_t initial_cap);
+bool  bbq_hmap_init_a(bbq_hmap* m, size_t initial_cap, bbq_alloc* a);
+
+/* Has any put been refused? The entries present are correct; they are just not
+ * all of what was put. Distinct from the per-call `false` a caller may ignore. */
+bool  bbq_hmap_oom(const bbq_hmap* m);
 
 /* Release the table. Values are NOT owned and are not touched. The map is left valid
  * and reusable — a subsequent put re-allocates from the default capacity. */

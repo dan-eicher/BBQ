@@ -55,6 +55,9 @@ class CBurgBackend : public BurgBackend {
         out << "typedef struct " << ctx_type_ << " {\n";
         out << "    bbq_arena arena;\n";
         out << "    bbq_htree state_cache;\n";
+        out << "    /* The allocator everything here comes from, kept so the transient\n";
+        out << "       sets the graph walk builds are inside the same ceiling. */\n";
+        out << "    bbq_alloc* alloc;\n";
         out << "    /* Error sink: first-error-wins. Cleared by burg_rewrite() */\n";
         out << "    const char* burg_error_msg;\n";
         out << "    int burg_error_arg;\n";
@@ -68,6 +71,11 @@ class CBurgBackend : public BurgBackend {
 
     void emit_public_api(std::ostream& out) {
         out << "void " << ns_prefix_ << "burg_ctx_init(" << ctx_type_ << "* ctx);\n";
+        out << "/* The same, over an allocator of the caller's choosing. A matcher run\n";
+        out << "   against input nobody here wrote wants a bbq_budget here: past the\n";
+        out << "   ceiling the arena refuses, labelling stops, and burg_has_error says so\n";
+        out << "   — which is the only way this matcher can be bounded at all. */\n";
+        out << "void " << ns_prefix_ << "burg_ctx_init_a(" << ctx_type_ << "* ctx, bbq_alloc* alloc);\n";
         out << "void " << ns_prefix_ << "burg_ctx_free(" << ctx_type_ << "* ctx);\n";
         out << "void " << ns_prefix_ << "burg_rewrite(BURG_NODE_TYPE root, " << ctx_type_ << "* ctx);\n";
         out << "int "  << ns_prefix_ << "burg_rule(burg_state_t* state, int goalnt);\n";
@@ -94,8 +102,13 @@ class CBurgBackend : public BurgBackend {
 
     void emit_ctx_lifecycle(std::ostream& out) {
         out << "void " << ns_prefix_ << "burg_ctx_init(" << ctx_type_ << "* ctx) {\n";
-        out << "    bbq_arena_init(&ctx->arena, 4096);\n";
-        out << "    bbq_htree_init(&ctx->state_cache);\n";
+        out << "    " << ns_prefix_ << "burg_ctx_init_a(ctx, NULL);\n";
+        out << "}\n\n";
+
+        out << "void " << ns_prefix_ << "burg_ctx_init_a(" << ctx_type_ << "* ctx, bbq_alloc* alloc) {\n";
+        out << "    bbq_arena_init_a(&ctx->arena, 4096, alloc);\n";
+        out << "    bbq_htree_init_a(&ctx->state_cache, alloc);\n";
+        out << "    ctx->alloc = alloc;\n";
         out << "    ctx->burg_error_msg = NULL;\n";
         out << "    ctx->burg_error_arg = 0;\n";
         out << "}\n\n";
@@ -317,8 +330,7 @@ void CBurgBackend::emit_label_body(std::ostream& out, int indent) {
     pad(out, indent); out << "if (!burg_cache_store(id, p, ctx)) " << ns_prefix_
                          << "burg_set_error(\"out of memory\", 0, ctx);\n\n";
 
-    pad(out, indent); out << "for (int i = 0; i < arity; i++)\n";
-    pad(out, indent + 1); out << "p->children[i] = burg_label(BURG_NODE_CHILD(node, i), ctx);\n\n";
+    emit_label_children(out, indent, "burg_label");
 
     pad(out, indent); out << "burg_dp(p, node, ctx);\n";
     pad(out, indent); out << "return p;\n";
@@ -332,7 +344,7 @@ void CBurgBackend::emit_rpo_dfs(std::ostream& out, int indent) {
      * ends. Every insert and every push is checked, and a refusal ends the walk
      * with an error rather than spinning. */
     pad(out, indent + 1); out << "bbq_htree visited;\n";
-    pad(out, indent + 1); out << "bbq_htree_init(&visited);\n";
+    pad(out, indent + 1); out << "bbq_htree_init_a(&visited, ctx->alloc);\n";
     pad(out, indent + 1); out << "typedef struct { BURG_NODE_TYPE node; int succ; } Frame;\n";
     pad(out, indent + 1); out << "Frame* stack = NULL;\n";
     pad(out, indent + 1); out << "Frame f0;\n";
@@ -384,6 +396,11 @@ void CBurgBackend::emit_rewrite_body(std::ostream& out, int indent) {
     // to close. A grammar with no actions is a coverage QUERY, which is exactly
     // the case that needs the answer.
     pad(out, indent + 1); out << "burg_state_t* state = burg_label_tree(root, ctx);\n";
+    // A refused allocation gives back NULL, and the refusal is already latched —
+    // so this is not "no cover at this root", which would be a claim about the
+    // grammar. Reading state->rule here is the dereference the labeller's own
+    // guards exist to prevent, one frame up.
+    pad(out, indent + 1); out << "if (!state) return;\n";
     pad(out, indent + 1); out << "if (!state->rule[" << start_idx << "])\n";
     pad(out, indent + 2);
     out << ns_prefix_ << "burg_set_error(\"burg: start nonterminal has no rule at root\", "

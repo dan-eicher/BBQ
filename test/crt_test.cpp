@@ -570,6 +570,68 @@ TEST(BbqArenaOom, EveryAllocationFailurePointLeavesAUsableArena) {
     });
 }
 
+/* A leak checker cannot see the defect this pins. The pointer IS freed — with
+ * the WRONG SIZE — so LeakSanitizer is satisfied and an allocator that accounts
+ * for what it handed out is not. The arena's page table is three parallel arrays
+ * under ONE capacity; growing them one at a time left that capacity disagreeing
+ * with how much had actually been allocated, and everything past the disagreement
+ * was never handed back. Under a real sized allocator it is worse than an
+ * accounting drift: it is a free with a length that was never allocated.
+ *
+ * Sweeping the ceiling puts the refusal at every allocation in turn, including
+ * the ones inside a page-table growth. */
+TEST(BbqArenaOom, EveryFailurePointGivesBackExactlyWhatItTook) {
+    for (size_t ceiling = 0; ceiling <= 3000; ceiling += 8) {
+        bbq_budget b;
+        bbq_budget_init(&b, ceiling, nullptr);
+        bbq_arena a; bbq_arena_init_a(&a, 128, bbq_budget_handle(&b));
+        for (int i = 0; i < 40; i++)
+            if (!bbq_arena_alloc(&a, 64)) break;
+        bbq_arena_free(&a);
+        ASSERT_EQ(b.used, 0u) << "ceiling " << ceiling;
+    }
+}
+
+/* The same law over the rest. Every container is fed until its ceiling refuses,
+ * then freed; a container that releases with a size other than the one it
+ * allocated with shows up here and nowhere else. */
+TEST(BbqOom, EveryContainerGivesBackExactlyWhatItTook) {
+    for (size_t ceiling = 0; ceiling <= 4000; ceiling += 24) {
+        {
+            bbq_budget b; bbq_budget_init(&b, ceiling, nullptr);
+            bbq_htree t; bbq_htree_init_a(&t, bbq_budget_handle(&b));
+            for (int i = 0; i < 200; i++) bbq_htree_insert(&t, (bbq_htree_key)i * 7919, &t);
+            bbq_htree_free(&t);
+            ASSERT_EQ(b.used, 0u) << "htree, ceiling " << ceiling;
+        }
+        {
+            bbq_budget b; bbq_budget_init(&b, ceiling, nullptr);
+            bbq_dict d; bbq_dict_init_a(&d, bbq_budget_handle(&b));
+            for (int i = 0; i < 200; i++) {
+                char key[16];
+                snprintf(key, sizeof key, "k%d", i);
+                bbq_dict_puts(&d, key, &d);
+            }
+            bbq_dict_free(&d);
+            ASSERT_EQ(b.used, 0u) << "dict, ceiling " << ceiling;
+        }
+        {
+            bbq_budget b; bbq_budget_init(&b, ceiling, nullptr);
+            bbq_hmap m; bbq_hmap_init_a(&m, 8, bbq_budget_handle(&b));
+            for (int i = 0; i < 200; i++) bbq_hmap_put(&m, (uint64_t)i, &m);
+            bbq_hmap_free(&m);
+            ASSERT_EQ(b.used, 0u) << "hmap, ceiling " << ceiling;
+        }
+        {
+            bbq_budget b; bbq_budget_init(&b, ceiling, nullptr);
+            bbq_buf buf; bbq_buf_init_a(&buf, bbq_budget_handle(&b));
+            for (int i = 0; i < 2000; i++) bbq_buf_append_byte(&buf, (unsigned char)i);
+            bbq_buf_free(&buf);
+            ASSERT_EQ(b.used, 0u) << "buf, ceiling " << ceiling;
+        }
+    }
+}
+
 /* ════════════════════════════════════════════════════════════════════════════
  * A. Laws — bbq_htree
  * ══════════════════════════════════════════════════════════════════════════ */

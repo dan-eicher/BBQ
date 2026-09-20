@@ -269,6 +269,17 @@ endif()
 # cursor (bbq_runtime.h), the generated VM headers, the JIT runtime,
 # the calc frontend (calc_runner.h / CalcIR.h) and the VM host
 # (calc_vm_host.h / calc_host.h / calc_jit_driver.h).
+# These binaries are linked by raw clang commands, so the sanitizer flags the
+# rest of the build gets from add_link_options do not reach them — and half their
+# objects (calc_runner, the host) DO carry the instrumentation, which is what the
+# missing __ubsan_* references at link were. The stencils stay uninstrumented on
+# purpose: their bytes are copied into JIT memory, and instrumented code cannot be
+# relocated by a copy-and-patch patcher.
+set(CALC_VM_LINK_SAN "")
+if(BBQ_SANITIZE)
+    set(CALC_VM_LINK_SAN -fsanitize=address,undefined)
+endif()
+
 set(CALC_VM_INCS
     -I${CALC_VM_DIR}
     -I${CMAKE_CURRENT_SOURCE_DIR}/example
@@ -368,7 +379,7 @@ add_custom_command(
 set(CALC_VM_E2E ${CALC_VM_DIR}/calc_vm_e2e)
 add_custom_command(
     OUTPUT ${CALC_VM_E2E}
-    COMMAND ${CLANG_CXX_COMPILER} -std=c++17 -DCALC_EQSAT ${CALC_VM_INCS}
+    COMMAND ${CLANG_CXX_COMPILER} -std=c++17 -DCALC_EQSAT ${CALC_VM_LINK_SAN} ${CALC_VM_INCS}
             ${CMAKE_CURRENT_SOURCE_DIR}/example/test/calc_e2e_test.cpp
             $<TARGET_FILE:calc_runner> ${CALC_INTERP_O}
             ${CALC_OPTAB_O} ${CALC_VM_HOST_O} -lm -o ${CALC_VM_E2E}
@@ -388,7 +399,7 @@ add_test(NAME calc_vm_e2e COMMAND ${CALC_VM_E2E})
 set(CALC_VM_E2E_NOREWRITE ${CALC_VM_DIR}/calc_vm_e2e_norewrite)
 add_custom_command(
     OUTPUT ${CALC_VM_E2E_NOREWRITE}
-    COMMAND ${CLANG_CXX_COMPILER} -std=c++17 ${CALC_VM_INCS}
+    COMMAND ${CLANG_CXX_COMPILER} -std=c++17 ${CALC_VM_LINK_SAN} ${CALC_VM_INCS}
             ${CMAKE_CURRENT_SOURCE_DIR}/example/test/calc_e2e_test.cpp
             ${CMAKE_CURRENT_SOURCE_DIR}/example/calc_runner.cpp
             ${CMAKE_CURRENT_SOURCE_DIR}/example/frontend/Parser.cpp

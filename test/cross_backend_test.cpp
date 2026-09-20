@@ -287,6 +287,29 @@ NegRun run_bin_neg(const std::string& bin, const char* rule, const std::vector<u
     return r;
 }
 
+// Run the c-lite harness in `oom` mode: it re-parses the same bytes under every arena
+// ceiling from 0 up to what the unbounded parse cost, and prints one character per
+// ceiling — 'S' succeeded with an index identical to the unbounded one, '0' reported
+// failure, 'D' succeeded with a DIFFERENT index (a silently truncated capture tree),
+// 'L' the arena did not give back everything it took. Leak detection stays ON: a
+// refused parse that strands the builder's vectors is exactly the kind of defect this
+// sweep is for.
+NegRun run_bin_oom(const std::string& bin, const char* rule, const std::vector<uint8_t>& in) {
+    std::string hexstr;
+    char hex[8];
+    for (uint8_t b : in) { snprintf(hex, sizeof hex, "\\x%02x", b); hexstr += hex; }
+    std::string cmd = "printf '" + hexstr + "' | ASAN_OPTIONS=detect_leaks=1 " +
+                      bin + " " + rule + " oom 2>/dev/null";
+    NegRun r{};
+    FILE* p = popen(cmd.c_str(), "r");
+    if (!p) { r.crashed = true; return r; }
+    int ch;
+    while ((ch = fgetc(p)) != EOF) if (ch != '\n') r.bits += (char)ch;
+    int st = pclose(p);
+    r.crashed = WIFSIGNALED(st) || !WIFEXITED(st) || WEXITSTATUS(st) != 0;
+    return r;
+}
+
 // Byte string for a failure message — a GetPut/byte-equality mismatch is only readable
 // as the two byte strings side by side.
 std::string hexdump(const std::vector<uint8_t>& b) {
@@ -408,6 +431,8 @@ CLite build_clite_index() {
     }
     {
         std::ofstream f(dir + "/h.c");
+        // open_memstream (the ceiling sweep's index buffer) is POSIX 2008.
+        f << "#define _POSIX_C_SOURCE 200809L\n";
         f << "#include \"bbq_lite.h\"\n#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n";
         f << bbq::render::render_reader_view_c_decls(ctx);
         // The Ext rule's extern (view ABI): consume 4 bytes, like cek_readit.
@@ -435,6 +460,26 @@ CLite build_clite_index() {
              "  bbq_arena ar; bbq_arena_init(&ar,0); bbq_capture_metadata m; m.success=0; m.root=0;\n"
           << dispatch <<
              "  int ok = m.success?1:0; bbq_arena_free(&ar); return ok;\n}\n";
+        // Parse under a ceiling and, on success, dump the index into a buffer. A
+        // ceiling of 0 with bounded=0 is the unbounded run; `peak` reports what it
+        // cost, so the sweep can cover every allocation the parse makes.
+        f << "static int read_bounded(const char* rule, const uint8_t* b, size_t n,\n"
+             "                        size_t ceiling, int bounded, char** out, size_t* outlen,\n"
+             "                        size_t* peak){\n"
+             "  bbq_budget bg; bbq_budget_init(&bg, bounded?ceiling:SIZE_MAX, NULL);\n"
+             "  bbq_arena ar; bbq_arena_init_a(&ar, 0, bbq_budget_handle(&bg));\n"
+             "  bbq_capture_metadata m; m.success=0; m.root=0;\n"
+          << dispatch <<
+             "  int ok = 0; *out = NULL; *outlen = 0;\n"
+             "  /* m.success is the whole contract: a consumer that is told the parse\n"
+             "     worked walks m.root. Guarding on m.root here instead would hide a\n"
+             "     reader that reports success with nothing behind it. */\n"
+             "  if(m.success){ FILE* o = open_memstream(out, outlen);\n"
+             "    dump_node(\"$\", m.root, b, o); fclose(o); ok = 1; }\n"
+             "  bbq_arena_free(&ar);\n"
+             "  if(peak) *peak = bg.peak;\n"
+             "  if(bg.used != 0) ok = -1;   /* the arena did not give back what it took */\n"
+             "  return ok;\n}\n";
         f << "int main(int argc, char** argv){\n"
              "  if(argc<2) return 9;\n"
              "  static uint8_t in[4096]; size_t n=fread(in,1,sizeof in,stdin);\n"
@@ -445,6 +490,18 @@ CLite build_clite_index() {
              "      for(int d=0;d<3;d++){ if(ds[d]==in[p]) continue; memcpy(bb,in,n); bb[p]=ds[d];\n"
              "        putchar(read_one(argv[1],bb,n)?'1':'0'); } }\n"
              "    putchar('\\n'); return 0;\n"
+             "  }\n"
+             "  if(argc>=3 && !strcmp(argv[2],\"oom\")){\n"
+             "    char* full=NULL; size_t fl=0, peak=0;\n"
+             "    if(read_bounded(argv[1],in,n,0,0,&full,&fl,&peak)!=1) return 8;\n"
+             "    for(size_t c=0;c<=peak+16;c+=8){ char* d=NULL; size_t dl=0;\n"
+             "      int ok=read_bounded(argv[1],in,n,c,1,&d,&dl,NULL);\n"
+             "      if(ok<0) putchar('L');\n"
+             "      else if(!ok) putchar('0');\n"
+             "      else if(dl==fl && memcmp(d,full,dl)==0) putchar('S');\n"
+             "      else putchar('D');\n"
+             "      free(d); }\n"
+             "    free(full); putchar('\\n'); return 0;\n"
              "  }\n"
              "  const char* rule = argv[1]; const uint8_t* b = in;\n"
              "  bbq_arena ar; bbq_arena_init(&ar,0); bbq_capture_metadata m; m.success=0; m.root=0;\n"
@@ -979,6 +1036,38 @@ TEST(CrossBackend, ViewCReaderMatchesCek) {
         std::string cl_d(out.begin(), out.end());
         EXPECT_EQ(cl_d, cek_d) << c.rule << ": c-lite index dump diverges from the CEK\n"
                                << "  c-lite:\n" << cl_d << "  cek:\n" << cek_d;
+    }
+}
+
+// ── c-lite under a ceiling: the reader that runs on input nobody here wrote ──────
+//
+// The c-lite index reader is what javelina points at a .wasm and yoctojc at a CAP —
+// bytes from somewhere else, with a capture tree whose size the INPUT chooses. The
+// only thing that bounds that is an arena that refuses, and the caller already owns
+// the arena, so a budget goes straight in.
+//
+// What must hold at every ceiling: no out-of-bounds access (ASan aborts, which shows
+// up as `crashed`); nothing stranded (leak detection is on); and — the one that is
+// easy to get wrong — a parse that REPORTS SUCCESS must have produced the whole
+// index. A short capture tree still looks well-formed to a consumer, so "success
+// with fewer fields" is the dangerous outcome, not the loud one.
+TEST(CrossBackend, ViewCReaderUnderAnArenaCeiling) {
+    const CLite& cl = shared_clite();
+    ASSERT_TRUE(cl.ok) << cl.err;
+
+    for (auto& c : xcases()) {
+        SCOPED_TRACE(c.rule);
+        NegRun r = run_bin_oom(cl.bin, c.rule, c.valid);
+        ASSERT_FALSE(r.crashed) << c.rule << ": the ceiling sweep did not survive";
+        ASSERT_FALSE(r.bits.empty()) << c.rule << ": the sweep produced nothing";
+        EXPECT_EQ(r.bits.find('D'), std::string::npos)
+            << c.rule << ": reported success with a SHORT index — " << r.bits;
+        EXPECT_EQ(r.bits.find('L'), std::string::npos)
+            << c.rule << ": the arena kept something it was handed — " << r.bits;
+        EXPECT_NE(r.bits.find('0'), std::string::npos)
+            << c.rule << ": no ceiling refused anything, so the sweep proves nothing";
+        EXPECT_NE(r.bits.find('S'), std::string::npos)
+            << c.rule << ": no ceiling let the parse through, so nothing was compared";
     }
 }
 

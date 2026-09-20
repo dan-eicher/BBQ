@@ -689,29 +689,63 @@ void BurgBackend::emit_dp_body(std::ostream& out, int indent) {
     emit_label_dp_switch(out, indent);
 }
 
-// Arena alloc + BurgState init — shared between tree and graph label
+// Arena alloc + BurgState init — shared between tree and graph label.
+//
+// burg_dp reads p->children[i]->rule[...] in every rule it tries, so a state
+// that could not be allocated must never reach it. The refusal is latched on the
+// ctx and the labeller returns NULL; the callers below propagate that, and the
+// root/rewrite entry points already poll before they do anything with a state.
 void BurgBackend::emit_label_alloc(std::ostream& out, int indent) {
     pad(out, indent); out << "int arity = BURG_NODE_ARITY(node);\n";
     pad(out, indent); out << state_type() << "* p = (" << state_type() << "*)arena_alloc(sizeof(" << state_type() << ")" << ctx_arg() << ");\n";
+    emit_alloc_refusal(out, indent, "p");
     pad(out, indent); out << "p->op = BURG_NODE_OP(node);\n";
     pad(out, indent); out << "p->child_count = arity;\n";
     pad(out, indent); out << "p->children = arity > 0\n";
     pad(out, indent); out << "    ? (" << state_type() << "**)arena_alloc(arity * sizeof(" << state_type() << "*)" << ctx_arg() << ")\n";
     pad(out, indent); out << "    : NULL;\n";
+    emit_alloc_refusal(out, indent, "arity > 0 && !p->children");
     pad(out, indent); out << "for (int i = 0; i <= BURG_MAX_NT; i++) {\n";
     pad(out, indent + 1); out << "p->cost[i] = BURG_MAX_COST;\n";
     pad(out, indent + 1); out << "p->rule[i] = 0;\n";
     pad(out, indent); out << "}\n";
 }
 
+// `cond` is either a pointer that must be non-NULL, or a full test. Emits
+// nothing at all where the allocator throws instead of refusing.
+void BurgBackend::emit_alloc_refusal(std::ostream& out, int indent, const std::string& cond) {
+    if (!alloc_can_fail()) return;
+    std::string test = (cond.find(' ') == std::string::npos) ? ("!" + cond) : cond;
+    pad(out, indent);
+    out << "if (" << test << ") { " << sym_prefix()
+        << "burg_set_error(\"burg: out of memory labelling\", 0" << ctx_arg()
+        << "); return NULL; }\n";
+}
+
 // Tree label body — no cache, arena alloc, calls burg_dp
 void BurgBackend::emit_label_tree_body(std::ostream& out, int indent) {
     emit_label_alloc(out, indent);
     out << "\n";
-    pad(out, indent); out << "for (int i = 0; i < arity; i++)\n";
-    pad(out, indent + 1); out << "p->children[i] = burg_label_tree(BURG_NODE_CHILD(node, i)" << ctx_arg() << ");\n\n";
+    emit_label_children(out, indent, "burg_label_tree");
     pad(out, indent); out << "burg_dp(p, node" << ctx_arg() << ");\n";
     pad(out, indent); out << "return p;\n";
+}
+
+// The recursion, with a refused child ending the walk. Without the bail, burg_dp
+// would read rule[] through a NULL child on the very next line.
+void BurgBackend::emit_label_children(std::ostream& out, int indent,
+                                      const char* recurse) {
+    if (!alloc_can_fail()) {
+        pad(out, indent); out << "for (int i = 0; i < arity; i++)\n";
+        pad(out, indent + 1); out << "p->children[i] = " << recurse
+                                  << "(BURG_NODE_CHILD(node, i)" << ctx_arg() << ");\n\n";
+        return;
+    }
+    pad(out, indent); out << "for (int i = 0; i < arity; i++) {\n";
+    pad(out, indent + 1); out << "p->children[i] = " << recurse
+                              << "(BURG_NODE_CHILD(node, i)" << ctx_arg() << ");\n";
+    pad(out, indent + 1); out << "if (!p->children[i]) return NULL;   /* the refusal is already latched */\n";
+    pad(out, indent); out << "}\n\n";
 }
 
 // Graph label body — cache + arena alloc, calls burg_dp
@@ -726,8 +760,7 @@ void BurgBackend::emit_label_body(std::ostream& out, int indent) {
     pad(out, indent); out << "// Cache BEFORE DP (back-edge cut-point safety)\n";
     pad(out, indent); out << "burg_cache_store(id, p" << ctx_arg() << ");\n\n";
 
-    pad(out, indent); out << "for (int i = 0; i < arity; i++)\n";
-    pad(out, indent + 1); out << "p->children[i] = burg_label(BURG_NODE_CHILD(node, i)" << ctx_arg() << ");\n\n";
+    emit_label_children(out, indent, "burg_label");
 
     pad(out, indent); out << "burg_dp(p, node" << ctx_arg() << ");\n";
     pad(out, indent); out << "return p;\n";

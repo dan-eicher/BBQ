@@ -8,6 +8,8 @@ class CppBurgBackend : public BurgBackend {
     // BurgError, so the codegen's `if (burg_has_error()) return;` and
     // `burg_clear_error()` would be dead code.
     bool needs_error_polling() const override { return false; }
+    // arena_alloc here is `new char[]`: it throws, it never returns NULL.
+    bool alloc_can_fail() const override { return false; }
 
 public:
     void generate(std::ostream& out, const BurgAnalysis& a,

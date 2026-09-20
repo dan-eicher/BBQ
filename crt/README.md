@@ -166,6 +166,8 @@ Each invariant and the test that keeps it:
 | a refused allocation writes nothing, ever | `BbqVecOom.*`, `BbqBufOom.*` |
 | poison is sticky and keeps what was already there | `BbqVecOom.PoisonIsStickyAndKeepsWhatWasAlreadyThere` |
 | every allocation failure point leaves a usable container | `Bbq{Arena,Htree,Hmap,Dict}Oom.*` (exhaustive sweeps) |
+| everything taken is given back, at the size it was taken | `BbqOom.EveryContainerGivesBackExactlyWhatItTook`, `BbqArenaOom.EveryFailurePointGivesBackExactlyWhatItTook` |
+| a budget covers the handle, not just the contents | `Bbq{Htree,Dict}.TheHandleItselfIsChargedToTheAllocator` |
 | growth refuses rather than wrapping | `BbqVec.ReserveBeyondTheCeiling…`, `BbqArena.HugeRequestIsRefused…`, `BbqBuf.AppendThatWouldOverflow…` |
 | no non-terminating growth loop | `BbqBuf.HugeReserveIsRefusedRatherThanLoopingForever`, `BbqHmap.AnUnrepresentableCapacityIsRefused…` (the ctest TIMEOUT is half of each assertion) |
 | a full-width key is not narrowed | `BbqHtreeAdversarial.PointersDifferingOnlyAboveBitThirtyOne` |
@@ -176,6 +178,18 @@ Each invariant and the test that keeps it:
 | an abandoned iteration leaks nothing | `BbqHtreeIter.Abandoning…`, `BbqDictIter.Abandoning…` |
 | mutating mid-walk stops the walk | `Bbq{Htree,Dict}Iter.MutatingMidWalk…` |
 | they behave like the things they claim to be | `Bbq{Htree,Hmap,Dict,Vec}Differential.*` vs `std::` oracles |
+
+A release that passes the wrong size is invisible to a leak checker — the pointer
+*is* freed — so the two "gives back exactly what it took" sweeps are the only
+thing that sees it. That is what caught the arena growing its three parallel page
+arrays one at a time and leaving the capacity that frees them behind.
+
+The consumers that run on input nobody here wrote have their own ceiling sweeps,
+against the same contract: `CrossBackend.ViewCReaderUnderAnArenaCeiling` in
+`test/cross_backend_test.cpp` re-parses under every arena ceiling and fails on a
+parse that reports success with a short index, and
+`test_a_refused_arena_stops_labelling` in `burgc/tests/data/coverage_main.c` does
+the same for the BURS labeller.
 
 The collision chain is reached by installing a deliberately weak hash through
 `bbq_dict_init_hashed`. With a seeded 64-bit hash, finding two colliding keys is

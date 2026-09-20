@@ -49,9 +49,16 @@ size_t bbq_arena_used(const bbq_arena* a) {
     return used;
 }
 
-/* Room for one more page record, in all three parallel arrays. */
+/* Room for one more page record, in all three parallel arrays.
+ *
+ * ALL THREE OR NONE. page_cap is the allocated length of every one of them —
+ * that is what bbq_arena_free releases them with — so a growth that took for
+ * some and not others must not be left in place. Resizing them one at a time
+ * cannot be undone (a shrink can itself be refused), so the new blocks are
+ * allocated first and published only once all three exist. */
 static bool grow_page_table(bbq_arena* a) {
     size_t newcap, old = a->page_cap;
+    size_t nb_p, nb_s, ob_p, ob_s;
     char**  np;
     size_t* ns;
     size_t* nu;
@@ -60,30 +67,34 @@ static bool grow_page_table(bbq_arena* a) {
 
     newcap = old ? old * 2 : BBQ_ARENA_INIT_PAGES;
     if (newcap < old) return false;                                /* wrapped */
-    if (!bbq_mem_array_bytes(newcap, sizeof(char*)) ||
-        !bbq_mem_array_bytes(newcap, sizeof(size_t))) return false;
+    nb_p = bbq_mem_array_bytes(newcap, sizeof(char*));
+    nb_s = bbq_mem_array_bytes(newcap, sizeof(size_t));
+    if (!nb_p || !nb_s) return false;
+    ob_p = bbq_mem_array_bytes(old, sizeof(char*));
+    ob_s = bbq_mem_array_bytes(old, sizeof(size_t));
 
-    np = (char**)bbq_mem_resize(a->a, a->pages,
-                                bbq_mem_array_bytes(old, sizeof(char*)),
-                                bbq_mem_array_bytes(newcap, sizeof(char*)));
-    if (!np) return false;
-    a->pages = np;
+    np = (char**) bbq_mem_alloc(a->a, nb_p);
+    ns = (size_t*)bbq_mem_alloc(a->a, nb_s);
+    nu = (size_t*)bbq_mem_alloc(a->a, nb_s);
+    if (!np || !ns || !nu) {
+        bbq_mem_release(a->a, np, nb_p);
+        bbq_mem_release(a->a, ns, nb_s);
+        bbq_mem_release(a->a, nu, nb_s);
+        return false;                       /* the arena is exactly as it was */
+    }
+    if (old) {
+        memcpy(np, a->pages,      ob_p);
+        memcpy(ns, a->page_sizes, ob_s);
+        memcpy(nu, a->page_used,  ob_s);
+    }
+    bbq_mem_release(a->a, a->pages,      ob_p);
+    bbq_mem_release(a->a, a->page_sizes, ob_s);
+    bbq_mem_release(a->a, a->page_used,  ob_s);
 
-    ns = (size_t*)bbq_mem_resize(a->a, a->page_sizes,
-                                 bbq_mem_array_bytes(old, sizeof(size_t)),
-                                 bbq_mem_array_bytes(newcap, sizeof(size_t)));
-    if (!ns) return false;
+    a->pages      = np;
     a->page_sizes = ns;
-
-    nu = (size_t*)bbq_mem_resize(a->a, a->page_used,
-                                 bbq_mem_array_bytes(old, sizeof(size_t)),
-                                 bbq_mem_array_bytes(newcap, sizeof(size_t)));
-    if (!nu) return false;
-    a->page_used = nu;
-
-    /* Only now, when all three took: page_cap is what says how big they are, and
-     * a stale one that overstates any of them is a read past the end. */
-    a->page_cap = newcap;
+    a->page_used  = nu;
+    a->page_cap   = newcap;
     return true;
 }
 

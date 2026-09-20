@@ -20,6 +20,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "bbq_alloc.h"
 #include "coverage_node.h"
 #include "coverage_burg.h"
 
@@ -310,6 +311,67 @@ static void test_label_root_short_circuits_on_pending_error(burg_ctx_t* ctx) {
     check_trace(NULL, 0, "and emit nothing");
 }
 
+/* ── A ceiling the input can hit ───────────────────────────────────────────────
+ *
+ * The labeller allocates one state per node plus one child vector, out of the
+ * context arena. Run over a graph nobody here wrote, that is unbounded work; the
+ * only thing that bounds it is an allocator that refuses. burg_ctx_init_a is what
+ * a consumer passes a bbq_budget through.
+ *
+ * What must hold when the refusal lands: no write through the state that was not
+ * allocated (burg_dp reads p->children[i]->rule[] on its very next line), the
+ * error is latched, and every entry point still answers. The ceiling is swept
+ * across the whole range the run needs, so the refusal lands at each allocation
+ * in turn rather than at one hand-picked spot — sqlite's OOM discipline.
+ */
+static void test_a_refused_arena_stops_labelling(void) {
+    /* Const(Add(Const, Const)) is deep enough that the refusal can land on the
+     * root state, a child vector, or a child state — the three call sites. */
+    CovNode l = mk(COV_CONST, 1);
+    CovNode r = mk(COV_CONST, 2);
+    CovNode a = mk(COV_ADD, 3);
+    a.nkids = 2; a.kids[0] = &l; a.kids[1] = &r;
+
+    /* What the run costs unbounded, so the sweep covers every page it asks for. */
+    bbq_budget unbounded;
+    bbq_budget_init(&unbounded, SIZE_MAX, NULL);
+    {
+        burg_ctx_t c;
+        burg_ctx_init_a(&c, bbq_budget_handle(&unbounded));
+        cov_trace_reset();
+        burg_rewrite(&a, &c);
+        CHECK(!burg_has_error(&c), "precondition: unbounded, this tree covers");
+        burg_ctx_free(&c);
+    }
+    CHECK(unbounded.peak > 0, "precondition: the run allocates something to refuse");
+
+    int refused = 0;
+    for (size_t ceiling = 0; ceiling <= unbounded.peak; ceiling += 64) {
+        bbq_budget b;
+        bbq_budget_init(&b, ceiling, NULL);
+        burg_ctx_t c;
+        burg_ctx_init_a(&c, bbq_budget_handle(&b));
+
+        cov_trace_reset();
+        burg_rewrite(&a, &c);
+
+        if (burg_has_error(&c)) {
+            refused++;
+            /* Every entry point still answers on a poisoned run. */
+            CHECK(burg_label_root(&a, &c) == NULL,
+                  "label_root short-circuits once the arena has refused");
+            CHECK(burg_get_error(&c) != NULL, "a latched error has a message");
+        }
+        burg_ctx_free(&c);
+        if (b.used != 0) {
+            printf("FAIL [%s]: ceiling %zu leaked %zu byte(s)\n",
+                   __func__, ceiling, b.used);
+            failures++;
+        }
+    }
+    CHECK(refused > 0, "the sweep must actually reach a refusal, or it proves nothing");
+}
+
 /* ── The exported rule table, used as it is meant to be used ───────────────────
  *
  * The labeler's claim is that its cover is the CHEAPEST the rules admit. Nothing
@@ -510,6 +572,7 @@ int main(void) {
     test_cost_of_uncovered_goal(&ctx);
     test_label_root_reduce_to_explicit_goal(&ctx);
     test_label_root_short_circuits_on_pending_error(&ctx);
+    test_a_refused_arena_stops_labelling();
     test_rule_table_describes_the_grammar(&ctx);
     test_variadic_children_are_costed(&ctx);
     test_labeler_agrees_with_an_independent_search(&ctx);

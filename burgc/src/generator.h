@@ -113,6 +113,13 @@ protected:
     // be dead code.
     virtual bool needs_error_polling() const { return true; }
 
+    // Whether arena_alloc can hand back NULL. The C backend allocates from a
+    // bbq_arena, which refuses rather than aborting when the ceiling is hit, so
+    // the labeller has to check. The C++ backend's arena is `new char[]`, which
+    // throws — there is nothing to check, and emitting the test would put dead
+    // code on the hot path of every labelling.
+    virtual bool alloc_can_fail() const { return true; }
+
     // Terminal/nonterminal constant definitions (constexpr for C++, #define for C)
     void emit_defines(std::ostream& out);
     void emit_user_headers(std::ostream& out);
@@ -124,6 +131,8 @@ protected:
                        const std::string& prefix, bool fwd_decls);
     void emit_dp_body(std::ostream& out, int indent);
     void emit_label_alloc(std::ostream& out, int indent);
+    void emit_alloc_refusal(std::ostream& out, int indent, const std::string& cond);
+    void emit_label_children(std::ostream& out, int indent, const char* recurse);
     void emit_label_tree_body(std::ostream& out, int indent);
     virtual void emit_label_body(std::ostream& out, int indent);
     void emit_rule_func_body(std::ostream& out, int indent);

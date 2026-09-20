@@ -10,7 +10,13 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 # generators run during the build and a sanitized generator is slow.
 #
 #   cmake -B build-san -DBBQ_SANITIZE=ON -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
-#   cmake --build build-san -j && ctest --test-dir build-san --timeout 600
+#   ASAN_OPTIONS=detect_leaks=0 cmake --build build-san -j
+#   ASAN_OPTIONS=detect_leaks=0 ctest --test-dir build-san --timeout 900
+#
+# ASAN_OPTIONS goes on BOTH commands, in the shell. A `set(ENV{...})` here reaches
+# only the configure step, and the generators run during the BUILD; the ctest run
+# needs it too, and crt_tests turns leak detection back on for itself through its
+# own ENVIRONMENT property, which takes precedence.
 #
 # clang, because gcc's libasan is not installed everywhere (cross_backend_test
 # says the same about the C it spawns). LeakSanitizer is off: the generators are
@@ -21,8 +27,6 @@ option(BBQ_SANITIZE "Build with AddressSanitizer + UndefinedBehaviorSanitizer" O
 if(BBQ_SANITIZE)
     add_compile_options(-fsanitize=address,undefined -fno-omit-frame-pointer -g)
     add_link_options(-fsanitize=address,undefined)
-    # Applies to the generators this build runs, and to the tests it runs later.
-    set(ENV{ASAN_OPTIONS} "detect_leaks=0")
 endif()
 
 # --- C runtime library (for generated C code) ---
@@ -303,9 +307,26 @@ if(Python3_FOUND)
                     ${CMAKE_CURRENT_SOURCE_DIR}/test/test_bbq_python.py
                     --tb=short
                 WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
+            # Under BBQ_SANITIZE the module is an instrumented .so loaded by an
+            # interpreter that is not, so the ASan runtime is not in the process
+            # yet when the dynamic linker resolves its symbols. Preloading it is
+            # the only way round that, and it is what upstream ASan documents for
+            # sanitized extension modules.
+            set(_bbq_py_env "PYTHONPATH=${CMAKE_CURRENT_BINARY_DIR}")
+            if(BBQ_SANITIZE)
+                execute_process(
+                    COMMAND ${CMAKE_C_COMPILER} -print-file-name=libclang_rt.asan.so
+                    OUTPUT_VARIABLE _bbq_asan_rt OUTPUT_STRIP_TRAILING_WHITESPACE)
+                if(EXISTS "${_bbq_asan_rt}")
+                    list(APPEND _bbq_py_env "LD_PRELOAD=${_bbq_asan_rt}")
+                else()
+                    message(STATUS "bbq: no libclang_rt.asan.so from ${CMAKE_C_COMPILER}"
+                                   " — bbq_python_tests will fail to import under BBQ_SANITIZE")
+                endif()
+            endif()
             set_tests_properties(bbq_python_tests PROPERTIES
                 FIXTURES_REQUIRED bbq_python_module
-                ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_BINARY_DIR}")
+                ENVIRONMENT "${_bbq_py_env}")
         endif()
 
         # Free-threading stress. The module declares Py_MOD_GIL_NOT_USED, so it must

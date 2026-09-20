@@ -596,6 +596,7 @@ void CBackend::emit_helpers_block() {
     if (list_elems_.empty() && tuple_shapes_.empty()) return;
 
     out() << "/* ─── ddcgc-emitted list/tuple helpers ─── */\n";
+    out() << "#include <limits.h>\n";
     out() << "#include <string.h>\n\n";
 
     // Per-element-type list: dynamic vector + alloc-and-copy from a
@@ -614,15 +615,26 @@ void CBackend::emit_helpers_block() {
               << "    int count;\n"
               << "    int capacity;\n"
               << "    bbq_arena* arena;\n"
+              << "    /* Sticky, like every CRT container: once the arena refuses, the\n"
+              << "       list stops growing and keeps what it has. The elements present\n"
+              << "       are correct; `oom` is what says they are not all of them. */\n"
+              << "    int oom;\n"
               << "} " << t << ";\n\n";
         out() << "static inline " << t << " " << fn_prefix << "_make(bbq_arena* arena) {\n"
               << "    " << t << " r = {0}; r.arena = arena; return r;\n"
               << "}\n\n";
         out() << "static inline " << t << " " << fn_prefix
               << "_push(" << t << " a, " << elem << " v) {\n"
+              << "    if (a.oom) return a;\n"
               << "    if (a.count >= a.capacity) {\n"
-              << "        int nc = a.capacity ? a.capacity * 2 : 4;\n"
-              << "        " << elem << "* nd = (" << elem << "*)bbq_arena_alloc(a.arena, sizeof(*a.data) * (size_t)nc);\n"
+              << "        int nc;\n"
+              << "        " << elem << "* nd;\n"
+              << "        /* `capacity * 2` in int is signed overflow at 2^30 — undefined,\n"
+              << "           not a wrap, so the guard has to come first. */\n"
+              << "        if (a.capacity > INT_MAX / 2) { a.oom = 1; return a; }\n"
+              << "        nc = a.capacity ? a.capacity * 2 : 4;\n"
+              << "        nd = (" << elem << "*)bbq_arena_alloc(a.arena, sizeof(*a.data) * (size_t)nc);\n"
+              << "        if (!nd) { a.oom = 1; return a; }\n"
               << "        if (a.count) memcpy(nd, a.data, sizeof(*a.data) * (size_t)a.count);\n"
               << "        a.data = nd;\n"
               << "        a.capacity = nc;\n"
@@ -634,6 +646,7 @@ void CBackend::emit_helpers_block() {
               << "_concat(" << t << " a, " << t << " b) {\n"
               << "    for (int i = 0; i < b.count; ++i) a = " << fn_prefix
               << "_push(a, b.data[i]);\n"
+              << "    if (b.oom) a.oom = 1;   /* a short input makes a short result */\n"
               << "    return a;\n"
               << "}\n\n";
         out() << "static inline " << t << " " << fn_prefix
@@ -641,6 +654,7 @@ void CBackend::emit_helpers_block() {
               << "    " << t << " r = {0}; r.arena = arena;\n"
               << "    if (n <= 0) return r;\n"
               << "    r.data = (" << elem << "*)bbq_arena_alloc(arena, sizeof(*r.data) * (size_t)n);\n"
+              << "    if (!r.data) { r.oom = 1; return r; }\n"
               << "    memcpy(r.data, arr, sizeof(*r.data) * (size_t)n);\n"
               << "    r.count = n;\n"
               << "    r.capacity = n;\n"

@@ -158,6 +158,9 @@ static bbq_field_capture* copy_to_arena(bbq_capture_builder* b, const bbq_field_
     if (count == 0) return NULL;
     bbq_field_capture* dst = (bbq_field_capture*)bbq_arena_alloc(b->arena,
                                  (size_t)count * sizeof(bbq_field_capture));
+    /* The arena refused. It is now poisoned, so bbq_view_finish sees it at the
+     * boundary and reports a failed parse; here the only job is not to write. */
+    if (!dst) return NULL;
     memcpy(dst, src, (size_t)count * sizeof(bbq_field_capture));
     for (int i = 0; i < count; i++) {
         if ((dst[i].type == BBQ_CT_Struct || dst[i].type == BBQ_CT_Array)
@@ -221,16 +224,29 @@ bbq_capture_metadata bbq_view_finish(bbq_view_ctx_t* c, bool ok) {
     if (n > 0) {
         bbq_field_capture* top = copy_to_arena(b, b->fields, n);
         bbq_field_capture* root = (bbq_field_capture*)bbq_arena_alloc(b->arena, sizeof(bbq_field_capture));
-        root->name = NULL;
-        root->start_offset = 0;
-        root->end_offset = c->cur.pos;
-        root->type = BBQ_CT_Struct;
-        root->children = top;
-        root->child_count = n;
-        root->build_buf_index = -1;
-        root->variant_tag = -1;
-        root->computed_value = NULL;
-        meta.root = root;
+        if (root) {
+            root->name = NULL;
+            root->start_offset = 0;
+            root->end_offset = c->cur.pos;
+            root->type = BBQ_CT_Struct;
+            root->children = top;
+            root->child_count = n;
+            root->build_buf_index = -1;
+            root->variant_tag = -1;
+            root->computed_value = NULL;
+            meta.root = root;
+        }
+    }
+    /* The boundary the sticky contract is for. Every refusal along the parse is
+     * still recorded: on the arena for the nodes, on the builder's own vectors
+     * for the fields that never made it in. A tree missing part of what was read
+     * is not a successful parse, whatever the grammar said — and it is the
+     * dangerous shape, because a short field list still looks well-formed. */
+    if (bbq_arena_oom(b->arena) || bbq_vec_oom(b->fields) ||
+        bbq_vec_oom(b->scopes) || bbq_vec_oom(b->child_buf)) {
+        meta.success = false;
+        meta.root    = NULL;
+        if (!meta.error_message) meta.error_message = "out of memory: capture builder";
     }
     return meta;
 }
@@ -314,18 +330,25 @@ static bbq_computed_value* alloc_cv(bbq_view_ctx_t* c) {
     return (bbq_computed_value*)bbq_arena_alloc(c->builder.arena, sizeof(bbq_computed_value));
 }
 
+/* A refused computed value is a parse failure, not a span with nothing behind
+ * it: a later where-clause reads these by name, and a NULL cv there is the same
+ * dereference one step further from the cause. These three have no return, so
+ * the cursor's error latch carries it — the reader checks it at the next read. */
 void bbq_view_add_computed_int(bbq_view_ctx_t* c, const char* name, int64_t v) {
     bbq_computed_value* cv = alloc_cv(c);
+    if (!cv) { bbq_fail(&c->cur, "out of memory: computed value"); return; }
     cv->kind = BBQ_CV_INT; cv->i = v;
     add_computed_span(&c->builder, name, cv, c->cur.pos, c->cur.pos);
 }
 void bbq_view_add_computed_float(bbq_view_ctx_t* c, const char* name, double v) {
     bbq_computed_value* cv = alloc_cv(c);
+    if (!cv) { bbq_fail(&c->cur, "out of memory: computed value"); return; }
     cv->kind = BBQ_CV_FLOAT; cv->f = v;
     add_computed_span(&c->builder, name, cv, c->cur.pos, c->cur.pos);
 }
 void bbq_view_add_computed_bool(bbq_view_ctx_t* c, const char* name, bool v) {
     bbq_computed_value* cv = alloc_cv(c);
+    if (!cv) { bbq_fail(&c->cur, "out of memory: computed value"); return; }
     cv->kind = BBQ_CV_BOOL; cv->b = v;
     add_computed_span(&c->builder, name, cv, c->cur.pos, c->cur.pos);
 }
@@ -335,6 +358,7 @@ bool bbq_view_uleb_capture(bbq_view_ctx_t* c, const char* name, int bits) {
     uint64_t v;
     if (!bbq_read_uleb128(&c->cur, &v, bits)) return false;
     bbq_computed_value* cv = alloc_cv(c);
+    if (!cv) return bbq_fail(&c->cur, "out of memory: computed value");
     cv->kind = BBQ_CV_INT; cv->i = (int64_t)v;
     add_computed_span(&c->builder, name, cv, start, c->cur.pos);
     return true;
@@ -345,6 +369,7 @@ bool bbq_view_sleb_capture(bbq_view_ctx_t* c, const char* name, int bits) {
     int64_t v;
     if (!bbq_read_sleb128(&c->cur, &v, bits)) return false;
     bbq_computed_value* cv = alloc_cv(c);
+    if (!cv) return bbq_fail(&c->cur, "out of memory: computed value");
     cv->kind = BBQ_CV_INT; cv->i = v;
     add_computed_span(&c->builder, name, cv, start, c->cur.pos);
     return true;

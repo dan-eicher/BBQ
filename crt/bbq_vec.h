@@ -51,6 +51,17 @@
  * defines it to its own function reading its own per-thread or per-interpreter
  * state. bbq_vec_reserve_a names the allocator explicitly for a vector's first
  * allocation.
+ *
+ * BBQ_VEC_ALLOC() is expanded in the TRANSLATION UNIT THAT PUSHES, which is why
+ * the macros hand it to the out-of-line half rather than letting that half read
+ * its own copy. A file that defines it sees it honoured; one that does not gets
+ * libc, and the two can share a vector's type but never a vector.
+ *
+ * sizeof(bbq_vec_hdr) is part of the ABI — an object compiled against a different
+ * version of this header computes a different element offset and corrupts the
+ * heap on first access. There is no version stamp to check that with: nothing
+ * embeds a header by value across a compilation boundary, and a macro nobody
+ * compares is not a guard. Rebuild against one header.
  */
 #ifndef BBQ_VEC_H
 #define BBQ_VEC_H
@@ -58,11 +69,6 @@
 #include <stddef.h>
 #include <limits.h>
 #include "bbq_alloc.h"
-
-/* sizeof(bbq_vec_hdr) is part of the ABI: an object file compiled against a
- * different header computes a different element offset and corrupts the heap at
- * the first access. Consumers that embed a vec by value check this. */
-#define BBQ_VEC_ABI 2
 
 #ifdef __cplusplus
 extern "C" {
@@ -92,7 +98,7 @@ typedef struct bbq_vec_hdr {
 /* Grow to at least one more than the current length, or to `want` elements.
  * Both return the pointer to store back: the same block, a new one, or a
  * poisoned one. Neither ever returns NULL for a vector that had elements. */
-void* bbq__vec_grow  (void* v, size_t elem_size);
+void* bbq__vec_grow  (void* v, size_t elem_size, bbq_alloc* born_with);
 void* bbq__vec_resize(void* v, size_t want, size_t elem_size, bbq_alloc* born_with);
 void  bbq__vec_release(void* v, size_t elem_size);
 
@@ -146,7 +152,8 @@ int  bbq__vec_topi    (const void* v);         /* index of the last element    *
  * advance — see the failure contract above. */
 #define bbq_vec_push(v, val) do {                                             \
     if (bbq_vec_len(v) >= bbq_vec_cap(v))                                     \
-        (v) = bbq__vec_cast(v) bbq__vec_grow((v), sizeof(*(v)));              \
+        (v) = bbq__vec_cast(v) bbq__vec_grow((v), sizeof(*(v)),               \
+                                             BBQ_VEC_ALLOC());                \
     if (!bbq_vec_oom(v))                                                      \
         (v)[bbq__vec_hdr(v)->len++] = (val);                                  \
 } while (0)

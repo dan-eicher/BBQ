@@ -105,7 +105,11 @@ void* bbq__vec_resize(void* v, size_t want, size_t elem_size, bbq_alloc* born_wi
     return (char*)h + sizeof(bbq_vec_hdr);
 }
 
-void* bbq__vec_grow(void* v, size_t elem_size) {
+/* `born_with` comes from the CALLER's BBQ_VEC_ALLOC(), expanded in the caller's
+ * translation unit. Resolving it here instead would read this file's copy of the
+ * macro — always the libc default — and every vector born through a push would
+ * quietly ignore the embedder's choice, which is most of them. */
+void* bbq__vec_grow(void* v, size_t elem_size, bbq_alloc* born_with) {
     size_t oldcap, want;
 
     if (v && bbq__vec_hdr(v)->cap < 0) return v;               /* already poisoned */
@@ -118,7 +122,7 @@ void* bbq__vec_grow(void* v, size_t elem_size) {
     if (want > (size_t)BBQ_VEC_MAX_CAP) want = (size_t)BBQ_VEC_MAX_CAP;
     if (want <= oldcap) return poison(v);                      /* at the ceiling */
 
-    return bbq__vec_resize(v, want, elem_size, BBQ_VEC_ALLOC());
+    return bbq__vec_resize(v, want, elem_size, born_with);
 }
 
 void bbq__vec_release(void* v, size_t elem_size) {

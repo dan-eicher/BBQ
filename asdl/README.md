@@ -64,6 +64,28 @@ analysis).
 **-h**
 : Show help.
 
+## TEMPLATES ARE MEANT TO BE FORKED
+
+`templates/*.inja` are starting points, not a fixed backend. A consumer that
+wants deep-copy, a visitor, an arena-free variant or anything else copies the
+template next to its own grammar and adds it there, which is why this tool has
+no flags for any of it. `javelina/compiler` does exactly that for its SIR.
+
+A fork owns everything it copied, including the parts that are not about shape.
+The one that matters:
+
+**Every `bbq_arena_alloc` in the emitted code can return NULL.** The arena
+refuses rather than aborting — that is the whole point of it, because the AST
+being built came from input nobody here wrote — so a constructor that stamps
+`_n->loc` without looking is a NULL dereference reachable from a large enough
+source file. Guard the allocation, return NULL, and let the caller ask
+`bbq_arena_oom()` at its own boundary.
+
+The same applies to anything a fork adds that allocates. A deep-copy memoised on
+a `bbq_vec`, for instance, has a sharper version of the problem: the memo is what
+makes a back-edge terminate, so a refused entry that is ignored turns a cyclic
+graph into unbounded recursion. Latch the refusal and unwind on it.
+
 ## ASDL FORMAT
 
 ```

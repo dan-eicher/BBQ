@@ -212,7 +212,11 @@ add_test(NAME bbq_tests COMMAND bbq_tests)
 # oversized request as fatal by default; allocator_may_return_null=1 makes it
 # answer NULL, which is what malloc does and what the code under test handles.
 # Both settings are inert in an unsanitized build.
-add_executable(crt_tests test/crt_test.cpp)
+# crt_vec_alloc_test.cpp is a SEPARATE translation unit on purpose: BBQ_VEC_ALLOC
+# is read where a vector is pushed, so defining it changes every vector in the
+# file — which is exactly what that suite is about, and exactly what the rest of
+# crt_test.cpp must not have.
+add_executable(crt_tests test/crt_test.cpp test/crt_vec_alloc_test.cpp)
 target_link_libraries(crt_tests PRIVATE bbq_crt GTest::GTest GTest::Main)
 target_compile_definitions(crt_tests PRIVATE SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
 add_test(NAME crt_tests COMMAND crt_tests)

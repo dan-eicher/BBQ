@@ -36,7 +36,12 @@ allocator other than the one that allocated it.
 **Two entry points, everywhere.** `bbq_X_init(...)` allocates from libc, which is
 right for a compiler pass, a build tool or a test. `bbq_X_init_a(..., alloc)`
 names an allocator, and anything processing untrusted input wants it — that is
-where a budget goes. `bbq_htree` and `bbq_dict` additionally offer
+where a budget goes.
+
+`bbq_vec` is the exception, because its macros are handed a bare `T*` and nothing
+else: a vector is born with `BBQ_VEC_ALLOC()`, a macro the embedder defines, read
+in **the translation unit that pushes**. A file that defines it sees it honoured
+on every vector it creates; one that does not gets libc. `bbq_htree` and `bbq_dict` additionally offer
 `_create`/`_create_a`/`_destroy` for callers that thread a handle through
 signatures rather than owning the storage; the handle comes from the same
 allocator, so a budget still covers everything.
@@ -168,6 +173,7 @@ Each invariant and the test that keeps it:
 | every allocation failure point leaves a usable container | `Bbq{Arena,Htree,Hmap,Dict}Oom.*` (exhaustive sweeps) |
 | everything taken is given back, at the size it was taken | `BbqOom.EveryContainerGivesBackExactlyWhatItTook`, `BbqArenaOom.EveryFailurePointGivesBackExactlyWhatItTook` |
 | a budget covers the handle, not just the contents | `Bbq{Htree,Dict}.TheHandleItselfIsChargedToTheAllocator` |
+| `BBQ_VEC_ALLOC()` reaches the path vectors are actually born on | `VecAlloc.*` (its own TU — the hook is per-file) |
 | growth refuses rather than wrapping | `BbqVec.ReserveBeyondTheCeiling…`, `BbqArena.HugeRequestIsRefused…`, `BbqBuf.AppendThatWouldOverflow…` |
 | no non-terminating growth loop | `BbqBuf.HugeReserveIsRefusedRatherThanLoopingForever`, `BbqHmap.AnUnrepresentableCapacityIsRefused…` (the ctest TIMEOUT is half of each assertion) |
 | a full-width key is not narrowed | `BbqHtreeAdversarial.PointersDifferingOnlyAboveBitThirtyOne` |

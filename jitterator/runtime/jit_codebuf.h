@@ -126,9 +126,21 @@ static inline void jcb_emit(jit_codebuf_t* b, const uint8_t* data, size_t len) {
 
 /* Absolute writes: the VALUE does not depend on where the buffer sits (a native
  * address, an immediate), so these are legal in either phase — a move copies them
- * along unchanged. Only PC-relative fields have to wait for the seal. */
-static inline void jcb_patch32(jit_codebuf_t* b, size_t off, int32_t v) { memcpy(b->base + off, &v, 4); }
-static inline void jcb_patch64(jit_codebuf_t* b, size_t off, uint64_t v) { memcpy(b->base + off, &v, 8); }
+ * along unchanged. Only PC-relative fields have to wait for the seal.
+ *
+ * The offset is BOUNDS-CHECKED against what has been stamped, not against the
+ * capacity: a patch reaching past `size` is one aimed at bytes no stencil put
+ * there. Every other write in this file refuses what it cannot honour, and these
+ * two used to be the exception — a patch offset comes from a generated table, so
+ * "the table is right" was the whole argument that they could not miss. */
+static inline void jcb_patch32(jit_codebuf_t* b, size_t off, int32_t v) {
+    if (off + 4 > b->size) { b->failed = 1; return; }
+    memcpy(b->base + off, &v, 4);
+}
+static inline void jcb_patch64(jit_codebuf_t* b, size_t off, uint64_t v) {
+    if (off + 8 > b->size) { b->failed = 1; return; }
+    memcpy(b->base + off, &v, 8);
+}
 
 /* Patch a 32-bit PC-relative field at `off` so it reaches `target`.
  *
@@ -148,6 +160,7 @@ static inline void jcb_patch64(jit_codebuf_t* b, size_t off, uint64_t v) { memcp
  * to wherever the buffer used to be. */
 static inline int jcb_patch_rel32(jit_codebuf_t* b, size_t off, uint64_t target) {
     if (!b->sealed) { b->failed = 1; return -1; }
+    if (off + 4 > b->size) { b->failed = 1; return -1; }
     int64_t from = (int64_t)(intptr_t)(b->base + off) + 4;
     int64_t disp = (int64_t)target - from;
     if (disp < INT32_MIN || disp > INT32_MAX) { b->failed = 1; return -1; }
@@ -156,13 +169,32 @@ static inline int jcb_patch_rel32(jit_codebuf_t* b, size_t off, uint64_t target)
     return 0;
 }
 
-/* Make the buffer executable, flush the icache, return the base pointer. After
- * this no further emit/patch is allowed. Returns NULL on mprotect failure. */
+/* Make the stamped code executable, flush the icache, return the base pointer.
+ * After this no further emit/patch is allowed. Returns NULL if anything did not
+ * fit, if nothing was stamped, or on an mprotect failure.
+ *
+ * ONLY THE PAGES THAT HOLD CODE. The capacity above `size` is released first,
+ * which matters for more than tidiness: a zero byte decodes as `add [rax], al`,
+ * so a run of executable zeroes is a slide an attacker who can land control flow
+ * anywhere in it rides forward to whatever follows. Marking the unwritten tail
+ * executable hands that out for free — and an engine embedded in an application
+ * is exactly where someone goes looking for it. Trimming also returns the
+ * address space, so a cached function costs its own code and nothing more. */
 static inline void* jcb_finalize(jit_codebuf_t* b) {
     /* Something did not fit. Handing the buffer back would hand back code that is
      * not what was stamped — a short body, or a branch to the wrong place. */
     if (b->failed) return NULL;
     if (b->finalized) return b->base;
+    /* Nothing stamped: there is no code to make executable, and a caller that
+     * jumps to an empty buffer runs off the end of it. */
+    if (b->size == 0) { b->failed = 1; return NULL; }
+
+    size_t used = jcb_page_align(b->size);
+    if (used < b->cap) {
+        /* Partial unmap: the tail is dead — the buffer is sealed, so nothing more
+         * is coming. A failure here is not fatal to the code, only to the trim. */
+        if (munmap(b->base + used, b->cap - used) == 0) b->cap = used;
+    }
     if (mprotect(b->base, b->cap, PROT_READ | PROT_EXEC) != 0) return NULL;
     b->finalized = 1;
     b->sealed = 1;   /* nothing more may be emitted into executable code */

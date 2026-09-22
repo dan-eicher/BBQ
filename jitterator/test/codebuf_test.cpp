@@ -191,6 +191,84 @@ TEST(CodeBuf, ResetReturnsToTheEmitPhase) {
     EXPECT_TRUE(jcb_ok(&s.b)) << "re-emitting is what reset is for";
 }
 
+// ── finalize hands back the pages that hold code, and no others ────
+//
+// A zero byte decodes as `add [rax], al`, so a run of executable zeroes is a
+// slide: control flow landing anywhere in it rides forward to whatever follows.
+// An unwritten tail marked executable hands that out for free, which in an
+// engine embedded in an application is exactly what someone goes looking for.
+TEST(CodeBuf, FinalizeTrimsTheUnwrittenTail) {
+    Buf s(page() * 8);
+    uint8_t ret[1] = { 0xC3 };
+    jcb_emit(&s.b, ret, sizeof ret);
+    ASSERT_EQ(s.b.cap, page() * 8);
+
+    jcb_seal(&s.b);
+    ASSERT_NE(jcb_finalize(&s.b), nullptr);
+
+    EXPECT_EQ(s.b.cap, page()) << "seven pages of executable nothing were handed back";
+    int (*fn)(void) = (int (*)(void))s.b.base;
+    fn();   // and the one page that does hold code still runs
+}
+
+TEST(CodeBuf, FinalizeKeepsEveryPageThatHoldsCode) {
+    Buf s(page());
+    std::vector<uint8_t> body(page() + 64, 0x90);   // nops across a page boundary
+    body.back() = 0xC3;                              // ret
+    jcb_emit(&s.b, body.data(), body.size());
+    ASSERT_TRUE(jcb_ok(&s.b));
+
+    jcb_seal(&s.b);
+    ASSERT_NE(jcb_finalize(&s.b), nullptr);
+    EXPECT_EQ(s.b.cap, jcb_page_align(body.size())) << "no page holding code may be trimmed";
+    EXPECT_GE(s.b.cap, s.b.size);
+    int (*fn)(void) = (int (*)(void))s.b.base;
+    fn();
+}
+
+// A buffer nobody stamped has no code to make executable, and a caller jumping
+// into it runs off the end. Refused, the way a zero-size stencil is.
+TEST(CodeBuf, FinalizeRefusesAnEmptyBuffer) {
+    Buf s;
+    jcb_seal(&s.b);
+    EXPECT_EQ(jcb_finalize(&s.b), nullptr);
+    EXPECT_FALSE(jcb_ok(&s.b));
+}
+
+// ── patches land inside what was stamped ───────────────────────────
+//
+// A patch offset comes from a generated table, and "the table is right" was the
+// entire argument that these could not miss. Every other write here refuses what
+// it cannot honour.
+TEST(CodeBuf, AbsolutePatchesPastTheStampedBytesAreRefused) {
+    Buf s;
+    uint8_t code[8] = { 0 };
+    jcb_emit(&s.b, code, sizeof code);
+
+    jcb_patch64(&s.b, 4, 0x1122334455667788ull);   // 4+8 > 8
+    EXPECT_FALSE(jcb_ok(&s.b)) << "a patch past `size` aims at bytes no stencil put there";
+
+    jcb_reset(&s.b);
+    jcb_emit(&s.b, code, sizeof code);
+    jcb_patch32(&s.b, 6, 1);                       // 6+4 > 8
+    EXPECT_FALSE(jcb_ok(&s.b));
+
+    jcb_reset(&s.b);
+    jcb_emit(&s.b, code, sizeof code);
+    jcb_patch64(&s.b, 0, 1);                       // exactly fits
+    jcb_patch32(&s.b, 4, 1);
+    EXPECT_TRUE(jcb_ok(&s.b)) << "a patch that fits is still a patch";
+}
+
+TEST(CodeBuf, RelativePatchPastTheStampedBytesIsRefused) {
+    Buf s;
+    uint8_t code[8] = { 0 };
+    jcb_emit(&s.b, code, sizeof code);
+    jcb_seal(&s.b);
+    EXPECT_EQ(jcb_patch_rel32(&s.b, 6, (uint64_t)(uintptr_t)s.b.base), -1);
+    EXPECT_FALSE(jcb_ok(&s.b));
+}
+
 TEST(CodeBuf, FinalizeSealsSoNothingMoreCanBeEmitted) {
     Buf s;
     uint8_t ret[1] = { 0xC3 };

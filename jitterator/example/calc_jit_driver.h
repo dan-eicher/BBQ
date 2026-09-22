@@ -505,7 +505,16 @@ static inline calc_jit_func_t* calc_jit_compile(bbq_ctx_t code) {
     }
     size_t n = sp.n;
 
-    /* Shared footer pool for the rip-relative data loads (operands, consts). */
+    /* Shared footer pool for the rip-relative data loads (operands, consts),
+     * deduped by value so equal constants share one slot.
+     *
+     * The dedup is a nested scan, which is O(nrec²) — fine HERE, where nrec is
+     * the data holes of one arithmetic expression, and deliberately left legible.
+     * It does not survive contact with real function sizes: javelina hit
+     * quadratic JIT COMPILATION on its runtime library's big bodies with exactly
+     * this loop and replaced it with a hash map keyed on the value. If you are
+     * copying this driver for something that compiles real code, copy that
+     * instead. */
     for (int i = 0; i < nrec; i++) {
         size_t foff = (size_t)-1;
         for (int j = 0; j < i; j++) if (recs[j].value == recs[i].value) { foff = recs[j].foff; break; }

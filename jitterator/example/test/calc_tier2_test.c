@@ -366,18 +366,9 @@ static calc_jit_func_t* stamp_chain(const step_t* steps, int nsteps, size_t code
     }
     offs[nsteps] = calc_emit_stencil(&buf, &stencil_table[STENCIL_GEN_ST_HALT], NULL, recs, &nrec);
 
-    for (int i = 0; i < nrec; i++) {
-        size_t foff = (size_t)-1;
-        for (int j = 0; j < i; j++) if (recs[j].value == recs[i].value) { foff = recs[j].foff; break; }
-        if (foff == (size_t)-1) { foff = buf.size; jcb_emit(&buf, (const uint8_t*)&recs[i].value, 8); }
-        recs[i].foff = foff;
-    }
-    /* The pool was the last emit: the layout is final, so displacements may be
-     * written against `base` and the buffer will not move again. */
-    jcb_seal(&buf);
-    for (int i = 0; i < nrec; i++)
-        jcb_patch_rel32(&buf, recs[i].patch_addr,
-                        (uint64_t)(uintptr_t)(buf.base + recs[i].foff));
+    /* The driver's own pool layout and seal — this harness stamps its chain by
+     * hand, but the pool is the driver's claim and is not re-derived here. */
+    calc_layout_pool(&buf, recs, nrec);
 
     uint8_t* base = buf.base;
     const StencilDef* ed = &stencil_table[STENCIL_ENTRY];
@@ -556,6 +547,62 @@ static void refusal_laws(void) {
     CHECK(calc_jit_cap == CALC_TIER2_N, "F-7: an oversized cap became %d", calc_jit_cap);
     calc_jit_set_cap(CALC_TIER2_N);
     ok("F: the walk refuses undeclared opcodes and terminates on truncated ones");
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
+ * G. The footer pool
+ *
+ * Every rip-relative data load resolves through the pool, so its layout is two
+ * claims at once: equal values share one slot — the pool is the function's
+ * DISTINCT constants, not its data holes — and the displacement written at each
+ * hole reaches the slot that hole's record was given. The programs above use the
+ * pool heavily but cannot separate those: a dedup that never fired and one that
+ * fired wrongly both give right answers, as long as every hole reaches SOME slot
+ * holding its value. This asks the layout directly.
+ * ══════════════════════════════════════════════════════════════════════════ */
+static void pool_laws(void) {
+    enum { CODE = 64, NREC = 5 };
+    static const uint64_t vals[NREC]  = { 7, 42, 7, 9, 42 };
+    static const size_t   sites[NREC] = { 0, 8, 16, 24, 32 };
+
+    jit_codebuf_t buf;
+    if (jcb_init(&buf, 4096) != 0) { CHECK(0, "G-0: the code buffer would not map"); return; }
+    /* Stand-in code: the pool goes after it and the patch sites are inside it.
+     * What the bytes are does not matter — nothing here is ever called. */
+    uint8_t filler[CODE]; memset(filler, 0xCC, sizeof filler);
+    jcb_emit(&buf, filler, sizeof filler);
+
+    calc_data_hole_t recs[NREC];
+    for (int i = 0; i < NREC; i++) {
+        recs[i].patch_addr = sites[i]; recs[i].value = vals[i]; recs[i].foff = 0;
+    }
+
+    calc_layout_pool(&buf, recs, NREC);
+
+    CHECK(buf.size == CODE + 3 * 8,
+          "G-1: three distinct values wanted a %d-byte pool, the layout used %zu",
+          3 * 8, buf.size - CODE);
+    CHECK(recs[0].foff == recs[2].foff,
+          "G-2: the two 7s got slots %zu and %zu", recs[0].foff, recs[2].foff);
+    CHECK(recs[1].foff == recs[4].foff,
+          "G-3: the two 42s got slots %zu and %zu", recs[1].foff, recs[4].foff);
+    CHECK(recs[0].foff != recs[1].foff && recs[1].foff != recs[3].foff
+          && recs[0].foff != recs[3].foff,
+          "G-4: 7, 42 and 9 did not get three distinct slots (%zu, %zu, %zu)",
+          recs[0].foff, recs[1].foff, recs[3].foff);
+
+    for (int i = 0; i < NREC; i++) {
+        uint64_t slot; memcpy(&slot, buf.base + recs[i].foff, 8);
+        CHECK(slot == vals[i], "G-5 rec %d: slot %zu holds %llu, wanted %llu",
+              i, recs[i].foff, (unsigned long long)slot, (unsigned long long)vals[i]);
+        int32_t disp; memcpy(&disp, buf.base + recs[i].patch_addr, 4);
+        CHECK(buf.base + recs[i].patch_addr + 4 + disp == buf.base + recs[i].foff,
+              "G-6 rec %d: the displacement at %zu reaches %+d bytes on, not slot %zu",
+              i, recs[i].patch_addr, disp, recs[i].foff);
+    }
+    CHECK(jcb_ok(&buf), "G-7: the layout left the buffer in its failed state");
+    jcb_free(&buf);
+    ok("G: the pool is the distinct values, and every hole's displacement reaches its slot");
 }
 
 /* ════════════════════════════════════════════════════════════════════════════ */
@@ -908,6 +955,7 @@ int main(void) {
 
     transition_laws();
     refusal_laws();
+    pool_laws();
 
     printf("\n%d checks", checks);
     if (!fails) { printf(", all passed\n"); return 0; }

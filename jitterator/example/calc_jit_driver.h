@@ -29,6 +29,7 @@
 #include "calc_sigtab.h"           /* opgen: storage classes — calc_sigtab[], calc_class_* */
 #include "calc_jit_symbols.h"      /* opgen: _HOLE_<native> -> address */
 #include "jit_codebuf.h"           /* jitterator's executable code buffer */
+#include "bbq_hmap.h"              /* crt: the footer pool's value -> slot map */
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -72,6 +73,41 @@ static inline size_t calc_emit_stencil(jit_codebuf_t* buf, const StencilDef* s,
         }
     }
     return base;
+}
+
+/* The other half of a data record's life: lay the footer pool out at the end of
+ * the buffer, seal, and turn every record into the displacement its stencil
+ * loads through. Equal values share one 8-byte slot, so the pool is exactly the
+ * distinct constants of the function.
+ *
+ * Keyed through the crt's hash map rather than a nested scan over the records.
+ * A pool dedup is a "what slot did I give this value?" lookup asked once per
+ * data hole, which is bbq_hmap's stated case, and one call site reads better
+ * than the quadratic loop it replaces. If a put is refused the map simply does
+ * not know that value yet and the next equal one gets its own slot: a larger
+ * pool, never a wrong displacement.
+ *
+ * It lives here rather than in its caller because the pool layout is a claim
+ * about the emitted code, and a harness with its own copy pins its copy. */
+static inline void calc_layout_pool(jit_codebuf_t* buf, calc_data_hole_t* recs, int nrec) {
+    bbq_hmap slots;
+    bbq_hmap_init(&slots, 0);
+    for (int i = 0; i < nrec; i++) {
+        if (bbq_hmap_contains(&slots, recs[i].value)) {
+            recs[i].foff = (size_t)(uintptr_t)bbq_hmap_get(&slots, recs[i].value);
+            continue;
+        }
+        recs[i].foff = buf->size;
+        jcb_emit(buf, (const uint8_t*)&recs[i].value, 8);
+        bbq_hmap_put(&slots, recs[i].value, (void*)(uintptr_t)recs[i].foff);
+    }
+    bbq_hmap_free(&slots);
+    /* The pool was the last thing emitted, so the layout is final: seal, and
+     * every displacement is computed against the address the code will run at. */
+    jcb_seal(buf);
+    for (int i = 0; i < nrec; i++)
+        jcb_patch_rel32(buf, recs[i].patch_addr,
+                        (uint64_t)(uintptr_t)(buf->base + recs[i].foff));
 }
 
 /* Fill one branch hole of an already-stamped stencil — the target was not known
@@ -505,29 +541,8 @@ static inline calc_jit_func_t* calc_jit_compile(bbq_ctx_t code) {
     }
     size_t n = sp.n;
 
-    /* Shared footer pool for the rip-relative data loads (operands, consts),
-     * deduped by value so equal constants share one slot.
-     *
-     * The dedup is a nested scan, which is O(nrec²) — fine HERE, where nrec is
-     * the data holes of one arithmetic expression, and deliberately left legible.
-     * It does not survive contact with real function sizes: javelina hit
-     * quadratic JIT COMPILATION on its runtime library's big bodies with exactly
-     * this loop and replaced it with a hash map keyed on the value. If you are
-     * copying this driver for something that compiles real code, copy that
-     * instead. */
-    for (int i = 0; i < nrec; i++) {
-        size_t foff = (size_t)-1;
-        for (int j = 0; j < i; j++) if (recs[j].value == recs[i].value) { foff = recs[j].foff; break; }
-        if (foff == (size_t)-1) { foff = buf.size; jcb_emit(&buf, (const uint8_t*)&recs[i].value, 8); }
-        recs[i].foff = foff;
-    }
-    /* The pool was the last thing emitted, so the layout is final: seal, and every
-     * displacement below is computed against the address the code will run at. */
-    jcb_seal(&buf);
-
-    for (int i = 0; i < nrec; i++)
-        jcb_patch_rel32(&buf, recs[i].patch_addr,
-                        (uint64_t)(uintptr_t)(buf.base + recs[i].foff));
+    /* Shared footer pool for the rip-relative data loads (operands, consts). */
+    calc_layout_pool(&buf, recs, nrec);
 
     /* Linear fall-through chain + control -> the one resync; guards -> trap. */
     uint8_t* base = buf.base;

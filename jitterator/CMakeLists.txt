@@ -391,9 +391,9 @@ add_custom_command(
     COMMAND ${CLANG_CXX_COMPILER} -std=c++17 -DCALC_EQSAT ${CALC_VM_LINK_SAN} ${CALC_VM_INCS}
             ${CMAKE_CURRENT_SOURCE_DIR}/example/test/calc_e2e_test.cpp
             $<TARGET_FILE:calc_runner> ${CALC_INTERP_O}
-            ${CALC_OPTAB_O} ${CALC_VM_HOST_O} -lm -o ${CALC_VM_E2E}
+            ${CALC_OPTAB_O} ${CALC_VM_HOST_O} $<TARGET_FILE:bbq_crt> -lm -o ${CALC_VM_E2E}
     DEPENDS ${CALC_INTERP_O} ${CALC_OPTAB_O} calc_runner ${CALC_REWRITE_H} ${CALC_VM_RUNTIME_HDRS}
-            ${CALC_VM_HOST_O}
+            ${CALC_VM_HOST_O} bbq_crt
             ${CMAKE_CURRENT_SOURCE_DIR}/example/test/calc_e2e_test.cpp
     COMMENT "clang: calc VM e2e (parse -> ddcg -> IR -> bytecode -> interp AND jit)"
     VERBATIM
@@ -412,10 +412,10 @@ add_custom_command(
             ${CMAKE_CURRENT_SOURCE_DIR}/example/test/calc_e2e_test.cpp
             ${CMAKE_CURRENT_SOURCE_DIR}/example/calc_runner.cpp
             ${CMAKE_CURRENT_SOURCE_DIR}/example/frontend/Parser.cpp
-            ${CALC_INTERP_O} ${CALC_OPTAB_O} ${CALC_VM_HOST_O} -lm
+            ${CALC_INTERP_O} ${CALC_OPTAB_O} ${CALC_VM_HOST_O} $<TARGET_FILE:bbq_crt> -lm
             -o ${CALC_VM_E2E_NOREWRITE}
     DEPENDS ${CALC_INTERP_O} ${CALC_OPTAB_O} calc_runner ${CALC_REWRITE_H} ${CALC_VM_RUNTIME_HDRS}
-            ${CALC_VM_HOST_O}
+            ${CALC_VM_HOST_O} bbq_crt
             ${CMAKE_CURRENT_SOURCE_DIR}/example/test/calc_e2e_test.cpp
             ${CMAKE_CURRENT_SOURCE_DIR}/example/calc_runner.cpp
     COMMENT "clang: calc e2e with the rewrite pass compiled out (falsifier)"
@@ -430,8 +430,8 @@ add_custom_command(
     OUTPUT ${CALC_VM_JIT}
     COMMAND ${CLANG_C_COMPILER} -std=c11 -O2 ${CALC_VM_INCS}
             ${CMAKE_CURRENT_SOURCE_DIR}/example/test/calc_vm_test.c
-            ${CALC_INTERP_O} ${CALC_VM_HOST_O} -lm -o ${CALC_VM_JIT}
-    DEPENDS ${CALC_INTERP_O} ${CALC_VM_STENCIL_TABLE} ${CALC_VM_HOST_O}
+            ${CALC_INTERP_O} ${CALC_VM_HOST_O} $<TARGET_FILE:bbq_crt> -lm -o ${CALC_VM_JIT}
+    DEPENDS ${CALC_INTERP_O} ${CALC_VM_STENCIL_TABLE} ${CALC_VM_HOST_O} bbq_crt
             ${CMAKE_CURRENT_SOURCE_DIR}/example/test/calc_vm_test.c
     COMMENT "clang: calc VM interp==JIT harness"
     VERBATIM
@@ -454,8 +454,8 @@ add_custom_command(
     OUTPUT ${CALC_VM_TIER2}
     COMMAND ${CLANG_C_COMPILER} -std=c11 -O2 ${CALC_VM_INCS}
             ${CMAKE_CURRENT_SOURCE_DIR}/example/test/calc_tier2_test.c
-            ${CALC_INTERP_O} -lm -o ${CALC_VM_TIER2}
-    DEPENDS ${CALC_INTERP_O} ${CALC_VM_STENCIL_TABLE} ${CALC_VM_RUNTIME_HDRS}
+            ${CALC_INTERP_O} $<TARGET_FILE:bbq_crt> -lm -o ${CALC_VM_TIER2}
+    DEPENDS ${CALC_INTERP_O} ${CALC_VM_STENCIL_TABLE} ${CALC_VM_RUNTIME_HDRS} bbq_crt
             ${CMAKE_CURRENT_SOURCE_DIR}/example/test/calc_tier2_test.c
             ${CMAKE_CURRENT_SOURCE_DIR}/example/calc_host.h
             ${CMAKE_CURRENT_SOURCE_DIR}/example/calc_jit_driver.h

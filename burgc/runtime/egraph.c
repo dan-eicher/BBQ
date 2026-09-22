@@ -46,6 +46,9 @@ void eg_init(egraph* g) {
 
 bool eg_oom(const egraph* g) { return g->oom; }
 
+void  eg_set_user(egraph* g, void* user) { g->user = user; }
+void* eg_user(const egraph* g) { return g->user; }
+
 void eg_free(egraph* g) {
     for (int i = 0; i < bbq_vec_len(g->classes); i++)
         bbq_vec_free(g->classes[i].node_idx);

@@ -248,7 +248,9 @@ inline calc_ir::Node* eqsat_optimize(calc_ir::Node* root, eg_caps caps) {
     // as each node is added, so a class created earlier would have none.
     calc_set_analysis(&g, nullptr);
     eg_id c = eqsat_build(&g, root);
-    calc_rewrite_region(&g, caps);
+    // NULL: this demo reports no per-rule counts, so it keeps none. A consumer
+    // that wants them declares a calc_run_t and reads its own.
+    calc_rewrite_region(&g, nullptr, caps);
 
     eg_extract_result r;
     calc_ir::Node* out = root;

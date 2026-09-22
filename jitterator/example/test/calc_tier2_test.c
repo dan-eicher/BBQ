@@ -343,8 +343,11 @@ static calc_jit_func_t* stamp_chain(const step_t* steps, int nsteps, size_t code
 
     for (int i = 0; i < nsteps; i++) {
         const StencilDef* d = &stencil_table[steps[i].sid];
-        uint64_t vals[16] = {0};
-        calc_fill_native_holes(d, vals);
+        uint64_t vals[CALC_JIT_MAX_HOLES] = {0};
+        if (!calc_fill_native_holes(d, vals, CALC_JIT_MAX_HOLES)) {
+            printf("  FAIL: stencil %d has more holes than a stamp can fill\n", steps[i].sid);
+            return NULL;
+        }
         if (steps[i].op >= 0) {
             calc_jit_meta_t m = calc_jit_meta[steps[i].op];
             for (int k = 0; k < m.operand_count; k++) {
@@ -369,9 +372,12 @@ static calc_jit_func_t* stamp_chain(const step_t* steps, int nsteps, size_t code
         if (foff == (size_t)-1) { foff = buf.size; jcb_emit(&buf, (const uint8_t*)&recs[i].value, 8); }
         recs[i].foff = foff;
     }
+    /* The pool was the last emit: the layout is final, so displacements may be
+     * written against `base` and the buffer will not move again. */
+    jcb_seal(&buf);
     for (int i = 0; i < nrec; i++)
-        jcb_patch32(&buf, recs[i].patch_addr,
-                    (int32_t)((long)recs[i].foff - (long)(recs[i].patch_addr + 4)));
+        jcb_patch_rel32(&buf, recs[i].patch_addr,
+                        (uint64_t)(uintptr_t)(buf.base + recs[i].foff));
 
     uint8_t* base = buf.base;
     const StencilDef* ed = &stencil_table[STENCIL_ENTRY];

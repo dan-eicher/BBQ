@@ -50,6 +50,15 @@ if(CLANG_FOR_TESTS)
     set_tests_properties(jitterator_tests PROPERTIES TIMEOUT 300)
 endif()
 
+# The code buffer's own tests. No clang and no extractor needed — the buffer is
+# header-only C and these stamp bytes by hand, which is the point: the two-phase
+# contract (emit, seal, then patch displacements) is what every driver rests on
+# and it had nothing checking it.
+add_executable(codebuf_tests test/codebuf_test.cpp)
+target_include_directories(codebuf_tests PRIVATE runtime)
+target_link_libraries(codebuf_tests PRIVATE GTest::GTest GTest::Main)
+add_test(NAME codebuf_tests COMMAND codebuf_tests)
+
 # --- Calculator (full toolchain demo: pegc + asdl + ddcg + burgc + opgen) ---
 # The calc lowers parsed programs through pegc → ddcg → CPS/ANF IR →
 # burgc (cg_jump) → opgen-generated two-tier VM. clang is needed for the

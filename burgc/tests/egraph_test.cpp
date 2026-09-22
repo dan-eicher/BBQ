@@ -452,4 +452,52 @@ TEST(EGraph, ModifyAddsTheImpliedConstantAndIsIdempotent) {
     EXPECT_EQ(eg_node_count(&gr.g), before) << "modify must be idempotent";
 }
 
+// ── the caller pointer the graph carries ──────────────────────────
+//
+// A rewrite rule's auxiliaries are handed the graph and the classes their
+// binders matched, and their emitted signature cannot grow a parameter without
+// every grammar's call text growing an argument to match. So a value an
+// auxiliary needs that does NOT fit an e-node's int64 payload — javelina's
+// 16-byte vector immediates, interned into a per-region table with the payload
+// carrying an index — reaches it through the graph it is already given.
+TEST(EGraphUser, RoundTripsAndDefaultsToNull) {
+    Graph gr;
+    EXPECT_EQ(eg_user(&gr.g), nullptr) << "eg_init leaves it unset";
+    int side_table = 7;
+    eg_set_user(&gr.g, &side_table);
+    EXPECT_EQ(eg_user(&gr.g), &side_table);
+    eg_set_user(&gr.g, nullptr);
+    EXPECT_EQ(eg_user(&gr.g), nullptr);
+}
+
+// It is NOT the analysis's user. That one belongs to the make/join/modify hooks
+// and consumers already pass their own through it, so carrying the auxiliaries'
+// context there would collide with a live use.
+TEST(EGraphUser, IsIndependentOfTheAnalysisUser) {
+    Graph gr;
+    int mine = 1, analysis_ctx = 2;
+    eg_set_user(&gr.g, &mine);
+
+    eg_analysis a;
+    a.size = sizeof(long);
+    a.make = nullptr; a.join = nullptr; a.modify = nullptr;
+    a.user = &analysis_ctx;
+    eg_set_analysis(&gr.g, &a);
+
+    EXPECT_EQ(eg_user(&gr.g), &mine) << "installing an analysis must not disturb it";
+}
+
+// Survives the graph growing and merging — it is the caller's, and the runtime
+// only stores it.
+TEST(EGraphUser, SurvivesMutation) {
+    Graph gr;
+    int ctx = 42;
+    eg_set_user(&gr.g, &ctx);
+    eg_id a = eg_add(&gr.g, OP_A, 0, nullptr, 0);
+    eg_id b = eg_add(&gr.g, OP_B, 0, nullptr, 0);
+    eg_merge(&gr.g, a, b);
+    eg_rebuild(&gr.g);
+    EXPECT_EQ(eg_user(&gr.g), &ctx);
+}
+
 }  // namespace

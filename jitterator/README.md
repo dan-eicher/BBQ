@@ -83,13 +83,18 @@ the offending symbol named:
 `runtime/jit_codebuf.h` (C) and `runtime/jitterator.h` (C++) mmap, stamp, patch
 and mprotect. Two things worth knowing:
 
-- **The buffer never moves.** It reserves `JCB_RESERVE` (64 MB of address space,
-  pages on demand) up front. Stamped code holds displacements computed from
-  `base`, so a grow-by-copy would leave every one of them pointing at where the
-  buffer used to be.
-- **Failure is sticky.** An emit that does not fit, or a displacement out of
-  rel32 range, marks the buffer; `jcb_finalize` then returns `NULL` instead of
-  handing back code that is not what was stamped. Check it.
+- **Two phases, split by `jcb_seal`.** Stamped code holds displacements computed
+  from `base`, so a grow that moves the buffer invalidates every one already
+  written. The rule that makes growth safe is that nothing depending on `base` is
+  written while the layout can still change: copy every stencil, `jcb_seal`, then
+  patch the displacements. The buffer enforces it — emitting after the seal, or
+  `jcb_patch_rel32` before it, marks the buffer failed. Absolute patches
+  (`jcb_patch32`/`jcb_patch64`) are base-independent and legal in either phase.
+  So the buffer starts at whatever `jcb_init` was asked for and grows by moving.
+- **Failure is sticky.** An emit that does not fit, a displacement out of rel32
+  range, or a write on the wrong side of the seal marks the buffer; `jcb_finalize`
+  then returns `NULL` instead of handing back code that is not what was stamped.
+  Check it.
 
 ## Tests
 

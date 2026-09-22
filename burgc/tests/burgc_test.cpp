@@ -1860,8 +1860,9 @@ static const char* kRewriteSpec =
 TEST(BurgRewriteEmit, EmitsEntryPointAndRuleTable) {
     std::string code = gen_rewrite(kRewriteSpec);
     ASSERT_FALSE(code.empty());
-    // One entry point, named for the grammar, taking the graph and its caps.
-    EXPECT_NE(code.find("calc_rewrite_region(egraph* g, eg_caps caps)"),
+    // One entry point, named for the grammar, taking the graph, the caller's run
+    // record for the per-rule counts, and its caps.
+    EXPECT_NE(code.find("calc_rewrite_region(egraph* g, calc_run_t* run,"),
               std::string::npos) << code;
     // Each rule becomes a matcher function carrying its own name.
     EXPECT_NE(code.find("mul_pow2"), std::string::npos);
@@ -1870,6 +1871,47 @@ TEST(BurgRewriteEmit, EmitsEntryPointAndRuleTable) {
     EXPECT_NE(code.find("is_pow2("), std::string::npos);
     // The auxiliary is called by plain name.
     EXPECT_NE(code.find("ctz("), std::string::npos);
+}
+
+// The per-rule fire counts belong to whoever asked for the saturation. They were
+// a file-scope array with EXTERNAL linkage, incremented by the round: one
+// process's totals however many callers were producing them, and in one consumer
+// written every round and read never. eg_saturate already carries a caller
+// pointer to the round, which is what this now uses.
+TEST(BurgRewriteEmit, RuleCountsGoToTheCallersRecord) {
+    std::string code = gen_rewrite(kRewriteSpec);
+    ASSERT_FALSE(code.empty());
+    // A record the caller declares and owns...
+    EXPECT_NE(code.find("} calc_run_t;"), std::string::npos) << code;
+    // ...reached through eg_saturate's user pointer, not hardcoded to 0...
+    EXPECT_NE(code.find("eg_saturate(g, calc_round, run, caps)"), std::string::npos) << code;
+    // ...and counted into, tolerating NULL for a caller that wants no figures.
+    EXPECT_NE(code.find("if (run) run->fires["), std::string::npos) << code;
+    // Nothing at file scope accumulates them any more.
+    EXPECT_EQ(code.find("unsigned long long calc_rule_fires["), std::string::npos) << code;
+    // The names stay static data — they are the grammar's, not a run's.
+    EXPECT_NE(code.find("const char* const calc_rule_names["), std::string::npos);
+}
+
+// The round must not silently drop the pointer it is handed: `(void)user;` was
+// how the counters ended up in a global in the first place.
+TEST(BurgRewriteEmit, RoundUsesThePointerItIsGiven) {
+    std::string code = gen_rewrite(kRewriteSpec);
+    ASSERT_FALSE(code.empty());
+    EXPECT_EQ(code.find("(void)user;"), std::string::npos) << code;
+    EXPECT_NE(code.find("calc_run_t* run = (calc_run_t*)user;"), std::string::npos) << code;
+}
+
+// An auxiliary's signature takes the classes its binders matched and nothing
+// else. That is load-bearing: the CALL is authored in the grammar's own text
+// (subst_binders rewrites $names and copies the rest verbatim), so a parameter
+// added here would silently disagree with every grammar's call site. A value an
+// auxiliary needs that does not fit an e-node payload reaches it through
+// eg_set_user on the graph instead.
+TEST(BurgRewriteEmit, AuxiliarySignatureTakesOnlyClasses) {
+    std::string code = gen_rewrite(kRewriteSpec);
+    ASSERT_FALSE(code.empty());
+    EXPECT_NE(code.find("extern eg_id ctz(egraph* g, eg_id);"), std::string::npos) << code;
 }
 
 // `$$` in a guard names the class the rule MATCHED, so a rule can compare

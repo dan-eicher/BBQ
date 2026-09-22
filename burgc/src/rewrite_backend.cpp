@@ -238,31 +238,46 @@ void emit_rewriter(std::ostream& o, const BurgAnalysis& a,
     o << "/* Which rules did work, by name — a saturating pass that reports\n"
          " * only \"changed\" hides which axiom earned its place, and a rule\n"
          " * that never fires on any corpus is dead weight nobody can see.\n"
-         " * A fire is one round in which the rule added information. */\n"
+         " * A fire is one round in which the rule added information.\n"
+         " *\n"
+         " * The COUNTS belong to the caller, in a record it owns and passes in\n"
+         " * (NULL to keep none). They used to accumulate in a file-scope array\n"
+         " * with external linkage, which made them one process's totals however\n"
+         " * many callers were producing them — and eg_saturate already carries a\n"
+         " * caller pointer to the round for exactly this. */\n"
          "enum { " << name << "_NRULES = " << a.spec->rewrites.size() << " };\n"
          "const char* const " << name << "_rule_names[" << name << "_NRULES"
       << " ? " << name << "_NRULES : 1] = {\n";
     for (auto* rw : a.spec->rewrites)
         o << "    \"" << rw->name << "\",\n";
     o << "};\n"
-         "unsigned long long " << name << "_rule_fires[" << name << "_NRULES"
-      << " ? " << name << "_NRULES : 1];\n\n";
+         "typedef struct {\n"
+         "    unsigned long long fires[" << name << "_NRULES ? " << name << "_NRULES : 1];\n"
+         "} " << name << "_run_t;\n\n";
 
-    o << "/* One pass over the rule set. */\n"
+    o << "/* One pass over the rule set. `user` is the run record, or NULL. */\n"
          "static bool " << name << "_round(egraph* g, void* user) {\n"
-         "    (void)user;\n"
+         "    " << name << "_run_t* run = (" << name << "_run_t*)user;\n"
          "    bool changed = false;\n";
     {
         size_t ri = 0;
         for (auto* rw : a.spec->rewrites)
             o << "    if (rw_" << rw->name << "(g)) { changed = true; "
-              << name << "_rule_fires[" << ri++ << "]++; }\n";
+                 "if (run) run->fires[" << ri++ << "]++; }\n";
     }
     o << "    return changed;\n"
          "}\n\n";
 
-    o << "/* Saturate the region to fixpoint or to whichever cap binds. */\n"
-         "int " << name << "_rewrite_region(egraph* g, eg_caps caps) {\n"
-         "    return eg_saturate(g, " << name << "_round, 0, caps);\n"
+    o << "/* Saturate the region to fixpoint or to whichever cap binds. `run`\n"
+         " * takes this saturation's per-rule counts, NULL to keep none.\n"
+         " *\n"
+         " * Anything an auxiliary needs that does not fit an e-node's payload\n"
+         " * reaches it through eg_set_user on the graph, set before saturating —\n"
+         " * not through here, because the auxiliaries' emitted signature cannot\n"
+         " * grow a parameter without every grammar's call text growing an\n"
+         " * argument to match. */\n"
+         "int " << name << "_rewrite_region(egraph* g, " << name << "_run_t* run,\n"
+         "                                 eg_caps caps) {\n"
+         "    return eg_saturate(g, " << name << "_round, run, caps);\n"
          "}\n";
 }

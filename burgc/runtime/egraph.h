@@ -268,6 +268,14 @@ struct egraph {
      * of bytes holding analysis->size per class, indexed by class id. */
     eg_analysis*     analysis;
     unsigned char*   class_data;
+    /* A caller pointer this graph carries, for the rewrite rules' auxiliaries.
+     * They are handed the graph and the classes their binders matched, and the
+     * emitted signature cannot grow a parameter without every grammar's call
+     * text growing an argument too — so a value an auxiliary needs that does not
+     * fit an e-node's int64 payload reaches it through here. Distinct from
+     * `analysis->user`, which belongs to the analysis hooks and is already in
+     * use by consumers that installed one. Untouched by the runtime. */
+    void*            user;
     /* hash → first node index with that hash; nodes chain via next_hash.
      * The chain exists because a hash is not an identity: a hit is a
      * candidate to compare, never an answer. */
@@ -286,6 +294,11 @@ struct egraph {
 /* Did this graph run out of memory? Its contents are consistent but incomplete;
  * nothing built from it after the flag was set can be trusted to be whole. */
 bool eg_oom(const egraph* g);
+
+/* The caller pointer the graph carries for the rules' auxiliaries (see `user`).
+ * Set it before saturating; the runtime only stores and returns it. */
+void  eg_set_user(egraph* g, void* user);
+void* eg_user(const egraph* g);
 
 #ifdef __cplusplus
 }

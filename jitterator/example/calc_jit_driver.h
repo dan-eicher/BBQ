@@ -52,10 +52,13 @@ static inline size_t calc_emit_stencil(jit_codebuf_t* buf, const StencilDef* s,
         size_t pa = base + p->offset;
         switch (p->type) {
         case PATCH_REL_BRANCH: {
+            /* 0 = not known yet, which is every branch hole: they name another
+             * stencil in this buffer and are backpatched after the seal. A
+             * non-zero one here would be a displacement written while the buffer
+             * can still move, so jcb_patch_rel32 refuses it (pre-seal) and
+             * finalize hands back nothing — loudly, rather than a branch to
+             * wherever the buffer used to be. */
             uint64_t t = vals ? vals[p->hole_index] : 0;
-            /* rel32 reaches +-2 GB. Every branch hole here targets another stencil
-             * in this same buffer, so it always does — the check is what keeps
-             * that true if a stencil ever tail-calls a native instead. */
             if (t) jcb_patch_rel32(buf, pa, t);
             break;
         }
@@ -72,9 +75,15 @@ static inline size_t calc_emit_stencil(jit_codebuf_t* buf, const StencilDef* s,
 }
 
 /* Fill one branch hole of an already-stamped stencil — the target was not known
- * when it was stamped, because it is the stencil that comes after it. */
+ * when it was stamped, because it is the stencil that comes after it.
+ *
+ * `hi` < 0 means the caller looked the hole up and did not find it. Returning
+ * early says so; falling into the loop would compare it against an unsigned
+ * hole_index, match nothing, and patch nothing — the same silence either way,
+ * except that this one is the answer rather than an accident. */
 static inline void calc_backpatch(jit_codebuf_t* buf, size_t base,
                                   const StencilDef* s, int hi, uint64_t t) {
+    if (hi < 0) return;
     for (uint32_t i = 0; i < s->patch_count; i++) {
         const PatchEntry* p = &s->patches[i];
         if ((int)p->hole_index != hi || p->type != PATCH_REL_BRANCH) continue;
@@ -89,11 +98,20 @@ static inline int calc_find_hole(const StencilDef* d, const char* n) {
 
 /* The name -> address lookup is opgen's own (calc_jit_symbols.h); the test used to
  * carry a second copy of it. */
-static inline void calc_fill_native_holes(const StencilDef* d, uint64_t* v) {
+/* The room a stamp has for one stencil's hole values. It bounds what the
+ * GENERATED table may contain, and the table is toolchain output whose holes
+ * track the C compiler that produced the stencils — so exceeding it is a refusal
+ * here, never a write past the array. */
+#define CALC_JIT_MAX_HOLES 16
+
+/* Returns 0 for a stencil with more holes than the caller's array holds. */
+static inline int calc_fill_native_holes(const StencilDef* d, uint64_t* v, int nv) {
+    if (d->hole_count > nv) return 0;
     for (int i = 0; i < d->hole_count; i++) {
         void* a = calc_jit_sym(d->hole_names[i]);
         if (a) v[i] = (uint64_t)(uintptr_t)a;
     }
+    return 1;
 }
 
 static inline uint64_t calc_decode_operand(bbq_ctx_t* c, jit_operand_kind_t k) {
@@ -180,18 +198,21 @@ static inline int calc_decode_insn(bbq_ctx_t* c, calc_insn_t* in) {
     return 1;
 }
 
-/* This instruction's holes, resolved against the stencil actually being stamped. */
-static inline void calc_insn_vals(const calc_insn_t* in, const StencilDef* def,
-                                  uint64_t* vals) {
+/* This instruction's holes, resolved against the stencil actually being stamped.
+ * Returns 0 if the stencil has more holes than `vals` holds, which the caller
+ * turns into a refusal rather than stamping a stencil it could not fill. */
+static inline int calc_insn_vals(const calc_insn_t* in, const StencilDef* def,
+                                 uint64_t* vals) {
     calc_jit_meta_t m = calc_jit_meta[in->op];
-    memset(vals, 0, 16 * sizeof *vals);
-    calc_fill_native_holes(def, vals);
+    memset(vals, 0, CALC_JIT_MAX_HOLES * sizeof *vals);
+    if (!calc_fill_native_holes(def, vals, CALC_JIT_MAX_HOLES)) return 0;
     for (int k = 0; k < m.operand_count; k++) {
         int h = calc_find_hole(def, m.operands[k].hole);
         if (h >= 0) vals[h] = in->imm[k];
     }
     int hip = calc_find_hole(def, "_HOLE_ip");
     if (hip >= 0) vals[hip] = in->next;
+    return 1;
 }
 
 /* ── Tier 2: Ertl's stack cache ─────────────────────────────────────────────
@@ -395,7 +416,10 @@ static inline int calc_spill_one(calc_stamp_t* s, calc_cache_t* c, size_t bpos) 
  * spill to move it. */
 static inline calc_jit_func_t* calc_jit_compile(bbq_ctx_t code) {
     calc_jit_func_t* fn = (calc_jit_func_t*)malloc(sizeof *fn);
-    jit_codebuf_t buf; jcb_init(&buf, 4096);
+    if (!fn) return NULL;
+    /* One page to start; the buffer grows (and moves) during the emit phase. */
+    jit_codebuf_t buf;
+    if (jcb_init(&buf, 4096) != 0) { free(fn); return NULL; }
     size_t code_len = code.length;
     /* A tiled instruction can imply spills as well as itself: one per live slot,
      * at most the cache depth. */
@@ -468,8 +492,8 @@ static inline calc_jit_func_t* calc_jit_compile(bbq_ctx_t code) {
          * puts it on the stack with its tag, and the meta already names it. */
         int st = cache.n, keeps = calc_state_ok(in.op, base, st, &cache, in.ctl);
         int chosen = keeps ? calc_variant[base][st] : base;
-        uint64_t vals[16];
-        calc_insn_vals(&in, &stencil_table[chosen], vals);
+        uint64_t vals[CALC_JIT_MAX_HOLES];
+        if (!calc_insn_vals(&in, &stencil_table[chosen], vals)) { bad = 1; break; }
         calc_stamp(&sp, chosen, vals, in.pos);
         calc_jit_stats.stamped++;
         if (st > 0) calc_jit_stats.cached++;
@@ -488,9 +512,13 @@ static inline calc_jit_func_t* calc_jit_compile(bbq_ctx_t code) {
         if (foff == (size_t)-1) { foff = buf.size; jcb_emit(&buf, (const uint8_t*)&recs[i].value, 8); }
         recs[i].foff = foff;
     }
+    /* The pool was the last thing emitted, so the layout is final: seal, and every
+     * displacement below is computed against the address the code will run at. */
+    jcb_seal(&buf);
+
     for (int i = 0; i < nrec; i++)
-        jcb_patch32(&buf, recs[i].patch_addr,
-                    (int32_t)((long)recs[i].foff - (long)(recs[i].patch_addr + 4)));
+        jcb_patch_rel32(&buf, recs[i].patch_addr,
+                        (uint64_t)(uintptr_t)(buf.base + recs[i].foff));
 
     /* Linear fall-through chain + control -> the one resync; guards -> trap. */
     uint8_t* base = buf.base;

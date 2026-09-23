@@ -152,7 +152,7 @@ static bool {{ fn.kpfx }}_k{{ o.id }}(bbq_view_ctx_t* ctx) {
     { int64_t _n = (int64_t)({{ o.count }});   /* count decode-on-access, before the scope opens */
       bbq_cap_begin_array(&ctx->builder, "{{ o.field }}", ctx->cur.pos);
       if (_n == 0) { BBQ_MUSTTAIL return {{ fn.kpfx }}_k{{ o.end }}(ctx); }  /* EndArray closes it */
-      bbq_push_loop_n(&ctx->cur, _n); }
+      if (!bbq_push_loop_n(&ctx->cur, _n)) return bbq_fail(&ctx->cur, "out of memory: loop stack"); }
     BBQ_MUSTTAIL return {{ fn.kpfx }}_k{{ o.body }}(ctx);
 {% else if o.op == "array_next" %}
     if (bbq_loop_next(&ctx->cur)) { BBQ_MUSTTAIL return {{ fn.kpfx }}_k{{ o.body }}(ctx); }
@@ -172,7 +172,7 @@ static bool {{ fn.kpfx }}_k{{ o.id }}(bbq_view_ctx_t* ctx) {
     // Empty array: terminator true before the first element (cond = !(until)) — what the CEK does.
     if (!({{ o.cond }})) { BBQ_MUSTTAIL return {{ fn.kpfx }}_k{{ o.end }}(ctx); }
 {% endif %}
-    bbq_push_loop_unbounded(&ctx->cur);
+    if (!bbq_push_loop_unbounded(&ctx->cur)) return bbq_fail(&ctx->cur, "out of memory: loop stack");
     BBQ_MUSTTAIL return {{ fn.kpfx }}_k{{ o.body }}(ctx);
 {% else if o.op == "array_next_grow" %}
     bbq_loop_advance(&ctx->cur);
@@ -186,7 +186,7 @@ static bool {{ fn.kpfx }}_k{{ o.id }}(bbq_view_ctx_t* ctx) {
 {% if o.counted %}
     { int64_t _n = (int64_t)({{ o.count }});   /* decode count in the PARENT scope */
       bbq_cap_begin_array(&ctx->builder, "{{ o.field }}", ctx->cur.pos);
-      bbq_push_loop_n(&ctx->cur, _n);
+      if (!bbq_push_loop_n(&ctx->cur, _n)) return bbq_fail(&ctx->cur, "out of memory: loop stack");
       for (;;) {
           if (bbq_loop_index(&ctx->cur) >= _n) break;
           if (ctx->cur.pos >= bbq_effective_end(&ctx->cur)) { bbq_pop_loop(&ctx->cur); return bbq_fail(&ctx->cur, "{{ o.msg }}"); }
@@ -197,7 +197,7 @@ static bool {{ fn.kpfx }}_k{{ o.id }}(bbq_view_ctx_t* ctx) {
       bbq_pop_loop(&ctx->cur); }
 {% else %}
     bbq_cap_begin_array(&ctx->builder, "{{ o.field }}", ctx->cur.pos);
-    bbq_push_loop_unbounded(&ctx->cur);
+    if (!bbq_push_loop_unbounded(&ctx->cur)) return bbq_fail(&ctx->cur, "out of memory: loop stack");
     for (;;) {
         if (ctx->cur.pos >= bbq_effective_end(&ctx->cur)) break;
         bbq_view_checkpoint_t _cp = bbq_view_save(ctx);

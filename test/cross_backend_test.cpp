@@ -293,7 +293,10 @@ NegRun run_bin_neg(const std::string& bin, const char* rule, const std::vector<u
 // failure, 'D' succeeded with a DIFFERENT index (a silently truncated capture tree),
 // 'L' the arena did not give back everything it took. Leak detection stays ON: a
 // refused parse that strands the builder's vectors is exactly the kind of defect this
-// sweep is for.
+// sweep is for. The line opens with 'U' if the unbounded parse never cost the budget
+// more than the arena it leaves behind — the builder's vectors and the cursor's stacks
+// were allocated somewhere the ceiling cannot see, so the ceiling does not bound the
+// parse.
 NegRun run_bin_oom(const std::string& bin, const char* rule, const std::vector<uint8_t>& in) {
     std::string hexstr;
     char hex[8];
@@ -459,23 +462,31 @@ CLite build_clite_index() {
         f << "static int read_one(const char* rule, const uint8_t* b, size_t n){\n"
              "  bbq_arena ar; bbq_arena_init(&ar,0); bbq_capture_metadata m; m.success=0; m.root=0;\n"
           << dispatch <<
-             "  int ok = m.success?1:0; bbq_arena_free(&ar); return ok;\n}\n";
+             "  /* Unbounded, so nothing was refused: a failure here is the input's, and\n"
+             "     blaming the allocator for it ('X', which no CEK bit matches) would send\n"
+             "     a caller to retry a malformed input with more memory. */\n"
+             "  int ok = m.success ? 1 : m.oom ? -1 : 0; bbq_arena_free(&ar); return ok;\n}\n";
         // Parse under a ceiling and, on success, dump the index into a buffer. A
         // ceiling of 0 with bounded=0 is the unbounded run; `peak` reports what it
         // cost, so the sweep can cover every allocation the parse makes.
         f << "static int read_bounded(const char* rule, const uint8_t* b, size_t n,\n"
              "                        size_t ceiling, int bounded, char** out, size_t* outlen,\n"
-             "                        size_t* peak){\n"
+             "                        size_t* peak, size_t* held){\n"
              "  bbq_budget bg; bbq_budget_init(&bg, bounded?ceiling:SIZE_MAX, NULL);\n"
              "  bbq_arena ar; bbq_arena_init_a(&ar, 0, bbq_budget_handle(&bg));\n"
              "  bbq_capture_metadata m; m.success=0; m.root=0;\n"
           << dispatch <<
              "  int ok = 0; *out = NULL; *outlen = 0;\n"
+             "  /* A ceiling that bit must be named as the reason. */\n"
+             "  if(!m.success && bounded && bg.denials>0 && !m.oom) ok = -2;\n"
              "  /* m.success is the whole contract: a consumer that is told the parse\n"
              "     worked walks m.root. Guarding on m.root here instead would hide a\n"
              "     reader that reports success with nothing behind it. */\n"
-             "  if(m.success){ FILE* o = open_memstream(out, outlen);\n"
+             "  if(ok==0 && m.success){ FILE* o = open_memstream(out, outlen);\n"
              "    dump_node(\"$\", m.root, b, o); fclose(o); ok = 1; }\n"
+             "  /* The parse has returned and freed its scratch, so what the budget still\n"
+             "     carries is the arena's own charge, bookkeeping included. */\n"
+             "  if(held) *held = bg.used;\n"
              "  bbq_arena_free(&ar);\n"
              "  if(peak) *peak = bg.peak;\n"
              "  if(bg.used != 0) ok = -1;   /* the arena did not give back what it took */\n"
@@ -484,19 +495,21 @@ CLite build_clite_index() {
              "  if(argc<2) return 9;\n"
              "  static uint8_t in[4096]; size_t n=fread(in,1,sizeof in,stdin);\n"
              "  if(argc>=3 && !strcmp(argv[2],\"neg\")){\n"
-             "    for(size_t L=0; L<=n; L++) putchar(read_one(argv[1],in,L)?'1':'0');\n"
+             "    for(size_t L=0; L<=n; L++){ int r=read_one(argv[1],in,L); putchar(r<0?'X':r?'1':'0'); }\n"
              "    static uint8_t bb[4096];\n"
              "    for(size_t p=0;p<n;p++){ uint8_t ds[3]={0x00,0xFF,(uint8_t)(in[p]+1)};\n"
              "      for(int d=0;d<3;d++){ if(ds[d]==in[p]) continue; memcpy(bb,in,n); bb[p]=ds[d];\n"
-             "        putchar(read_one(argv[1],bb,n)?'1':'0'); } }\n"
+             "        { int r=read_one(argv[1],bb,n); putchar(r<0?'X':r?'1':'0'); } } }\n"
              "    putchar('\\n'); return 0;\n"
              "  }\n"
              "  if(argc>=3 && !strcmp(argv[2],\"oom\")){\n"
-             "    char* full=NULL; size_t fl=0, peak=0;\n"
-             "    if(read_bounded(argv[1],in,n,0,0,&full,&fl,&peak)!=1) return 8;\n"
+             "    char* full=NULL; size_t fl=0, peak=0, held=0;\n"
+             "    if(read_bounded(argv[1],in,n,0,0,&full,&fl,&peak,&held)!=1) return 8;\n"
+             "    if(peak<=held) putchar('U');\n"
              "    for(size_t c=0;c<=peak+16;c+=8){ char* d=NULL; size_t dl=0;\n"
-             "      int ok=read_bounded(argv[1],in,n,c,1,&d,&dl,NULL);\n"
-             "      if(ok<0) putchar('L');\n"
+             "      int ok=read_bounded(argv[1],in,n,c,1,&d,&dl,NULL,NULL);\n"
+             "      if(ok==-2) putchar('M');\n"
+             "      else if(ok<0) putchar('L');\n"
              "      else if(!ok) putchar('0');\n"
              "      else if(dl==fl && memcmp(d,full,dl)==0) putchar('S');\n"
              "      else putchar('D');\n"
@@ -1064,6 +1077,10 @@ TEST(CrossBackend, ViewCReaderUnderAnArenaCeiling) {
             << c.rule << ": reported success with a SHORT index — " << r.bits;
         EXPECT_EQ(r.bits.find('L'), std::string::npos)
             << c.rule << ": the arena kept something it was handed — " << r.bits;
+        EXPECT_EQ(r.bits.find('M'), std::string::npos)
+            << c.rule << ": a refused parse did not say it was refused — " << r.bits;
+        EXPECT_EQ(r.bits.find('U'), std::string::npos)
+            << c.rule << ": the parse's scratch escaped the arena's allocator — " << r.bits;
         EXPECT_NE(r.bits.find('0'), std::string::npos)
             << c.rule << ": no ceiling refused anything, so the sweep proves nothing";
         EXPECT_NE(r.bits.find('S'), std::string::npos)
@@ -1219,7 +1236,7 @@ TEST(CrossBackend, RestSizeRecomputedOnModify) {
       f << "int main(void){ static uint8_t in[256]; size_t n=fread(in,1,sizeof in,stdin);\n"
            "  bbq_ctx_t rc; bbq_ctx_init(&rc,in,n); r_t o; memset(&o,0,sizeof o);\n"
            "  if(!r_read(&rc,&o)) return 2;\n"
-           "  o.xs.items=realloc(o.xs.items,(o.xs.count+1)*sizeof(*o.xs.items));\n"
+           "  o.xs.items=bbq_owned_resize(NULL,o.xs.items,(o.xs.count+1)*sizeof(*o.xs.items));\n"
            "  o.xs.items[o.xs.count]=40; o.xs.count++;\n"
            "  bbq_write_ctx_t wc; bbq_write_ctx_init_growable(&wc,64);\n"
            "  if(!r_write(&wc,&o)) return 3;\n"
@@ -1274,7 +1291,7 @@ TEST(CrossBackend, CountPrefixRecomputedOnModify) {
       f << "int main(void){ static uint8_t in[256]; size_t n=fread(in,1,sizeof in,stdin);\n"
            "  bbq_ctx_t rc; bbq_ctx_init(&rc,in,n); a_t o; memset(&o,0,sizeof o);\n"
            "  if(!a_read(&rc,&o)) return 2;\n"
-           "  o.xs.items=realloc(o.xs.items,(o.xs.count+1)*sizeof(*o.xs.items));\n"
+           "  o.xs.items=bbq_owned_resize(NULL,o.xs.items,(o.xs.count+1)*sizeof(*o.xs.items));\n"
            "  o.xs.items[o.xs.count]=0x0033; o.xs.count++;\n"
            "  bbq_write_ctx_t wc; bbq_write_ctx_init_growable(&wc,64);\n"
            "  if(!a_write(&wc,&o)) return 3;\n"
@@ -1328,7 +1345,7 @@ TEST(CrossBackend, PathCountRecomputedOnModify) {
       f << "int main(void){ static uint8_t in[256]; size_t n=fread(in,1,sizeof in,stdin);\n"
            "  bbq_ctx_t rc; bbq_ctx_init(&rc,in,n); r_t o; memset(&o,0,sizeof o);\n"
            "  if(!r_read(&rc,&o)) return 2;\n"
-           "  o.xs.items=realloc(o.xs.items,(o.xs.count+1)*sizeof(*o.xs.items));\n"
+           "  o.xs.items=bbq_owned_resize(NULL,o.xs.items,(o.xs.count+1)*sizeof(*o.xs.items));\n"
            "  o.xs.items[o.xs.count]=0xDD; o.xs.count++;  /* note: h.n left stale on purpose */\n"
            "  bbq_write_ctx_t wc; bbq_write_ctx_init_growable(&wc,64);\n"
            "  if(!r_write(&wc,&o)) return 3;\n"

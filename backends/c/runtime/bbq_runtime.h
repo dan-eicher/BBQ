@@ -14,29 +14,73 @@
 
 #include "bbq_read.h"
 
-#include <stdlib.h>   /* malloc / realloc / free — owning leaves + array growth */
+#include <stddef.h>
+#include <stdint.h>
 #include <string.h>
 
-/* ── Unbounded-array backing store (owning) ──────────────────
- * Ensure the innermost unbounded array's backing store holds the current index;
- * doubles capacity and zeroes new slots. Returns the (possibly realloc'd) pointer,
- * or NULL on allocation failure. (c-lite records spans instead of materializing
- * elements, so it never grows a backing store — owning-only.) */
-static inline void* bbq_array_grow(bbq_ctx_t* ctx, void* items, size_t elem) {
-    int d = ctx->loop_depth - 1;
-    if (d < 0) return items;
-    size_t need = (size_t)ctx->loop_indices[d] + 1;
-    if (need <= ctx->loop_caps[d]) return items;
-    size_t newcap = ctx->loop_caps[d] ? ctx->loop_caps[d] * 2 : 4;
-    if (newcap < need) newcap = need;
-    void* p = realloc(items, newcap * elem);
-    if (!p) return NULL;
-    memset((char*)p + ctx->loop_caps[d] * elem, 0, (newcap - ctx->loop_caps[d]) * elem);
-    ctx->loop_caps[d] = newcap;
-    return p;
+/* ── Owned storage ──────────────────────────────────────────
+ * Every block the owning reader hands out — an array's store, a bytes or string
+ * copy — comes from the reader context's allocator and carries a header naming
+ * its size and that allocator. <type>_free reads it back, so a block is always
+ * returned to the allocator it came from with the size it was taken at, and the
+ * public struct shapes (items + count, data + length) stay what they are.
+ *
+ * The header is a max_align_t-aligned union, so the block after it is aligned for
+ * any element type. */
+typedef union {
+    struct {
+        size_t     bytes;
+        bbq_alloc* a;
+    } h;
+    max_align_t align;
+} bbq_owned_hdr;
+
+/* Resize the owned block at `p` (NULL: a new one from `a`) to `bytes`. NULL when
+ * refused, and `p` is then untouched. */
+static inline void* bbq_owned_resize(bbq_alloc* a, void* p, size_t bytes) {
+    bbq_owned_hdr* old = p ? (bbq_owned_hdr*)p - 1 : NULL;
+    if (bytes > SIZE_MAX - sizeof(bbq_owned_hdr)) return NULL;
+    bbq_alloc* use = old ? old->h.a : a;
+    size_t old_total = old ? sizeof(bbq_owned_hdr) + old->h.bytes : 0;
+    bbq_owned_hdr* n = (bbq_owned_hdr*)bbq_mem_resize(
+        use, old, old_total, sizeof(bbq_owned_hdr) + bytes);
+    if (!n) return NULL;
+    n->h.bytes = bytes;
+    n->h.a = use;
+    return n + 1;
 }
 
-/* Owning bytes read: copies into malloc'd storage, so the struct is self-contained
+/* Give an owned block back. NULL is nothing to give. */
+static inline void bbq_owned_free(const void* p) {
+    if (!p) return;
+    bbq_owned_hdr* h = (bbq_owned_hdr*)(uintptr_t)p - 1;
+    bbq_mem_release(h->h.a, h, sizeof(bbq_owned_hdr) + h->h.bytes);
+}
+
+/* ── Unbounded-array backing store (owning) ──────────────────
+ * Ensure the innermost array's backing store holds the current index; doubles
+ * capacity and zeroes new slots. False when the growth was refused — and then
+ * *items is untouched, so the struct still owns what it had and <type>_free
+ * releases it. (c-lite records spans instead of materializing elements, so it
+ * never grows a backing store — owning-only.) */
+static inline bool bbq_array_grow(bbq_ctx_t* ctx, void** items, size_t elem) {
+    int d = ctx->loop_depth - 1;
+    if (d < 0) return true;
+    size_t need = (size_t)ctx->loop_indices[d] + 1;
+    size_t cap = ctx->loop_caps[d];
+    if (need <= cap) return true;
+    size_t newcap = cap ? cap * 2 : 4;
+    if (newcap < need) newcap = need;
+    if (elem && newcap > SIZE_MAX / elem) { ctx->store_oom = true; return false; }
+    void* p = bbq_owned_resize(BBQ__CTX_ALLOC(ctx), *items, newcap * elem);
+    if (!p) { ctx->store_oom = true; return false; }
+    memset((char*)p + cap * elem, 0, (newcap - cap) * elem);
+    ctx->loop_caps[d] = newcap;
+    *items = p;
+    return true;
+}
+
+/* Owning bytes read: copies into owned storage, so the struct is self-contained
  * and outlives the input buffer — the same semantics as the C++ backend's owning
  * std::vector<uint8_t>. <type>_free releases it. (Borrow semantics proved unsound
  * for any reader whose input is transient — e.g. a parse IR decoded from scratch
@@ -44,8 +88,8 @@ static inline void* bbq_array_grow(bbq_ctx_t* ctx, void* items, size_t elem) {
 static inline bool bbq_read_bytes(bbq_ctx_t* ctx, const uint8_t** out,
                                    size_t* out_len, size_t len) {
     if (ctx->pos + len > bbq_effective_end(ctx)) return bbq_fail(ctx, "bytes: overrun");
-    uint8_t* copy = (uint8_t*)malloc(len ? len : 1);
-    if (!copy) return bbq_fail(ctx, "bytes: out of memory");
+    uint8_t* copy = (uint8_t*)bbq_owned_resize(BBQ__CTX_ALLOC(ctx), NULL, len ? len : 1);
+    if (!copy) { ctx->store_oom = true; return bbq_fail(ctx, "bytes: out of memory"); }
     memcpy(copy, ctx->data + ctx->pos, len);
     *out = copy;
     *out_len = len;
@@ -53,13 +97,14 @@ static inline bool bbq_read_bytes(bbq_ctx_t* ctx, const uint8_t** out,
     return true;
 }
 
-/* Owning string read: a malloc'd, NUL-terminated copy (the NUL is not counted in
+/* Owning string read: an owned, NUL-terminated copy (the NUL is not counted in
  * out_len) — the same semantics as the C++ backend's owning std::string. */
 static inline bool bbq_read_string(bbq_ctx_t* ctx, const char** out,
                                     size_t* out_len, size_t len) {
     if (ctx->pos + len > bbq_effective_end(ctx)) return bbq_fail(ctx, "string: overrun");
-    char* copy = (char*)malloc(len + 1);
-    if (!copy) return bbq_fail(ctx, "string: out of memory");
+    char* copy = len < SIZE_MAX
+        ? (char*)bbq_owned_resize(BBQ__CTX_ALLOC(ctx), NULL, len + 1) : NULL;
+    if (!copy) { ctx->store_oom = true; return bbq_fail(ctx, "string: out of memory"); }
     memcpy(copy, ctx->data + ctx->pos, len);
     copy[len] = '\0';
     *out = copy;
@@ -71,17 +116,19 @@ static inline bool bbq_read_string(bbq_ctx_t* ctx, const char** out,
 /* ── Write context ──────────────────────────────────────── */
 
 /* A write buffer is either caller-supplied and fixed (bbq_write_ctx_init: overflow
- * fails the write) or runtime-owned and growable (bbq_write_ctx_init_growable: the
- * buffer is malloc'd and doubles on demand). The growable byte buffer uses plain
- * realloc, not the crt arena; the dual-state stacks below are crt bbq_vec. Both the
- * buffer and the stacks are released by bbq_write_ctx_free. */
+ * fails the write) or runtime-owned and growable (bbq_write_ctx_init_growable[_a]:
+ * the buffer doubles on demand). The growable buffer and the dual-state stacks below
+ * both come from the ctx's allocator, and bbq_write_ctx_free releases both. */
 typedef struct {
     uint8_t* data;
     size_t capacity;
     size_t pos;
     bool little_endian;
-    bool owns;          /* true: `data` is malloc'd here, grows on demand, freed by
+    bool owns;          /* true: `data` is the runtime's, grows on demand, freed by
                            bbq_write_ctx_free. false: fixed caller buffer, overflow fails. */
+    /* Where the growable buffer (NULL = libc) and the stacks (NULL = the including
+     * file's BBQ_VEC_ALLOC()) come from. */
+    bbq_alloc* alloc;
     bool endian_seeded; /* latch: the outermost write seeds little_endian from the
                            grammar default; nested rule calls inherit the live register
                            so `@endian:` switches persist (the reader's endian_seeded dual). */
@@ -139,28 +186,36 @@ static inline void bbq_write_ctx_init(bbq_write_ctx_t* ctx,
     ctx->pos = 0;
     ctx->little_endian = false;
     ctx->owns = false;
+    ctx->alloc = NULL;
     bbq_write_ctx_reset_state(ctx);
 }
 
-/* Growable, runtime-owned write buffer. Returns false if the initial allocation
- * fails. Release with bbq_write_ctx_free once the serialized bytes have been copied
- * out (or on any error path). */
-static inline bool bbq_write_ctx_init_growable(bbq_write_ctx_t* ctx, size_t initial) {
+/* Growable, runtime-owned write buffer drawn from `alloc` (NULL = libc). Returns false
+ * if the initial allocation fails. Release with bbq_write_ctx_free once the serialized
+ * bytes have been copied out (or on any error path). */
+static inline bool bbq_write_ctx_init_growable_a(bbq_write_ctx_t* ctx, size_t initial,
+                                                 bbq_alloc* alloc) {
     if (initial < 64) initial = 64;
     ctx->pos = 0;
     ctx->little_endian = false;
     ctx->owns = true;
+    ctx->alloc = alloc;
+    ctx->capacity = 0;
     bbq_write_ctx_reset_state(ctx);   /* nulls the stacks first — safe to free on alloc failure */
-    ctx->data = (uint8_t*)malloc(initial);
-    if (!ctx->data) { ctx->capacity = 0; return false; }
+    ctx->data = (uint8_t*)bbq_mem_alloc(alloc, initial);
+    if (!ctx->data) return false;
     ctx->capacity = initial;
     return true;
+}
+
+static inline bool bbq_write_ctx_init_growable(bbq_write_ctx_t* ctx, size_t initial) {
+    return bbq_write_ctx_init_growable_a(ctx, initial, NULL);
 }
 
 /* Release a growable buffer's storage plus the growable dual-state stacks. The fixed caller
  * buffer (owns == false) is left to the caller; the stacks are always the runtime's own. */
 static inline void bbq_write_ctx_free(bbq_write_ctx_t* ctx) {
-    if (ctx->owns) free(ctx->data);
+    if (ctx->owns) bbq_mem_release(ctx->alloc, ctx->data, ctx->capacity);
     ctx->data = NULL;
     ctx->capacity = 0;
     ctx->owns = false;
@@ -174,14 +229,18 @@ static inline void bbq_write_ctx_free(bbq_write_ctx_t* ctx) {
     bbq_vec_free(ctx->count_holes);
 }
 
-/* Ensure room for `need` more bytes. Grows an owned buffer (doubling realloc); a
- * fixed caller buffer just reports overflow. */
+/* Ensure room for `need` more bytes. Grows an owned buffer (doubling); a fixed caller
+ * buffer just reports overflow. A size that cannot be represented is refused, never
+ * wrapped: `pos + need` overflowing would pass the room check, and a doubling that
+ * overflowed to zero would never reach the target. */
 static inline bool bbq_write_reserve(bbq_write_ctx_t* ctx, size_t need) {
-    if (ctx->pos + need <= ctx->capacity) return true;
+    if (ctx->pos <= ctx->capacity && need <= ctx->capacity - ctx->pos) return true;
     if (!ctx->owns) return false;
+    if (need > SIZE_MAX - ctx->pos) return false;
+    size_t want = ctx->pos + need;
     size_t newcap = ctx->capacity ? ctx->capacity : 64;
-    while (newcap < ctx->pos + need) newcap *= 2;
-    uint8_t* nd = (uint8_t*)realloc(ctx->data, newcap);
+    while (newcap < want) newcap = newcap > SIZE_MAX / 2 ? want : newcap * 2;
+    uint8_t* nd = (uint8_t*)bbq_mem_resize(ctx->alloc, ctx->data, ctx->capacity, newcap);
     if (!nd) return false;
     ctx->data = nd;
     ctx->capacity = newcap;
@@ -407,7 +466,7 @@ static inline bool bbq_write_string(bbq_write_ctx_t* ctx,
  * and leaves the depth alone when it did not — so a caller that discards the
  * result gets a short stack rather than a write past the end of one. */
 static inline bool bbq_w_push_loop_base(bbq_write_ctx_t* ctx, int base) {
-    if (!BBQ__STACK_ENSURE(ctx->loop_bases, ctx->loop_base_depth)) return false;
+    if (!BBQ__STACK_ENSURE(ctx, ctx->loop_bases, ctx->loop_base_depth)) return false;
     ctx->loop_bases[ctx->loop_base_depth++] = base;
     return true;
 }
@@ -421,8 +480,8 @@ static inline int bbq_w_loop_depth(const bbq_write_ctx_t* ctx) { return ctx->loo
 
 /* Counted loop (the writer always knows the count): push with the stored limit. */
 static inline bool bbq_w_push_loop_n(bbq_write_ctx_t* ctx, int64_t limit) {
-    if (!BBQ__STACK_ENSURE(ctx->loop_indices, ctx->loop_depth) ||
-        !BBQ__STACK_ENSURE(ctx->loop_limits,  ctx->loop_depth)) return false;
+    if (!BBQ__STACK_ENSURE(ctx, ctx->loop_indices, ctx->loop_depth) ||
+        !BBQ__STACK_ENSURE(ctx, ctx->loop_limits,  ctx->loop_depth)) return false;
     ctx->loop_indices[ctx->loop_depth] = 0;
     ctx->loop_limits[ctx->loop_depth] = limit;
     ctx->loop_depth++;
@@ -447,7 +506,7 @@ static inline int64_t bbq_w_loop_index_at(const bbq_write_ctx_t* ctx, int depth)
 /* Scope stack: an invoke pushes the caller's struct so a sub-rule can resolve a
  * field in the enclosing scope (the dual of the reader's bbq_scope_ptr). */
 static inline bool bbq_w_push_scope(bbq_write_ctx_t* ctx, const void* ptr) {
-    if (!BBQ__STACK_ENSURE(ctx->scopes, ctx->scope_depth)) return false;
+    if (!BBQ__STACK_ENSURE(ctx, ctx->scopes, ctx->scope_depth)) return false;
     ctx->scopes[ctx->scope_depth++] = ptr;
     return true;
 }
@@ -478,8 +537,8 @@ static inline bool bbq_w_advance(bbq_write_ctx_t* ctx, size_t by) {
 /* Interval window: record [pos, end). pop seeks the cursor to the window end so the
  * outer continues after it (matching the reader, which leaves pos==end on pop). */
 static inline bool bbq_w_push_interval(bbq_write_ctx_t* ctx, size_t end) {
-    if (!BBQ__STACK_ENSURE(ctx->interval_starts, ctx->interval_depth) ||
-        !BBQ__STACK_ENSURE(ctx->interval_ends,   ctx->interval_depth)) return false;
+    if (!BBQ__STACK_ENSURE(ctx, ctx->interval_starts, ctx->interval_depth) ||
+        !BBQ__STACK_ENSURE(ctx, ctx->interval_ends,   ctx->interval_depth)) return false;
     ctx->interval_starts[ctx->interval_depth] = ctx->pos;
     ctx->interval_ends[ctx->interval_depth] = end;
     ctx->interval_depth++;
@@ -494,7 +553,7 @@ static inline bool bbq_w_pop_interval(bbq_write_ctx_t* ctx) {
 /* @rest: record the offset where the (computed) size prefix will be inserted — the rest
  * is then written starting here, with no size yet. */
 static inline bool bbq_w_push_rest(bbq_write_ctx_t* ctx) {
-    if (!BBQ__STACK_ENSURE(ctx->rest_holes, ctx->rest_depth)) return false;
+    if (!BBQ__STACK_ENSURE(ctx, ctx->rest_holes, ctx->rest_depth)) return false;
     ctx->rest_holes[ctx->rest_depth++] = ctx->pos;
     return true;
 }
@@ -514,7 +573,8 @@ static inline bool bbq_w__count_holes_ensure(bbq_write_ctx_t* ctx, int id) {
     int64_t nc = oldcap ? oldcap : 8;
     while (nc <= (int64_t)id && nc < (int64_t)BBQ_VEC_MAX_CAP) nc *= 2;
     if (nc > (int64_t)BBQ_VEC_MAX_CAP || id >= BBQ_VEC_MAX_CAP) return false;
-    if (!bbq_vec_try_reserve(ctx->count_holes, (int)nc)) return false;
+    bbq_vec_reserve_a(ctx->count_holes, (int)nc, BBQ__CTX_ALLOC(ctx));
+    if (bbq_vec_cap(ctx->count_holes) < (int)nc) return false;
     for (int i = oldcap; i < bbq_vec_cap(ctx->count_holes); i++) ctx->count_holes[i] = 0;
     return true;
 }

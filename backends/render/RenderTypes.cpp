@@ -215,7 +215,7 @@ struct TypeLowerer {
             case NodeKind::Primitive: {
                 auto* p = static_cast<Primitive*>(type);
                 if (dynamic_cast<BytesKind*>(p->kind) || dynamic_cast<StringKind*>(p->kind))
-                    out << ind << "free((void*)" << target << ".data);\n";
+                    out << ind << "bbq_owned_free(" << target << ".data);\n";
                 break;
             }
             case NodeKind::Array: {
@@ -224,7 +224,7 @@ struct TypeLowerer {
                     out << ind << "for (size_t i = 0; i < " << target << ".count; i++)\n";
                     emit_field_free(arr->element, target + ".items[i]", out, indent + 1);
                 }
-                out << ind << "free(" << target << ".items);\n";
+                out << ind << "bbq_owned_free(" << target << ".items);\n";
                 break;
             }
             case NodeKind::RuleRef: {

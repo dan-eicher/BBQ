@@ -111,7 +111,9 @@ TEST(RenderTypes, BytesFieldFreed) {
     auto h = render("Foo = struct { len: uint8, data: bytes[len] }");
     EXPECT_TRUE(has(h, "bbq_bytes_t data;"));
     EXPECT_TRUE(has(h, "foo_free"));                   // owns the bytes
-    EXPECT_TRUE(has(h, "free((void*)"));
+    // Released to the allocator it came from, with its size — never libc free.
+    EXPECT_TRUE(has(h, "bbq_owned_free(p->data.data)"));
+    EXPECT_FALSE(has(h, "free((void*)"));
 }
 
 TEST(RenderTypes, UserHeader) {

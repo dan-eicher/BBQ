@@ -20,7 +20,7 @@ bool {{ fn.name }}(bbq_ctx_t* ctx, {{ fn.type }}* out) {
     // CEK seeds little_endian at machine init); the latch makes every later rule
     // call inherit the live register so `@endian:` switches persist.
     if (!ctx->endian_seeded) { ctx->little_endian = {% if default_le %}true{% else %}false{% endif %}; ctx->endian_seeded = true; }
-    bbq_push_loop_base(ctx, bbq_loop_depth(ctx));  // this rule's arrays index from here
+    if (!bbq_push_loop_base(ctx, bbq_loop_depth(ctx))) return bbq_fail(ctx, "out of memory: loop stack");  // this rule's arrays index from here
     bool _ok = {{ fn.kpfx }}_k{{ fn.entry }}(ctx, out, bbq_pos(ctx));
     bbq_pop_loop_base(ctx);
     return _ok;
@@ -48,7 +48,7 @@ static bool {{ fn.kpfx }}_k{{ o.id }}(bbq_ctx_t* ctx, {{ fn.type }}* out, size_t
     BBQ_MUSTTAIL return {{ fn.kpfx }}_k{{ o.next }}(ctx, out, _struct_start);
 {% else if o.op == "invoke" %}
 {% if o.scope %}
-    bbq_push_scope(ctx, out);
+    if (!bbq_push_scope(ctx, out)) return bbq_fail(ctx, "out of memory: scope stack");
 {% endif %}
     if (!{{ kfn(o.fn) }}_read(ctx, &{{ o.target }})) return bbq_fail(ctx, "{{ o.msg }}");
 {% if o.scope %}
@@ -119,15 +119,13 @@ static bool {{ fn.kpfx }}_k{{ o.id }}(bbq_ctx_t* ctx, {{ fn.type }}* out, size_t
     { size_t _n = (size_t)({{ o.count }});
       {{ o.field }}.count = 0; {{ o.field }}.items = NULL;
       if (_n == 0) { BBQ_MUSTTAIL return {{ fn.kpfx }}_k{{ o.end }}(ctx, out, _struct_start); }
-      bbq_push_loop_n(ctx, (int64_t)_n); }
-    {{ o.field }}.items = bbq_array_grow(ctx, {{ o.field }}.items, sizeof(*{{ o.field }}.items));
-    if (!{{ o.field }}.items) return bbq_fail(ctx, "{{ o.msg }}");
+      if (!bbq_push_loop_n(ctx, (int64_t)_n)) return bbq_fail(ctx, "out of memory: loop stack"); }
+    if (!bbq_array_grow(ctx, (void**)&{{ o.field }}.items, sizeof(*{{ o.field }}.items))) return bbq_fail(ctx, "out of memory: array store");
     {{ o.field }}.count = 1;
     BBQ_MUSTTAIL return {{ fn.kpfx }}_k{{ o.body }}(ctx, out, _struct_start);
 {% else if o.op == "array_next" %}
     if (bbq_loop_next(ctx)) {
-        {{ o.field }}.items = bbq_array_grow(ctx, {{ o.field }}.items, sizeof(*{{ o.field }}.items));
-        if (!{{ o.field }}.items) return bbq_fail(ctx, "{{ o.msg }}");
+        if (!bbq_array_grow(ctx, (void**)&{{ o.field }}.items, sizeof(*{{ o.field }}.items))) return bbq_fail(ctx, "out of memory: array store");
         {{ o.field }}.count = (size_t)(bbq_loop_index(ctx) + 1);
         BBQ_MUSTTAIL return {{ fn.kpfx }}_k{{ o.body }}(ctx, out, _struct_start);
     }
@@ -136,7 +134,7 @@ static bool {{ fn.kpfx }}_k{{ o.id }}(bbq_ctx_t* ctx, {{ fn.type }}* out, size_t
 {% else if o.op == "array_begin_grow" %}
     // Uncounted (eof/until) array: grow the backing store as elements parse.
     {{ o.field }}.count = 0; {{ o.field }}.items = NULL;
-    bbq_push_loop_unbounded(ctx);
+    if (!bbq_push_loop_unbounded(ctx)) return bbq_fail(ctx, "out of memory: loop stack");
 {% if o.mode == "eof" %}
     if (bbq_pos(ctx) >= bbq_effective_end(ctx)) { bbq_pop_loop(ctx); BBQ_MUSTTAIL return {{ fn.kpfx }}_k{{ o.end }}(ctx, out, _struct_start); }
 {% else if o.mode == "until" %}
@@ -144,15 +142,13 @@ static bool {{ fn.kpfx }}_k{{ o.id }}(bbq_ctx_t* ctx, {{ fn.type }}* out, size_t
     // true at the start (cond = !(until) is the read-another guard) — what the CEK does.
     if (!({{ o.cond }})) { bbq_pop_loop(ctx); BBQ_MUSTTAIL return {{ fn.kpfx }}_k{{ o.end }}(ctx, out, _struct_start); }
 {% endif %}
-    {{ o.field }}.items = bbq_array_grow(ctx, {{ o.field }}.items, sizeof(*{{ o.field }}.items));
-    if (!{{ o.field }}.items) return bbq_fail(ctx, "{{ o.msg }}");
+    if (!bbq_array_grow(ctx, (void**)&{{ o.field }}.items, sizeof(*{{ o.field }}.items))) return bbq_fail(ctx, "out of memory: array store");
     {{ o.field }}.count = 1;
     BBQ_MUSTTAIL return {{ fn.kpfx }}_k{{ o.body }}(ctx, out, _struct_start);
 {% else if o.op == "array_next_grow" %}
     bbq_loop_advance(ctx);
     if ({{ o.cond }}) {
-        {{ o.field }}.items = bbq_array_grow(ctx, {{ o.field }}.items, sizeof(*{{ o.field }}.items));
-        if (!{{ o.field }}.items) return bbq_fail(ctx, "{{ o.msg }}");
+        if (!bbq_array_grow(ctx, (void**)&{{ o.field }}.items, sizeof(*{{ o.field }}.items))) return bbq_fail(ctx, "out of memory: array store");
         {{ o.field }}.count = (size_t)(bbq_loop_index(ctx) + 1);
         BBQ_MUSTTAIL return {{ fn.kpfx }}_k{{ o.body }}(ctx, out, _struct_start);
     }
@@ -167,9 +163,9 @@ static bool {{ fn.kpfx }}_k{{ o.id }}(bbq_ctx_t* ctx, {{ fn.type }}* out, size_t
     {{ o.field }}.items = NULL;
 {% if o.counted %}
     // The count bounds the loop only — the store grows per element, same as uncounted.
-    bbq_push_loop_n(ctx, (int64_t)({{ o.count }}));
+    if (!bbq_push_loop_n(ctx, (int64_t)({{ o.count }}))) return bbq_fail(ctx, "out of memory: loop stack");
 {% else %}
-    bbq_push_loop_unbounded(ctx);
+    if (!bbq_push_loop_unbounded(ctx)) return bbq_fail(ctx, "out of memory: loop stack");
 {% endif %}
     for (;;) {
 {% if o.counted %}
@@ -181,8 +177,7 @@ static bool {{ fn.kpfx }}_k{{ o.id }}(bbq_ctx_t* ctx, {{ fn.type }}* out, size_t
         if (bbq_pos(ctx) >= bbq_effective_end(ctx)) break;  // eof: no count contract, stop
 {% endif %}
         bbq_checkpoint_t _cp = bbq_save(ctx);
-        {{ o.field }}.items = bbq_array_grow(ctx, {{ o.field }}.items, sizeof(*{{ o.field }}.items));
-        if (!{{ o.field }}.items) return bbq_fail(ctx, "{{ o.msg }}");
+        if (!bbq_array_grow(ctx, (void**)&{{ o.field }}.items, sizeof(*{{ o.field }}.items))) return bbq_fail(ctx, "out of memory: array store");
         if ({{ fn.kpfx }}_k{{ o.body }}(ctx, out, _struct_start)) {
             {{ o.field }}.count = (size_t)(bbq_loop_index(ctx) + 1);
             bbq_loop_advance(ctx);
@@ -201,8 +196,7 @@ static bool {{ fn.kpfx }}_k{{ o.id }}(bbq_ctx_t* ctx, {{ fn.type }}* out, size_t
     // advance the counter, then compare against the freshly evaluated count.
     bbq_loop_advance(ctx);
     if (bbq_loop_index(ctx) < (int64_t)({{ o.count }})) {
-        {{ o.field }}.items = bbq_array_grow(ctx, {{ o.field }}.items, sizeof(*{{ o.field }}.items));
-        if (!{{ o.field }}.items) return bbq_fail(ctx, "{{ o.msg }}");
+        if (!bbq_array_grow(ctx, (void**)&{{ o.field }}.items, sizeof(*{{ o.field }}.items))) return bbq_fail(ctx, "out of memory: array store");
         {{ o.field }}.count = (size_t)(bbq_loop_index(ctx) + 1);
         BBQ_MUSTTAIL return {{ fn.kpfx }}_k{{ o.body }}(ctx, out, _struct_start);
     }

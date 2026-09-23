@@ -81,6 +81,14 @@ typedef struct {
     size_t length;
     size_t pos;
     bool little_endian;
+    /* Where the parse stacks — and, for the owning reader, every array store and
+     * bytes/string copy it hands out — come from. NULL = the including file's
+     * BBQ_VEC_ALLOC() (libc unless it defines one). Their size is the input's to
+     * choose, so a caller bounding a parse names its budget here (bbq_ctx_init_a). */
+    bbq_alloc* alloc;
+    /* Sticky: an owned store or leaf copy was refused (the stacks carry their own
+     * flags). The parse failed there; this says it failed for memory, not input. */
+    bool store_oom;
     /* Error */
     char error[BBQ_ERROR_LEN];
     bool has_error;
@@ -119,6 +127,13 @@ static inline void bbq_ctx_init(bbq_ctx_t* ctx, const uint8_t* data, size_t len)
     ctx->length = len;
 }
 
+/* The same, with the parse stacks drawn from `alloc` for the ctx's lifetime. */
+static inline void bbq_ctx_init_a(bbq_ctx_t* ctx, const uint8_t* data, size_t len,
+                                  bbq_alloc* alloc) {
+    bbq_ctx_init(ctx, data, len);
+    ctx->alloc = alloc;
+}
+
 /* Release the growable parse stacks (loop / scope / interval backing stores). The input
  * `data` is borrowed, so it is untouched. Safe on a zero-initialized ctx (all stacks NULL)
  * and idempotent — bbq_vec_free nulls each pointer. A bare cursor that never pushed a frame
@@ -131,6 +146,16 @@ static inline void bbq_ctx_free(bbq_ctx_t* ctx) {
     bbq_vec_free(ctx->loop_bases);
     bbq_vec_free(ctx->interval_starts);
     bbq_vec_free(ctx->interval_ends);
+}
+
+/* Was any allocation the parse needed refused — a stack's growth, or an owned
+ * store or copy? The question for a boundary that wants to know whether a failed
+ * parse failed on its input or on its memory. */
+static inline bool bbq_ctx_oom(const bbq_ctx_t* ctx) {
+    return ctx->store_oom || bbq_vec_oom(ctx->scopes) || bbq_vec_oom(ctx->loop_indices) ||
+           bbq_vec_oom(ctx->loop_limits) || bbq_vec_oom(ctx->loop_caps) ||
+           bbq_vec_oom(ctx->loop_bases) || bbq_vec_oom(ctx->interval_starts) ||
+           bbq_vec_oom(ctx->interval_ends);
 }
 
 static inline size_t bbq_pos(const bbq_ctx_t* ctx) { return ctx->pos; }
@@ -219,10 +244,17 @@ static inline void bbq_restore(bbq_ctx_t* ctx, bbq_checkpoint_t cp) {
  * An EXPRESSION, true iff the slot is now there. It has to be: this is a parser
  * running on input it did not write, and the previous statement form discarded the
  * failure and let the caller write `v[depth]` into a buffer that had not grown.
- * Deeply-nested input plus one refused allocation was an out-of-bounds heap write. */
-#define BBQ__STACK_ENSURE(v, depth) \
-    ((depth) < bbq_vec_cap(v) || \
-     bbq_vec_try_reserve(v, bbq_vec_cap(v) ? bbq_vec_cap(v) * 2 : 8))
+ * Deeply-nested input plus one refused allocation was an out-of-bounds heap write.
+ *
+ * A stack is born from its context's allocator (read and write contexts both carry
+ * one), so the budget that bounds the parse bounds its nesting too. */
+#define BBQ__CTX_ALLOC(ctx) ((ctx)->alloc ? (ctx)->alloc : BBQ_VEC_ALLOC())
+#define BBQ__STACK_ENSURE(ctx, v, depth)                                        \
+    ((depth) < bbq_vec_cap(v) || __extension__ ({                               \
+        int _sw = bbq_vec_cap(v) ? bbq_vec_cap(v) * 2 : 8;                      \
+        bbq_vec_reserve_a((v), _sw, BBQ__CTX_ALLOC(ctx));                       \
+        bbq_vec_cap(v) >= _sw;                                                  \
+    }))
 
 /* Every pusher below reports whether the value went on the stack, and leaves the
  * depth counter ALONE when it did not. That second half is what keeps an
@@ -232,7 +264,7 @@ static inline void bbq_restore(bbq_ctx_t* ctx, bbq_checkpoint_t cp) {
  * clamps. Such a caller reports success with a short stack, which is a wrong
  * answer; it no longer corrupts the heap, which was the alternative. */
 static inline bool bbq_push_scope(bbq_ctx_t* ctx, void* ptr) {
-    if (!BBQ__STACK_ENSURE(ctx->scopes, ctx->scope_depth))
+    if (!BBQ__STACK_ENSURE(ctx, ctx->scopes, ctx->scope_depth))
         return bbq_fail(ctx, "out of memory: scope stack");
     ctx->scopes[ctx->scope_depth++] = ptr;
     return true;
@@ -253,9 +285,9 @@ static inline void* bbq_scope_ptr(const bbq_ctx_t* ctx, int levels_up) {
  * half-pushed frame, and every reader of a loop frame assumes the three are in
  * lockstep. */
 static inline bool bbq__loop_ensure(bbq_ctx_t* ctx) {
-    return BBQ__STACK_ENSURE(ctx->loop_indices, ctx->loop_depth)
-        && BBQ__STACK_ENSURE(ctx->loop_limits,  ctx->loop_depth)
-        && BBQ__STACK_ENSURE(ctx->loop_caps,    ctx->loop_depth);
+    return BBQ__STACK_ENSURE(ctx, ctx->loop_indices, ctx->loop_depth)
+        && BBQ__STACK_ENSURE(ctx, ctx->loop_limits,  ctx->loop_depth)
+        && BBQ__STACK_ENSURE(ctx, ctx->loop_caps,    ctx->loop_depth);
 }
 static inline bool bbq_push_loop(bbq_ctx_t* ctx) {
     if (!bbq__loop_ensure(ctx)) return bbq_fail(ctx, "out of memory: loop stack");
@@ -331,7 +363,7 @@ static inline int64_t bbq_loop_index_at(const bbq_ctx_t* ctx, int depth) {
 // Per-rule loop base (loop_depth at the rule's entry). Pushed at each invoke; the
 // top rule's base is 0 (empty stack). Array slots index by base + nesting level.
 static inline bool bbq_push_loop_base(bbq_ctx_t* ctx, int base) {
-    if (!BBQ__STACK_ENSURE(ctx->loop_bases, ctx->loop_base_depth))
+    if (!BBQ__STACK_ENSURE(ctx, ctx->loop_bases, ctx->loop_base_depth))
         return bbq_fail(ctx, "out of memory: loop-base stack");
     ctx->loop_bases[ctx->loop_base_depth++] = base;
     return true;
@@ -362,8 +394,8 @@ static inline bool bbq_push_interval_checked(bbq_ctx_t* ctx, size_t end) {
      * formed (start <= end). Mirrors the CEK's PushIntervalApplyKont. */
     if (start > end || start < bbq_effective_start(ctx) || end > bbq_effective_end(ctx))
         return bbq_fail(ctx, "interval out of range");
-    if (!BBQ__STACK_ENSURE(ctx->interval_starts, ctx->interval_depth) ||
-        !BBQ__STACK_ENSURE(ctx->interval_ends,   ctx->interval_depth))
+    if (!BBQ__STACK_ENSURE(ctx, ctx->interval_starts, ctx->interval_depth) ||
+        !BBQ__STACK_ENSURE(ctx, ctx->interval_ends,   ctx->interval_depth))
         return bbq_fail(ctx, "out of memory: interval stack");
     ctx->interval_starts[ctx->interval_depth] = start;
     ctx->interval_ends[ctx->interval_depth] = end;

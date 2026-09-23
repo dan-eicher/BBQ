@@ -33,6 +33,15 @@ static double rd_f64be(const uint8_t* b, size_t o) { uint64_t r = rd_u64be(b, o)
 
 /* ── builder internals ── */
 
+/* The builder is sticky, like the containers under it: once one of its vectors has
+ * refused, it stops building. What it holds is then short and bbq_view_finish fails
+ * the parse — but the parse runs on until it gets there, searching this builder by
+ * name as it goes, so nothing recorded in the meantime may point past what was
+ * actually stored. */
+static bool builder_refused(const bbq_capture_builder* b) {
+    return bbq_vec_oom(b->fields) || bbq_vec_oom(b->scopes) || bbq_vec_oom(b->child_buf);
+}
+
 static int take_pending(bbq_capture_builder* b) {
     int t = b->pending_variant_tag;
     b->pending_variant_tag = -1;
@@ -42,6 +51,7 @@ static int take_pending(bbq_capture_builder* b) {
 static void begin_scope(bbq_capture_builder* b, const char* name, size_t pos,
                         bbq_capture_type type, int variant_tag) {
     int tag = (variant_tag != -1) ? variant_tag : take_pending(b);
+    if (builder_refused(b)) return;
     bbq_capture_scope s;
     s.name = name; s.start_pos = pos; s.first_child_index = bbq_vec_len(b->fields);
     s.type = type; s.variant_tag = tag;
@@ -49,6 +59,9 @@ static void begin_scope(bbq_capture_builder* b, const char* name, size_t pos,
 }
 
 static void end_scope(bbq_capture_builder* b, size_t pos) {
+    /* A refused begin never pushed its scope, so there is nothing of this scope's
+     * to close — and the one on top belongs to someone else. */
+    if (builder_refused(b) || bbq_vec_len(b->scopes) == 0) return;
     bbq_capture_scope scope = bbq_vec_last(b->scopes);
     int first = scope.first_child_index;
     int count = bbq_vec_len(b->fields) - first;
@@ -68,6 +81,8 @@ static void end_scope(bbq_capture_builder* b, size_t pos) {
         int buf_start = bbq_vec_len(b->child_buf);
         for (int i = first; i < bbq_vec_len(b->fields); i++)
             bbq_vec_push(b->child_buf, b->fields[i]);
+        /* A short copy: `count` children at buf_start would run off the end. */
+        if (bbq_vec_oom(b->child_buf)) return;
         fc.build_buf_index = buf_start;
     }
     bbq_vec_truncate(b->fields, first);
@@ -77,6 +92,7 @@ static void end_scope(bbq_capture_builder* b, size_t pos) {
 
 static void add_computed_span(bbq_capture_builder* b, const char* name,
                               bbq_computed_value* cv, size_t start, size_t end) {
+    if (builder_refused(b)) return;
     bbq_field_capture fc;
     fc.name = name; fc.start_offset = start; fc.end_offset = end;
     fc.type = BBQ_CT_Computed; fc.children = NULL; fc.child_count = 0;
@@ -100,6 +116,7 @@ void bbq_cap_begin_variant(bbq_capture_builder* b, const char* name, size_t pos,
 
 void bbq_cap_add_field(bbq_capture_builder* b, const char* name, size_t start,
                        size_t end, bbq_capture_type type, bbq_computed_value* cv) {
+    if (builder_refused(b)) return;
     bbq_field_capture fc;
     fc.name = name; fc.start_offset = start; fc.end_offset = end; fc.type = type;
     fc.children = NULL; fc.child_count = 0; fc.build_buf_index = -1;
@@ -188,11 +205,20 @@ void bbq_view_restore(bbq_view_ctx_t* c, bbq_view_checkpoint_t cp) {
 
 /* ── view ctx lifecycle ── */
 
+/* Everything a parse builds grows with the input — the capture list and child
+ * buffer with how many fields there are, the scope and cursor stacks with how
+ * deeply they nest — so all of it is born from the allocator the caller's arena
+ * was. One budget on that arena then bounds the whole parse, not just the index
+ * it leaves behind. A refused birth poisons the vector; bbq_view_finish reports
+ * it. */
 void bbq_view_ctx_init(bbq_view_ctx_t* c, const uint8_t* data, size_t len, bbq_arena* arena) {
-    bbq_ctx_init(&c->cur, data, len);
+    bbq_ctx_init_a(&c->cur, data, len, arena->a);
     c->builder.fields = NULL;
     c->builder.scopes = NULL;
     c->builder.child_buf = NULL;
+    bbq_vec_reserve_a(c->builder.fields, 16, arena->a);
+    bbq_vec_reserve_a(c->builder.scopes, 8, arena->a);
+    bbq_vec_reserve_a(c->builder.child_buf, 16, arena->a);
     c->builder.pending_variant_tag = -1;
     c->builder.arena = arena;   /* caller-owned; outlives the returned metadata */
 }
@@ -219,9 +245,13 @@ bbq_capture_metadata bbq_view_finish(bbq_view_ctx_t* c, bool ok) {
     }
     meta.error_offset = c->cur.pos;
     meta.root = NULL;
+    meta.oom = false;
 
+    /* Asked before anything is copied: a refused builder's field list is short, and
+     * resolving it would only spend the arena on a tree that is not the input's. */
+    bool refused = builder_refused(b) || bbq_ctx_oom(&c->cur);
     int n = bbq_vec_len(b->fields);
-    if (n > 0) {
+    if (!refused && n > 0) {
         bbq_field_capture* top = copy_to_arena(b, b->fields, n);
         bbq_field_capture* root = (bbq_field_capture*)bbq_arena_alloc(b->arena, sizeof(bbq_field_capture));
         if (root) {
@@ -241,10 +271,12 @@ bbq_capture_metadata bbq_view_finish(bbq_view_ctx_t* c, bool ok) {
      * still recorded: on the arena for the nodes, on the builder's own vectors
      * for the fields that never made it in. A tree missing part of what was read
      * is not a successful parse, whatever the grammar said — and it is the
-     * dangerous shape, because a short field list still looks well-formed. */
-    if (bbq_arena_oom(b->arena) || bbq_vec_oom(b->fields) ||
-        bbq_vec_oom(b->scopes) || bbq_vec_oom(b->child_buf)) {
+     * dangerous shape, because a short field list still looks well-formed. The
+     * cursor's stacks count too: a loop frame that was refused leaves the parse
+     * counting against a different frame, which is a different tree. */
+    if (refused || bbq_arena_oom(b->arena)) {
         meta.success = false;
+        meta.oom     = true;
         meta.root    = NULL;
         if (!meta.error_message) meta.error_message = "out of memory: capture builder";
     }

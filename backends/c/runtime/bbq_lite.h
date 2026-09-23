@@ -66,6 +66,11 @@ typedef struct {
     bbq_field_capture* root;
     const char* error_message;
     size_t error_offset;
+    /* The parse failed because an allocation was refused — the arena, the
+     * builder's vectors or the cursor's stacks — not because of the input.
+     * The two want different answers: a malformed input is rejected, a
+     * refused one may be retried with a larger budget. */
+    bool oom;
 } bbq_capture_metadata;
 
 /* Build-phase scope frame (open struct/array/variant). */

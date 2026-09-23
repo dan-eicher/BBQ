@@ -13,7 +13,7 @@ static bool {{ fn.kpfx }}_w{{ o.id }}(bbq_write_ctx_t* ctx, const {{ fn.type }}*
 {% for fn in functions %}
 bool {{ fn.name }}(bbq_write_ctx_t* ctx, const {{ fn.type }}* in) {
     if (!ctx->endian_seeded) { ctx->little_endian = {% if default_le %}true{% else %}false{% endif %}; ctx->endian_seeded = true; }
-    bbq_w_push_loop_base(ctx, bbq_w_loop_depth(ctx));
+    if (!bbq_w_push_loop_base(ctx, bbq_w_loop_depth(ctx))) return false;
     bool _ok = {{ fn.kpfx }}_w{{ fn.entry }}(ctx, in);
     bbq_w_pop_loop_base(ctx);
     return _ok;
@@ -25,7 +25,7 @@ static bool {{ fn.kpfx }}_w{{ o.id }}(bbq_write_ctx_t* ctx, const {{ fn.type }}*
     (void)ctx; (void)in;
 {% if o.op == "read" %}
 {% if existsIn(o, "rest_reserve") %}
-    bbq_w_push_rest(ctx);  // @rest size: computed from the rest's bytes at pop, not stored
+    if (!bbq_w_push_rest(ctx)) return false;  // @rest size: computed from the rest's bytes at pop, not stored
 {% else if existsIn(o, "count_reserve") %}
     if (!bbq_w_reserve_count(ctx, {{ o.count_id }}, {{ o.prim.w }}, {% if o.prim.enc == "uleb" %}true{% else %}false{% endif %})) return false;  // count: array length, not stored
 {% else %}
@@ -47,7 +47,7 @@ static bool {{ fn.kpfx }}_w{{ o.id }}(bbq_write_ctx_t* ctx, const {{ fn.type }}*
     BBQ_MUSTTAIL return {{ fn.kpfx }}_w{{ o.next }}(ctx, in);
 {% else if o.op == "invoke" %}
 {% if o.scope %}
-    bbq_w_push_scope(ctx, in);
+    if (!bbq_w_push_scope(ctx, in)) return false;
 {% endif %}
     if (!{{ kfn(o.fn) }}_write(ctx, &{{ o.target }})) return false;
 {% if o.scope %}
@@ -128,7 +128,7 @@ static bool {{ fn.kpfx }}_w{{ o.id }}(bbq_write_ctx_t* ctx, const {{ fn.type }}*
 {% endif %}
     { size_t _n = (size_t)({{ o.field }}.count);
       if (_n == 0) { BBQ_MUSTTAIL return {{ fn.kpfx }}_w{{ o.end }}(ctx, in); }
-      bbq_w_push_loop_n(ctx, (int64_t)_n); }
+      if (!bbq_w_push_loop_n(ctx, (int64_t)_n)) return false; }
     BBQ_MUSTTAIL return {{ fn.kpfx }}_w{{ o.body }}(ctx, in);
 {% else if o.op == "array_next" or o.op == "array_next_grow" or o.op == "array_next_count" %}
     if (bbq_w_loop_next(ctx)) { BBQ_MUSTTAIL return {{ fn.kpfx }}_w{{ o.body }}(ctx, in); }
@@ -146,7 +146,7 @@ static bool {{ fn.kpfx }}_w{{ o.id }}(bbq_write_ctx_t* ctx, const {{ fn.type }}*
     if (!bbq_w_patch_count(ctx, {{ o.count_id }}, (uint64_t)({{ o.field }}.count), {{ o.count_prim.w }}, {% if o.count_prim.enc == "uleb" %}true{% else %}false{% endif %}, {% if o.count_prim.be %}false{% else %}true{% endif %})) return false;
 {% endif %}
     { size_t _n = (size_t)({{ o.field }}.count);
-      bbq_w_push_loop_n(ctx, (int64_t)_n);
+      if (!bbq_w_push_loop_n(ctx, (int64_t)_n)) return false;
       for (size_t _i = 0; _i < _n; _i++) {
           if (!{{ fn.kpfx }}_w{{ o.body }}(ctx, in)) { bbq_w_pop_loop(ctx); return false; }
           bbq_w_loop_next(ctx);

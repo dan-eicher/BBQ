@@ -279,7 +279,7 @@ int main(int argc, char** argv) {
     assert(wctx.pos == (size_t)sz);
     assert(memcmp(buf, out, sz) == 0);
 
-    free(list.items.items);
+    bbq_owned_free(list.items.items);
     printf("OK: array round-trip (%ld bytes)\n", sz);
     return 0;
 }
@@ -333,7 +333,7 @@ int main(int argc, char** argv) {
     assert(wctx.pos == (size_t)sz);   // a fixed-width count would overshoot by 3 bytes
     assert(memcmp(buf, out, sz) == 0);
 
-    free(list.items.items);
+    bbq_owned_free(list.items.items);
     bbq_ctx_free(&ctx);
     bbq_write_ctx_free(&wctx);
     printf("OK: uleb count array round-trip (%ld bytes)\n", sz);
@@ -906,6 +906,189 @@ int main(int argc, char** argv) {
     uint8_t data[] = {0};
     std::string err;
     ASSERT_TRUE(run_c_e2e(spec, harness, data, 0, &err)) << err;
+}
+
+// ── A growable write buffer refuses a size it cannot represent ──
+// `pos + need` past SIZE_MAX used to wrap into a small number that passed the room
+// check (and the write went wherever that pointed); a target above SIZE_MAX/2 used
+// to double the capacity through zero and never stop. Both are refusals now — the
+// budget turns the second one's huge request into a deterministic no.
+TEST(CBackendE2E, GrowableWriterRefusesRatherThanWraps) {
+    const char* spec =
+        "@endian big\n"
+        "Hdr = struct { a: uint32be, b: uint32be }";
+
+    const char* harness = R"(
+#include "testWriter.h"
+#include <stdio.h>
+#include <stdint.h>
+#include <assert.h>
+
+int main(int argc, char** argv) {
+    (void)argc; (void)argv;
+    bbq_budget b; bbq_budget_init(&b, 1u << 20, NULL);
+    bbq_write_ctx_t w;
+    assert(bbq_write_ctx_init_growable_a(&w, 64, bbq_budget_handle(&b)));
+    size_t real_pos = w.pos;
+
+    w.pos = SIZE_MAX - 2;                 /* pos + 8 is unrepresentable */
+    assert(!bbq_write_reserve(&w, 8));
+    w.pos = SIZE_MAX / 2 + 10;            /* reachable only by doubling through zero */
+    assert(!bbq_write_reserve(&w, 1));
+    assert(b.denials == 1);               /* the second one was asked for, and refused */
+
+    w.pos = real_pos;
+    hdr_t hdr = { .a = 1, .b = 2 };
+    assert(hdr_write(&w, &hdr));          /* still usable: nothing was changed */
+    bbq_write_ctx_free(&w);
+    assert(b.used == 0);
+    printf("OK\n");
+    return 0;
+}
+)";
+
+    uint8_t data[] = {0};
+    std::string err;
+    ASSERT_TRUE(run_c_e2e(spec, harness, data, 0, &err)) << err;
+}
+
+// ── A growable writer under every ceiling ──
+// The buffer and the dual-state stacks both come from the ctx's allocator, so one
+// budget bounds the write. Under each ceiling the write either succeeds with the
+// unbounded bytes or reports failure — and in both cases gives back all it took.
+TEST(CBackendE2E, GrowableWriterUnderACeiling) {
+    const char* spec =
+        "@endian big\n"
+        "Item = struct { v: uint16be }\n"
+        "List = struct { n: uint8, items: array<Item>[n], tail: uint32be }";
+
+    const char* harness = R"(
+#include "testWriter.h"
+#include <stdio.h>
+#include <string.h>
+#include <assert.h>
+
+int main(int argc, char** argv) {
+    (void)argc; (void)argv;
+    item_t items[40];
+    for (int i = 0; i < 40; i++) items[i].v = (uint16_t)(i * 7);
+    list_t l = { .n = 40, .items = { .items = items, .count = 40 }, .tail = 0xCAFEF00D };
+
+    bbq_budget ub; bbq_budget_init(&ub, SIZE_MAX, NULL);
+    bbq_write_ctx_t w;
+    assert(bbq_write_ctx_init_growable_a(&w, 8, bbq_budget_handle(&ub)));
+    assert(list_write(&w, &l));
+    uint8_t full[256]; size_t fl = w.pos; assert(fl <= sizeof full);
+    memcpy(full, w.data, fl);
+    bbq_write_ctx_free(&w);
+    size_t peak = ub.peak;
+
+    int refused = 0, took = 0;
+    for (size_t c = 0; c <= peak + 8; c++) {
+        bbq_budget b; bbq_budget_init(&b, c, NULL);
+        if (bbq_write_ctx_init_growable_a(&w, 8, bbq_budget_handle(&b)) && list_write(&w, &l)) {
+            assert(w.pos == fl && memcmp(w.data, full, fl) == 0);
+            took++;
+        } else {
+            refused++;
+        }
+        bbq_write_ctx_free(&w);
+        assert(b.used == 0);
+    }
+    assert(refused > 0 && took > 0);
+    printf("OK %d refused %d took\n", refused, took);
+    return 0;
+}
+)";
+
+    uint8_t data[] = {0};
+    std::string err;
+    ASSERT_TRUE(run_c_e2e(spec, harness, data, 0, &err)) << err;
+}
+
+// ── The owning reader under a refusing allocator ──
+//
+// Every block the owning reader hands out — array stores (grown, nested),
+// bytes and string copies — comes from the reader context's allocator. Each
+// allocation of a whole read is refused in turn, sticky and once: a refused
+// read fails and says it was memory (bbq_ctx_oom), its _free gives back
+// everything it took, and an unrefused read is the unbounded one. An
+// allocator that grants nothing yields no storage at all, which is what
+// shows nothing came from libc.
+TEST(CBackendE2E, OwningReaderUnderRefusal) {
+    const char* spec =
+        "@endian big\n"
+        "Word = struct { len: uint8, text: string[len] }\n"
+        "Row = struct { n: uint8, words: array<Word>[n], blen: uint8, blob: bytes[blen] }\n"
+        "Doc = struct { rows: uint8, items: array<Row>[rows] }";
+
+    const char* harness = R"(
+#include "testReader.h"
+#include <stdio.h>
+#include <string.h>
+#include <assert.h>
+
+static int read_under(const uint8_t* in, size_t n, bbq_alloc* a, doc_t* d,
+                      bool* oom) {
+    bbq_ctx_t c;
+    bbq_ctx_init_a(&c, in, n, a);
+    memset(d, 0, sizeof *d);
+    int ok = doc_read(&c, d);
+    *oom = bbq_ctx_oom(&c);
+    bbq_ctx_free(&c);
+    return ok;
+}
+
+int main(int argc, char** argv) {
+    (void)argc;
+    FILE* f = fopen(argv[1], "rb");
+    uint8_t in[512]; size_t n = fread(in, 1, sizeof in, f); fclose(f);
+
+    bbq_budget base_b; bbq_budget_init(&base_b, SIZE_MAX, NULL);
+    bbq_faulty base_f; bbq_faulty_init(&base_f, 0, 0, bbq_budget_handle(&base_b));
+    doc_t want; bool oom;
+    assert(read_under(in, n, bbq_faulty_handle(&base_f), &want, &oom) && !oom);
+    size_t served = base_f.served;
+    assert(served > 8);
+
+    int refused = 0;
+    for (int once = 0; once <= 1; once++) {
+        for (size_t k = 1; k <= served; k++) {
+            bbq_budget b; bbq_budget_init(&b, SIZE_MAX, NULL);
+            bbq_faulty fl; bbq_faulty_init(&fl, k, once, bbq_budget_handle(&b));
+            doc_t got;
+            int ok = read_under(in, n, bbq_faulty_handle(&fl), &got, &oom);
+            assert(!ok && oom);
+            doc_free(&got);
+            assert(b.used == 0);
+            refused++;
+        }
+    }
+
+    bbq_budget none; bbq_budget_init(&none, 0, NULL);
+    doc_t empty;
+    assert(!read_under(in, n, bbq_budget_handle(&none), &empty, &oom) && oom);
+    doc_free(&empty);
+    assert(none.used == 0 && none.peak == 0);
+
+    assert(want.rows == 2 && want.items.count == 2);
+    assert(want.items.items[1].words.count == 3);
+    assert(strcmp(want.items.items[1].words.items[2].text.data, "xyz") == 0);
+    assert(want.items.items[0].blob.length == 2);
+    doc_free(&want);
+    assert(base_b.used == 0);
+    printf("OK %d refusals over %zu allocations\n", refused, served);
+    return 0;
+}
+)";
+
+    uint8_t data[] = {
+        2,                                  // rows
+        1, 2, 'h', 'i', 2, 0xAA, 0xBB,      // row 0: one word "hi", blob AA BB
+        3, 1, 'a', 2, 'b', 'c', 3, 'x', 'y', 'z', 0,   // row 1: a, bc, xyz; no blob
+    };
+    std::string err;
+    ASSERT_TRUE(run_c_e2e(spec, harness, data, sizeof(data), &err)) << err;
 }
 
 // ── Empty array ──

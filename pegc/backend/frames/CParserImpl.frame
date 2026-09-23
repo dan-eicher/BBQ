@@ -13,6 +13,11 @@ PEG_INTERNAL void peg_init(peg_state* p, const char* input, int length) {
     p->col = 1;
 }
 
+/* ── Halt ────────────────────────────────────────────────── */
+
+PEG_INTERNAL void peg_halt(peg_state* p) { p->halted = true; }
+PEG_INTERNAL bool peg_halted(const peg_state* p) { return p->halted; }
+
 /* ── Position ────────────────────────────────────────────── */
 
 PEG_INTERNAL int peg_line(const peg_state* p) { return p->line; }
@@ -52,6 +57,7 @@ PEG_INTERNAL void peg_restore(peg_state* p, peg_mark m) {
 /* ── Character matching ──────────────────────────────────── */
 
 PEG_INTERNAL bool peg_match_char(peg_state* p, char c) {
+    if (p->halted) return false;
     if (p->pos < p->end && *p->pos == c) {
         peg_advance(p);
         return true;
@@ -64,7 +70,7 @@ PEG_INTERNAL bool peg_match_char(peg_state* p, char c) {
  * calls compiling one real corpus), and the C compiler folds the fixed-size
  * memcmp of a short literal into direct byte compares. */
 PEG_INTERNAL bool peg_match_n(peg_state* p, const char* str, int len) {
-    if (p->pos + len > p->end) return false;
+    if (p->halted || p->pos + len > p->end) return false;
     if (memcmp(p->pos, str, (size_t)len) != 0) return false;
     for (int i = 0; i < len; i++) peg_advance(p);
     return true;
@@ -75,6 +81,7 @@ PEG_INTERNAL bool peg_match(peg_state* p, const char* str) {
 }
 
 PEG_INTERNAL bool peg_match_charset(peg_state* p, bool (*fn)(char)) {
+    if (p->halted) return false;
     if (p->pos < p->end && fn(*p->pos)) {
         peg_advance(p);
         return true;
@@ -115,6 +122,7 @@ PEG_INTERNAL void peg_span_chars(peg_state* p, bool (*fn)(char)) {
    where C source legitimately contains the close marker in `//`
    comment text. */
 PEG_INTERNAL bool peg_scan_to(peg_state* p, const char* delim, peg_span* out) {
+    if (p->halted) return false;
     int dlen = (int)strlen(delim);
     const char* start = p->pos;
     while (p->pos + dlen <= p->end) {

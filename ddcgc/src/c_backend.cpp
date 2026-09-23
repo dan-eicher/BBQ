@@ -649,6 +649,19 @@ void CBackend::emit_helpers_block() {
               << "    if (b.oom) a.oom = 1;   /* a short input makes a short result */\n"
               << "    return a;\n"
               << "}\n\n";
+        // Indexing reads through here. Every index a rule computes from
+        // the list it indexes is in range by construction, but one taken
+        // from ANOTHER list — or from sema — is only in range while both
+        // are whole, and a list that ran short under a refusal is not.
+        // Out of range reads the element type's zero rather than past
+        // the storage.
+        out() << "static inline " << elem << " " << fn_prefix
+              << "_at(" << t << " a, int i) {\n"
+              << "    " << elem << " z;\n"
+              << "    if (i >= 0 && i < a.count) return a.data[i];\n"
+              << "    memset(&z, 0, sizeof z);\n"
+              << "    return z;\n"
+              << "}\n\n";
         out() << "static inline " << t << " " << fn_prefix
               << "_from_arr(bbq_arena* arena, " << elem << "* arr, int n) {\n"
               << "    " << t << " r = {0}; r.arena = arena;\n"
@@ -1122,17 +1135,26 @@ bool CBackend::emit_seq_field_acc(DdcgAst::FieldAccExpr* fa) {
 }
 
 void CBackend::emit_index_acc(DdcgAst::IndexAccExpr* ix) {
-    // C list types are structs (data ptr + count); emit `.data[i]`
-    // when the base is list-typed. Fall back to plain operator[]
-    // for anything else (raw arrays, pointers).
+    // C list types are structs (data ptr + count); a list-typed base
+    // reads through the list's checked `_at`. Fall back to plain
+    // operator[] for anything else (raw arrays, pointers).
     auto it = check_->expr_types.find(ix->base);
     bool is_list = (it != check_->expr_types.end() &&
-                    it->second.kind == TypeKind::List);
+                    it->second.kind == TypeKind::List &&
+                    !it->second.elems.empty());
+    if (is_list) {
+        out() << compiler_prefix() << "_list_"
+              << sanitize_for_suffix(c_for_type(it->second.elems[0]))
+              << "_at(";
+        emit_expr(ix->base);
+        out() << ", ";
+        emit_expr(ix->index);
+        out() << ")";
+        return;
+    }
     out() << "(";
     emit_expr(ix->base);
-    out() << ")";
-    if (is_list) out() << ".data";
-    out() << "[";
+    out() << ")[";
     emit_expr(ix->index);
     out() << "]";
 }
@@ -1606,6 +1628,19 @@ void CBackend::emit_dispatcher(const std::string& sum_name) {
              << "(void)Lnext;\n";
     if (!env_dest_name_.empty()) {
         indent() << "(void)" << env_dest_name_ << ";\n";
+    }
+    // Optional consumer hook: if the .ddcg declares an AUX named
+    // `refused : () -> bool`, every dispatcher asks it first and walks
+    // nothing once it says yes. An allocation a rule needed was refused
+    // somewhere below, so the term under construction is already not
+    // the program's; walking on would only reach more code over short
+    // lists and NULL nodes. The dispatcher answers the ir_root zero and
+    // the rules above it unwind — the consumer reports the refusal.
+    for (auto* a : file_->auxiliaries) {
+        if (a->name != "refused") continue;
+        indent() << "if (" << compiler_prefix() << "_refused(ctx)) return "
+                 << c_zero_for(ir_root_type_) << ";\n";
+        break;
     }
     indent() << "ctx->current_loc = node->loc;\n";
 

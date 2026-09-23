@@ -105,6 +105,12 @@ typedef struct {
 
     peg_mark furthest;
 
+    /* Set by peg_halt, from a semantic action that cannot go on — its
+     * allocator refused, say. From then every match fails and no action
+     * runs, so the parse unwinds without building on what came back
+     * short. The caller asks whoever halted it why. */
+    bool halted;
+
     void* user_data;
 } peg_state;
 

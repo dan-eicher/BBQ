@@ -52,6 +52,15 @@ AUXILIARIES
   // `add` / `sym` rules would run on top of their guarded siblings.
   on_dispatch_result : (int) -> int
 
+  // Optional consumer hook: every dispatcher asks it first and walks
+  // nothing once it says yes — the latch a consumer whose allocator
+  // refused mid-walk needs, so no rule runs over what came back short.
+  refused : () -> bool
+
+  // Logs a value read through an index outside its list, which the
+  // C backend answers with the element type's zero.
+  note_past_end : (int) -> int
+
 PREDICATES
   is_zero       : (int) -> bool
   is_short_name : (string) -> bool
@@ -66,6 +75,7 @@ MEMBERS (.
     bbq_arena* arena;
     SourceLoc current_loc;
     int next_label;
+    int refuse;
     const char* trace_entries[256];
     int trace_count;
 .)
@@ -164,10 +174,13 @@ fun describe_rho(r : rho) -> int {
 //   - FieldAccExpr on a Dest value (`r2.depth`)
 //   - BoolLit (`true` literal arg)
 //   - TupleLit (`(a, b)` constructor)
+//   - IndexAccExpr outside the list, on both sides
 fun feature_demo(r : rho, x : int) -> int {
     let neg  = -x;
     let xs   = [x, neg];
     let head = xs[0];
+    let _    = note_past_end(xs[2]);
+    let _    = note_past_end(xs[0 - 1]);
     let r2   = r with depth := 1;
     let _    = bool_demo(true);
     let _    = tup_sum((head, neg));

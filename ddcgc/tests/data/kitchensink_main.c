@@ -112,6 +112,15 @@ int kitchensink_on_dispatch_result(kitchensink_ctx_t* ctx, int v) {
     return v;
 }
 
+bool kitchensink_refused(kitchensink_ctx_t* ctx) {
+    return ctx->refuse != 0;
+}
+
+int kitchensink_note_past_end(kitchensink_ctx_t* ctx, int v) {
+    trace_push(ctx, trace_fmt(ctx, "past_end:%d", v));
+    return v;
+}
+
 bool kitchensink_is_zero(kitchensink_ctx_t* ctx, int n) {
     (void)ctx; return n == 0;
 }
@@ -324,6 +333,23 @@ int main(void) {
         rc = 1;
     }
 
+    /* Both out-of-range reads in feature_demo come back as int's zero,
+     * and nothing else reaches note_past_end. */
+    int past_end = 0;
+    for (int i = 0; i < ctx.trace_count; ++i) {
+        if (strncmp(ctx.trace_entries[i], "past_end:", 9) != 0) continue;
+        past_end++;
+        if (strcmp(ctx.trace_entries[i], "past_end:0") != 0) {
+            fprintf(stderr, "FAIL: index past the end read %s, not zero\n",
+                    ctx.trace_entries[i]);
+            rc = 1;
+        }
+    }
+    if (past_end == 0) {
+        fprintf(stderr, "FAIL: the past-the-end reads never ran\n");
+        rc = 1;
+    }
+
     if (rc) {
         dump_trace(&ctx);
     } else {
@@ -338,6 +364,22 @@ int main(void) {
                    kActionMarkers[i].marker, kActionMarkers[i].desc);
         }
         printf("result=%d, trace=%d entries\n", result, ctx.trace_count);
+    }
+
+    /* Refused: the dispatcher returns ir_root's zero before any rule,
+     * the dispatch hook included, runs. */
+    if (rc == 0) {
+        kitchensink_ctx_t rctx = {0};
+        rctx.arena = &arena;
+        rctx.refuse = 1;
+        int refused = kitchensink_compile_expr(&rctx, root, rho, ac(&rctx),
+                                               fail(&rctx), 0);
+        if (refused != 0 || rctx.trace_count != 0) {
+            fprintf(stderr, "FAIL: a refused walk returned %d after %d trace "
+                    "entries\n", refused, rctx.trace_count);
+            dump_trace(&rctx);
+            rc = 1;
+        }
     }
 
     bbq_arena_free(&arena);

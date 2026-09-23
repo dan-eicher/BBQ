@@ -313,7 +313,11 @@ void cg_rule_call(Ctx* ctx, RuleCall* rc, std::ostream& out, int indent) {
 }
 
 // ── Action: (. code .) ─────────────────────────────────────
+// No action runs on a halted parse: the one that halted it did so because
+// what it built came back short, and an action after it would build on
+// that.
 void cg_action(Ctx* ctx, Action* act, std::ostream& out, int indent) {
+    out << indent_str(indent) << "if (p->halted) " << ctx->fail << ";\n";
     out << indent_str(indent) << act->code << "\n";
 }
 

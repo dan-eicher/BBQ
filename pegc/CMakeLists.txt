@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(pegc LANGUAGES CXX)
+project(pegc LANGUAGES C CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
@@ -94,3 +94,26 @@ target_link_libraries(pegc_tests PRIVATE pegc_backend GTest::GTest GTest::Main)
 target_compile_definitions(pegc_tests PRIVATE
     SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
 add_test(NAME pegc_tests COMMAND pegc_tests)
+
+# C backend e2e: the halt contract. The only other consumer of -lang c
+# output is outside this tree, so the contract is pinned here.
+set(PEGC_HALT_OUT ${CMAKE_CURRENT_BINARY_DIR}/halt_gen)
+add_custom_command(
+    OUTPUT ${PEGC_HALT_OUT}/halt_parser.h ${PEGC_HALT_OUT}/halt_parser.c
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${PEGC_HALT_OUT}
+    COMMAND pegc ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/halt.peg -lang c
+                 -frames ${CMAKE_CURRENT_SOURCE_DIR}/backend/frames
+                 -o ${PEGC_HALT_OUT}/
+    DEPENDS pegc ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/halt.peg
+            ${CMAKE_CURRENT_SOURCE_DIR}/backend/frames/CParserImpl.frame
+    COMMENT "Running pegc -lang c on tests/data/halt.peg"
+    VERBATIM)
+add_executable(pegc_halt_c_e2e
+    tests/data/halt_main.c
+    ${PEGC_HALT_OUT}/halt_parser.c)
+set_target_properties(pegc_halt_c_e2e PROPERTIES
+    LINKER_LANGUAGE C C_STANDARD 11 C_STANDARD_REQUIRED ON)
+target_compile_options(pegc_halt_c_e2e PRIVATE -Wall -Wextra -Werror)
+target_include_directories(pegc_halt_c_e2e PRIVATE
+    ${PEGC_HALT_OUT} ${CMAKE_CURRENT_SOURCE_DIR}/runtime)
+add_test(NAME pegc_halt_c_e2e COMMAND pegc_halt_c_e2e)

@@ -1,0 +1,36 @@
+// halt.peg — the C backend's halt contract, end to end.
+//
+// Every action records that it ran; the one whose id the driver names
+// halts the parse. After that no action may run and the parse must
+// fail — the shape a grammar whose AST constructors draw from a
+// refusing allocator relies on.
+
+COMPILER Halt
+
+(.
+typedef struct {
+    int ran[16];
+    int nran;
+    int halt_at;
+} halt_ctx_t;
+
+#define HC ((halt_ctx_t*)p->user_data)
+#define NOTE(id) do {                                                  \
+        if (HC->nran < 16) HC->ran[HC->nran++] = (id);                 \
+        if ((id) == HC->halt_at) peg_halt(p);                          \
+    } while (0)
+
+static inline void report_parse_error(peg_state* p) { (void)p; }
+.)
+
+IGNORE ' '
+
+PRODUCTIONS
+
+Halt = Item { Item } (. NOTE(99); .) .
+
+Item = "x" (. NOTE(1); .)
+     | "y" (. NOTE(2); .)
+     .
+
+END Halt.

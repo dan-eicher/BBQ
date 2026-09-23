@@ -39,6 +39,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "bbq_alloc.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -49,11 +51,23 @@ typedef int eg_id;
 
 typedef struct egraph egraph;
 
+/* Every allocation the graph makes — its vectors, its hashcons, its
+ * analysis facts, and extraction's plans and results — comes from `a`
+ * (NULL = libc), captured here and used until eg_free. eg_init is
+ * eg_init_a(g, NULL). */
 void eg_init(egraph* g);
+void eg_init_a(egraph* g, bbq_alloc* a);
 void eg_free(egraph* g);
 
 /* Intern `op[data](kids[0..nkids))` and return its e-class. Building the
  * same term twice returns the same class and adds no node.
+ *
+ * -1 once the graph is out of memory (eg_oom), or when a kid is not a class
+ * this graph handed out. -1 is accepted everywhere a class id is: eg_find
+ * returns it unchanged, eg_class_data answers NULL, eg_merge answers false,
+ * and the class accessors report no nodes — so a matcher that feeds one
+ * add's result into the next needs no check of its own, and the caller asks
+ * eg_oom once at the end.
  *
  * `data` distinguishes leaves that share an operator: two locals differ by
  * slot, two constants by value, two opaque nodes by identity, and none of
@@ -148,8 +162,9 @@ typedef struct {
  * struct is copied. */
 void eg_set_analysis(egraph* g, const eg_analysis* a);
 
-/* The fact for `c`, or NULL when no analysis is installed. Valid until
- * the next merge or rebuild. */
+/* The fact for `c`, or NULL when no analysis is installed, `c` is not a
+ * class, or the class's fact could not be allocated. Valid until the next
+ * merge or rebuild. */
 void* eg_class_data(egraph* g, eg_id c);
 
 /* Saturation bounds. Both are caller-supplied: the graph cannot know what
@@ -163,8 +178,9 @@ typedef struct {
  * it changed the graph. The generated matcher supplies this. */
 typedef bool (*eg_round_fn)(egraph* g, void* user);
 
-/* Run `round` until it reports no change, or a cap binds. Rebuilds after
- * each round so a rule sees a congruent graph. Returns rounds executed. */
+/* Run `round` until it reports no change, a cap binds, or the graph runs
+ * out of memory. Rebuilds after each round so a rule sees a congruent graph.
+ * Returns rounds executed. */
 int eg_saturate(egraph* g, eg_round_fn round, void* user, eg_caps caps);
 
 /* ── Extraction ────────────────────────────────────────────────────
@@ -178,6 +194,11 @@ typedef struct {
     int*     kids;
     int      count;
     int      root;
+    /* What the arrays were allocated with and how large, so eg_extract_free
+     * gives them back to the allocator that made them. */
+    bbq_alloc* a;
+    size_t     cap;        /* entries in ops/data/kid_off/nkids */
+    size_t     kids_cap;   /* entries in kids */
 } eg_extract_result;
 
 /* What one e-node costs, asked of the consumer per NODE rather than read
@@ -197,7 +218,8 @@ typedef int (*eg_cost_fn)(int op, int64_t data, void* user);
 
 /* Extract the cheapest term for `root`'s class under `cost`. Returns false
  * when the class has no finite-cost term (every candidate cycles back
- * through itself). */
+ * through itself), or when extraction's own storage was refused — which
+ * sets eg_oom, so the two are told apart there. */
 bool eg_extract(egraph* g, eg_id root,
                 eg_cost_fn cost, void* user,
                 eg_extract_result* out);
@@ -231,13 +253,15 @@ bool eg_extract_excluding(egraph* g, eg_id root,
  *
  * The plan is a SNAPSHOT: any mutation (eg_add, eg_merge, eg_rebuild)
  * invalidates it, and extracting from a stale plan is the caller's bug.
- * eg_extract_prepare returns false only when allocation fails.
+ * eg_extract_prepare returns false only when allocation fails (and sets
+ * eg_oom).
  * eg_extract_from returns false when the root's class has no finite-cost
  * term under the plan (same meaning as eg_extract's false). */
 typedef struct {
     long long* cost;    /* per class: cheapest term cost, -1 = none      */
     int*       best;    /* per class: the chosen e-node index, -1 = none */
     int        nclasses;
+    bbq_alloc* a;       /* what cost/best were allocated with */
 } eg_extract_plan;
 
 bool eg_extract_prepare(egraph* g, eg_cost_fn cost, void* user,
@@ -254,11 +278,12 @@ void eg_extract_free(eg_extract_result* r);
  * Exposed so a consumer can place an egraph in its own storage; the
  * fields are the runtime's business. Every array is a bbq_vec — a typed
  * pointer whose length lives in a header behind it — so NULL is a valid
- * empty vector and eg_init is a memset. */
+ * empty vector, born from `a` on its first push. */
 struct eg_node;
 struct eg_class;
 
 struct egraph {
+    bbq_alloc*       a;         /* every allocation's source; NULL = libc */
     struct eg_node*  nodes;
     eg_id*           kids;      /* every node's children, contiguous */
     struct eg_class* classes;
@@ -292,7 +317,8 @@ struct egraph {
 };
 
 /* Did this graph run out of memory? Its contents are consistent but incomplete;
- * nothing built from it after the flag was set can be trusted to be whole. */
+ * nothing built from it after the flag was set can be trusted to be whole —
+ * including a fact, a rewrite's result, or an extraction. */
 bool eg_oom(const egraph* g);
 
 /* The caller pointer the graph carries for the rules' auxiliaries (see `user`).

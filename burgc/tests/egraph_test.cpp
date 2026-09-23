@@ -501,3 +501,166 @@ TEST(EGraphUser, SurvivesMutation) {
 }
 
 }  // namespace
+
+// ── Refusal ───────────────────────────────────────────────────────
+//
+// Every allocation the graph makes comes from the allocator it was born
+// with, and a refused one leaves the graph flagged, consistent, and giving
+// back everything it took. The scenario exercises each allocating path:
+// interning (kids, nodes, classes, parent, hashcons, a class's node list),
+// the analysis (its copy, the fact vector, modify's snapshot), merging (the
+// join's scratch, the worklist), rebuilding (the hashcons re-init and the
+// restore pass's scratch) and extraction (the plan and the result).
+namespace {
+
+struct Outcome {
+    bool oom = false;
+    bool extracted = false;
+    int  root_op = -1;
+    int64_t root_data = 0;
+    int  count = 0;
+};
+
+Outcome refusal_scenario(bbq_alloc* a) {
+    Outcome o;
+    egraph g;
+    eg_init_a(&g, a);
+    eg_analysis an = kc_analysis();
+    eg_set_analysis(&g, &an);
+
+    eg_id x = eg_add(&g, OP_A, 0, nullptr, 0);
+    eg_id two = eg_add(&g, OP_CONST, 2, nullptr, 0);
+    eg_id three = eg_add(&g, OP_CONST, 3, nullptr, 0);
+    eg_id sk[2] = { two, three };
+    eg_id sum = eg_add(&g, OP_ADD, 0, sk, 2);          // modify adds CONST 5
+    eg_id mk[2] = { x, two };
+    eg_id mul = eg_add(&g, OP_MUL, 0, mk, 2);
+    eg_id one = eg_add(&g, OP_CONST + 1, 0, nullptr, 0);
+    eg_id hk[2] = { x, one };
+    eg_id shl = eg_add(&g, OP_SHL, 0, hk, 2);
+    eg_merge(&g, mul, shl);
+    eg_id wide[12];
+    for (int i = 0; i < 12; i++) wide[i] = (i & 1) ? sum : mul;
+    eg_id w = eg_add(&g, OP_F, 0, wide, 12);
+    eg_rebuild(&g);
+
+    int cost[64];
+    for (int i = 0; i < 64; i++) cost[i] = 1;
+    cost[OP_MUL] = 10;
+    eg_extract_result r;
+    o.extracted = eg_extract(&g, eg_find(&g, w), by_op, cost, &r);
+    if (o.extracted) {
+        o.root_op = eg_extracted_op(&r, r.root);
+        o.root_data = r.data[r.root];
+        o.count = r.count;
+        eg_extract_free(&r);
+    }
+    o.oom = eg_oom(&g);
+    eg_free(&g);
+    return o;
+}
+
+}  // namespace
+
+// An allocator that grants nothing builds nothing. If any of the graph's
+// storage came from somewhere other than the allocator it was given — a
+// vector born from the file's default, a malloc left behind — this graph
+// would have nodes in it.
+TEST(EGraphRefusal, EveryAllocationComesFromTheGraphsAllocator) {
+    bbq_budget b;
+    bbq_budget_init(&b, 0, nullptr);
+    egraph g;
+    eg_init_a(&g, bbq_budget_handle(&b));
+    eg_analysis an = kc_analysis();
+    eg_set_analysis(&g, &an);
+    eg_id x = eg_add(&g, OP_A, 0, nullptr, 0);
+    eg_id k[1] = { x };
+    eg_add(&g, OP_F, 0, k, 1);
+    eg_rebuild(&g);
+    EXPECT_TRUE(eg_oom(&g));
+    EXPECT_EQ(eg_node_count(&g), 0u);
+    EXPECT_EQ(eg_class_count(&g), 0);
+    eg_free(&g);
+    EXPECT_GT(b.denials, 0u);
+    EXPECT_EQ(b.used, 0u);
+}
+
+// Once out of memory the graph hands out -1, and -1 is accepted everywhere
+// an id is — the generated matcher feeds one add's result straight into the
+// next and never checks.
+TEST(EGraphRefusal, AnOutOfMemoryGraphAnswersMinusOneAndAcceptsIt) {
+    bbq_faulty f;
+    bbq_faulty_init(&f, 3, 0, nullptr);      // the third allocation onward
+    egraph g;
+    eg_init_a(&g, bbq_faulty_handle(&f));
+    eg_analysis an = kc_analysis();
+    eg_set_analysis(&g, &an);
+    eg_id got = 0;
+    for (int i = 0; i < 64 && got >= 0; i++)
+        got = eg_add(&g, OP_CONST, i, nullptr, 0);
+    ASSERT_TRUE(eg_oom(&g));
+    EXPECT_EQ(got, -1);
+    EXPECT_EQ(eg_add(&g, OP_CONST, 999, nullptr, 0), -1);
+    EXPECT_EQ(eg_find(&g, -1), -1);
+    EXPECT_EQ(eg_class_data(&g, -1), nullptr);
+    EXPECT_FALSE(eg_merge(&g, -1, 0));
+    EXPECT_FALSE(eg_merge(&g, 0, -1));
+    EXPECT_EQ(eg_class_nodes(&g, -1), 0);
+    EXPECT_EQ(eg_class_node_op(&g, -1, 0), -1);
+    EXPECT_EQ(eg_class_node_kid(&g, -1, 0, 0), -1);
+    eg_id bad[1] = { -1 };
+    EXPECT_EQ(eg_add(&g, OP_F, 0, bad, 1), -1);
+    eg_extract_result r;
+    EXPECT_FALSE(eg_extract(&g, -1, by_op, nullptr, &r));
+    eg_free(&g);
+}
+
+// An id the graph never handed out is refused on a HEALTHY graph too, rather
+// than read through: eg_find would index the union-find with it.
+TEST(EGraphRefusal, ForeignIdsAreRefusedWithoutFlaggingTheGraph) {
+    Graph gr;
+    eg_id x = eg_add(&gr.g, OP_A, 0, nullptr, 0);
+    eg_id foreign[2] = { x, 77 };
+    EXPECT_EQ(eg_add(&gr.g, OP_F, 0, foreign, 2), -1);
+    EXPECT_FALSE(eg_merge(&gr.g, x, 77));
+    EXPECT_EQ(eg_find(&gr.g, 77), 77);
+    EXPECT_FALSE(eg_oom(&gr.g));
+}
+
+// Every allocation of the scenario refused in turn, sticky (a real ceiling)
+// and once (everything after the refused one succeeds — which is what shows
+// a path that ignored the refusal and carried on). Refused anywhere: the
+// graph says so and gives back all it took. Refused nowhere: the answer the
+// unbounded graph gives.
+TEST(EGraphRefusal, EveryRefusalIsFlaggedAndReleasesEverything) {
+    bbq_budget base_b;
+    bbq_budget_init(&base_b, SIZE_MAX, nullptr);
+    bbq_faulty base_f;
+    bbq_faulty_init(&base_f, 0, 0, bbq_budget_handle(&base_b));
+    Outcome want = refusal_scenario(bbq_faulty_handle(&base_f));
+    ASSERT_FALSE(want.oom);
+    ASSERT_TRUE(want.extracted);
+    ASSERT_EQ(base_b.used, 0u);
+    size_t served = base_f.served;
+    ASSERT_GT(served, 10u);
+
+    for (int once = 0; once <= 1; once++) {
+        for (size_t n = 1; n <= served + 1; n++) {
+            bbq_budget b;
+            bbq_budget_init(&b, SIZE_MAX, nullptr);
+            bbq_faulty f;
+            bbq_faulty_init(&f, n, once, bbq_budget_handle(&b));
+            Outcome got = refusal_scenario(bbq_faulty_handle(&f));
+            EXPECT_EQ(b.used, 0u) << "n=" << n << " once=" << once;
+            if (n <= served) {
+                EXPECT_TRUE(got.oom) << "refusal " << n << " once=" << once
+                                     << " went unreported";
+            } else {
+                EXPECT_FALSE(got.oom);
+                EXPECT_EQ(got.root_op, want.root_op);
+                EXPECT_EQ(got.root_data, want.root_data);
+                EXPECT_EQ(got.count, want.count);
+            }
+        }
+    }
+}

@@ -36,12 +36,30 @@ struct eg_class {
     int* node_idx;   /* bbq_vec of node indices */
 };
 
-void eg_init(egraph* g) {
+/* Append to one of the graph's vectors. A vector takes its allocator at
+ * its first allocation, and a bare push would take this file's
+ * BBQ_VEC_ALLOC() — so a vector not yet born is born here from the
+ * graph's. A refused birth leaves it poisoned, and the push then fails
+ * like any other refused push. */
+#define EG_TRY_PUSH(g, v, x) __extension__ ({                                 \
+    if (!(v)) bbq_vec_reserve_a((v), 8, (g)->a);                              \
+    bbq_vec_try_push((v), (x));                                               \
+})
+
+/* A class id this graph handed out. */
+static bool eg_valid(const egraph* g, eg_id id) {
+    return id >= 0 && id < bbq_vec_len(g->parent);
+}
+
+void eg_init(egraph* g) { eg_init_a(g, NULL); }
+
+void eg_init_a(egraph* g, bbq_alloc* a) {
     memset(g, 0, sizeof *g);
-    bbq_hmap* m = (bbq_hmap*)calloc(1, sizeof *m);
+    g->a = a;
+    bbq_hmap* m = (bbq_hmap*)bbq_mem_alloc(a, sizeof *m);
     if (!m) { g->oom = true; return; }
-    if (!bbq_hmap_init(m, 0)) g->oom = true;
     g->hashcons = m;
+    if (!bbq_hmap_init_a(m, 0, a)) g->oom = true;
 }
 
 bool eg_oom(const egraph* g) { return g->oom; }
@@ -52,32 +70,40 @@ void* eg_user(const egraph* g) { return g->user; }
 void eg_free(egraph* g) {
     for (int i = 0; i < bbq_vec_len(g->classes); i++)
         bbq_vec_free(g->classes[i].node_idx);
-    if (g->hashcons) { bbq_hmap_free((bbq_hmap*)g->hashcons); free(g->hashcons); }
+    if (g->hashcons) {
+        bbq_hmap_free((bbq_hmap*)g->hashcons);
+        bbq_mem_release(g->a, g->hashcons, sizeof(bbq_hmap));
+    }
     bbq_vec_free(g->nodes);
     bbq_vec_free(g->kids);
     bbq_vec_free(g->classes);
     bbq_vec_free(g->parent);
     bbq_vec_free(g->worklist);
     bbq_vec_free(g->class_data);
-    free(g->analysis);
+    bbq_mem_release(g->a, g->analysis, sizeof *g->analysis);
     memset(g, 0, sizeof *g);
 }
 
 /* ── e-class analysis (egg §4.1) ─────────────────────────────────── */
 
 void eg_set_analysis(egraph* g, const eg_analysis* a) {
-    free(g->analysis);
+    bbq_mem_release(g->a, g->analysis, sizeof *g->analysis);
     g->analysis = NULL;
     bbq_vec_truncate(g->class_data, 0);
     if (!a || a->size == 0) return;
-    g->analysis = (eg_analysis*)malloc(sizeof *g->analysis);
-    if (!g->analysis) return;
+    g->analysis = (eg_analysis*)bbq_mem_alloc(g->a, sizeof *g->analysis);
+    /* A graph without the analysis its caller installed computes no facts,
+     * and a caller reading "no fact" would take it for "nothing known". */
+    if (!g->analysis) { g->oom = true; return; }
     *g->analysis = *a;
 }
 
 void* eg_class_data(egraph* g, eg_id c) {
-    if (!g->analysis) return NULL;
-    return g->class_data + (size_t)eg_find(g, c) * g->analysis->size;
+    if (!g->analysis || !eg_valid(g, c)) return NULL;
+    size_t off = (size_t)eg_find(g, c) * g->analysis->size;
+    /* A class whose fact slot was refused has none to hand out. */
+    if (off + g->analysis->size > (size_t)bbq_vec_len(g->class_data)) return NULL;
+    return g->class_data + off;
 }
 
 /* Reserve and zero the fact slot for a freshly created class. Zeroing is
@@ -92,8 +118,9 @@ static void analysis_reserve(egraph* g, eg_id cls) {
      * same denial of service as a crash. bbq_vec_fill either makes the room or
      * says it could not. */
     if ((size_t)bbq_vec_len(g->class_data) < need) {
-        if (need > (size_t)BBQ_VEC_MAX_CAP ||
-            !bbq_vec_fill(g->class_data, (int)need, (unsigned char)0)) {
+        if (need > (size_t)BBQ_VEC_MAX_CAP) { g->oom = true; return; }
+        if (!g->class_data) bbq_vec_reserve_a(g->class_data, (int)need, g->a);
+        if (!bbq_vec_fill(g->class_data, (int)need, (unsigned char)0)) {
             g->oom = true;
             return;
         }
@@ -106,6 +133,7 @@ size_t eg_node_count(const egraph* g) { return (size_t)bbq_vec_len(g->nodes); }
 /* ── union-find ──────────────────────────────────────────────────── */
 
 eg_id eg_find(egraph* g, eg_id id) {
+    if (!eg_valid(g, id)) return id;
     while (g->parent[id] != id) {
         g->parent[id] = g->parent[g->parent[id]];   /* halving */
         id = g->parent[id];
@@ -116,20 +144,21 @@ eg_id eg_find(egraph* g, eg_id id) {
 /* The id is read from the length BEFORE the pushes, so a push that silently did
  * nothing would hand back an id whose class and parent slot do not exist — and
  * eg_find reads g->parent[id] immediately. Both pushes are checked, and the
- * class is only born if both took. */
+ * class is only born if both took; otherwise -1. */
 static eg_id eg_new_class(egraph* g) {
     eg_id id = (eg_id)bbq_vec_len(g->classes);
     struct eg_class empty; empty.node_idx = NULL;
-    if (!bbq_vec_try_push(g->classes, empty)) { g->oom = true; return id; }
-    if (!bbq_vec_try_push(g->parent, id)) {     /* a fresh class is its own root */
+    if (!EG_TRY_PUSH(g, g->classes, empty)) { g->oom = true; return -1; }
+    if (!EG_TRY_PUSH(g, g->parent, id)) {       /* a fresh class is its own root */
         bbq_vec_truncate(g->classes, id);       /* unwind the half-made class */
         g->oom = true;
+        return -1;
     }
     return id;
 }
 
 static void class_push(egraph* g, eg_id cls, int node_idx) {
-    if (!bbq_vec_try_push(g->classes[cls].node_idx, node_idx)) g->oom = true;
+    if (!EG_TRY_PUSH(g, g->classes[cls].node_idx, node_idx)) g->oom = true;
 }
 
 /* ── hashcons ────────────────────────────────────────────────────── */
@@ -196,19 +225,22 @@ static eg_id hashcons_lookup(egraph* g, int op, int64_t data,
 }
 
 eg_id eg_add(egraph* g, int op, int64_t data, const eg_id* kids, int nkids) {
-    /* Canonicalise into the shared array first: the key is the canonical
-     * form, and the node keeps exactly what was hashed. */
+    if (g->oom || nkids < 0) return -1;
+    for (int i = 0; i < nkids; i++)
+        if (!eg_valid(g, kids[i])) return -1;
+
     /* Append the canonical children, then look up: the key IS the canonical
-     * form. On a hit the appended tail is abandoned (the vec is truncated
-     * back), so a shared term costs no storage. */
+     * form, and the node keeps exactly what was hashed. On a hit the
+     * appended tail is abandoned (the vec is truncated back), so a shared
+     * term costs no storage. */
     size_t off = (size_t)bbq_vec_len(g->kids);
     for (int i = 0; i < nkids; i++)
-        if (!bbq_vec_try_push(g->kids, eg_find(g, kids[i]))) {
+        if (!EG_TRY_PUSH(g, g->kids, eg_find(g, kids[i]))) {
             /* `off` was taken from the length, and kbase below indexes from it.
              * A short tail would hash the wrong children. */
             bbq_vec_truncate(g->kids, (int)off);
             g->oom = true;
-            return 0;
+            return -1;
         }
 
     /* A childless node adds nothing, so `g->kids` may still be NULL —
@@ -220,6 +252,7 @@ eg_id eg_add(egraph* g, int op, int64_t data, const eg_id* kids, int nkids) {
     if (found >= 0) { bbq_vec_truncate(g->kids, (int)off); return found; }
 
     eg_id cls = eg_new_class(g);
+    if (cls < 0) { bbq_vec_truncate(g->kids, (int)off); return -1; }
     struct eg_node n;
     n.op = op;
     n.data = data;
@@ -231,18 +264,19 @@ eg_id eg_add(egraph* g, int op, int64_t data, const eg_id* kids, int nkids) {
     int idx = bbq_vec_len(g->nodes);
     /* `idx` is the pre-push length and is handed to class_push and the hashcons,
      * both of which index g->nodes with it. */
-    if (!bbq_vec_try_push(g->nodes, n)) {
+    if (!EG_TRY_PUSH(g, g->nodes, n)) {
         bbq_vec_truncate(g->kids, (int)off);
         g->oom = true;
-        return cls;
+        return -1;
     }
     class_push(g, cls, idx);
     hashcons_insert(g, (size_t)idx, h);
 
     /* egg Fig. 9 lines 10-11: a new singleton's fact is make() of its one
-     * e-node, and modify() may then add to the class. */
+     * e-node, and modify() may then add to the class. A class whose slot
+     * was refused gets no make(): there is nowhere for the fact to go. */
     analysis_reserve(g, cls);
-    if (g->analysis) {
+    if (g->analysis && !g->oom) {
         size_t sz = g->analysis->size;
         g->analysis->make(g, op, data, kbase, nkids,
                           g->class_data + (size_t)cls * sz,
@@ -251,12 +285,11 @@ eg_id eg_add(egraph* g, int op, int64_t data, const eg_id* kids, int nkids) {
             /* On a COPY: modify may intern a node, which grows the fact
              * array and moves it, so a pointer into it would dangle the
              * moment modify used the graph it was handed. */
-            unsigned char* snap = (unsigned char*)malloc(sz);
-            if (snap) {
-                memcpy(snap, g->class_data + (size_t)cls * sz, sz);
-                g->analysis->modify(g, cls, snap, g->analysis->user);
-                free(snap);
-            }
+            unsigned char* snap = (unsigned char*)bbq_mem_alloc(g->a, sz);
+            if (!snap) { g->oom = true; return cls; }
+            memcpy(snap, g->class_data + (size_t)cls * sz, sz);
+            g->analysis->modify(g, cls, snap, g->analysis->user);
+            bbq_mem_release(g->a, snap, sz);
         }
     }
     return cls;
@@ -268,13 +301,23 @@ eg_id eg_add(egraph* g, int op, int64_t data, const eg_id* kids, int nkids) {
  * left incomplete — a wrong answer, not a crash, which is exactly why it has to
  * be recorded rather than dropped. */
 static void work_push(egraph* g, eg_id cls) {
-    if (!bbq_vec_try_push(g->worklist, cls)) g->oom = true;
+    if (!EG_TRY_PUSH(g, g->worklist, cls)) g->oom = true;
 }
 
 bool eg_merge(egraph* g, eg_id a, eg_id b) {
+    if (g->oom || !eg_valid(g, a) || !eg_valid(g, b)) return false;
     a = eg_find(g, a);
     b = eg_find(g, b);
     if (a == b) return false;
+
+    /* The join's scratch is taken before anything moves: a merge that could
+     * not join the facts is not made at all. */
+    unsigned char* tmp = NULL;
+    size_t sz = g->analysis ? g->analysis->size : 0;
+    if (g->analysis) {
+        tmp = (unsigned char*)bbq_mem_zalloc(g->a, sz);
+        if (!tmp) { g->oom = true; return false; }
+    }
 
     /* Fold the smaller class into the larger so repair touches fewer nodes. */
     if (bbq_vec_len(g->classes[a].node_idx) <
@@ -289,16 +332,12 @@ bool eg_merge(egraph* g, eg_id a, eg_id b) {
     bbq_vec_truncate(g->classes[b].node_idx, 0);
 
     /* egg Fig. 9 lines 17-18: the survivor's fact is the join of both. */
-    if (g->analysis) {
-        size_t sz = g->analysis->size;
-        unsigned char* tmp = (unsigned char*)calloc(1, sz);
-        if (tmp) {
-            g->analysis->join(g->class_data + (size_t)a * sz,
-                              g->class_data + (size_t)b * sz,
-                              tmp, g->analysis->user);
-            memcpy(g->class_data + (size_t)a * sz, tmp, sz);
-            free(tmp);
-        }
+    if (tmp) {
+        g->analysis->join(g->class_data + (size_t)a * sz,
+                          g->class_data + (size_t)b * sz,
+                          tmp, g->analysis->user);
+        memcpy(g->class_data + (size_t)a * sz, tmp, sz);
+        bbq_mem_release(g->a, tmp, sz);
     }
 
     /* Every node in the graph may now have a stale child; the repair pass
@@ -321,11 +360,16 @@ bool eg_merge(egraph* g, eg_id a, eg_id b) {
  * join is a semilattice operation and the caller's domain has finite
  * height (widening is the caller's, see egraph.h). */
 static void analysis_restore(egraph* g) {
-    if (!g->analysis) return;
+    if (!g->analysis || g->oom) return;
     size_t sz = g->analysis->size;
-    unsigned char* made = (unsigned char*)calloc(1, sz);
-    unsigned char* joined = (unsigned char*)calloc(1, sz);
-    if (!made || !joined) { free(made); free(joined); return; }
+    unsigned char* made = (unsigned char*)bbq_mem_zalloc(g->a, sz);
+    unsigned char* joined = (unsigned char*)bbq_mem_zalloc(g->a, sz);
+    if (!made || !joined) {
+        bbq_mem_release(g->a, made, sz);
+        bbq_mem_release(g->a, joined, sz);
+        g->oom = true;
+        return;
+    }
 
     /* Bounded, for the same reason saturation is: a congruence cycle can
      * let a fact keep moving, and a bound is a parameter rather than a
@@ -354,7 +398,7 @@ static void analysis_restore(egraph* g) {
     }
 
     if (g->analysis->modify) {
-        for (eg_id c = 0; c < (eg_id)bbq_vec_len(g->classes); c++) {
+        for (eg_id c = 0; c < (eg_id)bbq_vec_len(g->classes) && !g->oom; c++) {
             if (eg_find(g, c) != c) continue;
             /* Same copy as in eg_add, for the same reason: modify interns
              * nodes, and interning moves this array. */
@@ -362,12 +406,12 @@ static void analysis_restore(egraph* g) {
             g->analysis->modify(g, c, made, g->analysis->user);
         }
     }
-    free(made);
-    free(joined);
+    bbq_mem_release(g->a, made, sz);
+    bbq_mem_release(g->a, joined, sz);
 }
 
 void eg_rebuild(egraph* g) {
-    while (bbq_vec_len(g->worklist) > 0) {
+    while (bbq_vec_len(g->worklist) > 0 && !g->oom) {
         bbq_vec_truncate(g->worklist, 0);
 
         /* A merge changed some class's canonical id, so every node's
@@ -378,7 +422,7 @@ void eg_rebuild(egraph* g) {
          * duplicate, which re-arms the worklist and runs this to a fixpoint. */
         bbq_hmap* m = (bbq_hmap*)g->hashcons;
         bbq_hmap_free(m);
-        if (!bbq_hmap_init(m, 0)) { g->oom = true; return; }
+        if (!bbq_hmap_init_a(m, 0, g->a)) { g->oom = true; return; }
 
         for (int i = 0; i < bbq_vec_len(g->nodes); i++) {
             if (!g->nodes[i].live) continue;
@@ -412,6 +456,7 @@ void eg_rebuild(egraph* g) {
  * `live` rather than compacted — an index here is stable for the duration
  * of one matcher pass, which is what a matcher needs. */
 static int class_live_node(egraph* g, eg_id cls, int i) {
+    if (!eg_valid(g, cls)) return -1;
     struct eg_class* c = &g->classes[eg_find(g, cls)];
     int seen = 0;
     for (int k = 0; k < bbq_vec_len(c->node_idx); k++) {
@@ -425,6 +470,7 @@ static int class_live_node(egraph* g, eg_id cls, int i) {
 int eg_class_count(const egraph* g) { return bbq_vec_len(g->classes); }
 
 int eg_class_nodes(egraph* g, eg_id cls) {
+    if (!eg_valid(g, cls)) return 0;
     struct eg_class* c = &g->classes[eg_find(g, cls)];
     int n = 0;
     for (int k = 0; k < bbq_vec_len(c->node_idx); k++)
@@ -457,7 +503,8 @@ eg_id eg_class_node_kid(egraph* g, eg_id cls, int i, int k) {
 
 int eg_saturate(egraph* g, eg_round_fn round, void* user, eg_caps caps) {
     int r = 0;
-    while (r < caps.rounds && bbq_vec_len(g->nodes) < caps.node_budget) {
+    while (r < caps.rounds && bbq_vec_len(g->nodes) < caps.node_budget &&
+           !g->oom) {
         bool changed = round(g, user);
         r++;
         eg_rebuild(g);
@@ -494,9 +541,14 @@ bool eg_extract_prepare(egraph* g, eg_cost_fn cost, void* user,
                         eg_extract_plan* plan) {
     size_t nc = (size_t)bbq_vec_len(g->classes);
     plan->nclasses = (int)nc;
-    plan->cost = (long long*)malloc((nc ? nc : 1) * sizeof *plan->cost);
-    plan->best = (int*)malloc((nc ? nc : 1) * sizeof *plan->best);
-    if (!plan->cost || !plan->best) { eg_extract_plan_free(plan); return false; }
+    plan->a = g->a;
+    plan->cost = (long long*)bbq_mem_alloc(g->a, (nc ? nc : 1) * sizeof *plan->cost);
+    plan->best = (int*)bbq_mem_alloc(g->a, (nc ? nc : 1) * sizeof *plan->best);
+    if (!plan->cost || !plan->best) {
+        eg_extract_plan_free(plan);
+        g->oom = true;
+        return false;
+    }
     for (size_t i = 0; i < nc; i++) { plan->cost[i] = -1; plan->best[i] = -1; }
 
     ext_state st;
@@ -527,7 +579,9 @@ bool eg_extract_prepare(egraph* g, eg_cost_fn cost, void* user,
 }
 
 void eg_extract_plan_free(eg_extract_plan* plan) {
-    free(plan->cost); free(plan->best);
+    size_t nc = plan->nclasses > 0 ? (size_t)plan->nclasses : 1;
+    bbq_mem_release(plan->a, plan->cost, nc * sizeof *plan->cost);
+    bbq_mem_release(plan->a, plan->best, nc * sizeof *plan->best);
     plan->cost = NULL; plan->best = NULL; plan->nclasses = 0;
 }
 
@@ -539,20 +593,31 @@ bool eg_extract_from(egraph* g, const eg_extract_plan* plan, eg_id root,
     st.cost = plan->cost;
     st.best = plan->best;
 
+    if (!eg_valid(g, root) || (size_t)root >= nc) return false;
     root = eg_find(g, root);
     if (st.cost[root] < 0) return false;
 
-    /* Size the output: one node per class on the chosen term. */
-    int* memo = (int*)malloc(nc * sizeof *memo);
+    /* Size the output: one node per class on the chosen term. The chosen
+     * term takes at most one node per class, and every node's children
+     * already sit in g->kids — so that total bounds the output. */
+    size_t memo_bytes = nc * sizeof(int);
+    int* memo = (int*)bbq_mem_alloc(g->a, memo_bytes);
+    out->a        = g->a;
+    out->cap      = nc;
+    out->kids_cap = (size_t)bbq_vec_len(g->kids) + 1;
+    out->ops     = (int*)bbq_mem_alloc(g->a, nc * sizeof(int));
+    out->data    = (int64_t*)bbq_mem_alloc(g->a, nc * sizeof(int64_t));
+    out->nkids   = (int*)bbq_mem_alloc(g->a, nc * sizeof(int));
+    out->kid_off = (int*)bbq_mem_alloc(g->a, nc * sizeof(int));
+    out->kids    = (int*)bbq_mem_alloc(g->a, out->kids_cap * sizeof(int));
+    if (!memo || !out->ops || !out->data || !out->nkids || !out->kid_off ||
+        !out->kids) {
+        bbq_mem_release(g->a, memo, memo_bytes);
+        eg_extract_free(out);
+        g->oom = true;
+        return false;
+    }
     for (size_t i = 0; i < nc; i++) memo[i] = -1;
-
-    out->ops     = (int*)malloc(nc * sizeof(int));
-    out->data    = (int64_t*)malloc(nc * sizeof(int64_t));
-    out->nkids   = (int*)malloc(nc * sizeof(int));
-    out->kid_off = (int*)malloc(nc * sizeof(int));
-    /* The chosen term takes at most one node per class, and every node's
-     * children already sit in g->kids — so that total bounds the output. */
-    out->kids    = (int*)malloc(((size_t)bbq_vec_len(g->kids) + 1) * sizeof(int));
 
     /* Emit children-first so every kid already has an index, filling the
      * kid array as we go. The walk stack is a bbq_vec: the fixed 256-slot
@@ -560,7 +625,13 @@ bool eg_extract_from(egraph* g, const eg_extract_plan* plan, eg_id root,
      * and a library never smashes its host's stack over input shape. */
     int nkids_total = 0;
     eg_id* stack = NULL; int sp = 0;
-    if (!bbq_vec_try_push(stack, root)) { free(memo); bbq_vec_free(stack); return false; }
+    if (!EG_TRY_PUSH(g, stack, root)) {
+        bbq_mem_release(g->a, memo, memo_bytes);
+        bbq_vec_free(stack);
+        eg_extract_free(out);
+        g->oom = true;
+        return false;
+    }
     sp = 1;
     /* iterative post-order over the chosen nodes */
     while (sp > 0) {
@@ -576,7 +647,11 @@ bool eg_extract_from(egraph* g, const eg_extract_plan* plan, eg_id root,
                  * past the storage and the next iteration would read it. */
                 if (sp >= (int)bbq_vec_len(stack)) {
                     if (!bbq_vec_try_push(stack, kc)) {
-                        free(memo); bbq_vec_free(stack); return false;
+                        bbq_mem_release(g->a, memo, memo_bytes);
+                        bbq_vec_free(stack);
+                        eg_extract_free(out);
+                        g->oom = true;
+                        return false;
                     }
                 } else stack[sp] = kc;
                 sp++; pending = true;
@@ -595,7 +670,8 @@ bool eg_extract_from(egraph* g, const eg_extract_plan* plan, eg_id root,
     }
     out->root = memo[root];
 
-    free(memo); bbq_vec_free(stack);
+    bbq_mem_release(g->a, memo, memo_bytes);
+    bbq_vec_free(stack);
     return true;
 }
 
@@ -624,6 +700,10 @@ int eg_extracted_op(const eg_extract_result* r, int node) {
 }
 
 void eg_extract_free(eg_extract_result* r) {
-    free(r->ops); free(r->data); free(r->nkids); free(r->kid_off); free(r->kids);
+    bbq_mem_release(r->a, r->ops,     r->cap * sizeof(int));
+    bbq_mem_release(r->a, r->data,    r->cap * sizeof(int64_t));
+    bbq_mem_release(r->a, r->nkids,   r->cap * sizeof(int));
+    bbq_mem_release(r->a, r->kid_off, r->cap * sizeof(int));
+    bbq_mem_release(r->a, r->kids,    r->kids_cap * sizeof(int));
     memset(r, 0, sizeof *r);
 }

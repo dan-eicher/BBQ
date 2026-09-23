@@ -40,9 +40,10 @@ void TablesEmitter::emit_opcodes_h(FILE* out) {
         "#define OPCF_INVOKE       0x04u   /* mnemonic starts with \"invoke\" */\n"
         "#define OPCF_SWITCH       0x08u   /* {s,i}{table,lookup}switch */\n"
         "#define OPCF_HAS_CP_REF   0x10u   /* any operand is a CP reference */\n"
-        "#define OPCF_ENDS_BB      0x20u   /* control flow does not fall through */\n"
+        "#define OPCF_ENDS_BB      0x20u   /* ends a basic block: control may leave (cond or uncond) */\n"
         "#define OPCF_LOCAL_LOAD   0x40u   /* pushes a local-variable value (sload/aload/iload) */\n"
-        "#define OPCF_LOCAL_STORE  0x80u   /* writes a local variable (sstore/astore/istore, sinc/iinc) */\n\n"
+        "#define OPCF_LOCAL_STORE  0x80u   /* writes a local variable (sstore/astore/istore, sinc/iinc) */\n"
+        "#define OPCF_NO_FALLTHROUGH 0x100u /* the next sequential op is not a successor */\n\n"
         "/* Sentinel values in opcode_stack_delta[] / opcode_length[]. */\n"
         "#define OPCD_VARIABLE     ((signed char)-128) /* per-call-site delta */\n"
         "#define OPCL_VARIABLE     0                   /* payload-dependent length */\n\n");
@@ -52,7 +53,7 @@ void TablesEmitter::emit_opcodes_h(FILE* out) {
         "extern const unsigned char opcode_length[256];\n"
         "extern const signed char   opcode_stack_delta[256];\n"
         "extern const char* const   opcode_name[256];\n"
-        "extern const unsigned char opcode_flags[256];\n"
+        "extern const unsigned short opcode_flags[256];\n"
         "extern const unsigned char opcode_cp_ref_offset[256];\n"
         "/* Stack cells popped by an opcode (sum of stack_in widths).\n"
         " * OPCD_VARIABLE for per-call-site opcodes (invokes/dup_x/switch). */\n"
@@ -90,6 +91,18 @@ static void emit_uchar_table(FILE* out, const char* name, F get) {
 }
 
 template <class F>
+static void emit_ushort_table(FILE* out, const char* name, F get) {
+    fprintf(out, "const unsigned short %s[256] = {\n", name);
+    for (int row = 0; row < 16; row++) {
+        fprintf(out, "    /* 0x%02X */ ", row * 16);
+        for (int col = 0; col < 16; col++)
+            fprintf(out, "%4d,", get(row * 16 + col));
+        fprintf(out, "\n");
+    }
+    fprintf(out, "};\n\n");
+}
+
+template <class F>
 static void emit_schar_table(FILE* out, const char* name, F get) {
     fprintf(out, "const signed char %s[256] = {\n", name);
     for (int row = 0; row < 16; row++) {
@@ -113,7 +126,7 @@ void TablesEmitter::emit_opcode_tables_c(FILE* out) {
 
     emit_uchar_table(out, "opcode_length",        [&](int op){ return s.derived(op).length; });
     emit_schar_table(out, "opcode_stack_delta",   [&](int op){ return s.derived(op).sp_delta; });
-    emit_uchar_table(out, "opcode_flags",         [&](int op){ return (int)s.derived(op).flags; });
+    emit_ushort_table(out, "opcode_flags",        [&](int op){ return (int)s.derived(op).flags; });
     emit_uchar_table(out, "opcode_cp_ref_offset", [&](int op){ return s.derived(op).cp_ref_offset; });
     emit_uchar_table(out, "opcode_narrow_form",   [&](int op){ return s.derived(op).narrow_form; });
     emit_schar_table(out, "opcode_local_index",   [&](int op){ return s.derived(op).present ? s.derived(op).local_index : -1; });

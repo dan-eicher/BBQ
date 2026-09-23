@@ -13,9 +13,10 @@ constexpr unsigned OPCF_RETURN      = 0x02u;   // {s,i,a,}return
 constexpr unsigned OPCF_INVOKE      = 0x04u;   // mnemonic starts with "invoke"
 constexpr unsigned OPCF_SWITCH      = 0x08u;   // {s,i}{table,lookup}switch
 constexpr unsigned OPCF_HAS_CP_REF  = 0x10u;   // any operand is a CP reference
-constexpr unsigned OPCF_ENDS_BB     = 0x20u;   // control flow does not fall through
+constexpr unsigned OPCF_ENDS_BB     = 0x20u;   // ends a basic block: control may leave (cond or uncond)
 constexpr unsigned OPCF_LOCAL_LOAD  = 0x40u;   // pushes a local-variable value
 constexpr unsigned OPCF_LOCAL_STORE = 0x80u;   // writes a local variable
+constexpr unsigned OPCF_NO_FALLTHROUGH = 0x100u; // the next sequential op is not a successor
 
 // Sentinel for opcode_stack_delta[]: the per-opcode delta cannot be encoded
 // statically (invokes, dup_x, swap_x, switches, jsr, ret) — computed at the

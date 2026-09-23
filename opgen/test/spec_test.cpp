@@ -27,6 +27,14 @@ ireturn 0x20 ( i32 v -- )
 goto 0x30 ( -- )
     flag: branch
 
+goto_always 0x31 [ u16 off ] ( -- )
+    branch: "1" -> "pc + off"
+
+ifz 0x32 [ u16 off ] ( i32 v -- )
+    branch: "v == 0" -> "pc + off"
+
+athrow 0x33 ( i32 ref -- )
+
 invokestatic 0x40 ( -- )
     flag: special_invoke
 
@@ -58,6 +66,30 @@ TEST(OpgenSpec, Flags) {
     EXPECT_TRUE(spec.derived(0x30).flags & opgen::OPCF_BRANCH);     // via `flag: branch`
     EXPECT_TRUE(spec.derived(0x30).flags & opgen::OPCF_ENDS_BB);
     EXPECT_TRUE(spec.derived(0x40).flags & opgen::OPCF_INVOKE);     // "invoke" prefix
+}
+
+// ENDS_BB and NO_FALLTHROUGH are different questions. A conditional branch ends
+// a basic block (control may leave) but falls through when not taken; a
+// consumer tracking what is reachable by fallthrough needs the second one, and
+// reading the first in its place drops the not-taken successor as dead.
+TEST(OpgenSpec, FallthroughIsNotBlockEnd) {
+    auto* m = parse(kSpec);
+    ASSERT_NE(m, nullptr);
+    opgen::Spec spec(m);
+
+    // return, athrow and an unconditional branch: never fall through.
+    for (int op : {0x20, 0x31, 0x33}) {
+        EXPECT_TRUE(spec.derived(op).flags & opgen::OPCF_ENDS_BB) << std::hex << op;
+        EXPECT_TRUE(spec.derived(op).flags & opgen::OPCF_NO_FALLTHROUGH) << std::hex << op;
+    }
+    // A conditional branch ends the block and still falls through.
+    EXPECT_TRUE(spec.derived(0x32).flags & opgen::OPCF_ENDS_BB);
+    EXPECT_FALSE(spec.derived(0x32).flags & opgen::OPCF_NO_FALLTHROUGH);
+    // `flag: branch` names no condition, so it is assumed to fall through.
+    EXPECT_TRUE(spec.derived(0x30).flags & opgen::OPCF_ENDS_BB);
+    EXPECT_FALSE(spec.derived(0x30).flags & opgen::OPCF_NO_FALLTHROUGH);
+    // Straight-line code is neither.
+    EXPECT_FALSE(spec.derived(0x10).flags & (opgen::OPCF_ENDS_BB | opgen::OPCF_NO_FALLTHROUGH));
 }
 
 // A spec that declares its opcodes without writing bodies for them: the

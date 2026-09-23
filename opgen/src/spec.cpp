@@ -165,13 +165,23 @@ unsigned Spec::compute_flags(const Opcode* op) const {
     if (has_flag(op, "special_switch"))      f |= OPCF_SWITCH;
     for (auto* o : op->operands)
         if (o->cp_ref) { f |= OPCF_HAS_CP_REF; break; }
-    // ENDS_BB: anything that doesn't fall through to the next sequential op.
-    if ((f & (OPCF_BRANCH | OPCF_RETURN | OPCF_SWITCH)) ||
+    // ENDS_BB: anything after which control may leave the sequence — so the
+    // next op starts a new basic block. A conditional branch ends one too.
+    const bool transfers_always =
+        (f & (OPCF_RETURN | OPCF_SWITCH)) ||
         std::strcmp(op->mnemonic, "athrow") == 0 ||
         has_flag(op, "special_jsr") ||
-        has_flag(op, "special_ret")) {
-        f |= OPCF_ENDS_BB;
-    }
+        has_flag(op, "special_ret") ||
+        // A branch whose condition is the constant 1 is taken every time.
+        // One declared only by `flag: branch` has no condition to read, so
+        // it is assumed to fall through: a consumer that believes dead code
+        // is live over-counts, one that believes live code is dead drops it.
+        // (The condition is held as written, quotes and all.)
+        (op->br.has_value() && std::strcmp((*op->br)->condition, "\"1\"") == 0);
+    if ((f & OPCF_BRANCH) || transfers_always) f |= OPCF_ENDS_BB;
+    // NO_FALLTHROUGH: the next sequential op is not a successor at all. What
+    // follows is reached only by a branch to it, or not at all.
+    if (transfers_always) f |= OPCF_NO_FALLTHROUGH;
     // Local access is read from the body's actual effect, not the
     // `local_value` annotation (the `_this` field ops carry `local_value`
     // for the implicit `this` slot but neither load nor store a local).

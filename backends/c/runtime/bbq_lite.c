@@ -55,7 +55,7 @@ static void begin_scope(bbq_capture_builder* b, const char* name, size_t pos,
     bbq_capture_scope s;
     s.name = name; s.start_pos = pos; s.first_child_index = bbq_vec_len(b->fields);
     s.type = type; s.variant_tag = tag;
-    bbq_vec_push(b->scopes, s);
+    bbq_vec_push_a(b->scopes, s, b->arena->a);
 }
 
 static void end_scope(bbq_capture_builder* b, size_t pos) {
@@ -80,13 +80,13 @@ static void end_scope(bbq_capture_builder* b, size_t pos) {
     if (count > 0) {
         int buf_start = bbq_vec_len(b->child_buf);
         for (int i = first; i < bbq_vec_len(b->fields); i++)
-            bbq_vec_push(b->child_buf, b->fields[i]);
+            bbq_vec_push_a(b->child_buf, b->fields[i], b->arena->a);
         /* A short copy: `count` children at buf_start would run off the end. */
         if (bbq_vec_oom(b->child_buf)) return;
         fc.build_buf_index = buf_start;
     }
     bbq_vec_truncate(b->fields, first);
-    bbq_vec_push(b->fields, fc);
+    bbq_vec_push_a(b->fields, fc, b->arena->a);
     bbq_vec_truncate(b->scopes, bbq_vec_len(b->scopes) - 1);
 }
 
@@ -97,7 +97,7 @@ static void add_computed_span(bbq_capture_builder* b, const char* name,
     fc.name = name; fc.start_offset = start; fc.end_offset = end;
     fc.type = BBQ_CT_Computed; fc.children = NULL; fc.child_count = 0;
     fc.build_buf_index = -1; fc.variant_tag = take_pending(b); fc.computed_value = cv;
-    bbq_vec_push(b->fields, fc);
+    bbq_vec_push_a(b->fields, fc, b->arena->a);
 }
 
 /* ── builder public API ── */
@@ -121,7 +121,7 @@ void bbq_cap_add_field(bbq_capture_builder* b, const char* name, size_t start,
     fc.name = name; fc.start_offset = start; fc.end_offset = end; fc.type = type;
     fc.children = NULL; fc.child_count = 0; fc.build_buf_index = -1;
     fc.variant_tag = take_pending(b); fc.computed_value = cv;
-    bbq_vec_push(b->fields, fc);
+    bbq_vec_push_a(b->fields, fc, b->arena->a);
 }
 
 void bbq_cap_set_pending_variant_tag(bbq_capture_builder* b, int tag) {

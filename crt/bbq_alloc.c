@@ -4,6 +4,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#if defined(__linux__)
+#  include <sys/types.h>
+#  include <sys/random.h>   /* getrandom — bbq_hash_seed */
+#endif
 
 /* ── The four entry points ─────────────────────────────────────────────────── */
 
@@ -140,42 +144,22 @@ bbq_alloc* bbq_faulty_handle(bbq_faulty* f) { return &f->iface; }
 
 /* ── Hash seed ────────────────────────────────────────────────────────────── */
 
-static uint64_t g_seed;
-static int      g_seed_ready;
-
-/* Drawn from the OS once. getrandom/arc4random are the right sources; the
- * address-and-clock fallback is there for a platform with neither, and it is
- * weak — it makes collisions harder to aim, not impossible. Anything relying on
- * the strong property should check that it got a real source. */
-static uint64_t seed_from_os(void) {
+/* A fresh draw per call, and no state: containers each take one at init (bbq_alloc.h).
+ * getrandom/arc4random are the right sources — one cheap call, no file descriptor —
+ * and the address-and-clock fallback is there for a platform with neither. It is weak:
+ * it makes collisions harder to aim, not impossible. Anything relying on the strong
+ * property should check that it got a real source. */
+uint64_t bbq_hash_seed(void) {
     uint64_t s = 0;
 #if defined(__linux__)
-    {
-        FILE* f = fopen("/dev/urandom", "rb");
-        if (f) {
-            size_t got = fread(&s, 1, sizeof s, f);
-            fclose(f);
-            if (got == sizeof s && s) return s;
-        }
-    }
+    if (getrandom(&s, sizeof s, 0) == (ssize_t)sizeof s && s) return s;
+#elif defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
+    arc4random_buf(&s, sizeof s);
+    if (s) return s;
 #endif
-    {
-        /* ASLR gives the address some entropy; the clock gives the rest. */
-        uintptr_t here = (uintptr_t)(void*)&g_seed;
-        s = (uint64_t)here * 0x9E3779B97F4A7C15ULL;
-        s ^= (uint64_t)(uintptr_t)&s << 17;
-        s ^= (uint64_t)clock() * 0xBF58476D1CE4E5B9ULL;
-        s ^= (uint64_t)time(NULL);
-    }
+    /* ASLR gives the stack address some entropy; the clock gives the rest. */
+    s  = (uint64_t)(uintptr_t)&s * 0x9E3779B97F4A7C15ULL;
+    s ^= (uint64_t)clock() * 0xBF58476D1CE4E5B9ULL;
+    s ^= (uint64_t)time(NULL);
     return s ? s : 0x9E3779B97F4A7C15ULL;
-}
-
-uint64_t bbq_hash_seed(void) {
-    if (!g_seed_ready) { g_seed = seed_from_os(); g_seed_ready = 1; }
-    return g_seed;
-}
-
-void bbq_hash_seed_set(uint64_t seed) {
-    g_seed = seed;
-    g_seed_ready = 1;
 }

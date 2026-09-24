@@ -45,12 +45,12 @@
  * ── ALLOCATORS ──────────────────────────────────────────────────────────────
  *
  * A vector captures its allocator at its first successful allocation and keeps it
- * for its lifetime, so it can never be freed through a different one. Selection
- * cannot be per-call — these macros receive a bare T* and nothing else — so a new
- * vector is born with BBQ_VEC_ALLOC(), which is NULL (libc) unless the embedder
- * defines it to its own function reading its own per-thread or per-interpreter
- * state. bbq_vec_reserve_a names the allocator explicitly for a vector's first
- * allocation.
+ * for its lifetime, so it can never be freed through a different one. Every form
+ * that can make that first allocation has an _a twin that names the allocator —
+ * bbq_vec_push_a, _try_push_a, _reserve_a, _try_reserve_a, _fill_a — and a library
+ * should use those, passing its own context's allocator: nothing then depends on
+ * state outside the context. The bare forms use BBQ_VEC_ALLOC(), which is NULL
+ * (libc) unless the embedder defines it.
  *
  * BBQ_VEC_ALLOC() is expanded in the TRANSLATION UNIT THAT PUSHES, which is why
  * the macros hand it to the out-of-line half rather than letting that half read
@@ -150,10 +150,16 @@ int  bbq__vec_topi    (const void* v);         /* index of the last element    *
 
 /* Append. On allocation failure this stores nothing and the length does not
  * advance — see the failure contract above. */
-#define bbq_vec_push(v, val) do {                                             \
+#define bbq_vec_push(v, val)     bbq_vec_push_a((v), (val), BBQ_VEC_ALLOC())
+
+/* …naming the allocator a NEW vector is born with. Every form that can give a vector
+ * its first block has an _a twin, so a caller holding its context's allocator never
+ * needs BBQ_VEC_ALLOC() — nor the per-thread state an embedder would otherwise have
+ * to keep for it. On a vector that already has a block, `alloc` is ignored: the
+ * vector keeps the allocator it was born with. */
+#define bbq_vec_push_a(v, val, alloc) do {                                    \
     if (bbq_vec_len(v) >= bbq_vec_cap(v))                                     \
-        (v) = bbq__vec_cast(v) bbq__vec_grow((v), sizeof(*(v)),               \
-                                             BBQ_VEC_ALLOC());                \
+        (v) = bbq__vec_cast(v) bbq__vec_grow((v), sizeof(*(v)), (alloc));     \
     if (!bbq_vec_oom(v))                                                      \
         (v)[bbq__vec_hdr(v)->len++] = (val);                                  \
 } while (0)
@@ -165,8 +171,9 @@ int  bbq__vec_topi    (const void* v);         /* index of the last element    *
  * A statement expression because bbq_vec_push is a statement and cannot appear
  * in a comma expression. GNU only, which this header already requires for
  * __typeof__, and which the gtest build has been compiling as C++ all along. */
-#define bbq_vec_try_push(v, val) __extension__ ({                             \
-    bbq_vec_push((v), (val));                                                 \
+#define bbq_vec_try_push(v, val) bbq_vec_try_push_a((v), (val), BBQ_VEC_ALLOC())
+#define bbq_vec_try_push_a(v, val, alloc) __extension__ ({                    \
+    bbq_vec_push_a((v), (val), (alloc));                                      \
     !bbq_vec_oom(v);                                                          \
 })
 
@@ -186,19 +193,21 @@ int  bbq__vec_topi    (const void* v);         /* index of the last element    *
 } while (0)
 
 /* Reserve, as an expression: true iff the capacity is now there. */
-#define bbq_vec_try_reserve(v, n) __extension__ ({                            \
+#define bbq_vec_try_reserve(v, n) bbq_vec_try_reserve_a((v), (n), BBQ_VEC_ALLOC())
+#define bbq_vec_try_reserve_a(v, n, alloc) __extension__ ({                   \
     int _rn = (int)(n);                                                       \
     if (bbq_vec_cap(v) < _rn)                                                 \
         (v) = bbq__vec_cast(v) bbq__vec_resize((v), (size_t)_rn,              \
-                                               sizeof(*(v)), BBQ_VEC_ALLOC());\
+                                               sizeof(*(v)), (alloc));        \
     bbq_vec_cap(v) >= _rn;                                                    \
 })
 
 /* Extend to exactly n elements with `val`, or fail and change nothing. This is
  * the safe form of `while (len < n) push(v, val)`, which does not terminate once
  * the vector is poisoned. */
-#define bbq_vec_fill(v, n, val) __extension__ ({                              \
-    int _fok = bbq_vec_try_reserve((v), (n));                                 \
+#define bbq_vec_fill(v, n, val)  bbq_vec_fill_a((v), (n), (val), BBQ_VEC_ALLOC())
+#define bbq_vec_fill_a(v, n, val, alloc) __extension__ ({                     \
+    int _fok = bbq_vec_try_reserve_a((v), (n), (alloc));                      \
     if (_fok) {                                                               \
         for (int _fi = bbq_vec_len(v); _fi < (int)(n); _fi++) (v)[_fi] = (val); \
         if ((int)(n) > bbq_vec_len(v)) bbq_vec_setlen((v), (int)(n));          \

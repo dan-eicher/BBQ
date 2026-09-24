@@ -36,15 +36,11 @@ struct eg_class {
     int* node_idx;   /* bbq_vec of node indices */
 };
 
-/* Append to one of the graph's vectors. A vector takes its allocator at
- * its first allocation, and a bare push would take this file's
- * BBQ_VEC_ALLOC() — so a vector not yet born is born here from the
- * graph's. A refused birth leaves it poisoned, and the push then fails
- * like any other refused push. */
-#define EG_TRY_PUSH(g, v, x) __extension__ ({                                 \
-    if (!(v)) bbq_vec_reserve_a((v), 8, (g)->a);                              \
-    bbq_vec_try_push((v), (x));                                               \
-})
+/* Append to one of the graph's vectors. A vector takes its allocator at its
+ * first allocation, so a vector not yet born is born from the graph's — never
+ * from BBQ_VEC_ALLOC(). A refused birth leaves it poisoned, and the push then
+ * fails like any other refused push. */
+#define EG_TRY_PUSH(g, v, x) bbq_vec_try_push_a((v), (x), (g)->a)
 
 /* A class id this graph handed out. */
 static bool eg_valid(const egraph* g, eg_id id) {
@@ -119,8 +115,7 @@ static void analysis_reserve(egraph* g, eg_id cls) {
      * says it could not. */
     if ((size_t)bbq_vec_len(g->class_data) < need) {
         if (need > (size_t)BBQ_VEC_MAX_CAP) { g->oom = true; return; }
-        if (!g->class_data) bbq_vec_reserve_a(g->class_data, (int)need, g->a);
-        if (!bbq_vec_fill(g->class_data, (int)need, (unsigned char)0)) {
+        if (!bbq_vec_fill_a(g->class_data, (int)need, (unsigned char)0, g->a)) {
             g->oom = true;
             return;
         }
@@ -646,7 +641,7 @@ bool eg_extract_from(egraph* g, const eg_extract_plan* plan, eg_id root,
                  * push that silently did nothing would leave sp pointing one
                  * past the storage and the next iteration would read it. */
                 if (sp >= (int)bbq_vec_len(stack)) {
-                    if (!bbq_vec_try_push(stack, kc)) {
+                    if (!bbq_vec_try_push_a(stack, kc, g->a)) {
                         bbq_mem_release(g->a, memo, memo_bytes);
                         bbq_vec_free(stack);
                         eg_extract_free(out);

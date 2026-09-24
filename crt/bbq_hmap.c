@@ -15,9 +15,9 @@
  * CONTENT — op, data and canonical children — and that content comes from the
  * program being compiled. An unseeded mix over attacker-chosen content lets every
  * key be steered onto one probe run, turning the map into a linear scan (Klink &
- * Wälde, 28C3 2011). The seed is drawn from the OS once per process. */
-static uint64_t hmap_mix(uint64_t x) {
-    x ^= bbq_hash_seed();
+ * Wälde, 28C3 2011). Each map draws its own seed from the OS at init. */
+static uint64_t hmap_mix(uint64_t seed, uint64_t x) {
+    x ^= seed;
     x ^= x >> 33;
     x *= 0xff51afd7ed558ccdULL;
     x ^= x >> 33;
@@ -69,6 +69,10 @@ bool bbq_hmap_init(bbq_hmap* m, size_t initial_cap) {
 }
 
 bool bbq_hmap_init_a(bbq_hmap* m, size_t initial_cap, bbq_alloc* a) {
+    return bbq_hmap_init_seeded(m, initial_cap, a, bbq_hash_seed());
+}
+
+bool bbq_hmap_init_seeded(bbq_hmap* m, size_t initial_cap, bbq_alloc* a, uint64_t seed) {
     size_t cap = round_pow2(initial_cap ? initial_cap : BBQ_HMAP_DEFAULT_CAP);
     m->keys = NULL;
     m->vals = NULL;
@@ -77,6 +81,7 @@ bool bbq_hmap_init_a(bbq_hmap* m, size_t initial_cap, bbq_alloc* a) {
     m->len  = 0;
     m->a    = a;
     m->oom  = false;
+    m->seed = seed;
     if (!cap) { m->oom = true; return false; }     /* no power of two that large */
     if (!hmap_alloc(m, cap)) { m->oom = true; return false; }
     return true;
@@ -100,7 +105,7 @@ void bbq_hmap_free(bbq_hmap* m) {
  * allowed to fill, so this always terminates. */
 static size_t hmap_slot(const bbq_hmap* m, uint64_t key) {
     size_t mask = m->cap - 1;
-    size_t i = (size_t)hmap_mix(key) & mask;
+    size_t i = (size_t)hmap_mix(m->seed, key) & mask;
     while (m->used[i] && m->keys[i] != key)
         i = (i + 1) & mask;
     return i;

@@ -52,6 +52,7 @@ typedef struct {
     size_t     len;     /* entries in use                          */
     bbq_alloc* a;       /* captured at init; NULL = libc           */
     bool       oom;     /* sticky: some put was refused            */
+    uint64_t   seed;    /* this map's own hash seed, drawn at init */
 } bbq_hmap;
 
 /* Initialize. `initial_cap` is rounded up to a power of two; 0 selects a default.
@@ -65,6 +66,10 @@ typedef struct {
  * bound what that input costs. */
 bool  bbq_hmap_init(bbq_hmap* m, size_t initial_cap);
 bool  bbq_hmap_init_a(bbq_hmap* m, size_t initial_cap, bbq_alloc* a);
+
+/* As _init_a, with the hash seed given rather than drawn: a reproducible bucket layout,
+ * for a test and only a test (bbq_alloc.h, "Hash seed"). */
+bool  bbq_hmap_init_seeded(bbq_hmap* m, size_t initial_cap, bbq_alloc* a, uint64_t seed);
 
 /* Has any put been refused? The entries present are correct; they are just not
  * all of what was put. Distinct from the per-call `false` a caller may ignore. */

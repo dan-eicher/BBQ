@@ -107,17 +107,20 @@ bbq_alloc* bbq_faulty_handle(bbq_faulty* f);
 
 /* ── Hash seed ───────────────────────────────────────────────────────────────
  *
- * One per process, drawn from the OS on first use. Every CRT hash is seeded from
- * it, because an unseeded hash over attacker-supplied keys is a denial of service:
- * colliding keys are cheap to construct, they all land on one chain, and lookup
- * degrades to a linear scan (Klink & Wälde, 28C3 2011). Seeding is the standard
- * answer and the reason Python, Ruby, Rust and Perl all adopted it.
- */
+ * A FRESH seed from the OS on every call. There is no process-wide seed: every CRT
+ * hash container draws its own at init and keeps it, so no state is shared between
+ * containers or threads — a library a host calls from several threads has nothing
+ * here to race on, and one container's seed says nothing about another's.
+ *
+ * Seeded at all because an unseeded hash over attacker-supplied keys is a denial of
+ * service: colliding keys are cheap to construct, they all land on one chain, and
+ * lookup degrades to a linear scan (Klink & Wälde, 28C3 2011). Seeding is the
+ * standard answer and the reason Python, Ruby, Rust and Perl all adopted it.
+ *
+ * A test that needs a reproducible bucket layout seeds the container itself
+ * (bbq_hmap_init_seeded, bbq_dict_init_seeded) — and only a test: a fixed seed is
+ * the vulnerability this exists to close. */
 uint64_t bbq_hash_seed(void);
-
-/* Override the seed. For tests that need a reproducible bucket layout — and only
- * for those: a fixed seed is the vulnerability this exists to close. */
-void bbq_hash_seed_set(uint64_t seed);
 
 #ifdef __cplusplus
 }

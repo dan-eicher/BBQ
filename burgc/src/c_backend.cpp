@@ -349,7 +349,9 @@ void CBurgBackend::emit_rpo_dfs(std::ostream& out, int indent) {
     pad(out, indent + 1); out << "Frame* stack = NULL;\n";
     pad(out, indent + 1); out << "Frame f0;\n";
     pad(out, indent + 1); out << "f0.node = root; f0.succ = 0;\n";
-    pad(out, indent + 1); out << "bool rpo_oom = !bbq_vec_try_push(stack, f0);\n";
+    // Born from ctx->alloc like `visited` above — never from BBQ_VEC_ALLOC(), which would
+    // make the matcher depend on state outside the context it is handed.
+    pad(out, indent + 1); out << "bool rpo_oom = !bbq_vec_try_push_a(stack, f0, ctx->alloc);\n";
     pad(out, indent + 1); out << "rpo_oom = rpo_oom || !bbq_htree_insert(&visited, (bbq_htree_key)(uintptr_t)BURG_NODE_ID(root), (void*)(uintptr_t)1);\n\n";
 
     pad(out, indent + 1); out << "while (!rpo_oom && bbq_vec_len(stack) > 0) {\n";
@@ -362,10 +364,10 @@ void CBurgBackend::emit_rpo_dfs(std::ostream& out, int indent) {
     pad(out, indent + 4); out << "Frame fn;\n";
     pad(out, indent + 4); out << "fn.node = s; fn.succ = 0;\n";
     pad(out, indent + 4); out << "if (!bbq_htree_insert(&visited, (bbq_htree_key)(uintptr_t)BURG_NODE_ID(s), (void*)(uintptr_t)1)\n";
-    pad(out, indent + 5); out << "|| !bbq_vec_try_push(stack, fn)) { rpo_oom = true; break; }\n";
+    pad(out, indent + 5); out << "|| !bbq_vec_try_push_a(stack, fn, ctx->alloc)) { rpo_oom = true; break; }\n";
     pad(out, indent + 3); out << "}\n";
     pad(out, indent + 2); out << "} else {\n";
-    pad(out, indent + 3); out << "if (!bbq_vec_try_push(rpo, f->node)) { rpo_oom = true; break; }\n";
+    pad(out, indent + 3); out << "if (!bbq_vec_try_push_a(rpo, f->node, ctx->alloc)) { rpo_oom = true; break; }\n";
     pad(out, indent + 3); out << "bbq_vec_truncate(stack, bbq_vec_len(stack) - 1);\n";
     pad(out, indent + 2); out << "}\n";
     pad(out, indent + 1); out << "}\n";

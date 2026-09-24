@@ -59,13 +59,17 @@ extern "C" {
 
 typedef struct bbq_dict_node bbq_dict_node;
 
-typedef uint64_t (*bbq_dict_hash_fn)(const void* key, size_t len);
+/* A hash is handed the dict's own seed with every key, so the seed lives on the container
+ * and nowhere else (bbq_alloc.h, "Hash seed"). A hash that ignores it is allowed — the
+ * weak-hash tests install one — at the cost of the flooding defence. */
+typedef uint64_t (*bbq_dict_hash_fn)(uint64_t seed, const void* key, size_t len);
 
 typedef struct bbq_dict {
     bbq_htree        index;   /* hash -> head of the chain sharing that hash */
     size_t           count;
     bbq_alloc*       a;
     bbq_dict_hash_fn hash;
+    uint64_t         seed;    /* this dict's own hash seed, drawn at init */
     bool             oom;
     uint32_t         gen;     /* bumped by every mutation, for iterator safety */
 } bbq_dict;
@@ -107,6 +111,10 @@ void      bbq_dict_destroy(bbq_dict* d);
  * costs speed and never correctness. */
 void bbq_dict_init_hashed(bbq_dict* d, bbq_alloc* a, bbq_dict_hash_fn hash);
 
+/* As _init_a, with the hash seed given rather than drawn: a reproducible bucket layout,
+ * for a test and only a test. */
+void bbq_dict_init_seeded(bbq_dict* d, bbq_alloc* a, uint64_t seed);
+
 /* Did any insertion get refused? The entries present are correct and complete
  * per key; the dict is just missing some of what was put into it. */
 bool bbq_dict_oom(const bbq_dict* d);
@@ -147,7 +155,7 @@ typedef struct {
 void bbq_dict_iter_init(const bbq_dict* d, bbq_dict_iter* it);
 bool bbq_dict_next(bbq_dict_iter* it, bbq_dict_entry* out);
 
-/* The hash the dict keys its tree on: SipHash-1-3, seeded per process.
+/* The hash the dict keys its tree on: SipHash-1-3, keyed by the dict's own seed.
  *
  * Seeded because the keys are names from input this library does not control. An
  * unseeded hash — djb2, which this was — lets an attacker compute keys that all
@@ -156,9 +164,9 @@ bool bbq_dict_next(bbq_dict_iter* it, bbq_dict_entry* out);
  * SipHash (Aumasson & Bernstein, 2012) is the answer Python, Ruby, Rust and Perl
  * all adopted for it.
  *
- * Exposed so a caller holding the digest can skip recomputing it. Two runs of the
- * same program give different values for the same key; nothing may persist one. */
-uint64_t bbq_dict_hash(const void* key, size_t len);
+ * Exposed so a caller holding the digest can skip recomputing it (with that dict's
+ * `seed`). Two dicts give different values for the same key; nothing may persist one. */
+uint64_t bbq_dict_hash(uint64_t seed, const void* key, size_t len);
 
 #ifdef __cplusplus
 }

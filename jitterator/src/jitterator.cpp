@@ -426,7 +426,9 @@ static std::string render_stencil_table(const std::vector<Stencil>& stencils) {
     out += "    uint32_t patch_count;\n";
     out += "    uint16_t hole_count;\n";
     out += "    uint16_t data_hole_count;  // holes needing constant pool (8 bytes each)\n";
-    out += "    const char **hole_names;\n";
+    // const all the way down: these names decide which address the stitcher writes into
+    // executable code, so they belong in memory nothing can write after relocation.
+    out += "    const char *const *hole_names;\n";
     // The holes a stitcher resolves by NAME on every instruction it stamps. The
     // mapping is fixed when this table is generated, so it is emitted rather than
     // searched for: a driver asking `find_hole(def, \"_HOLE_ip\")` per instruction
@@ -465,7 +467,7 @@ static std::string render_stencil_table(const std::vector<Stencil>& stencils) {
 
         // Hole names
         if (!s.hole_names.empty()) {
-            out += "static const char *holes_" + s.name + "[] = {";
+            out += "static const char *const holes_" + s.name + "[] = {";
             for (auto& h : s.hole_names) {
                 out += "\"" + h + "\", ";
             }

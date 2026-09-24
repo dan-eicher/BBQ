@@ -31,8 +31,8 @@
  * without atomics: with no writer there is no data race, by definition.
  *
  * `slack` is a crumple zone, not storage: len is 0 so no correct caller indexes
- * it, and a stray v[0] from a caller that ignored the contract lands inside an
- * object we own rather than out of bounds.
+ * it, and a stray v[0] READ from a caller that ignored the contract lands inside
+ * an object we own rather than out of bounds (a stray write faults — see below).
  */
 #define BBQ__VEC_SLACK 16
 
@@ -47,9 +47,13 @@ typedef struct {
 _Static_assert(offsetof(bbq__vec_sentinel, slack) == sizeof(bbq_vec_hdr),
                "poison sentinel: element data must sit exactly one header past hdr");
 
-static bbq__vec_sentinel bbq__vec_poison_obj = { { 0, -1, (bbq_alloc*)0 }, { 0 } };
+/* const, so the "nothing writes it" above is enforced rather than promised: the object lives
+ * in read-only memory, and a write through a poisoned vector — a caller that ignored the
+ * contract — faults instead of landing in the one object every thread's poisoned vectors
+ * share. The pointer handed out is non-const only because bbq_vec's API is T*. */
+static const bbq__vec_sentinel bbq__vec_poison_obj = { { 0, -1, (bbq_alloc*)0 }, { 0 } };
 
-static void* poison_data(void) { return bbq__vec_poison_obj.slack; }
+static void* poison_data(void) { return (void*)bbq__vec_poison_obj.slack; }
 
 static int is_sentinel(const void* v) { return v == (const void*)bbq__vec_poison_obj.slack; }
 

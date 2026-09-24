@@ -24,7 +24,7 @@ static size_t node_bytes(size_t len) {
 
 /* ── SipHash-1-3 ──────────────────────────────────────────────────────────────
  *
- * Seeded from bbq_hash_seed(). One compression round per 8-byte block and three
+ * Keyed by the dict's own seed. One compression round per 8-byte block and three
  * finalisation rounds: the variant Rust and the Linux kernel use for hash tables,
  * chosen because the property needed here is that an attacker cannot COMPUTE
  * colliding keys, not that the digest be cryptographic.
@@ -38,9 +38,8 @@ static size_t node_bytes(size_t len) {
         v2 += v1; v1 = SIP_ROTL(v1, 17); v1 ^= v2; v2 = SIP_ROTL(v2, 32); \
     } while (0)
 
-uint64_t bbq_dict_hash(const void* key, size_t len) {
+uint64_t bbq_dict_hash(uint64_t seed, const void* key, size_t len) {
     const unsigned char* in = (const unsigned char*)key;
-    uint64_t seed = bbq_hash_seed();
     uint64_t k0 = seed, k1 = seed ^ 0x9E3779B97F4A7C15ULL;
     uint64_t v0 = 0x736f6d6570736575ULL ^ k0;
     uint64_t v1 = 0x646f72616e646f6dULL ^ k1;
@@ -84,8 +83,14 @@ void bbq_dict_init_hashed(bbq_dict* d, bbq_alloc* a, bbq_dict_hash_fn hash) {
     d->count = 0;
     d->a     = a;
     d->hash  = hash ? hash : bbq_dict_hash;
+    d->seed  = bbq_hash_seed();
     d->oom   = false;
     d->gen   = 0;
+}
+
+void bbq_dict_init_seeded(bbq_dict* d, bbq_alloc* a, uint64_t seed) {
+    bbq_dict_init_hashed(d, a, bbq_dict_hash);
+    d->seed = seed;
 }
 
 void bbq_dict_init(bbq_dict* d) { bbq_dict_init_hashed(d, NULL, bbq_dict_hash); }
@@ -150,7 +155,7 @@ static bbq_dict_node* find(const bbq_dict* d, const void* key, size_t len,
 }
 
 bool bbq_dict_put(bbq_dict* d, const void* key, size_t len, void* value) {
-    uint64_t h = d->hash(key, len);
+    uint64_t h = d->hash(d->seed, key, len);
     bbq_dict_node* hit = find(d, key, len, h, NULL);
     bbq_dict_node* n;
 
@@ -179,16 +184,16 @@ bool bbq_dict_put(bbq_dict* d, const void* key, size_t len, void* value) {
 }
 
 void* bbq_dict_get(const bbq_dict* d, const void* key, size_t len) {
-    bbq_dict_node* n = find(d, key, len, d->hash(key, len), NULL);
+    bbq_dict_node* n = find(d, key, len, d->hash(d->seed, key, len), NULL);
     return n ? n->value : NULL;
 }
 
 bool bbq_dict_contains(const bbq_dict* d, const void* key, size_t len) {
-    return find(d, key, len, d->hash(key, len), NULL) != NULL;
+    return find(d, key, len, d->hash(d->seed, key, len), NULL) != NULL;
 }
 
 void* bbq_dict_delete(bbq_dict* d, const void* key, size_t len) {
-    uint64_t h = d->hash(key, len);
+    uint64_t h = d->hash(d->seed, key, len);
     bbq_dict_node* prev = NULL;
     bbq_dict_node* n = find(d, key, len, h, &prev);
     void* v;

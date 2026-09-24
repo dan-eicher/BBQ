@@ -138,12 +138,20 @@ TEST(BbqAlloc, FaultyFailsTheNthAllocation) {
     bbq_mem_release(nullptr, p4, 8);
 }
 
-TEST(BbqAlloc, HashSeedIsStableWithinAProcessAndOverridable) {
-    EXPECT_EQ(bbq_hash_seed(), bbq_hash_seed());
-    uint64_t original = bbq_hash_seed();
-    bbq_hash_seed_set(0x1234);
-    EXPECT_EQ(bbq_hash_seed(), 0x1234u);
-    bbq_hash_seed_set(original);
+/* No process-wide seed: every draw is fresh, and each container keeps its own. A seed
+ * shared across the process was state every thread of a host read and wrote. */
+TEST(BbqAlloc, HashSeedIsDrawnFreshPerCallAndKeptPerContainer) {
+    EXPECT_NE(bbq_hash_seed(), bbq_hash_seed());   /* 2^-64 to fail by chance */
+    bbq_hmap m1, m2;
+    bbq_hmap_init(&m1, 0); bbq_hmap_init(&m2, 0);
+    EXPECT_NE(m1.seed, m2.seed);
+    bbq_hmap_free(&m1); bbq_hmap_free(&m2);
+    bbq_hmap s; bbq_hmap_init_seeded(&s, 0, nullptr, 0x1234);
+    EXPECT_EQ(s.seed, 0x1234u);                    /* the reproducible form, for tests */
+    bbq_hmap_free(&s);
+    bbq_dict d; bbq_dict_init_seeded(&d, nullptr, 0x5678);
+    EXPECT_EQ(d.seed, 0x5678u);
+    bbq_dict_free(&d);
 }
 
 /* ════════════════════════════════════════════════════════════════════════════
@@ -165,6 +173,31 @@ TEST(BbqVec, PushGrowsAndPreservesOrder) {
     ASSERT_EQ(bbq_vec_len(v), 1000);
     for (int i = 0; i < 1000; i++) EXPECT_EQ(v[i], i * 3);
     bbq_vec_free(v);
+}
+
+/* Every form that can give a vector its first block names the allocator in its _a twin,
+ * and the vector keeps it: a library passes its context's allocator and needs no
+ * BBQ_VEC_ALLOC() state. Counted, so a form that fell back to libc reads 0. */
+TEST(BbqVec, EveryBirthFormHasAnAllocatorNamingTwin) {
+    {   Counting c; int* v = nullptr;
+        bbq_vec_push_a(v, 1, c.handle());
+        EXPECT_EQ(c.served(), 1u);
+        for (int i = 0; i < 100; i++) bbq_vec_push(v, i);   /* grows through the birth allocator */
+        EXPECT_GT(c.served(), 1u);
+        bbq_vec_free(v); }
+    {   Counting c; int* v = nullptr;
+        EXPECT_TRUE(bbq_vec_try_push_a(v, 1, c.handle()));
+        EXPECT_EQ(c.served(), 1u); bbq_vec_free(v); }
+    {   Counting c; int* v = nullptr;
+        bbq_vec_reserve_a(v, 4, c.handle());
+        EXPECT_EQ(c.served(), 1u); bbq_vec_free(v); }
+    {   Counting c; int* v = nullptr;
+        EXPECT_TRUE(bbq_vec_try_reserve_a(v, 4, c.handle()));
+        EXPECT_EQ(c.served(), 1u); bbq_vec_free(v); }
+    {   Counting c; int* v = nullptr;
+        EXPECT_TRUE(bbq_vec_fill_a(v, 5, 7, c.handle()));
+        EXPECT_EQ(c.served(), 1u); ASSERT_EQ(bbq_vec_len(v), 5); EXPECT_EQ(v[4], 7);
+        bbq_vec_free(v); }
 }
 
 TEST(BbqVec, PopAndLast) {
@@ -1064,7 +1097,7 @@ TEST(BbqDict, ClearThenReuse) {
  * problem over 2^64 — so the unlink paths are reached by installing a hash that
  * collides on purpose. The chain is what makes the dict correct rather than
  * usually-right, and it would otherwise ship untested. */
-static uint64_t AllCollide(const void*, size_t len) { return len; }
+static uint64_t AllCollide(uint64_t, const void*, size_t len) { return len; }
 
 TEST(BbqDict, CollidingKeysStayDistinctEntries) {
     bbq_dict d; bbq_dict_init_hashed(&d, nullptr, AllCollide);
@@ -1183,19 +1216,15 @@ TEST(BbqDictAdversarial, TheHashIsSeededSoCollisionsCannotBePrecomputed) {
     /* The defence is that an attacker cannot know the mapping. Two different
      * seeds must disagree about a key's bucket; a hash that ignored the seed
      * (djb2, which this was) would give the same answer both times. */
-    uint64_t saved = bbq_hash_seed();
-    bbq_hash_seed_set(0x1111111111111111ULL);
-    uint64_t a = bbq_dict_hash("java/lang/String", 16);
-    bbq_hash_seed_set(0x2222222222222222ULL);
-    uint64_t b = bbq_dict_hash("java/lang/String", 16);
-    bbq_hash_seed_set(saved);
+    uint64_t a = bbq_dict_hash(0x1111111111111111ULL, "java/lang/String", 16);
+    uint64_t b = bbq_dict_hash(0x2222222222222222ULL, "java/lang/String", 16);
     EXPECT_NE(a, b);
 }
 
 /* djb2, the hash this used to ship: h = h*33 + c, unseeded. Installed here as a
  * known-weak control, so the flooding assertion below is shown to have teeth
  * rather than merely passing. */
-static uint64_t Djb2(const void* key, size_t len) {
+static uint64_t Djb2(uint64_t, const void* key, size_t len) {
     const unsigned char* b = (const unsigned char*)key;
     uint32_t h = 5381;
     for (size_t i = 0; i < len; i++) h = h * 33 + b[i];
@@ -1221,7 +1250,8 @@ TEST(BbqDictAdversarial, AColliderSetFloodsTheWeakHashAndNotTheRealOne) {
 
     auto longest_chain = [&](bbq_dict_hash_fn fn) {
         std::unordered_map<uint64_t, int> per_hash;
-        for (auto& k : keys) per_hash[fn(k.data(), k.size())]++;
+        uint64_t seed = bbq_hash_seed();   /* a seed the attacker does not know, as a dict draws */
+        for (auto& k : keys) per_hash[fn(seed, k.data(), k.size())]++;
         int longest = 0;
         for (auto& kv : per_hash) longest = std::max(longest, kv.second);
         return longest;
